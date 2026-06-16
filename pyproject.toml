@@ -1,0 +1,36 @@
+[project]
+name = "casoCAD"
+version = "0.1.0"
+description = "Programmable SDF-based lattice-grid CAD engine with PySide6, ModernGL and Apache Arrow export."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Edoardo Failla" }
+]
+
+dependencies = [
+    "PySide6==6.11.1",
+    "moderngl==5.12.0",
+    "glcontext==3.0.0",
+    "pyarrow==24.0.0",
+    "numpy>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*", "core*", "scenes*"]
+
+[tool.setuptools.package-data]
+"app.viewport" = ["shaders/*.vert", "shaders/*.frag", "shaders/*.glsl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

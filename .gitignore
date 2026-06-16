@@ -1,0 +1,9 @@
+*.venv/
+*.egg-info/
+*__pycache__/
+*.py[cod]
+*.arrow
+*outbin/
+*.mp4
+*.serena/
+lbm_frames/

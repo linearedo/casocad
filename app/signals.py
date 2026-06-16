@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+from PySide6.QtCore import QObject, Signal
+
+
+class AppSignals(QObject):
+    document_changed = Signal(object)
+    scene_changed = Signal(object)
+    mesh_ready = Signal(object)
+    preview_ready = Signal(object)
+    node_selected = Signal(object)
+    selection_changed = Signal(object)
+    add_primitive_requested = Signal(str)
+    viewport_create_requested = Signal(str)
+    viewport_shape_drawn = Signal(str, object, object)
+    viewport_move_requested = Signal(int, object)
+    viewport_boundary_hovered = Signal(object)
+    viewport_boundary_region_requested = Signal(object)
+    delete_nodes_requested = Signal(object)
+    csg_requested = Signal(str, object)
+    transform_requested = Signal(str, object)
+    solid_from_2d_requested = Signal(str, object)
+    set_fluid_root_requested = Signal(object)
+    set_tag_enabled_requested = Signal(object, bool)
+    create_boundary_region_requested = Signal(object)
+    node_edited = Signal()
+    export_requested = Signal(str)
+    mesh_requested = Signal()
+    mesh_progress = Signal(int)
+    log_message = Signal(str, str)
+
+
+signals = AppSignals()

@@ -1,0 +1,25 @@
+{
+  "fluid_domain": {
+    "root_object_id": null,
+    "tag_object_ids": []
+  },
+  "format": "casocad_scene",
+  "objects": [
+    {
+      "center": [
+        -1.6115768156486392,
+        -6.88737702288419,
+        0.0
+      ],
+      "name": "sphere_6",
+      "object_id": 6,
+      "radius": 4.166978996259039,
+      "type": "Sphere"
+    }
+  ],
+  "root_object_ids": [
+    6
+  ],
+  "unit": "m",
+  "version": 2
+}
