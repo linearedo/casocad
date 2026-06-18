@@ -7,7 +7,7 @@ import numpy as np
 from core.boundary import BoundaryRegion
 from core.scene import SceneDocument
 from core.serialization import load_scene, save_scene
-from core.sdf import PlacedSDF1D
+from core.sdf import Box, PlacedSDF1D, SegmentProfile
 
 
 def test_scene_json_roundtrip_preserves_geometry_and_domain(tmp_path) -> None:
@@ -34,6 +34,21 @@ def test_scene_json_roundtrip_preserves_geometry_and_domain(tmp_path) -> None:
         (tag.object_id, tag.name, tag.dimension)
         for tag in document.fluid_domain.tag_objects
     ]
+
+
+def test_scene_json_roundtrip_preserves_3d_primitive_orientation(tmp_path) -> None:
+    document = SceneDocument()
+    handle = document.add_primitive("box")
+    document.rotate_object(handle, "z", 90.0, (0.0, 0.0, 0.0))
+    path = tmp_path / "oriented-box.casocad.json"
+
+    save_scene(document, path)
+    restored = load_scene(path)
+    restored_box = restored.objects[0]
+
+    assert isinstance(restored_box, Box)
+    assert np.allclose(restored_box.axis_u, (0.0, 1.0, 0.0), atol=1e-12)
+    assert np.allclose(restored_box.axis_v, (-1.0, 0.0, 0.0), atol=1e-12)
 
 
 def test_load_rejects_unknown_format(tmp_path) -> None:
@@ -95,6 +110,25 @@ def test_scene_json_roundtrip_preserves_2d_fluid_domain(tmp_path) -> None:
     assert isinstance(region, PlacedSDF1D)
     assert region.origin == (0.0, -0.35, 0.0)
     assert region.axis_u == (1.0, 0.0, 0.0)
+
+
+def test_segment_profile_serialization_loads_legacy_interval_type(tmp_path) -> None:
+    document = SceneDocument()
+    document.add_primitive("segment")
+    path = tmp_path / "segment.casocad.json"
+
+    save_scene(document, path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["objects"][0]["profile"]["type"] == "SegmentProfile"
+
+    payload["objects"][0]["profile"]["type"] = "IntervalProfile"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    restored = load_scene(path)
+    node = restored.objects[0]
+
+    assert isinstance(node, PlacedSDF1D)
+    assert isinstance(node.profile, SegmentProfile)
 
 
 def test_version_2_scene_loads_without_boundary_regions(tmp_path) -> None:

@@ -5,8 +5,15 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QPoint, Qt, QTimer
+from PySide6.QtGui import QAction, QColor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMenu, QSlider
+from PySide6.QtWidgets import (
+    QApplication,
+    QDoubleSpinBox,
+    QMenu,
+    QPushButton,
+    QSlider,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -42,15 +49,112 @@ def main() -> int:
             fail("SDF opacity control did not update the viewport")
             return
         opacity_slider.setValue(100)
+        background_button = window.findChild(QPushButton, "backgroundColorButton")
+        if background_button is None:
+            fail("background color control is missing")
+            return
+        if not np.allclose(
+            window.viewport.background_color,
+            (36 / 255, 31 / 255, 50 / 255),
+        ):
+            fail("viewport background does not default to #241F32")
+            return
+        window._set_background_color(QColor.fromRgb(32, 64, 96))
+        if not np.allclose(
+            window.viewport.background_color,
+            (32 / 255, 64 / 255, 96 / 255),
+        ):
+            fail("background color control did not update the viewport")
+            return
         if window.viewport._grid_spacing <= 0.0:
             fail("empty scene did not retain a valid reference-grid spacing")
             return
+        snap_action = window.findChild(QAction, "snapEnabledAction")
+        if snap_action is None:
+            fail("snap toggle is missing")
+            return
+        snap_action.setChecked(False)
+        if window.viewport.snap_enabled:
+            fail("snap toggle did not disable viewport snap")
+            return
+        snap_action.setChecked(True)
+        if not window.viewport.snap_enabled:
+            fail("snap toggle did not enable viewport snap")
+            return
+        grid_spacing = window.findChild(QDoubleSpinBox, "gridSpacingSpin")
+        if grid_spacing is None:
+            fail("grid spacing snap control is missing")
+            return
+        grid_spacing.setValue(0.25)
+        if not np.isclose(window.viewport.grid_spacing, 0.25):
+            fail("grid spacing snap control did not update the viewport")
+            return
+        window._reset_grid_spacing()
+        if np.isclose(window.viewport.grid_spacing, 0.25):
+            fail("auto snap control did not restore automatic grid spacing")
+            return
+        if not np.isclose(grid_spacing.value(), window.viewport.grid_spacing):
+            fail("auto snap control did not update the snap spinbox")
+            return
+        grid_spacing.setValue(0.25)
         viewport = window.viewport
         first = QPoint(viewport.width() // 2 - 120, viewport.height() // 2 - 50)
         second = QPoint(viewport.width() // 2 + 80, viewport.height() // 2 + 70)
         viewport.begin_create_tool("box")
         QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=first)
         QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=second)
+        if len(window.document.objects) != 1:
+            fail("box creation did not add one object")
+            return
+        if application.focusWidget() is not viewport:
+            fail("viewport did not keep focus after drawing a shape")
+            return
+        window._undo_document_edit()
+        if window.document.objects:
+            fail("undo did not remove the viewport-created box")
+            return
+        window._redo_document_edit()
+        if len(window.document.objects) != 1 or not isinstance(
+            window.document.objects[0],
+            Box,
+        ):
+            fail("redo did not restore the viewport-created box")
+            return
+        if not np.isclose(window.viewport.grid_spacing, 0.25):
+            fail("manual grid spacing did not survive document republish")
+            return
+        box = window.document.objects[0]
+        original_center = box.center
+        box.center = (3.0, 0.0, 0.0)
+        window.scene_tree.select_handle(window.document.handle_for(box))
+        window._frame_scene()
+        if not np.isclose(window.viewport.camera.target[0], 3.0):
+            fail(
+                "Frame Scene did not prefer the selected object's bounding box "
+                f"(target={window.viewport.camera.target})"
+            )
+            return
+        box.center = original_center
+        window.scene_tree.select_handle(
+            window.document.handle_for(window.document.objects[0])
+        )
+        QTest.keyClick(window, Qt.Key.Key_Delete)
+        if window.document.objects:
+            fail("Delete shortcut did not remove the selected object")
+            return
+        window._undo_document_edit()
+        if len(window.document.objects) != 1 or not isinstance(
+            window.document.objects[0],
+            Box,
+        ):
+            fail("undo did not restore the object deleted by shortcut")
+            return
+        window.scene_tree.tree.clearSelection()
+        box = window.document.objects[0]
+        window._on_viewport_scene_object_selected(box.object_id)
+        if window.scene_tree.selected_handles() != [window.document.handle_for(box)]:
+            fail("viewport object selection did not select the Scene tree item")
+            return
 
         first = QPoint(viewport.width() // 2 - 40, viewport.height() // 2 - 30)
         second = QPoint(viewport.width() // 2 + 30, viewport.height() // 2 + 40)

@@ -10,6 +10,7 @@ from .boundary import BoundaryRegion
 from .mesher import FluidDomain
 from .scene import SceneDocument
 from .sdf import (
+    BezierCurveProfile,
     BinaryProfile1D,
     BinaryProfile,
     Box,
@@ -19,18 +20,21 @@ from .sdf import (
     EllipseProfile,
     Extrude,
     Intersection,
-    IntervalProfile,
     LoftImplicit,
     OffsetProfile,
     OffsetProfile1D,
     PlacedSDF1D,
+    PlacedPolyline2D,
     PlacedSDF2D,
+    PolygonProfile,
+    PolylineProfile,
     RectangleProfile,
     RegularPolygonProfile,
     Revolve,
     Rotate,
     RoundedRectangleProfile,
     Scale,
+    SegmentProfile,
     SmoothUnion,
     Sphere,
     SquareProfile,
@@ -127,20 +131,20 @@ def load_scene(path: str | Path) -> SceneDocument:
         regions_by_id = {
             region.object_id: region for region in document.boundary_regions
         }
-        tag_items: list[PlacedSDF1D | PlacedSDF2D | BoundaryRegion] = []
+        tag_items: list[PlacedSDF1D | PlacedPolyline2D | PlacedSDF2D | BoundaryRegion] = []
         for object_id in (int(item) for item in fluid.get("tag_object_ids", [])):
             region = regions_by_id.get(object_id)
             if region is not None:
                 tag_items.append(region)
             elif object_id in records:
                 tag = build(object_id)
-                if isinstance(tag, (PlacedSDF1D, PlacedSDF2D)):
+                if isinstance(tag, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D)):
                     tag_items.append(tag)
         tags = tuple(tag_items)
         if root.dimension == 2:
             migrated: list[PlacedSDF1D] = []
             for tag in tags:
-                if isinstance(tag, PlacedSDF1D):
+                if isinstance(tag, (PlacedSDF1D, PlacedPolyline2D)):
                     migrated.append(tag)
                 elif isinstance(tag, BoundaryRegion):
                     converted = _legacy_2d_boundary_tag(root, tag)
@@ -149,11 +153,11 @@ def load_scene(path: str | Path) -> SceneDocument:
                     document.boundary_regions.remove(tag)
                 else:
                     raise ValueError(
-                        "2D fluid tag objects must be PlacedSDF1D"
+                        "2D fluid tag objects must be PlacedSDF1D or PlacedPolyline2D"
                     )
             tags = tuple(migrated)
         if not all(
-            isinstance(tag, (PlacedSDF1D, PlacedSDF2D, BoundaryRegion))
+            isinstance(tag, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D, BoundaryRegion))
             for tag in tags
         ):
             raise ValueError(
@@ -166,7 +170,7 @@ def load_scene(path: str | Path) -> SceneDocument:
                 for tag in tags
                 if isinstance(
                     tag,
-                    (PlacedSDF1D, PlacedSDF2D, BoundaryRegion),
+                    (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D, BoundaryRegion),
                 )
             ),
         )
@@ -187,18 +191,30 @@ def _node_to_record(node: SDFNode) -> dict[str, Any]:
     if isinstance(node, Sphere):
         data.update(center=list(node.center), radius=node.radius)
     elif isinstance(node, Box):
-        data.update(center=list(node.center), half_size=list(node.half_size))
+        data.update(
+            center=list(node.center),
+            half_size=list(node.half_size),
+            axis_u=list(node.axis_u),
+            axis_v=list(node.axis_v),
+            axis_w=list(node.axis_w),
+        )
     elif isinstance(node, Cylinder):
         data.update(
             center=list(node.center),
             radius=node.radius,
             half_height=node.half_height,
+            axis_u=list(node.axis_u),
+            axis_v=list(node.axis_v),
+            axis_w=list(node.axis_w),
         )
     elif isinstance(node, Torus):
         data.update(
             center=list(node.center),
             major_radius=node.major_radius,
             minor_radius=node.minor_radius,
+            axis_u=list(node.axis_u),
+            axis_v=list(node.axis_v),
+            axis_w=list(node.axis_w),
         )
     elif isinstance(node, PlacedSDF1D):
         assert node.profile is not None
@@ -207,6 +223,14 @@ def _node_to_record(node: SDFNode) -> dict[str, Any]:
             origin=list(node.origin),
             axis_u=list(node.axis_u),
             source_ids=[child.object_id for child in node.sources],
+        )
+    elif isinstance(node, PlacedPolyline2D):
+        assert node.profile is not None
+        data.update(
+            profile=_profile_to_dict(node.profile),
+            origin=list(node.origin),
+            axis_u=list(node.axis_u),
+            axis_v=list(node.axis_v),
         )
     elif isinstance(node, PlacedSDF2D):
         assert node.profile is not None
@@ -258,13 +282,23 @@ def _node_from_record(
     if node_type == "Sphere":
         return Sphere(**common, center=tuple(data["center"]), radius=float(data["radius"]))
     if node_type == "Box":
-        return Box(**common, center=tuple(data["center"]), half_size=tuple(data["half_size"]))
+        return Box(
+            **common,
+            center=tuple(data["center"]),
+            half_size=tuple(data["half_size"]),
+            axis_u=tuple(data.get("axis_u", (1.0, 0.0, 0.0))),
+            axis_v=tuple(data.get("axis_v", (0.0, 1.0, 0.0))),
+            axis_w=tuple(data.get("axis_w", (0.0, 0.0, 1.0))),
+        )
     if node_type == "Cylinder":
         return Cylinder(
             **common,
             center=tuple(data["center"]),
             radius=float(data["radius"]),
             half_height=float(data["half_height"]),
+            axis_u=tuple(data.get("axis_u", (1.0, 0.0, 0.0))),
+            axis_v=tuple(data.get("axis_v", (0.0, 1.0, 0.0))),
+            axis_w=tuple(data.get("axis_w", (0.0, 0.0, 1.0))),
         )
     if node_type == "Torus":
         return Torus(
@@ -272,6 +306,9 @@ def _node_from_record(
             center=tuple(data["center"]),
             major_radius=float(data["major_radius"]),
             minor_radius=float(data["minor_radius"]),
+            axis_u=tuple(data.get("axis_u", (1.0, 0.0, 0.0))),
+            axis_v=tuple(data.get("axis_v", (0.0, 1.0, 0.0))),
+            axis_w=tuple(data.get("axis_w", (0.0, 0.0, 1.0))),
         )
     if node_type == "PlacedSDF2D":
         return PlacedSDF2D(
@@ -281,6 +318,14 @@ def _node_from_record(
             axis_u=tuple(data["axis_u"]),
             axis_v=tuple(data["axis_v"]),
             sources=tuple(build(int(item)) for item in data.get("source_ids", [])),
+        )
+    if node_type == "PlacedPolyline2D":
+        return PlacedPolyline2D(
+            **common,
+            profile=_profile_from_dict(data["profile"]),
+            origin=tuple(data["origin"]),
+            axis_u=tuple(data["axis_u"]),
+            axis_v=tuple(data["axis_v"]),
         )
     if node_type == "PlacedSDF1D":
         return PlacedSDF1D(
@@ -361,6 +406,9 @@ def _profile_from_dict(data: dict[str, Any]) -> Profile2D:
         "RoundedRectangleProfile": RoundedRectangleProfile,
         "EllipseProfile": EllipseProfile,
         "RegularPolygonProfile": RegularPolygonProfile,
+        "BezierCurveProfile": BezierCurveProfile,
+        "PolylineProfile": PolylineProfile,
+        "PolygonProfile": PolygonProfile,
         "OffsetProfile": OffsetProfile,
         "BinaryProfile": BinaryProfile,
     }
@@ -372,6 +420,8 @@ def _profile_from_dict(data: dict[str, Any]) -> Profile2D:
     for key in ("center", "half_size", "semi_axes"):
         if key in kwargs and isinstance(kwargs[key], list):
             kwargs[key] = tuple(kwargs[key])
+    if "points" in kwargs and isinstance(kwargs["points"], list):
+        kwargs["points"] = tuple(tuple(point) for point in kwargs["points"])
     for key in ("left", "right", "child"):
         if key in kwargs:
             kwargs[key] = _profile_from_dict(kwargs[key])
@@ -391,9 +441,10 @@ def _profile_1d_to_dict(profile: Profile1D) -> dict[str, Any]:
 
 def _profile_1d_from_dict(data: dict[str, Any]) -> Profile1D:
     profile_types = {
-        "IntervalProfile": IntervalProfile,
+        "IntervalProfile": SegmentProfile,
         "OffsetProfile1D": OffsetProfile1D,
         "BinaryProfile1D": BinaryProfile1D,
+        "SegmentProfile": SegmentProfile,
     }
     profile_type = str(data["type"])
     constructor = profile_types.get(profile_type)
@@ -439,7 +490,7 @@ def _legacy_2d_boundary_tag(
     return PlacedSDF1D(
         name=region.name,
         object_id=region.object_id,
-        profile=IntervalProfile(half_length=half_length),
+        profile=SegmentProfile(half_length=half_length),
         origin=tuple(float(value) for value in line_origin),
         axis_u=line_axis,
     )

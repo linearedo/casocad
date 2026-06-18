@@ -12,10 +12,10 @@ from app.main_window import MainWindow
 from core.mesher import FluidDomain
 from core.scene import SceneDocument
 from core.sdf import (
-    IntervalProfile,
     PlacedSDF1D,
     PlacedSDF2D,
     RectangleProfile,
+    SegmentProfile,
 )
 
 
@@ -44,7 +44,7 @@ def main() -> int:
     inlet = PlacedSDF1D(
         name="inlet",
         object_id=2,
-        profile=IntervalProfile(half_length=0.5),
+        profile=SegmentProfile(half_length=0.5),
         origin=(-0.8, 0.0, 0.0),
         axis_u=(0.0, 1.0, 0.0),
     )
@@ -76,7 +76,7 @@ def main() -> int:
             after = cyan_pixels(window.viewport.grabFramebuffer())
             if after < before + 20:
                 fail(
-                    "selecting the inlet did not highlight its 1D interval "
+                    "selecting the inlet did not highlight its 1D segment "
                     f"(before={before}, after={after})"
                 )
                 return

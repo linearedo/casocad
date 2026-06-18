@@ -8,7 +8,12 @@ import numpy as np
 X_AXIS_COLOR = (1.0, 0.0, 0.0)
 Y_AXIS_COLOR = (0.0, 1.0, 0.0)
 Z_AXIS_COLOR = (0.1, 0.45, 1.0)
+WORLD_AXIS_LENGTH = 50.0
+ROTATION_GIZMO_SEGMENTS = 72
 MAX_SELECTED_BOUNDARY_OWNERS = 128
+MAX_PREVIEW_ROTATIONS = 8
+POINT_VERTEX_WIDTH = 7
+SQUARE_INSTANCE_WIDTH = 12
 
 
 class SDFRenderer:
@@ -33,6 +38,24 @@ class SDFRenderer:
         self._grid_vao = context.vertex_array(
             self._grid_program, [(self._vertex_buffer, "2f", "in_position")]
         )
+        self._world_axis_program = self._load_program(
+            "world_axis.vert", "lattice_cells.frag"
+        )
+        world_axis_vertices = self._build_world_axis_vertices()
+        self._world_axis_buffer = context.buffer(world_axis_vertices.tobytes())
+        self._world_axis_vao = context.vertex_array(
+            self._world_axis_program,
+            [(self._world_axis_buffer, "3f 3f", "in_position", "in_color")],
+        )
+        self._world_axis_vertex_count = world_axis_vertices.shape[0]
+        self._rotation_gizmo_buffer = context.buffer(
+            reserve=3 * ROTATION_GIZMO_SEGMENTS * 2 * 6 * 4
+        )
+        self._rotation_gizmo_vao = context.vertex_array(
+            self._world_axis_program,
+            [(self._rotation_gizmo_buffer, "3f 3f", "in_position", "in_color")],
+        )
+        self._rotation_gizmo_vertex_count = 0
         self._gizmo_program = self._load_program(
             "orientation_gizmo.vert", "orientation_gizmo.frag"
         )
@@ -42,6 +65,9 @@ class SDFRenderer:
         self._point_buffer: moderngl.Buffer | None = None
         self._points_vao: moderngl.VertexArray | None = None
         self._point_count = 0
+        self._stream_point_chunks: list[
+            tuple[moderngl.Buffer, moderngl.VertexArray, int]
+        ] = []
         square_edges = np.asarray(
             (
                 (-0.5, -0.5), (0.5, -0.5),
@@ -55,6 +81,9 @@ class SDFRenderer:
         self._square_instance_buffer: moderngl.Buffer | None = None
         self._squares_vao: moderngl.VertexArray | None = None
         self._square_count = 0
+        self._stream_square_chunks: list[
+            tuple[moderngl.Buffer, moderngl.VertexArray, int]
+        ] = []
         self._cell_size = 1.0
         gizmo_vertices = np.asarray(
             (
@@ -90,6 +119,40 @@ class SDFRenderer:
         self._gizmo_label_vertex_count = label_vertices.shape[0]
         self._framebuffer: moderngl.Framebuffer | None = None
         self._framebuffer_glo: int | None = None
+
+    @staticmethod
+    def _build_world_axis_vertices() -> np.ndarray:
+        return np.asarray(
+            (
+                (0.0, 0.0, -WORLD_AXIS_LENGTH, *Z_AXIS_COLOR),
+                (0.0, 0.0, WORLD_AXIS_LENGTH, *Z_AXIS_COLOR),
+            ),
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def build_rotation_gizmo_vertices(
+        center: tuple[float, float, float],
+        radius: float,
+    ) -> np.ndarray:
+        center_array = np.asarray(center, dtype=np.float32)
+        radius = max(float(radius), 1.0e-6)
+        rings = (
+            (X_AXIS_COLOR, 1, 2),
+            (Y_AXIS_COLOR, 0, 2),
+            (Z_AXIS_COLOR, 0, 1),
+        )
+        vertices: list[tuple[float, ...]] = []
+        for color, first_axis, second_axis in rings:
+            for index in range(ROTATION_GIZMO_SEGMENTS):
+                first_angle = 2.0 * np.pi * index / ROTATION_GIZMO_SEGMENTS
+                second_angle = 2.0 * np.pi * (index + 1) / ROTATION_GIZMO_SEGMENTS
+                for angle in (first_angle, second_angle):
+                    point = center_array.copy()
+                    point[first_axis] += radius * np.cos(angle)
+                    point[second_axis] += radius * np.sin(angle)
+                    vertices.append((*point, *color))
+        return np.asarray(vertices, dtype=np.float32)
 
     def _load_program(
         self, vertex_name: str, fragment_name: str
@@ -156,6 +219,9 @@ class SDFRenderer:
         self._program = program
         self._vao = vao
 
+    def has_scene_program(self) -> bool:
+        return self._program is not None and self._vao is not None
+
     def bind_framebuffer(self, framebuffer_glo: int) -> None:
         if (
             self._framebuffer is None
@@ -183,6 +249,26 @@ class SDFRenderer:
         axis_i: tuple[float, float, float] = (1.0, 0.0, 0.0),
         axis_j: tuple[float, float, float] = (0.0, 1.0, 0.0),
     ) -> None:
+        point_vertices, square_instances = self.prepare_lattice_upload(
+            positions,
+            node_types,
+            boundary_faces,
+            source_object_ids,
+            primary_tag_ids,
+            cell_size,
+            dimension=dimension,
+            axis_i=axis_i,
+            axis_j=axis_j,
+        )
+        self.begin_lattice_upload(
+            point_vertices.shape[0],
+            square_instances.shape[0],
+            cell_size,
+        )
+        self.write_lattice_points(0, point_vertices)
+        self.write_lattice_squares(0, square_instances)
+
+    def clear_lattice(self) -> None:
         if self._points_vao is not None:
             self._points_vao.release()
         if self._point_buffer is not None:
@@ -191,27 +277,97 @@ class SDFRenderer:
             self._squares_vao.release()
         if self._square_instance_buffer is not None:
             self._square_instance_buffer.release()
-        if positions.size == 0:
-            self._point_buffer = None
-            self._points_vao = None
-            self._square_instance_buffer = None
-            self._squares_vao = None
-            self._point_count = 0
-            self._square_count = 0
-            return
-        boundary = node_types == 1
-        colors = self._lattice_colors(
+        self.clear_lattice_stream()
+        self._point_buffer = None
+        self._points_vao = None
+        self._square_instance_buffer = None
+        self._squares_vao = None
+        self._point_count = 0
+        self._square_count = 0
+
+    def clear_lattice_stream(self) -> None:
+        for buffer, vao, _count in self._stream_point_chunks:
+            vao.release()
+            buffer.release()
+        for buffer, vao, _count in self._stream_square_chunks:
+            vao.release()
+            buffer.release()
+        self._stream_point_chunks.clear()
+        self._stream_square_chunks.clear()
+
+    def append_lattice_preview_chunk(
+        self,
+        positions: np.ndarray,
+        node_types: np.ndarray,
+        boundary_faces: np.ndarray,
+        source_object_ids: np.ndarray,
+        primary_tag_ids: np.ndarray,
+        cell_size: float,
+        dimension: int = 3,
+        axis_i: tuple[float, float, float] = (1.0, 0.0, 0.0),
+        axis_j: tuple[float, float, float] = (0.0, 1.0, 0.0),
+    ) -> None:
+        point_vertices, square_instances = self.prepare_lattice_upload(
+            positions,
             node_types,
+            boundary_faces,
             source_object_ids,
             primary_tag_ids,
+            cell_size,
+            dimension=dimension,
+            axis_i=axis_i,
+            axis_j=axis_j,
         )
-
-        point_sizes = np.where(boundary, 5.0, 3.0).astype(np.float32)
-        point_vertices = np.column_stack(
-            (positions, colors, point_sizes)
-        ).astype(np.float32, copy=False)
+        self._cell_size = float(cell_size)
         if point_vertices.size:
-            self._point_buffer = self.context.buffer(point_vertices.tobytes())
+            point_buffer = self.context.buffer(point_vertices.tobytes())
+            point_vao = self.context.vertex_array(
+                self._points_program,
+                [
+                    (
+                        point_buffer,
+                        "3f 3f 1f",
+                        "in_position",
+                        "in_color",
+                        "in_point_size",
+                    )
+                ],
+            )
+            self._stream_point_chunks.append(
+                (point_buffer, point_vao, point_vertices.shape[0])
+            )
+        if square_instances.size:
+            square_buffer = self.context.buffer(square_instances.tobytes())
+            square_vao = self.context.vertex_array(
+                self._squares_program,
+                [
+                    (self._square_edge_buffer, "2f", "in_offset"),
+                    (
+                        square_buffer,
+                        "3f 3f 3f 3f /i",
+                        "in_center",
+                        "in_color",
+                        "in_axis_u",
+                        "in_axis_v",
+                    ),
+                ],
+            )
+            self._stream_square_chunks.append(
+                (square_buffer, square_vao, square_instances.shape[0])
+            )
+
+    def begin_lattice_upload(
+        self,
+        point_count: int,
+        square_count: int,
+        cell_size: float,
+    ) -> None:
+        self.clear_lattice()
+        self._cell_size = float(cell_size)
+        if point_count > 0:
+            self._point_buffer = self.context.buffer(
+                reserve=point_count * POINT_VERTEX_WIDTH * 4
+            )
             self._points_vao = self.context.vertex_array(
                 self._points_program,
                 [
@@ -224,23 +380,9 @@ class SDFRenderer:
                     )
                 ],
             )
-        else:
-            self._point_buffer = None
-            self._points_vao = None
-        self._point_count = positions.shape[0]
-
-        square_instances = self._build_boundary_square_instances(
-            positions,
-            boundary_faces,
-            colors,
-            cell_size,
-            dimension=dimension,
-            axis_i=axis_i,
-            axis_j=axis_j,
-        )
-        if square_instances.size:
+        if square_count > 0:
             self._square_instance_buffer = self.context.buffer(
-                square_instances.tobytes()
+                reserve=square_count * SQUARE_INSTANCE_WIDTH * 4
             )
             self._squares_vao = self.context.vertex_array(
                 self._squares_program,
@@ -256,11 +398,87 @@ class SDFRenderer:
                     ),
                 ],
             )
-        else:
-            self._square_instance_buffer = None
-            self._squares_vao = None
-        self._square_count = square_instances.shape[0]
-        self._cell_size = float(cell_size)
+
+    def write_lattice_points(
+        self,
+        start: int,
+        point_vertices: np.ndarray,
+    ) -> None:
+        if self._point_buffer is None or point_vertices.size == 0:
+            return
+        vertices = point_vertices.astype(np.float32, copy=False)
+        self._point_buffer.write(
+            vertices.tobytes(),
+            offset=start * POINT_VERTEX_WIDTH * 4,
+        )
+        self._point_count = max(self._point_count, start + vertices.shape[0])
+
+    def write_lattice_squares(
+        self,
+        start: int,
+        square_instances: np.ndarray,
+    ) -> None:
+        if self._square_instance_buffer is None or square_instances.size == 0:
+            return
+        instances = square_instances.astype(np.float32, copy=False)
+        self._square_instance_buffer.write(
+            instances.tobytes(),
+            offset=start * SQUARE_INSTANCE_WIDTH * 4,
+        )
+        self._square_count = max(self._square_count, start + instances.shape[0])
+
+    @classmethod
+    def prepare_lattice_upload(
+        cls,
+        positions: np.ndarray,
+        node_types: np.ndarray,
+        boundary_faces: np.ndarray,
+        source_object_ids: np.ndarray,
+        primary_tag_ids: np.ndarray,
+        cell_size: float,
+        *,
+        dimension: int = 3,
+        axis_i: tuple[float, float, float] = (1.0, 0.0, 0.0),
+        axis_j: tuple[float, float, float] = (0.0, 1.0, 0.0),
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if positions.size == 0:
+            return (
+                np.empty((0, POINT_VERTEX_WIDTH), dtype=np.float32),
+                np.empty((0, SQUARE_INSTANCE_WIDTH), dtype=np.float32),
+            )
+        boundary = node_types == 1
+        colors = cls._lattice_colors(
+            node_types,
+            source_object_ids,
+            primary_tag_ids,
+        )
+        point_vertices = cls._lattice_point_vertices(
+            positions,
+            boundary,
+            colors,
+        )
+        square_instances = cls._build_boundary_square_instances(
+            positions,
+            boundary_faces,
+            colors,
+            cell_size,
+            dimension=dimension,
+            axis_i=axis_i,
+            axis_j=axis_j,
+        )
+        return point_vertices, square_instances
+
+    @staticmethod
+    def _lattice_point_vertices(
+        positions: np.ndarray,
+        boundary: np.ndarray,
+        colors: np.ndarray,
+    ) -> np.ndarray:
+        point_sizes = np.where(boundary, 5.0, 3.0).astype(np.float32)
+        return np.column_stack((positions, colors, point_sizes)).astype(
+            np.float32,
+            copy=False,
+        )
 
     @staticmethod
     def _lattice_colors(
@@ -379,6 +597,7 @@ class SDFRenderer:
         grid_visible: bool,
         components_visible: bool,
         sdf_opacity: float,
+        background_color: tuple[float, float, float],
         view_rotation: np.ndarray,
         gizmo_visible: bool,
         grid_spacing: float,
@@ -386,16 +605,30 @@ class SDFRenderer:
         boundary_selection_active: bool,
         boundary_hover_owner_id: int,
         boundary_hover_direction: int,
+        boundary_hover_normal: tuple[float, float, float],
         scene_hover_object_id: int,
         scene_selected_object_id: int,
         selected_boundary_regions: tuple[tuple[int, int], ...],
+        selected_boundary_normals: tuple[tuple[float, float, float], ...],
         preview_kind: int,
         preview_start: tuple[float, float, float],
         preview_current: tuple[float, float, float],
         preview_move_delta: tuple[float, float, float],
+        preview_rotation_axes: tuple[int, ...],
+        preview_rotation_angles: tuple[float, ...],
+        preview_rotation_pivots: tuple[tuple[float, float, float], ...],
+        preview_cursor_active: bool,
+        preview_cursor: tuple[float, float, float],
+        preview_torus_minor_radius: float,
+        preview_point_count: int,
+        preview_points: tuple[tuple[float, float, float], ...],
+        preview_polygon_closed: bool,
+        rotation_gizmo_visible: bool,
+        rotation_gizmo_center: tuple[float, float, float],
+        rotation_gizmo_radius: float,
     ) -> None:
         self.context.viewport = (0, 0, width, height)
-        self.context.clear(0.025, 0.032, 0.045, 1.0)
+        self.context.clear(*background_color, 1.0)
         self.context.enable(moderngl.DEPTH_TEST)
         self.context.enable(moderngl.PROGRAM_POINT_SIZE)
         matrix_bytes = view_projection.T.astype(np.float32).tobytes()
@@ -405,21 +638,34 @@ class SDFRenderer:
                 "u_resolution": (float(width), float(height)),
                 "u_camera_position": camera_position,
                 "u_camera_target": camera_target,
+                "u_camera_right": tuple(float(value) for value in view_rotation[0]),
+                "u_camera_up": tuple(float(value) for value in view_rotation[1]),
                 "u_focal_length": focal_length,
                 "u_show_components": components_visible,
                 "u_surface_opacity": sdf_opacity,
+                "u_background_color": background_color,
                 "u_show_grid": grid_visible,
                 "u_grid_spacing": grid_spacing,
                 "u_grid_plane": grid_plane,
                 "u_boundary_selection_active": boundary_selection_active,
                 "u_boundary_hover_owner_id": boundary_hover_owner_id,
                 "u_boundary_hover_direction": boundary_hover_direction,
+                "u_boundary_hover_normal": boundary_hover_normal,
                 "u_scene_hover_object_id": scene_hover_object_id,
                 "u_scene_selected_object_id": scene_selected_object_id,
                 "u_preview_kind": preview_kind,
                 "u_preview_start": preview_start,
                 "u_preview_current": preview_current,
                 "u_preview_move_delta": preview_move_delta,
+                "u_preview_rotation_count": min(
+                    len(preview_rotation_axes),
+                    MAX_PREVIEW_ROTATIONS,
+                ),
+                "u_preview_cursor_active": preview_cursor_active,
+                "u_preview_cursor": preview_cursor,
+                "u_preview_torus_minor_radius": preview_torus_minor_radius,
+                "u_preview_point_count": preview_point_count,
+                "u_preview_polygon_closed": preview_polygon_closed,
                 "u_selected_boundary_region_count": len(
                     selected_boundary_regions
                 ),
@@ -439,6 +685,50 @@ class SDFRenderer:
                 self._program["u_selected_boundary_regions"].value = (
                     padded_regions
                 )
+            if "u_selected_boundary_normals" in self._program:
+                padded_normals = (
+                    *selected_boundary_normals,
+                    *((0.0, 0.0, 0.0),)
+                    * (
+                        MAX_SELECTED_BOUNDARY_OWNERS
+                        - len(selected_boundary_normals)
+                    ),
+                )
+                self._program["u_selected_boundary_normals"].value = (
+                    padded_normals
+                )
+            if "u_preview_rotation_axes" in self._program:
+                padded_axes = (
+                    *preview_rotation_axes[:MAX_PREVIEW_ROTATIONS],
+                    *(0 for _ in range(
+                        MAX_PREVIEW_ROTATIONS - len(preview_rotation_axes)
+                    )),
+                )
+                self._program["u_preview_rotation_axes"].value = padded_axes
+            if "u_preview_rotation_angles" in self._program:
+                padded_angles = (
+                    *preview_rotation_angles[:MAX_PREVIEW_ROTATIONS],
+                    *(0.0 for _ in range(
+                        MAX_PREVIEW_ROTATIONS - len(preview_rotation_angles)
+                    )),
+                )
+                self._program["u_preview_rotation_angles"].value = padded_angles
+            if "u_preview_rotation_pivots" in self._program:
+                padded_pivots = (
+                    *preview_rotation_pivots[:MAX_PREVIEW_ROTATIONS],
+                    *((0.0, 0.0, 0.0),)
+                    * (
+                        MAX_PREVIEW_ROTATIONS
+                        - len(preview_rotation_pivots)
+                    ),
+                )
+                self._program["u_preview_rotation_pivots"].value = padded_pivots
+            if "u_preview_points" in self._program:
+                padded_points = (
+                    *preview_points[:32],
+                    *((0.0, 0.0, 0.0),) * max(0, 32 - len(preview_points)),
+                )
+                self._program["u_preview_points"].value = padded_points
             self._vao.render(mode=moderngl.TRIANGLES)
             self.context.enable(moderngl.DEPTH_TEST)
         elif mode == "lattice":
@@ -450,9 +740,16 @@ class SDFRenderer:
                 )
                 self._grid_program["u_camera_position"].value = camera_position
                 self._grid_program["u_camera_target"].value = camera_target
+                self._grid_program["u_camera_right"].value = tuple(
+                    float(value) for value in view_rotation[0]
+                )
+                self._grid_program["u_camera_up"].value = tuple(
+                    float(value) for value in view_rotation[1]
+                )
                 self._grid_program["u_focal_length"].value = focal_length
                 self._grid_program["u_grid_spacing"].value = grid_spacing
                 self._grid_program["u_grid_plane"].value = grid_plane
+                self._grid_program["u_background_color"].value = background_color
                 self._grid_vao.render(mode=moderngl.TRIANGLES)
                 self.context.enable(moderngl.DEPTH_TEST)
             if self._points_vao is not None:
@@ -461,6 +758,10 @@ class SDFRenderer:
                     mode=moderngl.POINTS,
                     vertices=self._point_count,
                 )
+            if self._stream_point_chunks:
+                self._points_program["u_view_projection"].write(matrix_bytes)
+                for _buffer, vao, count in self._stream_point_chunks:
+                    vao.render(mode=moderngl.POINTS, vertices=count)
         if mode == "lattice" and self._squares_vao is not None:
             self._squares_program["u_view_projection"].write(matrix_bytes)
             self._squares_program["u_cell_size"].value = self._cell_size
@@ -468,6 +769,31 @@ class SDFRenderer:
                 mode=moderngl.LINES,
                 vertices=8,
                 instances=self._square_count,
+            )
+        if mode == "lattice" and self._stream_square_chunks:
+            self._squares_program["u_view_projection"].write(matrix_bytes)
+            self._squares_program["u_cell_size"].value = self._cell_size
+            for _buffer, vao, count in self._stream_square_chunks:
+                vao.render(mode=moderngl.LINES, vertices=8, instances=count)
+        if grid_visible:
+            self.context.disable(moderngl.DEPTH_TEST)
+            self._world_axis_program["u_view_projection"].write(matrix_bytes)
+            self._world_axis_vao.render(
+                mode=moderngl.LINES,
+                vertices=self._world_axis_vertex_count,
+            )
+        if rotation_gizmo_visible:
+            vertices = self.build_rotation_gizmo_vertices(
+                rotation_gizmo_center,
+                rotation_gizmo_radius,
+            )
+            self._rotation_gizmo_buffer.write(vertices.tobytes())
+            self._rotation_gizmo_vertex_count = vertices.shape[0]
+            self.context.disable(moderngl.DEPTH_TEST)
+            self._world_axis_program["u_view_projection"].write(matrix_bytes)
+            self._rotation_gizmo_vao.render(
+                mode=moderngl.LINES,
+                vertices=self._rotation_gizmo_vertex_count,
             )
         if gizmo_visible:
             self.context.disable(moderngl.DEPTH_TEST)
@@ -517,7 +843,13 @@ class SDFRenderer:
             self._squares_vao.release()
         if self._square_instance_buffer is not None:
             self._square_instance_buffer.release()
+        self.clear_lattice_stream()
         self._grid_vao.release()
+        self._world_axis_vao.release()
+        self._world_axis_buffer.release()
+        self._rotation_gizmo_vao.release()
+        self._rotation_gizmo_buffer.release()
+        self._world_axis_program.release()
         if self._framebuffer is not None:
             self._framebuffer.release()
         self._gizmo_vao.release()

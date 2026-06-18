@@ -4,28 +4,28 @@ import numpy as np
 
 from core.sdf import (
     BinaryProfile1D,
-    IntervalProfile,
     PlacedSDF1D,
     SDFTree,
+    SegmentProfile,
 )
 
 
-def test_interval_profile_has_signed_intrinsic_distance() -> None:
-    interval = IntervalProfile(center=0.5, half_length=1.0)
+def test_segment_profile_has_signed_intrinsic_distance() -> None:
+    segment = SegmentProfile(center=0.5, half_length=1.0)
     coordinates = np.asarray((-1.0, -0.5, 0.5, 1.5, 2.0))
 
     np.testing.assert_allclose(
-        interval.to_numpy(coordinates),
+        segment.to_numpy(coordinates),
         (0.5, 0.0, -1.0, 0.0, 0.5),
     )
-    assert interval.bounds() == (-0.5, 1.5)
+    assert segment.bounds() == (-0.5, 1.5)
 
 
 def test_placed_1d_projects_to_its_line() -> None:
     line = PlacedSDF1D(
         name="inlet",
         object_id=1,
-        profile=IntervalProfile(half_length=1.0),
+        profile=SegmentProfile(half_length=1.0),
         origin=(1.0, 2.0, 3.0),
         axis_u=(0.0, 1.0, 0.0),
     )
@@ -52,10 +52,10 @@ def test_placed_1d_projects_to_its_line() -> None:
     ]
 
 
-def test_1d_boolean_profile_preserves_interval_signs() -> None:
+def test_1d_boolean_profile_preserves_segment_signs() -> None:
     profile = BinaryProfile1D(
-        IntervalProfile(center=-0.5, half_length=0.75),
-        IntervalProfile(center=0.5, half_length=0.75),
+        SegmentProfile(center=-0.5, half_length=0.75),
+        SegmentProfile(center=0.5, half_length=0.75),
         "union",
     )
     coordinates = np.asarray((-1.5, -1.0, 0.0, 1.0, 1.5))
@@ -73,7 +73,7 @@ def test_placed_1d_generates_selectable_glsl() -> None:
     line = PlacedSDF1D(
         name="line",
         object_id=7,
-        profile=IntervalProfile(),
+        profile=SegmentProfile(),
     )
     tree = SDFTree(line, components=(line,))
     source = tree.to_glsl()

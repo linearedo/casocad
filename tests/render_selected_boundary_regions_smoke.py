@@ -178,13 +178,25 @@ def main() -> int:
         QTimer.singleShot(300, verify_multiple_selection)
 
     def verify_multiple_selection() -> None:
-        expected = ((box.object_id, (1 << 2) | (1 << 3)),)
+        expected = ((box.object_id, 0), (box.object_id, 0))
         if window.viewport._selected_boundary_regions != expected:
             fail(
-                "multiple Scene selections did not merge their direction masks "
+                "multiple Scene selections did not preserve their direction entries "
                 f"(got={window.viewport._selected_boundary_regions})"
             )
             return
+        expected_normals = ((0.0, -1.0, 0.0), (0.0, 1.0, 0.0))
+        for actual, expected_normal in zip(
+            window.viewport._selected_boundary_normals,
+            expected_normals,
+            strict=True,
+        ):
+            if actual != expected_normal:
+                fail(
+                    "multiple Scene selections did not preserve their direction normals "
+                    f"(got={window.viewport._selected_boundary_normals})"
+                )
+                return
         window.close()
         application.exit(0)
 

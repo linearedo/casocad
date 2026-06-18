@@ -11,7 +11,7 @@ from core.sdf import BoundingBox3D
 
 @dataclass
 class OrbitCamera:
-    yaw_degrees: float = 35.0
+    yaw_degrees: float = 215.0
     pitch_degrees: float = 22.0
     distance: float = 3.2
     target: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -35,12 +35,12 @@ class OrbitCamera:
 
     @staticmethod
     def standard_view_angles() -> tuple[float, float]:
-        return 35.0, 22.0
+        return 215.0, 22.0
 
     @staticmethod
     def plane_view_angles(plane: str) -> tuple[float, float]:
         if plane == "xy":
-            return 0.0, 90.0
+            return 180.0, 90.0
         if plane == "xz":
             return 180.0, 0.0
         if plane == "yz":
@@ -62,12 +62,10 @@ class OrbitCamera:
         target = np.asarray(self.target, dtype=np.float64)
         forward = target - eye
         forward /= np.linalg.norm(forward)
-        world_up = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
-        if abs(float(np.dot(forward, world_up))) > 0.995:
-            world_up = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
-        right = np.cross(forward, world_up)
-        right /= max(np.linalg.norm(right), 1e-12)
+        yaw = radians(self.yaw_degrees)
+        right = np.asarray((-cos(yaw), sin(yaw), 0.0), dtype=np.float64)
         up = np.cross(right, forward)
+        up /= max(np.linalg.norm(up), 1e-12)
         return forward, right, up
 
     def orbit(self, delta_x: float, delta_y: float) -> None:

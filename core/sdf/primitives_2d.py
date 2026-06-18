@@ -34,6 +34,341 @@ def _vec2(values: tuple[float, float]) -> str:
     return f"vec2({glsl_float(values[0])}, {glsl_float(values[1])})"
 
 
+def _as_points(
+    points: tuple[tuple[float, float], ...] | list[tuple[float, float]] | list[list[float]],
+) -> tuple[tuple[float, float], ...]:
+    return tuple((float(point[0]), float(point[1])) for point in points)
+
+
+def _segment_distance_numpy(
+    U: FloatArray,
+    V: FloatArray,
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> FloatArray:
+    ax, ay = first
+    bx, by = second
+    bax = bx - ax
+    bay = by - ay
+    denominator = bax * bax + bay * bay
+    if denominator <= 1e-24:
+        return np.asarray(np.sqrt((U - ax) ** 2 + (V - ay) ** 2), dtype=np.float64)
+    h = np.clip(((U - ax) * bax + (V - ay) * bay) / denominator, 0.0, 1.0)
+    dx = U - ax - h * bax
+    dy = V - ay - h * bay
+    return np.asarray(np.sqrt(dx * dx + dy * dy), dtype=np.float64)
+
+
+def _segment_distance_glsl(
+    p_var: str,
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> str:
+    a = _vec2(first)
+    b = _vec2(second)
+    pa = f"({p_var} - {a})"
+    ba = f"({b} - {a})"
+    h = f"clamp(dot({pa}, {ba}) / max(dot({ba}, {ba}), 1.0e-12), 0.0, 1.0)"
+    return f"length({pa} - {ba} * {h})"
+
+
+def _polyline_distance_numpy(
+    U: FloatArray,
+    V: FloatArray,
+    points: tuple[tuple[float, float], ...],
+    closed: bool,
+) -> FloatArray:
+    pairs = zip(points, points[1:])
+    distances = [
+        _segment_distance_numpy(U, V, first, second)
+        for first, second in pairs
+    ]
+    if closed:
+        distances.append(_segment_distance_numpy(U, V, points[-1], points[0]))
+    return np.asarray(np.minimum.reduce(distances), dtype=np.float64)
+
+
+def _polyline_distance_glsl(
+    p_var: str,
+    points: tuple[tuple[float, float], ...],
+    closed: bool,
+) -> str:
+    pairs = list(zip(points, points[1:]))
+    if closed:
+        pairs.append((points[-1], points[0]))
+    expression = _segment_distance_glsl(p_var, pairs[0][0], pairs[0][1])
+    for first, second in pairs[1:]:
+        expression = f"min({expression}, {_segment_distance_glsl(p_var, first, second)})"
+    return expression
+
+
+def _quadratic_bezier_spans(
+    points: tuple[tuple[float, float], ...],
+) -> tuple[
+    tuple[
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+    ],
+    ...,
+]:
+    return tuple(
+        (points[index], points[index + 1], points[index + 2])
+        for index in range(0, len(points) - 2, 2)
+    )
+
+
+def _quadratic_bezier_distance_numpy(
+    U: FloatArray,
+    V: FloatArray,
+    start: tuple[float, float],
+    control: tuple[float, float],
+    end: tuple[float, float],
+) -> FloatArray:
+    ax, ay = start
+    bx, by = control
+    cx, cy = end
+    a_x = bx - ax
+    a_y = by - ay
+    b_x = ax - 2.0 * bx + cx
+    b_y = ay - 2.0 * by + cy
+    c_x = 2.0 * a_x
+    c_y = 2.0 * a_y
+    b_dot_b = b_x * b_x + b_y * b_y
+    if b_dot_b <= 1.0e-24:
+        return _segment_distance_numpy(U, V, start, end)
+
+    d_x = ax - U
+    d_y = ay - V
+    kk = 1.0 / b_dot_b
+    kx = kk * (a_x * b_x + a_y * b_y)
+    ky = kk * (2.0 * (a_x * a_x + a_y * a_y) + d_x * b_x + d_y * b_y) / 3.0
+    kz = kk * (d_x * a_x + d_y * a_y)
+    p = ky - kx * kx
+    q = kx * (2.0 * kx * kx - 3.0 * ky) + kz
+    h = q * q + 4.0 * p * p * p
+    result = np.full(np.shape(U), np.inf, dtype=np.float64)
+
+    single_root = h >= 0.0
+    if np.any(single_root):
+        h_root = np.sqrt(np.maximum(h[single_root], 0.0))
+        x_0 = 0.5 * (h_root - q[single_root])
+        x_1 = 0.5 * (-h_root - q[single_root])
+        t = np.clip(np.cbrt(x_0) + np.cbrt(x_1) - kx, 0.0, 1.0)
+        w_x = d_x[single_root] + (c_x + b_x * t) * t
+        w_y = d_y[single_root] + (c_y + b_y * t) * t
+        result[single_root] = w_x * w_x + w_y * w_y
+
+    three_roots = ~single_root
+    if np.any(three_roots):
+        p_values = p[three_roots]
+        q_values = q[three_roots]
+        z = np.sqrt(np.maximum(-p_values, 0.0))
+        denominator = 2.0 * p_values * z
+        angle_argument = np.divide(
+            q_values,
+            denominator,
+            out=np.zeros_like(q_values),
+            where=np.abs(denominator) > 1.0e-24,
+        )
+        angle = np.arccos(np.clip(angle_argument, -1.0, 1.0)) / 3.0
+        m = np.cos(angle)
+        n = np.sin(angle) * 1.732050808
+        t_0 = np.clip((m + m) * z - kx, 0.0, 1.0)
+        t_1 = np.clip((-n - m) * z - kx, 0.0, 1.0)
+        d_x_values = d_x[three_roots]
+        d_y_values = d_y[three_roots]
+        w_0_x = d_x_values + (c_x + b_x * t_0) * t_0
+        w_0_y = d_y_values + (c_y + b_y * t_0) * t_0
+        w_1_x = d_x_values + (c_x + b_x * t_1) * t_1
+        w_1_y = d_y_values + (c_y + b_y * t_1) * t_1
+        result[three_roots] = np.minimum(
+            w_0_x * w_0_x + w_0_y * w_0_y,
+            w_1_x * w_1_x + w_1_y * w_1_y,
+        )
+
+    return np.asarray(np.sqrt(np.maximum(result, 0.0)), dtype=np.float64)
+
+
+def _quadratic_bezier_distance_glsl(
+    p_var: str,
+    start: tuple[float, float],
+    control: tuple[float, float],
+    end: tuple[float, float],
+) -> str:
+    return (
+        f"quadraticBezierDistance({p_var}, {_vec2(start)}, "
+        f"{_vec2(control)}, {_vec2(end)})"
+    )
+
+
+@dataclass(frozen=True)
+class PolylineProfile(Profile2D):
+    points: tuple[tuple[float, float], ...] = (
+        (-0.6, -0.4),
+        (0.6, -0.4),
+        (0.35, 0.4),
+        (-0.35, 0.4),
+    )
+
+    def __post_init__(self) -> None:
+        normalized = _as_points(self.points)
+        if len(normalized) < 2:
+            raise ValueError("polyline requires at least two points")
+        if all(
+            np.linalg.norm(np.asarray(second) - np.asarray(first)) <= 1e-12
+            for first, second in zip(normalized, normalized[1:])
+        ):
+            raise ValueError("polyline requires at least one nonzero segment")
+        object.__setattr__(self, "points", normalized)
+
+    @property
+    def kind(self) -> str:
+        return "polyline"
+
+    def to_glsl(self, p_var: str = "q") -> str:
+        return _polyline_distance_glsl(p_var, self.points, closed=False)
+
+    def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
+        return _polyline_distance_numpy(U, V, self.points, closed=False)
+
+    def bounds(self) -> tuple[float, float, float, float]:
+        points = np.asarray(self.points, dtype=np.float64)
+        return (
+            float(points[:, 0].min()),
+            float(points[:, 0].max()),
+            float(points[:, 1].min()),
+            float(points[:, 1].max()),
+        )
+
+
+@dataclass(frozen=True)
+class BezierCurveProfile(Profile2D):
+    points: tuple[tuple[float, float], ...] = (
+        (-0.6, -0.35),
+        (0.0, 0.55),
+        (0.6, -0.35),
+    )
+
+    def __post_init__(self) -> None:
+        normalized = _as_points(self.points)
+        if len(normalized) < 3:
+            raise ValueError("bezier curve requires at least three points")
+        if len(normalized) % 2 == 0:
+            raise ValueError(
+                "bezier curve requires an odd point count: anchor, control, anchor"
+            )
+        if all(
+            np.linalg.norm(np.asarray(control) - np.asarray(start)) <= 1e-12
+            and np.linalg.norm(np.asarray(end) - np.asarray(start)) <= 1e-12
+            for start, control, end in _quadratic_bezier_spans(normalized)
+        ):
+            raise ValueError("bezier curve requires at least one nonzero span")
+        object.__setattr__(self, "points", normalized)
+
+    @property
+    def kind(self) -> str:
+        return "bezier_polycurve" if len(self.points) > 3 else "bezier_curve"
+
+    def to_glsl(self, p_var: str = "q") -> str:
+        spans = _quadratic_bezier_spans(self.points)
+        expression = _quadratic_bezier_distance_glsl(p_var, *spans[0])
+        for span in spans[1:]:
+            expression = (
+                f"min({expression}, {_quadratic_bezier_distance_glsl(p_var, *span)})"
+            )
+        return expression
+
+    def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
+        distances = [
+            _quadratic_bezier_distance_numpy(U, V, start, control, end)
+            for start, control, end in _quadratic_bezier_spans(self.points)
+        ]
+        return np.asarray(np.minimum.reduce(distances), dtype=np.float64)
+
+    def bounds(self) -> tuple[float, float, float, float]:
+        points = np.asarray(self.points, dtype=np.float64)
+        return (
+            float(points[:, 0].min()),
+            float(points[:, 0].max()),
+            float(points[:, 1].min()),
+            float(points[:, 1].max()),
+        )
+
+
+@dataclass(frozen=True)
+class PolygonProfile(Profile2D):
+    points: tuple[tuple[float, float], ...] = (
+        (-0.6, -0.4),
+        (0.6, -0.4),
+        (0.35, 0.4),
+        (-0.35, 0.4),
+    )
+
+    def __post_init__(self) -> None:
+        normalized = _as_points(self.points)
+        if len(normalized) >= 2 and normalized[0] == normalized[-1]:
+            normalized = normalized[:-1]
+        if len(normalized) < 3:
+            raise ValueError("polygon requires at least three points")
+        object.__setattr__(self, "points", normalized)
+
+    @property
+    def kind(self) -> str:
+        return "polygon"
+
+    def to_glsl(self, p_var: str = "q") -> str:
+        distance = _polyline_distance_glsl(p_var, self.points, closed=True)
+        inside = "false"
+        for first, second in zip(
+            self.points,
+            (*self.points[1:], self.points[0]),
+            strict=True,
+        ):
+            ax, ay = first
+            bx, by = second
+            condition = (
+                f"(({glsl_float(ay)} > {p_var}.y) != ({glsl_float(by)} > {p_var}.y))"
+                f" && ({p_var}.x < ({glsl_float(bx)} - {glsl_float(ax)})"
+                f" * ({p_var}.y - {glsl_float(ay)})"
+                f" / ({glsl_float(by)} - {glsl_float(ay)}) + {glsl_float(ax)})"
+            )
+            inside = f"(({inside}) != ({condition}))"
+        return f"(({inside}) ? -({distance}) : ({distance}))"
+
+    def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
+        distance = _polyline_distance_numpy(U, V, self.points, closed=True)
+        inside = np.full(np.shape(distance), False, dtype=np.bool_)
+        for first, second in zip(
+            self.points,
+            (*self.points[1:], self.points[0]),
+            strict=True,
+        ):
+            ax, ay = first
+            bx, by = second
+            active = (ay > V) != (by > V)
+            intersection = np.full(np.shape(distance), ax, dtype=np.float64)
+            np.divide(
+                (bx - ax) * (V - ay),
+                by - ay,
+                out=intersection,
+                where=active,
+            )
+            intersection += ax
+            crosses = active & (U < intersection)
+            inside ^= crosses
+        return np.asarray(np.where(inside, -distance, distance), dtype=np.float64)
+
+    def bounds(self) -> tuple[float, float, float, float]:
+        points = np.asarray(self.points, dtype=np.float64)
+        return (
+            float(points[:, 0].min()),
+            float(points[:, 0].max()),
+            float(points[:, 1].min()),
+            float(points[:, 1].max()),
+        )
+
+
 @dataclass(frozen=True)
 class CircleProfile(Profile2D):
     center: tuple[float, float] = (0.0, 0.0)

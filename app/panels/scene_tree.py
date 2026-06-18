@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QMenu,
@@ -15,9 +17,55 @@ from PySide6.QtWidgets import (
 from app.signals import signals
 from core.boundary import BoundaryRegion
 from core.scene import SceneDocument
-from core.sdf import PlacedSDF1D
+from core.sdf import PlacedPolyline2D, PlacedSDF1D, PolylineProfile
 from core.sdf.base import SDFNode
 HANDLE_ROLE = Qt.ItemDataRole.UserRole
+SDF_ICON_DIR = Path(__file__).resolve().parents[2] / "assets" / "icons"
+SDF_MENU_ITEMS: tuple[tuple[str, str], ...] = (
+    ("Segment 1D", "segment"),
+    ("Polyline 1D", "polyline"),
+    ("Bezier Curve 1D", "bezier_curve"),
+    ("Bezier Polycurve 1D", "bezier_polycurve"),
+    ("Circle 2D", "circle"),
+    ("Rectangle 2D", "rectangle"),
+    ("Square 2D", "square"),
+    ("Rounded Rectangle 2D", "rounded_rectangle"),
+    ("Ellipse 2D", "ellipse"),
+    ("Regular Polygon 2D", "regular_polygon"),
+    ("Polygon 2D", "polygon"),
+    ("Sphere", "sphere"),
+    ("Box", "box"),
+    ("Cylinder", "cylinder"),
+    ("Torus", "torus"),
+)
+SDF_MENU_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("1D", SDF_MENU_ITEMS[:4]),
+    ("2D", SDF_MENU_ITEMS[4:11]),
+    ("3D", SDF_MENU_ITEMS[11:]),
+)
+
+
+def sdf_icon_path(kind: str) -> Path:
+    return SDF_ICON_DIR / f"sdf_{kind}.svg"
+
+
+def sdf_icon(kind: str) -> QIcon:
+    return QIcon(str(sdf_icon_path(kind)))
+
+
+def add_sdf_menu_actions(menu: QMenu, signal: object) -> None:
+    for index, (section, items) in enumerate(SDF_MENU_SECTIONS):
+        if index > 0:
+            menu.addSeparator()
+        header = menu.addSection(section)
+        header.setEnabled(False)
+        for label, kind in items:
+            action = QAction(sdf_icon(kind), label, menu)
+            action.setIconVisibleInMenu(True)
+            action.triggered.connect(
+                lambda checked=False, value=kind: signal.emit(value)
+            )
+            menu.addAction(action)
 
 
 class SceneTreePanel(QWidget):
@@ -29,48 +77,12 @@ class SceneTreePanel(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         add_button = QPushButton("Add SDF")
         add_menu = QMenu(add_button)
-        for label, kind in (
-            ("Interval 1D", "interval"),
-            ("Circle 2D", "circle"),
-            ("Rectangle 2D", "rectangle"),
-            ("Square 2D", "square"),
-            ("Rounded Rectangle 2D", "rounded_rectangle"),
-            ("Ellipse 2D", "ellipse"),
-            ("Regular Polygon 2D", "regular_polygon"),
-            ("Sphere", "sphere"),
-            ("Box", "box"),
-            ("Cylinder", "cylinder"),
-            ("Torus", "torus"),
-        ):
-            action = add_menu.addAction(label)
-            action.triggered.connect(
-                lambda checked=False, value=kind: signals.add_primitive_requested.emit(
-                    value
-                )
-            )
+        add_sdf_menu_actions(add_menu, signals.add_primitive_requested)
         add_button.setMenu(add_menu)
         layout.addWidget(add_button)
         draw_button = QPushButton("Draw on Grid")
         draw_menu = QMenu(draw_button)
-        for label, kind in (
-            ("Interval 1D", "interval"),
-            ("Circle 2D", "circle"),
-            ("Rectangle 2D", "rectangle"),
-            ("Square 2D", "square"),
-            ("Rounded Rectangle 2D", "rounded_rectangle"),
-            ("Ellipse 2D", "ellipse"),
-            ("Regular Polygon 2D", "regular_polygon"),
-            ("Sphere", "sphere"),
-            ("Box", "box"),
-            ("Cylinder", "cylinder"),
-            ("Torus", "torus"),
-        ):
-            action = draw_menu.addAction(label)
-            action.triggered.connect(
-                lambda checked=False, value=kind: signals.viewport_create_requested.emit(
-                    value
-                )
-            )
+        add_sdf_menu_actions(draw_menu, signals.viewport_create_requested)
         draw_button.setMenu(draw_menu)
         layout.addWidget(draw_button)
 
@@ -97,7 +109,10 @@ class SceneTreePanel(QWidget):
                 elif node in document.fluid_domain.tag_objects:
                     role = (
                         "Boundary tag"
-                        if isinstance(node, (PlacedSDF1D, BoundaryRegion))
+                        if isinstance(
+                            node,
+                            (PlacedSDF1D, PlacedPolyline2D, BoundaryRegion),
+                        )
                         else "Section tag"
                     )
             item = QTreeWidgetItem(
@@ -122,15 +137,18 @@ class SceneTreePanel(QWidget):
         ]
 
     def select_handle(self, handle: int) -> None:
+        self.select_handles([handle])
+
+    def select_handles(self, handles: list[int]) -> None:
+        targets = set(handles)
         iterator = self.tree.findItems(
             "*", Qt.MatchFlag.MatchWildcard | Qt.MatchFlag.MatchRecursive, 0
         )
+        self.tree.clearSelection()
         for item in iterator:
-            if item.data(0, HANDLE_ROLE) == handle:
-                self.tree.clearSelection()
+            if item.data(0, HANDLE_ROLE) in targets:
                 self.tree.setCurrentItem(item)
                 item.setSelected(True)
-                break
 
     def _on_selection_changed(self) -> None:
         handles = self.selected_handles()
@@ -146,25 +164,7 @@ class SceneTreePanel(QWidget):
             clicked_item.setSelected(True)
         menu = QMenu(self)
         add_menu = menu.addMenu("Add SDF")
-        for label, kind in (
-            ("Interval 1D", "interval"),
-            ("Circle 2D", "circle"),
-            ("Rectangle 2D", "rectangle"),
-            ("Square 2D", "square"),
-            ("Rounded Rectangle 2D", "rounded_rectangle"),
-            ("Ellipse 2D", "ellipse"),
-            ("Regular Polygon 2D", "regular_polygon"),
-            ("Sphere", "sphere"),
-            ("Box", "box"),
-            ("Cylinder", "cylinder"),
-            ("Torus", "torus"),
-        ):
-            action = add_menu.addAction(label)
-            action.triggered.connect(
-                lambda checked=False, value=kind: signals.add_primitive_requested.emit(
-                    value
-                )
-            )
+        add_sdf_menu_actions(add_menu, signals.add_primitive_requested)
         selected = self.selected_handles()
         boolean_menu = menu.addMenu("Boolean")
         selected_node = (
@@ -270,6 +270,17 @@ class SceneTreePanel(QWidget):
         )
         create_boundary.triggered.connect(
             lambda: signals.create_boundary_region_requested.emit(
+                self.selected_handles()
+            )
+        )
+        polygon_from_polyline = menu.addAction("Create Polygon from Polyline")
+        polygon_from_polyline.setEnabled(
+            len(selected) == 1
+            and isinstance(selected_node, PlacedPolyline2D)
+            and isinstance(selected_node.profile, PolylineProfile)
+        )
+        polygon_from_polyline.triggered.connect(
+            lambda: signals.create_polygon_from_polyline_requested.emit(
                 self.selected_handles()
             )
         )

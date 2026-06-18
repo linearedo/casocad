@@ -3,7 +3,9 @@ from __future__ import annotations
 import numpy as np
 
 from app.viewport.renderer import (
+    ROTATION_GIZMO_SEGMENTS,
     SDFRenderer,
+    WORLD_AXIS_LENGTH,
     X_AXIS_COLOR,
     Y_AXIS_COLOR,
     Z_AXIS_COLOR,
@@ -21,6 +23,27 @@ def test_gizmo_uses_red_x_green_y_blue_z_axis_colors() -> None:
     assert np.allclose(labels[10, -3:], Z_AXIS_COLOR)
 
 
+def test_world_axis_draws_blue_z_axis_through_scene_origin() -> None:
+    vertices = SDFRenderer._build_world_axis_vertices()
+
+    assert vertices.shape == (2, 6)
+    assert np.allclose(vertices[:, :2], 0.0)
+    assert np.allclose(vertices[:, 2], (-WORLD_AXIS_LENGTH, WORLD_AXIS_LENGTH))
+    assert np.allclose(vertices[:, 3:], Z_AXIS_COLOR)
+
+
+def test_rotation_gizmo_builds_xyz_rings_around_center() -> None:
+    vertices = SDFRenderer.build_rotation_gizmo_vertices((1.0, 2.0, 3.0), 0.5)
+
+    assert vertices.shape == (3 * ROTATION_GIZMO_SEGMENTS * 2, 6)
+    assert np.allclose(vertices[0, 0], 1.0)
+    assert np.allclose(vertices[0, 3:], X_AXIS_COLOR)
+    y_start = ROTATION_GIZMO_SEGMENTS * 2
+    z_start = ROTATION_GIZMO_SEGMENTS * 4
+    assert np.allclose(vertices[y_start, 3:], Y_AXIS_COLOR)
+    assert np.allclose(vertices[z_start, 3:], Z_AXIS_COLOR)
+
+
 def test_lattice_colors_distinguish_objects_and_keep_fluid_blue() -> None:
     colors = SDFRenderer._lattice_colors(
         node_types=np.asarray((0, 0, 1, 1), dtype=np.uint8),
@@ -30,6 +53,30 @@ def test_lattice_colors_distinguish_objects_and_keep_fluid_blue() -> None:
     assert np.allclose(colors[0], (0.12, 0.42, 1.00))
     assert not np.allclose(colors[1], colors[0])
     assert not np.allclose(colors[2], colors[3])
+
+
+def test_lattice_upload_preparation_packs_points_and_squares() -> None:
+    positions = np.asarray(
+        (
+            (0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (0.0, 1.0, 1.0),
+        ),
+        dtype=np.float32,
+    )
+    point_vertices, square_instances = SDFRenderer.prepare_lattice_upload(
+        positions,
+        np.ones(4, dtype=np.uint8),
+        np.ones(4, dtype=np.uint8),
+        np.ones(4, dtype=np.uint16),
+        np.zeros(4, dtype=np.uint16),
+        1.0,
+    )
+
+    assert point_vertices.shape == (4, 7)
+    assert square_instances.shape == (1, 12)
+    assert np.all(point_vertices[:, -1] == 5.0)
 
 
 def test_boundary_square_uses_four_lattice_points_as_vertices() -> None:

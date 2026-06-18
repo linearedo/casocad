@@ -5,28 +5,88 @@ out vec4 frag_color;
 uniform vec2 u_resolution;
 uniform vec3 u_camera_position;
 uniform vec3 u_camera_target;
+uniform vec3 u_camera_right;
+uniform vec3 u_camera_up;
 uniform float u_focal_length;
 uniform bool u_show_components;
 uniform float u_surface_opacity;
+uniform vec3 u_background_color;
 uniform bool u_show_grid;
 uniform float u_grid_spacing;
 uniform int u_grid_plane;
 uniform bool u_boundary_selection_active;
 uniform int u_boundary_hover_owner_id;
 uniform int u_boundary_hover_direction;
+uniform vec3 u_boundary_hover_normal;
 uniform int u_scene_hover_object_id;
 uniform int u_scene_selected_object_id;
 uniform int u_preview_kind;
 uniform vec3 u_preview_start;
 uniform vec3 u_preview_current;
 uniform vec3 u_preview_move_delta;
+const int MAX_PREVIEW_ROTATIONS = 8;
+uniform int u_preview_rotation_count;
+uniform int u_preview_rotation_axes[MAX_PREVIEW_ROTATIONS];
+uniform float u_preview_rotation_angles[MAX_PREVIEW_ROTATIONS];
+uniform vec3 u_preview_rotation_pivots[MAX_PREVIEW_ROTATIONS];
+uniform bool u_preview_cursor_active;
+uniform vec3 u_preview_cursor;
+uniform float u_preview_torus_minor_radius;
+uniform int u_preview_point_count;
+uniform bool u_preview_polygon_closed;
+uniform vec3 u_preview_points[32];
 const int MAX_SELECTED_BOUNDARY_OWNERS = 128;
 uniform int u_selected_boundary_region_count;
 uniform ivec2 u_selected_boundary_regions[MAX_SELECTED_BOUNDARY_OWNERS];
+uniform vec3 u_selected_boundary_normals[MAX_SELECTED_BOUNDARY_OWNERS];
 const vec3 SELECTION_OVERLAY_COLOR = vec3(0.15, 0.92, 1.0);
 const float SELECTION_OVERLAY_ALPHA = 0.92;
 const vec3 PREVIEW_COLOR = vec3(0.15, 0.92, 1.0);
 const float PI = 3.14159265359;
+
+float quadraticBezierDistance(vec2 pos, vec2 A, vec2 B, vec2 C) {
+    vec2 a = B - A;
+    vec2 b = A - 2.0 * B + C;
+    vec2 c = a * 2.0;
+    vec2 d = A - pos;
+    float b_dot_b = dot(b, b);
+    if (b_dot_b <= 1.0e-12) {
+        vec2 pa = pos - A;
+        vec2 ba = C - A;
+        float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0e-12), 0.0, 1.0);
+        return length(pa - ba * h);
+    }
+
+    float kk = 1.0 / b_dot_b;
+    float kx = kk * dot(a, b);
+    float ky = kk * (2.0 * dot(a, a) + dot(d, b)) / 3.0;
+    float kz = kk * dot(d, a);
+    float p = ky - kx * kx;
+    float q = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
+    float h = q * q + 4.0 * p * p * p;
+    float res = 0.0;
+
+    if (h >= 0.0) {
+        h = sqrt(h);
+        vec2 x = (vec2(h, -h) - q) * 0.5;
+        vec2 uv = sign(x) * pow(abs(x), vec2(1.0 / 3.0));
+        float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+        vec2 w = d + (c + b * t) * t;
+        res = dot(w, w);
+    } else {
+        float z = sqrt(max(-p, 0.0));
+        float denominator = 2.0 * p * z;
+        float angle_argument = denominator == 0.0 ? 0.0 : q / denominator;
+        float v = acos(clamp(angle_argument, -1.0, 1.0)) / 3.0;
+        float m = cos(v);
+        float n = sin(v) * 1.732050808;
+        vec3 t = clamp(vec3(m + m, -n - m, n - m) * z - kx, 0.0, 1.0);
+        vec2 qx = d + (c + b * t.x) * t.x;
+        vec2 qy = d + (c + b * t.y) * t.y;
+        res = min(dot(qx, qx), dot(qy, qy));
+    }
+    return sqrt(max(res, 0.0));
+}
 
 /*__SCENE_SDF__*/
 
@@ -37,14 +97,53 @@ bool movePreviewActive() {
     );
 }
 
-float renderSceneSDF(vec3 p) {
-    if (movePreviewActive()) {
-        return sceneMovedSDF(
-            p,
-            u_scene_selected_object_id,
-            u_preview_move_delta
+bool rotationPreviewActive() {
+    return (
+        u_scene_selected_object_id != 0
+        && u_preview_rotation_count > 0
+    );
+}
+
+vec3 inverseRotationStepPoint(vec3 p, int axis, float angle, vec3 pivot) {
+    float c = cos(angle);
+    float s = sin(angle);
+    vec3 local = p - pivot;
+    vec3 rotated;
+    if (axis == 0) {
+        rotated = vec3(local.x, c * local.y + s * local.z, -s * local.y + c * local.z);
+    } else if (axis == 1) {
+        rotated = vec3(c * local.x - s * local.z, local.y, s * local.x + c * local.z);
+    } else {
+        rotated = vec3(c * local.x + s * local.y, -s * local.x + c * local.y, local.z);
+    }
+    return pivot + rotated;
+}
+
+vec3 inverseRotationPreviewPoint(vec3 p) {
+    vec3 sample_point = p;
+    for (int offset = 0; offset < MAX_PREVIEW_ROTATIONS; ++offset) {
+        int index = u_preview_rotation_count - 1 - offset;
+        if (index < 0) {
+            break;
+        }
+        sample_point = inverseRotationStepPoint(
+            sample_point,
+            u_preview_rotation_axes[index],
+            u_preview_rotation_angles[index],
+            u_preview_rotation_pivots[index]
         );
     }
+    return sample_point;
+}
+
+vec3 previewTransformPoint(vec3 p) {
+    vec3 sample_point = rotationPreviewActive()
+        ? inverseRotationPreviewPoint(p)
+        : p;
+    return movePreviewActive() ? sample_point - u_preview_move_delta : sample_point;
+}
+
+float renderSceneSDF(vec3 p) {
     return sceneSDF(p);
 }
 
@@ -184,9 +283,7 @@ bool marchSelectedObject(
     hit_travel = 0.0;
     for (int step = 0; step < 128; ++step) {
         hit_point = ray_origin + ray_direction * hit_travel;
-        vec3 sample_point = movePreviewActive()
-            ? hit_point - u_preview_move_delta
-            : hit_point;
+        vec3 sample_point = previewTransformPoint(hit_point);
         float distance_to_object = sceneSelectedObjectSDF(
             sample_point,
             u_scene_selected_object_id
@@ -205,7 +302,7 @@ bool marchSelectedObject(
 vec3 selectedObjectNormal(vec3 p) {
     const float e = 0.0008;
     vec2 h = vec2(e, 0.0);
-    vec3 sample_point = movePreviewActive() ? p - u_preview_move_delta : p;
+    vec3 sample_point = previewTransformPoint(p);
     return normalize(vec3(
         sceneSelectedObjectSDF(sample_point + h.xyy, u_scene_selected_object_id)
             - sceneSelectedObjectSDF(
@@ -255,13 +352,114 @@ float regularPolygonSDF(vec2 q, float radius) {
     return result;
 }
 
+vec2 referencePlaneCoordinates(vec3 value) {
+    if (u_grid_plane == 2) return value.yz;
+    if (u_grid_plane == 1) return value.xz;
+    return value.xy;
+}
+
+float referencePlaneDistance(vec3 value) {
+    if (u_grid_plane == 2) return value.x;
+    if (u_grid_plane == 1) return value.y;
+    return value.z;
+}
+
+vec3 boxHalfSizeForReferencePlane(vec3 world_drag, float first, float second) {
+    vec3 actual_half_size = max(0.5 * abs(world_drag), vec3(0.05));
+    if (
+        abs(world_drag.x) > 0.000001
+        && abs(world_drag.y) > 0.000001
+        && abs(world_drag.z) > 0.000001
+    ) {
+        return actual_half_size;
+    }
+    float fallback = max(first, second);
+    if (u_grid_plane == 2) return vec3(fallback, first, second);
+    if (u_grid_plane == 1) return vec3(first, fallback, second);
+    return vec3(first, second, fallback);
+}
+
 float createPreviewSDF(vec3 p) {
     vec3 center = 0.5 * (u_preview_start + u_preview_current);
     vec3 local = p - center;
-    vec2 drag = u_preview_current.xy - u_preview_start.xy;
+    vec2 drag =
+        referencePlaneCoordinates(u_preview_current)
+        - referencePlaneCoordinates(u_preview_start);
+    vec2 local_plane = referencePlaneCoordinates(local);
+    float plane_distance = abs(referencePlaneDistance(local));
     float extent_x = max(abs(drag.x) * 0.5, 0.05);
     float extent_y = max(abs(drag.y) * 0.5, 0.05);
     float radius = max(length(drag) * 0.5, 0.05);
+
+    if (u_preview_kind == 12 || u_preview_kind == 13 || u_preview_kind == 14) {
+        if (u_preview_point_count < 2) {
+            return 1000000.0;
+        }
+        vec2 q = referencePlaneCoordinates(p);
+        float plane_distance_points = abs(referencePlaneDistance(p - u_preview_points[0]));
+        float distance_to_edges = 1000000.0;
+        if (u_preview_kind == 14) {
+            if (u_preview_point_count < 3) {
+                return 1000000.0;
+            }
+            for (int index = 0; index < 30; index += 2) {
+                if (index + 2 >= u_preview_point_count) {
+                    break;
+                }
+                vec2 a = referencePlaneCoordinates(u_preview_points[index]);
+                vec2 b = referencePlaneCoordinates(u_preview_points[index + 1]);
+                vec2 c = referencePlaneCoordinates(u_preview_points[index + 2]);
+                distance_to_edges = min(
+                    distance_to_edges,
+                    quadraticBezierDistance(q, a, b, c)
+                );
+            }
+            return max(distance_to_edges - 0.004, plane_distance_points - 0.002);
+        }
+        for (int index = 0; index < 31; ++index) {
+            if (index + 1 >= u_preview_point_count) {
+                break;
+            }
+            vec2 a = referencePlaneCoordinates(u_preview_points[index]);
+            vec2 b = referencePlaneCoordinates(u_preview_points[index + 1]);
+            vec2 pa = q - a;
+            vec2 ba = b - a;
+            float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0e-12), 0.0, 1.0);
+            distance_to_edges = min(distance_to_edges, length(pa - ba * h));
+        }
+        bool closed = u_preview_polygon_closed && u_preview_point_count >= 3;
+        if (closed) {
+            vec2 a = referencePlaneCoordinates(u_preview_points[u_preview_point_count - 1]);
+            vec2 b = referencePlaneCoordinates(u_preview_points[0]);
+            vec2 pa = q - a;
+            vec2 ba = b - a;
+            float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0e-12), 0.0, 1.0);
+            distance_to_edges = min(distance_to_edges, length(pa - ba * h));
+
+            bool inside = false;
+            for (int index = 0; index < 32; ++index) {
+                if (index >= u_preview_point_count) {
+                    break;
+                }
+                int next_index = index + 1;
+                if (next_index >= u_preview_point_count) {
+                    next_index = 0;
+                }
+                a = referencePlaneCoordinates(u_preview_points[index]);
+                b = referencePlaneCoordinates(u_preview_points[next_index]);
+                float denominator = b.y - a.y;
+                denominator = abs(denominator) < 1.0e-8 ? 1.0e-8 : denominator;
+                bool crosses = (
+                    ((a.y > q.y) != (b.y > q.y))
+                    && (q.x < (b.x - a.x) * (q.y - a.y) / denominator + a.x)
+                );
+                inside = inside != crosses;
+            }
+            float profile = inside ? -distance_to_edges : distance_to_edges;
+            return max(profile, plane_distance_points - 0.002);
+        }
+        return max(distance_to_edges - 0.004, plane_distance_points - 0.002);
+    }
 
     if (u_preview_kind == 1) {
         vec3 direction = u_preview_current - u_preview_start;
@@ -279,41 +477,57 @@ float createPreviewSDF(vec3 p) {
 
     float profile = 1000000.0;
     if (u_preview_kind == 2) {
-        profile = length(local.xy) - radius;
+        profile = length(local_plane) - radius;
     } else if (u_preview_kind == 3) {
-        profile = box2SDF(local.xy, vec2(extent_x, extent_y));
+        profile = box2SDF(local_plane, vec2(extent_x, extent_y));
     } else if (u_preview_kind == 4) {
-        profile = box2SDF(local.xy, vec2(max(extent_x, extent_y)));
+        profile = box2SDF(local_plane, vec2(max(extent_x, extent_y)));
     } else if (u_preview_kind == 5) {
         vec2 half_size = vec2(extent_x, extent_y);
         profile = roundedBox2SDF(
-            local.xy,
+            local_plane,
             half_size,
             max(0.01, min(half_size.x, half_size.y) * 0.2)
         );
     } else if (u_preview_kind == 6) {
         vec2 axes = vec2(extent_x, extent_y);
-        profile = (length(local.xy / axes) - 1.0) * min(axes.x, axes.y);
+        profile = (length(local_plane / axes) - 1.0) * min(axes.x, axes.y);
     } else if (u_preview_kind == 7) {
-        profile = regularPolygonSDF(local.xy, radius);
+        profile = regularPolygonSDF(local_plane, radius);
     }
     if (u_preview_kind >= 2 && u_preview_kind <= 7) {
-        return max(profile, abs(local.z) - 0.002);
+        return max(profile, plane_distance - 0.002);
     }
     if (u_preview_kind == 8) {
         return length(local) - radius;
     }
     if (u_preview_kind == 9) {
-        return box3SDF(local, vec3(extent_x, extent_y, max(extent_x, extent_y)));
+        vec3 world_drag = u_preview_current - u_preview_start;
+        return box3SDF(
+            local,
+            boxHalfSizeForReferencePlane(world_drag, extent_x, extent_y)
+        );
     }
     if (u_preview_kind == 10) {
+        vec3 world_drag = u_preview_current - u_preview_start;
+        float cylinder_radius = max(0.5 * length(world_drag.xy), 0.05);
+        float cylinder_half_height = (
+            abs(world_drag.z) > 0.000001
+            ? max(0.5 * abs(world_drag.z), 0.05)
+            : max(extent_x, extent_y)
+        );
         vec2 d = abs(vec2(length(local.xy), local.z))
-            - vec2(radius, max(extent_x, extent_y));
+            - vec2(cylinder_radius, cylinder_half_height);
         return min(max(d.x, d.y), 0.0) + length(max(d, vec2(0.0)));
     }
     if (u_preview_kind == 11) {
+        float torus_minor_radius = (
+            u_preview_torus_minor_radius > 0.0
+            ? u_preview_torus_minor_radius
+            : max(radius * 0.25, 0.02)
+        );
         return length(vec2(length(local.xy) - radius, local.z))
-            - max(radius * 0.25, 0.02);
+            - torus_minor_radius;
     }
     return 1000000.0;
 }
@@ -322,10 +536,48 @@ bool createPreviewActive() {
     return u_preview_kind > 0;
 }
 
+bool cursorPreviewActive() {
+    return u_preview_cursor_active;
+}
+
+float referencePlaneMarkerSDF(vec3 p, vec3 anchor, float scale) {
+    vec3 local = p - anchor;
+    vec2 q = referencePlaneCoordinates(local);
+    float plane_distance = abs(referencePlaneDistance(local));
+    float arm = clamp(u_grid_spacing * 0.28 * scale, 0.03, 0.16);
+    float thickness = clamp(u_grid_spacing * 0.035 * scale, 0.004, 0.02);
+    float first_bar = box2SDF(q, vec2(arm, thickness));
+    float second_bar = box2SDF(q, vec2(thickness, arm));
+    return max(min(first_bar, second_bar), plane_distance - thickness);
+}
+
+float cursorPreviewSDF(vec3 p) {
+    return referencePlaneMarkerSDF(p, u_preview_cursor, 1.0);
+}
+
+float createControlPointSDF(vec3 p) {
+    float start_marker = referencePlaneMarkerSDF(p, u_preview_start, 0.78);
+    float current_marker = referencePlaneMarkerSDF(p, u_preview_current, 0.78);
+    return min(start_marker, current_marker);
+}
+
 float previewSDF(vec3 p) {
     float distance_to_preview = 1000000.0;
+    if (cursorPreviewActive()) {
+        distance_to_preview = min(distance_to_preview, cursorPreviewSDF(p));
+    }
     if (createPreviewActive()) {
         distance_to_preview = min(distance_to_preview, createPreviewSDF(p));
+        distance_to_preview = min(distance_to_preview, createControlPointSDF(p));
+    }
+    if (movePreviewActive() || rotationPreviewActive()) {
+        distance_to_preview = min(
+            distance_to_preview,
+            sceneSelectedObjectSDF(
+                previewTransformPoint(p),
+                u_scene_selected_object_id
+            )
+        );
     }
     return distance_to_preview;
 }
@@ -398,37 +650,11 @@ bool marchNextSceneSurface(
 
 bool boundaryDirectionMatches(vec3 normal) {
     if (u_boundary_hover_direction < 0) return true;
-    if (u_boundary_hover_direction == 0) return normal.x < -0.95;
-    if (u_boundary_hover_direction == 1) return normal.x > 0.95;
-    if (u_boundary_hover_direction == 2) return normal.y < -0.95;
-    if (u_boundary_hover_direction == 3) return normal.y > 0.95;
-    if (u_boundary_hover_direction == 4) return normal.z < -0.95;
-    return normal.z > 0.95;
-}
-
-int boundaryDirectionBit(vec3 normal) {
-    vec3 absolute_normal = abs(normal);
-    if (
-        absolute_normal.x < 0.95
-        && absolute_normal.y < 0.95
-        && absolute_normal.z < 0.95
-    ) {
-        return 0;
-    }
-    if (
-        absolute_normal.x >= absolute_normal.y
-        && absolute_normal.x >= absolute_normal.z
-    ) {
-        return normal.x < 0.0 ? 1 : 2;
-    }
-    if (absolute_normal.y >= absolute_normal.z) {
-        return normal.y < 0.0 ? 4 : 8;
-    }
-    return normal.z < 0.0 ? 16 : 32;
+    if (length(u_boundary_hover_normal) < 0.5) return false;
+    return dot(normal, normalize(u_boundary_hover_normal)) > 0.90;
 }
 
 bool selectedBoundaryRegionMatches(int boundary_owner_id, vec3 normal) {
-    int direction_bit = boundaryDirectionBit(normal);
     for (int index = 0; index < MAX_SELECTED_BOUNDARY_OWNERS; ++index) {
         if (index >= u_selected_boundary_region_count) {
             break;
@@ -437,10 +663,13 @@ bool selectedBoundaryRegionMatches(int boundary_owner_id, vec3 normal) {
         if (
             selector.x == boundary_owner_id
             && (
-                selector.y == 63
+                selector.y == 1
                 || (
-                    direction_bit != 0
-                    && (selector.y & direction_bit) != 0
+                    length(u_selected_boundary_normals[index]) > 0.5
+                    && dot(
+                        normal,
+                        normalize(u_selected_boundary_normals[index])
+                    ) > 0.90
                 )
             )
         ) {
@@ -513,13 +742,8 @@ void main() {
         (gl_FragCoord.xy - 0.5 * u_resolution.xy) / max(u_resolution.y, 1.0);
 
     vec3 forward = normalize(u_camera_target - u_camera_position);
-    vec3 world_up = (
-        abs(dot(forward, vec3(0.0, 0.0, 1.0))) > 0.995
-        ? vec3(0.0, 1.0, 0.0)
-        : vec3(0.0, 0.0, 1.0)
-    );
-    vec3 right = normalize(cross(forward, world_up));
-    vec3 up = normalize(cross(right, forward));
+    vec3 right = normalize(u_camera_right);
+    vec3 up = normalize(u_camera_up);
     vec3 ray_direction = normalize(
         2.0 * screen_uv.x * right
         + 2.0 * screen_uv.y * up
@@ -542,13 +766,7 @@ void main() {
         }
     }
 
-    vec3 background_top = vec3(0.07, 0.10, 0.16);
-    vec3 background_bottom = vec3(0.018, 0.023, 0.033);
-    vec3 background = mix(
-        background_bottom,
-        background_top,
-        clamp(gl_FragCoord.y / max(u_resolution.y, 1.0), 0.0, 1.0)
-    );
+    vec3 background = u_background_color;
     background = gridBackground(ray_direction, background);
     vec3 color = background;
     bool selected_boundary_overlay = false;
@@ -658,7 +876,12 @@ void main() {
         }
     }
 
-    if (createPreviewActive() || movePreviewActive()) {
+    if (
+        cursorPreviewActive()
+        || createPreviewActive()
+        || movePreviewActive()
+        || rotationPreviewActive()
+    ) {
         vec3 preview_point;
         float preview_travel;
         if (marchPreview(

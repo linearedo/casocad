@@ -276,14 +276,14 @@ class LoftImplicit(SDFNode):
         ):
             assert first.profile is not None and second.profile is not None
             lower, upper = parameters[index], parameters[index + 1]
-            interval = (world_parameter >= lower) & (world_parameter <= upper)
+            active_range = (world_parameter >= lower) & (world_parameter <= upper)
             u0, v0, _ = first.project_numpy(X, Y, Z)
             u1, v1, _ = second.project_numpy(X, Y, Z)
             d0 = first.profile.to_numpy(u0, v0)
             d1 = second.profile.to_numpy(u1, v1)
             t = np.clip((world_parameter - lower) / (upper - lower), 0.0, 1.0)
             blended = (1.0 - t) * d0 + t * d1
-            result = np.where(interval, blended, result)
+            result = np.where(active_range, blended, result)
         cap_distance = np.maximum(parameters[0] - world_parameter, world_parameter - parameters[-1])
         return np.asarray(np.maximum(result, cap_distance), dtype=np.float64)
 

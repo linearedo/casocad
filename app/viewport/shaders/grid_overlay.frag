@@ -5,9 +5,12 @@ out vec4 frag_color;
 uniform vec2 u_resolution;
 uniform vec3 u_camera_position;
 uniform vec3 u_camera_target;
+uniform vec3 u_camera_right;
+uniform vec3 u_camera_up;
 uniform float u_focal_length;
 uniform float u_grid_spacing;
 uniform int u_grid_plane;
+uniform vec3 u_background_color;
 
 float lineCoverage(float coordinate, float spacing) {
     float distance_to_line =
@@ -68,24 +71,13 @@ void main() {
     vec2 screen_uv =
         (gl_FragCoord.xy - 0.5 * u_resolution.xy) / max(u_resolution.y, 1.0);
     vec3 forward = normalize(u_camera_target - u_camera_position);
-    vec3 world_up = (
-        abs(dot(forward, vec3(0.0, 0.0, 1.0))) > 0.995
-        ? vec3(0.0, 1.0, 0.0)
-        : vec3(0.0, 0.0, 1.0)
-    );
-    vec3 right = normalize(cross(forward, world_up));
-    vec3 up = normalize(cross(right, forward));
+    vec3 right = normalize(u_camera_right);
+    vec3 up = normalize(u_camera_up);
     vec3 ray_direction = normalize(
         2.0 * screen_uv.x * right
         + 2.0 * screen_uv.y * up
         + u_focal_length * forward
     );
-    vec3 background_top = vec3(0.07, 0.10, 0.16);
-    vec3 background_bottom = vec3(0.018, 0.023, 0.033);
-    vec3 background = mix(
-        background_bottom,
-        background_top,
-        clamp(gl_FragCoord.y / max(u_resolution.y, 1.0), 0.0, 1.0)
-    );
+    vec3 background = u_background_color;
     frag_color = vec4(gridBackground(ray_direction, background), 1.0);
 }

@@ -22,7 +22,7 @@ class Profile1D(ABC):
 
     @abstractmethod
     def to_numpy(self, T: FloatArray) -> FloatArray:
-        """Evaluate a local filled-interval signed distance."""
+        """Evaluate a local filled-segment signed distance."""
 
     @abstractmethod
     def bounds(self) -> tuple[float, float]:
@@ -30,13 +30,17 @@ class Profile1D(ABC):
 
 
 @dataclass(frozen=True)
-class IntervalProfile(Profile1D):
+class SegmentProfile(Profile1D):
     center: float = 0.0
     half_length: float = 0.5
 
     def __post_init__(self) -> None:
         if self.half_length <= 0.0:
-            raise ValueError("interval half length must be positive")
+            raise ValueError("segment half length must be positive")
+
+    @property
+    def kind(self) -> str:
+        return "segment"
 
     def to_glsl(self, p_var: str = "t") -> str:
         return (

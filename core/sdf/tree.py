@@ -87,13 +87,6 @@ class SDFTree:
         )
         return (
             f"float sceneSDF(vec3 p) {{\n    return {self.root.to_glsl('p')};\n}}\n"
-            "float sceneMovedSDF(\n"
-            "    vec3 p,\n"
-            "    int selected_object_id,\n"
-            "    vec3 preview_offset\n"
-            ") {\n"
-            f"    return {self._moved_sdf_glsl(self.root, 'p')};\n"
-            "}\n"
             f"int sceneBoundaryOwnerId(vec3 p) {{\n"
             f"    return {self._boundary_owner_glsl(self.root, 'p')};\n"
             "}\n"
@@ -118,100 +111,6 @@ class SDFTree:
             f"{selected_dimension_branches}\n"
             "    return 0;\n"
             "}"
-        )
-
-    def _moved_sdf_glsl(self, node: SDFNode, p_var: str) -> str:
-        moved_point = f"({p_var} - preview_offset)"
-        if isinstance(node, Translate):
-            assert node.child is not None
-            child_point = f"({p_var} - {glsl_vec3(node.offset)})"
-            moved_child_point = f"({moved_point} - {glsl_vec3(node.offset)})"
-            normal = self._moved_sdf_glsl(node.child, child_point)
-            moved = self._moved_sdf_glsl(node.child, moved_child_point)
-            return (
-                f"(selected_object_id == {node.object_id}"
-                f" ? {moved} : {normal})"
-            )
-        if isinstance(node, Scale):
-            assert node.child is not None
-            factor = glsl_float(node.factor)
-            child_point = f"({p_var} / {factor})"
-            moved_child_point = f"({moved_point} / {factor})"
-            normal = f"({self._moved_sdf_glsl(node.child, child_point)} * {factor})"
-            moved = f"({self._moved_sdf_glsl(node.child, moved_child_point)} * {factor})"
-            return (
-                f"(selected_object_id == {node.object_id}"
-                f" ? {moved} : {normal})"
-            )
-        if isinstance(node, Rotate):
-            assert node.child is not None
-            components = node._inverse_components(
-                f"{p_var}.x", f"{p_var}.y", f"{p_var}.z"
-            )
-            moved_components = node._inverse_components(
-                f"{moved_point}.x", f"{moved_point}.y", f"{moved_point}.z"
-            )
-            normal = self._moved_sdf_glsl(
-                node.child,
-                f"vec3({', '.join(components)})",
-            )
-            moved = self._moved_sdf_glsl(
-                node.child,
-                f"vec3({', '.join(moved_components)})",
-            )
-            return (
-                f"(selected_object_id == {node.object_id}"
-                f" ? {moved} : {normal})"
-            )
-        if isinstance(node, (Union, Intersection, Difference, SmoothUnion)):
-            assert node.left is not None and node.right is not None
-            if isinstance(node, Union):
-                normal = (
-                    f"min({self._moved_sdf_glsl(node.left, p_var)}, "
-                    f"{self._moved_sdf_glsl(node.right, p_var)})"
-                )
-                moved = f"min({node.left.to_glsl(moved_point)}, {node.right.to_glsl(moved_point)})"
-            elif isinstance(node, Intersection):
-                normal = (
-                    f"max({self._moved_sdf_glsl(node.left, p_var)}, "
-                    f"{self._moved_sdf_glsl(node.right, p_var)})"
-                )
-                moved = f"max({node.left.to_glsl(moved_point)}, {node.right.to_glsl(moved_point)})"
-            elif isinstance(node, Difference):
-                normal = (
-                    f"max({self._moved_sdf_glsl(node.left, p_var)}, "
-                    f"-({self._moved_sdf_glsl(node.right, p_var)}))"
-                )
-                moved = f"max({node.left.to_glsl(moved_point)}, -({node.right.to_glsl(moved_point)}))"
-            else:
-                smoothing = glsl_float(node.smoothing)
-                left = self._moved_sdf_glsl(node.left, p_var)
-                right = self._moved_sdf_glsl(node.right, p_var)
-                h = (
-                    f"clamp(0.5 + 0.5 * (({right}) - ({left}))"
-                    f" / {smoothing}, 0.0, 1.0)"
-                )
-                normal = (
-                    f"(mix(({right}), ({left}), {h})"
-                    f" - {smoothing} * {h} * (1.0 - {h}))"
-                )
-                moved_left = node.left.to_glsl(moved_point)
-                moved_right = node.right.to_glsl(moved_point)
-                moved_h = (
-                    f"clamp(0.5 + 0.5 * (({moved_right}) - ({moved_left}))"
-                    f" / {smoothing}, 0.0, 1.0)"
-                )
-                moved = (
-                    f"(mix(({moved_right}), ({moved_left}), {moved_h})"
-                    f" - {smoothing} * {moved_h} * (1.0 - {moved_h}))"
-                )
-            return (
-                f"(selected_object_id == {node.object_id}"
-                f" ? {moved} : {normal})"
-            )
-        return (
-            f"(selected_object_id == {node.object_id}"
-            f" ? {node.to_glsl(moved_point)} : {node.to_glsl(p_var)})"
         )
 
     def _selection_owner_glsl(self, node: SDFNode) -> str:

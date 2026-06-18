@@ -21,9 +21,9 @@ def _raymarch_project(
     target = np.asarray(camera.target, dtype=np.float64)
     forward = target - eye
     forward /= np.linalg.norm(forward)
-    right = np.cross(forward, np.asarray((0.0, 0.0, 1.0)))
-    right /= np.linalg.norm(right)
-    up = np.cross(right, forward)
+    rotation = camera.view_rotation().astype(np.float64)
+    right = rotation[0]
+    up = rotation[1]
     to_point = point - eye
     depth = np.dot(to_point, forward)
     screen_uv = camera.focal_length * np.asarray(
@@ -48,6 +48,18 @@ def test_raymarch_and_matrix_projection_share_focal_length() -> None:
     expected_y = camera.focal_length / np.linalg.norm(target - eye)
     assert np.isclose(projected_y, expected_y, rtol=1e-5)
     assert np.isclose(camera.focal_length, 1.0 / np.tan(np.pi / 8.0))
+
+
+def test_standard_3d_view_is_rotated_180_degrees_around_z() -> None:
+    camera = OrbitCamera()
+    yaw, pitch = camera.standard_view_angles()
+
+    assert yaw == 215.0
+    assert pitch == 22.0
+    assert camera.yaw_degrees == yaw
+    assert camera.pitch_degrees == pitch
+    assert camera.position[0] < 0.0
+    assert camera.position[1] < 0.0
 
 
 def test_pan_keeps_raymarch_and_grid_projection_aligned() -> None:
@@ -108,6 +120,29 @@ def test_xz_view_places_positive_x_on_screen_right() -> None:
     right = _matrix_project(camera, np.asarray((0.5, 0.0, 0.0)), 1.0)
 
     assert right[0] > left[0]
+
+
+def test_xy_view_places_positive_x_on_screen_right() -> None:
+    camera = OrbitCamera()
+    camera.set_plane_view("xy")
+
+    left = _matrix_project(camera, np.asarray((-0.5, 0.0, 0.0)), 1.0)
+    right = _matrix_project(camera, np.asarray((0.5, 0.0, 0.0)), 1.0)
+
+    assert right[0] > left[0]
+
+
+def test_camera_basis_does_not_flip_near_vertical_view() -> None:
+    camera = OrbitCamera(yaw_degrees=180.0, pitch_degrees=84.0)
+    right_before = camera.view_rotation()[0].astype(np.float64)
+    up_before = camera.view_rotation()[1].astype(np.float64)
+
+    camera.pitch_degrees = 86.0
+    right_after = camera.view_rotation()[0].astype(np.float64)
+    up_after = camera.view_rotation()[1].astype(np.float64)
+
+    assert np.dot(right_before, right_after) > 0.99
+    assert np.dot(up_before, up_after) > 0.99
 
 
 def test_orbit_from_top_plane_does_not_snap_far_from_plane() -> None:

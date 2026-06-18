@@ -23,10 +23,10 @@ from core.sdf import (
     CircleProfile,
     Cylinder,
     Difference,
-    IntervalProfile,
     PlacedSDF1D,
     PlacedSDF2D,
     RectangleProfile,
+    SegmentProfile,
     OffsetProfile,
     Sphere,
     Union,
@@ -192,7 +192,7 @@ def test_fluid_domain_accepts_2d_root_and_uses_four_neighbors() -> None:
     region = PlacedSDF1D(
         name="negative_u",
         object_id=2,
-        profile=IntervalProfile(half_length=0.5),
+        profile=SegmentProfile(half_length=0.5),
         origin=(0.0, -1.0, 0.0),
         axis_u=(0.0, 0.0, 1.0),
     )
@@ -213,7 +213,7 @@ def test_2d_fluid_domain_rejects_non_coplanar_1d_tags() -> None:
     tag = PlacedSDF1D(
         name="tag",
         object_id=2,
-        profile=IntervalProfile(),
+        profile=SegmentProfile(),
         origin=(0.0, 0.0, 1.0),
     )
 

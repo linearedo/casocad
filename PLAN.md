@@ -172,6 +172,65 @@ There is no mandatory universal file between the mesher and case generators.
 Python objects are the normal in-process interface. Arrow remains an optional
 serialization format for the current lattice data.
 
+### 4.1 Asynchronous Artifact Pipeline
+
+Interactive CAD edits must not synchronously perform expensive derived work on
+the Qt GUI thread. `SceneDocument` is the authoritative editable state, but
+rendering, meshing, export, and future case generation consume immutable,
+versioned snapshots and produce derived artifacts.
+
+The intended runtime flow is:
+
+```text
+SceneDocument edit
+    |
+    v
+increment document version
+    |
+    v
+DocumentSnapshot(version)
+    |
+    +-----------------------+--------------------------+
+    |                       |                          |
+    v                       v                          v
+RenderArtifactJob      MeshPreviewArtifactJob      ExportArtifactJob
+    |                       |                          |
+    v                       v                          v
+RenderArtifact         MeshPreviewArtifact          ExportArtifact
+    |                       |                          |
+    +---------- version check before GUI swap ---------+
+```
+
+Rules:
+
+- the GUI thread never waits for SDF graph traversal, GLSL generation,
+  meshing, Arrow writing, or large preview preparation
+- workers operate only on snapshots, never on the live `SceneDocument`
+- every artifact records the document version that produced it
+- stale artifacts are discarded when their version no longer matches the live
+  document
+- the viewport keeps the last valid artifact visible while a newer artifact is
+  being built
+- viewport draw and move interactions use temporary preview state until the
+  user commits the edit
+- meshing must be cancellable or stale-discardable when the document changes
+- large lattice previews should be streamed or uploaded with a per-frame
+  budget rather than pushed to the GPU in one blocking step
+
+Implementation should proceed incrementally:
+
+1. document versioning and snapshot metadata
+2. render artifacts built from snapshots and swapped only when current
+3. mesh/export jobs tagged with the snapshot version and discarded when stale
+4. process-isolated meshing for CPU-heavy lattice generation
+5. streamed mesh preview chunks and frame-budgeted viewport upload
+6. long-term replacement of per-scene GLSL recompilation with a stable shader
+   plus GPU scene-node buffers
+
+The final target is not merely threaded code. The target is a responsive
+artifact architecture where editing, visualization, meshing, and export are
+separate stages connected by versioned immutable data.
+
 ## 5. Code Organization
 
 Current code:

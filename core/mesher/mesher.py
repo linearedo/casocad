@@ -8,6 +8,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from core.boundary import BoundaryRegion
+from core.boundary_direction import (
+    owner_outside_direction_vector,
+    world_axis_direction_from_vector,
+)
 from core.io.arrow_writer import ArrowWriter
 from core.sdf.placed_1d import PlacedSDF1D
 from core.sdf.placed_2d import PlacedSDF2D
@@ -25,6 +29,7 @@ from .grid import GridSpec, derive_lattice_grid, generate_chunks
 from .resolution import recommended_max_dx
 
 ProgressCallback = Callable[[int, int], None]
+PreviewCallback = Callable[["LatticePreviewChunk"], None]
 
 
 def _preview_priorities(
@@ -55,6 +60,23 @@ def _lowest_priority_indices(
     if priorities.size <= limit:
         return np.arange(priorities.size, dtype=np.intp)
     return np.argpartition(priorities, limit - 1)[:limit]
+
+
+@dataclass(frozen=True)
+class LatticePreviewChunk:
+    dimension: int
+    preview_cell_size: float
+    preview_positions: NDArray[np.float32]
+    preview_node_types: NDArray[np.uint8]
+    preview_boundary_faces: NDArray[np.uint8]
+    preview_source_object_ids: NDArray[np.uint16]
+    preview_primary_tag_ids: NDArray[np.uint16]
+    preview_tag_ids: tuple[tuple[int, ...], ...]
+    preview_tag_axis_u: NDArray[np.float32]
+    preview_tag_axis_v: NDArray[np.float32]
+    preview_axis_i: tuple[float, float, float]
+    preview_axis_j: tuple[float, float, float]
+    preview_axis_k: tuple[float, float, float]
 
 
 @dataclass(frozen=True)
@@ -108,6 +130,14 @@ def _walk_unique(root: SDFNode) -> tuple[SDFNode, ...]:
     return tuple(result)
 
 
+def _object_id_directory(root: SDFNode) -> dict[int, SDFNode]:
+    return {
+        node.object_id: node
+        for node in _walk_unique(root)
+        if node.object_id > 0
+    }
+
+
 class LatticeMesher:
     def __init__(
         self,
@@ -137,7 +167,7 @@ class LatticeMesher:
             ),
             "tag_rule": (
                 "PlacedSDF1D: refined 2D boundary crossings on the placed "
-                "filled interval; PlacedSDF2D: nearest lattice layer and exact "
+                "filled segment; PlacedSDF2D: nearest lattice layer and exact "
                 "filled profile in 3D; "
                 "BoundaryRegion: refined per-edge SDF zero crossing with matching "
                 "boundary owner and optional exposed direction; node tag_ids are "
@@ -197,6 +227,7 @@ class LatticeMesher:
         self,
         path: str | Path,
         progress: ProgressCallback | None = None,
+        preview: PreviewCallback | None = None,
     ) -> LatticeResult:
         output_path = Path(path)
         tolerance = self.config.boundary_error_tolerance
@@ -222,7 +253,7 @@ class LatticeMesher:
                 preview_limit=self.preview_limit,
             )
             try:
-                result = attempt._mesh_once(path, progress)
+                result = attempt._mesh_once(path, progress, preview)
             except Exception:
                 output_path.unlink(missing_ok=True)
                 raise
@@ -250,6 +281,7 @@ class LatticeMesher:
         self,
         path: str | Path,
         progress: ProgressCallback | None = None,
+        preview: PreviewCallback | None = None,
     ) -> LatticeResult:
         output_path = Path(path)
         grid = derive_lattice_grid(self.domain.root, self.config.dx)
@@ -282,6 +314,7 @@ class LatticeMesher:
         interior_tag_axis_v = np.empty((0, 3), dtype=np.float32)
         interior_count = 0
         tag_by_id = {tag.object_id: tag for tag in self.domain.tag_objects}
+        owner_by_id = _object_id_directory(self.domain.root)
 
         def tag_axis(object_id: int, attribute: str) -> tuple[float, float, float]:
             tag = tag_by_id.get(object_id)
@@ -348,10 +381,36 @@ class LatticeMesher:
                             == tag.owner_object_id
                         )
                         if tag.outside_direction is not None:
-                            matched_samples &= (
-                                face_samples.directions
-                                == tag.outside_direction
+                            owner = owner_by_id.get(tag.owner_object_id)
+                            direction = (
+                                owner_outside_direction_vector(
+                                    owner,
+                                    tag.outside_direction,
+                                )
+                                if owner is not None
+                                else None
                             )
+                            if direction is None:
+                                matched_samples &= (
+                                    face_samples.directions
+                                    == tag.outside_direction
+                                )
+                            else:
+                                lattice_direction = (
+                                    world_axis_direction_from_vector(direction)
+                                )
+                                if lattice_direction is not None:
+                                    matched_samples &= (
+                                        face_samples.directions
+                                        == lattice_direction
+                                    )
+                                else:
+                                    alignment = np.einsum(
+                                        "ij,j->i",
+                                        face_samples.normals,
+                                        direction,
+                                    )
+                                    matched_samples &= alignment >= 0.90
                         matched_sample_indices = np.flatnonzero(
                             matched_samples
                         )
@@ -438,6 +497,24 @@ class LatticeMesher:
                         [items[0] if items else 0 for items in boundary_tags],
                         dtype=np.uint16,
                     )
+                    boundary_axis_u = np.asarray(
+                        [
+                            tag_axis(int(object_id), "axis_u")
+                            if object_id
+                            else (0.0, 0.0, 0.0)
+                            for object_id in boundary_primary_ids
+                        ],
+                        dtype=np.float32,
+                    )
+                    boundary_axis_v = np.asarray(
+                        [
+                            tag_axis(int(object_id), "axis_v")
+                            if object_id
+                            else (0.0, 0.0, 0.0)
+                            for object_id in boundary_primary_ids
+                        ],
+                        dtype=np.float32,
+                    )
                     preview_positions.append(positions[boundary_indices])
                     preview_node_types.append(node_type[boundary_indices])
                     preview_boundary_faces.append(
@@ -448,28 +525,30 @@ class LatticeMesher:
                     )
                     preview_primary_tag_ids.append(boundary_primary_ids)
                     preview_tag_ids.extend(boundary_tags)
-                    preview_tag_axis_u.append(
-                        np.asarray(
-                            [
-                                tag_axis(int(object_id), "axis_u")
-                                if object_id
-                                else (0.0, 0.0, 0.0)
-                                for object_id in boundary_primary_ids
-                            ],
-                            dtype=np.float32,
+                    preview_tag_axis_u.append(boundary_axis_u)
+                    preview_tag_axis_v.append(boundary_axis_v)
+                    if preview is not None:
+                        preview(
+                            LatticePreviewChunk(
+                                dimension=self.domain.root.dimension,
+                                preview_cell_size=self.config.dx,
+                                preview_positions=positions[boundary_indices],
+                                preview_node_types=node_type[boundary_indices],
+                                preview_boundary_faces=boundary_faces[
+                                    boundary_indices
+                                ],
+                                preview_source_object_ids=retained_source_ids[
+                                    boundary_indices
+                                ],
+                                preview_primary_tag_ids=boundary_primary_ids,
+                                preview_tag_ids=boundary_tags,
+                                preview_tag_axis_u=boundary_axis_u,
+                                preview_tag_axis_v=boundary_axis_v,
+                                preview_axis_i=grid.axis_i,
+                                preview_axis_j=grid.axis_j,
+                                preview_axis_k=grid.axis_k,
+                            )
                         )
-                    )
-                    preview_tag_axis_v.append(
-                        np.asarray(
-                            [
-                                tag_axis(int(object_id), "axis_v")
-                                if object_id
-                                else (0.0, 0.0, 0.0)
-                                for object_id in boundary_primary_ids
-                            ],
-                            dtype=np.float32,
-                        )
-                    )
 
                 if self.preview_limit > 0:
                     interior_indices = np.flatnonzero(node_type == 0)

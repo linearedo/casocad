@@ -10,10 +10,10 @@ from core.sdf import (
     CircleProfile,
     Cylinder,
     Difference,
-    IntervalProfile,
     PlacedSDF1D,
     PlacedSDF2D,
     RectangleProfile,
+    SegmentProfile,
     Sphere,
 )
 from core.scene import SceneDocument
@@ -105,7 +105,7 @@ def test_2d_arrow_lattice_uses_four_neighbors_and_one_k_layer(
     negative_u = PlacedSDF1D(
         name="inlet",
         object_id=2,
-        profile=IntervalProfile(half_length=0.5),
+        profile=SegmentProfile(half_length=0.5),
         origin=(1.0, 1.0, 3.0),
         axis_u=(0.0, 0.0, 1.0),
     )
@@ -623,6 +623,38 @@ def test_directional_boundary_region_selects_one_box_face(tmp_path) -> None:
     assert tagged.any()
     assert np.all(result.preview_positions[tagged, 0] == -0.5)
     assert np.all((result.preview_boundary_faces[tagged] & 1) != 0)
+
+
+def test_directional_boundary_region_follows_rotated_box_owner(tmp_path) -> None:
+    box = Box(
+        name="fluid",
+        object_id=1,
+        half_size=(0.5, 0.5, 0.5),
+        axis_u=(0.0, 1.0, 0.0),
+        axis_v=(-1.0, 0.0, 0.0),
+        axis_w=(0.0, 0.0, 1.0),
+    )
+    negative_local_x = BoundaryRegion(
+        name="negative_local_x",
+        object_id=2,
+        owner_object_id=box.object_id,
+        outside_direction=0,
+    )
+    result = LatticeMesher(
+        FluidDomain(box, (negative_local_x,)),
+        MesherConfig(dx=0.25, chunk_size=100),
+    ).mesh(tmp_path / "rotated-negative-local-x.arrow")
+    tagged = np.asarray(
+        [
+            negative_local_x.object_id in items
+            for items in result.preview_tag_ids
+        ],
+        dtype=np.bool_,
+    )
+
+    assert tagged.any()
+    assert np.all(result.preview_positions[tagged, 1] == -0.5)
+    assert np.all((result.preview_boundary_faces[tagged] & (1 << 2)) != 0)
 
 
 def test_directional_box_region_excludes_remote_csg_intersection(

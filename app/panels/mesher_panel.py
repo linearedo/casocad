@@ -67,7 +67,7 @@ class MesherPanel(QWidget):
         )
         rule = QLabel(
             "Boundary: refined SDF zero crossings on retained-to-OUTSIDE edges.\n"
-            "Tags: placed 1D intervals on 2D boundaries; placed 2D profiles "
+            "Tags: placed 1D segments on 2D boundaries; placed 2D profiles "
             "or owner regions on 3D boundaries."
         )
         rule.setWordWrap(True)

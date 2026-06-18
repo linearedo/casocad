@@ -4,7 +4,7 @@ casoCAD is an experimental SDF-based CAD and lattice-grid generator.
 
 The application provides:
 
-- A persistent scene with placed 1D intervals, 2D profiles, and 3D primitives.
+- A persistent scene with placed 1D segments, 2D profiles, and 3D primitives.
 - Scene-tree creation, selection, renaming, editing, and deletion.
 - Union, intersection, difference, and smooth-union CSG operations.
 - Nested CSG graph editing: any operation result can feed another operation.
@@ -71,14 +71,14 @@ meshing.
 
 Set one 2D or 3D result as the Fluid Domain, enable dimension-compatible tags,
 configure the Mesher panel, and click **Mesh Preview**. A 2D domain uses placed
-1D intervals for boundary regions. A 3D domain uses placed 2D profiles or
+1D segments for boundary regions. A 3D domain uses placed 2D profiles or
 owner-based `BoundaryRegion` objects. Selecting a primitive, CSG subtree, or
 tag filters the lattice to its geometric or tag attribution. Use **Mesh and
 Export .arrow** for the persistent solver file.
 
-For a 2D domain, choose **Interval 1D** and place or edit the interval on the
+For a 2D domain, choose **Segment 1D** and place or edit the segment on the
 domain boundary, or create a directional boundary SDF from a 2D owner. The
-current affine placement represents straight intervals; curved 1D embeddings
+current affine placement represents straight segments; curved 1D embeddings
 will require future arc or path placement types.
 
 For a 3D domain, choose **Boundary Region** in the toolbar, move over the final
