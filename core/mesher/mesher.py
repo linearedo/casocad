@@ -8,7 +8,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from core.boundary import BoundaryRegion
-from core.boundary_patches import SURFACE_SELECTOR_TYPES, surface_selector_values
+from core.boundary_patches import (
+    SURFACE_SELECTOR_TYPES,
+    boundary_region_scope_mask,
+    surface_selector_values,
+)
 from core.boundary_direction import (
     owner_outside_direction_vector,
     world_axis_direction_from_vector,
@@ -241,8 +245,18 @@ def _surface_split_selector_mask(
         scope_region=region,
     )
     inside = np.asarray(values <= tolerance, dtype=np.bool_)
+    if region is not None:
+        scope = boundary_region_scope_mask(
+            root,
+            region,
+            positions,
+            tolerance=tolerance,
+        )
+        inside &= scope
+    else:
+        scope = np.ones(positions.shape[0], dtype=np.bool_)
     if side == "outside":
-        return np.asarray(~inside, dtype=np.bool_)
+        return np.asarray(scope & ~inside, dtype=np.bool_)
     return inside
 
 

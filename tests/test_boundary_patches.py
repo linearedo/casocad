@@ -1227,6 +1227,62 @@ def test_surface_sdf_selector_mask_supports_outside_subregion() -> None:
     assert mask.tolist() == [False, True, False]
 
 
+def test_surface_sdf_selector_mask_is_limited_to_selected_boundary_region() -> None:
+    root = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="cut",
+        object_id=7,
+        center=(0.5, 0.0, 0.0),
+        radius=0.25,
+    )
+    region = BoundaryRegion(
+        name="volume +X / surface_cut inside",
+        object_id=8,
+        owner_object_id=root.object_id,
+        outside_direction=1,
+        patch_id="+X",
+        patch_type="face",
+        selector_id=f"selector:{cutter.object_id}",
+        selector_type="surface_sdf_subregion",
+        selector_side="inside",
+    )
+    inside_positions = np.asarray(
+        (
+            (0.5, 0.0, 0.0),
+            (-0.5, 0.0, 0.0),
+        ),
+        dtype=np.float64,
+    )
+    outside_positions = np.asarray(
+        (
+            (0.5, 0.35, 0.0),
+            (-0.5, 0.35, 0.0),
+        ),
+        dtype=np.float64,
+    )
+
+    inside_mask = _surface_split_selector_mask(
+        f"selector:{cutter.object_id}",
+        {cutter.object_id: cutter},
+        root,
+        inside_positions,
+        region=region,
+        tolerance=0.0,
+    )
+    outside_mask = _surface_split_selector_mask(
+        f"selector:{cutter.object_id}",
+        {cutter.object_id: cutter},
+        root,
+        outside_positions,
+        region=region,
+        side="outside",
+        tolerance=0.0,
+    )
+
+    assert inside_mask.tolist() == [True, False]
+    assert outside_mask.tolist() == [True, False]
+
+
 def test_boundary_patch_preview_node_for_box_face_is_render_ir_supported() -> None:
     box = Box(name="volume", object_id=1)
     hit = pick_boundary_patch(

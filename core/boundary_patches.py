@@ -751,6 +751,28 @@ def surface_selector_values(
     )
 
 
+def boundary_region_scope_mask(
+    root: SDFNode,
+    region: BoundaryRegion,
+    positions: NDArray[np.float64],
+    *,
+    tolerance: float = PATCH_TOLERANCE,
+) -> NDArray[np.bool_]:
+    scope = _region_patch_scope_volume(
+        root,
+        region,
+        max(PATCH_TOLERANCE * 4.0, 0.006),
+    )
+    if scope is None:
+        return np.ones(positions.shape[0], dtype=np.bool_)
+    values = scope.to_numpy(
+        positions[:, 0],
+        positions[:, 1],
+        positions[:, 2],
+    )
+    return np.asarray(values <= max(tolerance, PATCH_TOLERANCE), dtype=np.bool_)
+
+
 def _placed_2d_selector_volume(
     root: SDFNode,
     selector: PlacedSDF2D,

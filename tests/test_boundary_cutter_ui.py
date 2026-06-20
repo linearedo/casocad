@@ -238,6 +238,7 @@ def test_surface_cutter_draw_flow_creates_two_scene_tree_regions() -> None:
     application = _application()
     window, base_handle = _window_with_selected_box_boundary()
     try:
+        window.viewport.begin_boundary_cutter_tool("surface", "sphere")
         window._on_viewport_shape_drawn(
             "sphere",
             (0.5, -0.25, -0.25),
@@ -259,6 +260,26 @@ def test_surface_cutter_draw_flow_creates_two_scene_tree_regions() -> None:
             "surface_sdf_subregion"
         }
         assert selected == split_handles
+        tree_names = {
+            window.scene_tree.tree.topLevelItem(index).text(0)
+            for index in range(window.scene_tree.tree.topLevelItemCount())
+        }
+        selector_name = next(
+            region.selector_id
+            for region in split_regions
+            if region.selector_id is not None
+        )
+        selector_object_id = int(selector_name.removeprefix("selector:"))
+        selector = next(
+            node
+            for node in window.document.objects
+            if node.object_id == selector_object_id
+        )
+        assert selector.name.startswith("__boundary_selector_surface_cutter_")
+        assert selector.name not in tree_names
+        tree = window.document.visual_tree()
+        assert selector not in tree.components
+        assert selector in tree.selector_objects
     finally:
         window.close()
         window.deleteLater()

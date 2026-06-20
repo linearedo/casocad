@@ -571,6 +571,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         undo_snapshot = self._history_snapshot()
         base_region = self._selected_boundary_region_for_cutter()
+        surface_cutter_active = self._active_surface_cutter_kind(kind) is not None
         try:
             if self._active_planar_cutter_kind(kind) == "segment":
                 if base_region is None:
@@ -596,6 +597,11 @@ class MainWindow(QMainWindow):
             base_region,
             self.document.node(handle),
         )
+        if split_handles and surface_cutter_active:
+            self._mark_internal_boundary_selector(
+                self.document.node(handle),
+                "surface_cutter",
+            )
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
         if split_handles:
@@ -676,6 +682,15 @@ class MainWindow(QMainWindow):
             return shape_kind
         return None
 
+    def _active_surface_cutter_kind(self, kind: str) -> str | None:
+        active = self.viewport.active_boundary_cutter_tool()
+        if active is None:
+            return None
+        cutter_kind, shape_kind = active
+        if cutter_kind == "surface" and shape_kind == kind:
+            return shape_kind
+        return None
+
     def _planar_point_cutter_kind(self, kind: str) -> str:
         active = self._active_planar_cutter_kind(kind)
         if active == "polyline":
@@ -683,6 +698,16 @@ class MainWindow(QMainWindow):
         if active == "bezier_polycurve":
             return "bezier_surface"
         return kind
+
+    def _mark_internal_boundary_selector(
+        self,
+        selector: SDFNode,
+        label: str,
+    ) -> None:
+        if self.document.is_internal_scene_node(selector):
+            return
+        selector.name = f"{INTERNAL_BOUNDARY_SELECTOR_PREFIX}{label}_{selector.name}"
+        self.document.mark_changed()
 
     def _add_planar_segment_cutter_region(
         self,
