@@ -42,7 +42,7 @@ from core.boundary_patches import BoundaryPatchHit
 from core.sdf import PlacedSDF2D
 from core.sdf.base import BoundingBox3D, SDFNode
 from core.serialization import load_scene, save_scene
-from core.scene import SceneDocument
+from core.scene import INTERNAL_BOUNDARY_SELECTOR_PREFIX, SceneDocument
 from scenes.boolean_operations import build_scene as build_boolean_scene
 from scenes.lattice_benchmark import build_scene as build_benchmark_scene
 from scenes.pipe_3d import build_scene as build_pipe_scene
@@ -730,7 +730,7 @@ class MainWindow(QMainWindow):
                 (2.0 * span, 2.0 * span),
                 (0.0, 2.0 * span),
             ),
-            name="planar_segment_cutter",
+            name=f"{INTERNAL_BOUNDARY_SELECTOR_PREFIX}planar_segment_cutter",
             origin=tuple(float(value) for value in origin),
             axis_u=tuple(float(value) for value in line_axis),
             axis_v=tuple(float(value) for value in side_axis),

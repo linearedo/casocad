@@ -177,6 +177,19 @@ def test_planar_segment_cutter_draw_flow_creates_two_scene_tree_regions() -> Non
             "surface_split_profile"
         }
         assert selected == split_handles
+        tree_names = {
+            window.scene_tree.tree.topLevelItem(index).text(0)
+            for index in range(window.scene_tree.tree.topLevelItemCount())
+        }
+        assert "__boundary_selector_planar_segment_cutter" not in tree_names
+        assert any(
+            node.name == "__boundary_selector_planar_segment_cutter"
+            for node in window.document.objects
+        )
+        assert all(
+            component.name != "__boundary_selector_planar_segment_cutter"
+            for component in window.document.visual_tree().components
+        )
     finally:
         window.close()
         window.deleteLater()

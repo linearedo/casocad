@@ -115,6 +115,8 @@ class SceneTreePanel(QWidget):
         self.tree.clear()
         items: dict[int, QTreeWidgetItem] = {}
         for handle, node, parent_handle in document.walk():
+            if isinstance(node, SDFNode) and document.is_internal_scene_node(node):
+                continue
             role = ""
             if document.fluid_domain is not None:
                 if node is document.fluid_domain.root:

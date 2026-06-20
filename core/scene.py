@@ -77,6 +77,7 @@ Primitive3D = (
     | BezierTube
 )
 SceneItem = SDFNode | BoundaryRegion
+INTERNAL_BOUNDARY_SELECTOR_PREFIX = "__boundary_selector_"
 DEFAULT_BEZIER_POLYCURVE_POINTS = (
     (-0.65, -0.35),
     (-0.3, 0.55),
@@ -1943,7 +1944,10 @@ class SceneDocument:
         return True
 
     def _build_visual_tree(self) -> SDFTree:
-        three_dimensional = [node for node in self.objects if node.dimension == 3]
+        visible_objects = [
+            node for node in self.objects if not self.is_internal_scene_node(node)
+        ]
+        three_dimensional = [node for node in visible_objects if node.dimension == 3]
         if not three_dimensional:
             root: SDFNode = Sphere(
                 name="empty_visual_root",
@@ -1954,11 +1958,12 @@ class SceneDocument:
             root = three_dimensional[0]
             for node in three_dimensional[1:]:
                 root = Union(name="visual_union", left=root, right=node)
-        components = list(self.objects)
+        components = list(visible_objects)
         if self.fluid_domain is not None:
             for tag in self.fluid_domain.tag_objects:
                 if (
                     isinstance(tag, SDFNode)
+                    and not self.is_internal_scene_node(tag)
                     and all(existing is not tag for existing in components)
                 ):
                     components.append(tag)
@@ -2028,6 +2033,10 @@ class SceneDocument:
             yield from self._walk_node(root, None, seen)
         for region in self.boundary_regions:
             yield self.handle_for(region), region, None
+
+    @staticmethod
+    def is_internal_scene_node(node: SDFNode) -> bool:
+        return node.name.startswith(INTERNAL_BOUNDARY_SELECTOR_PREFIX)
 
     def _walk_node(
         self,
