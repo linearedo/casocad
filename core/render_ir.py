@@ -18,6 +18,7 @@ from .sdf import (
     CappedCone,
     Cone,
     Difference,
+    DistanceOffsetProfile,
     Extrude,
     Intersection,
     Cylinder,
@@ -400,6 +401,36 @@ def _build_profile_ir_node(
                 )
             ),
         )
+    elif isinstance(profile, PolylineProfile):
+        payload = RenderIRNode(
+            kind="profile_polyline_2d",
+            object_id=0,
+            dimension=2,
+            children=(),
+            params=tuple(
+                value
+                for point in profile.points
+                for value in (
+                    float(scale) * float(point[0]) + offset[0],
+                    float(scale) * float(point[1]) + offset[1],
+                )
+            ),
+        )
+    elif isinstance(profile, BezierCurveProfile):
+        payload = RenderIRNode(
+            kind="profile_bezier_curve_2d",
+            object_id=0,
+            dimension=2,
+            children=(),
+            params=tuple(
+                value
+                for point in profile.points
+                for value in (
+                    float(scale) * float(point[0]) + offset[0],
+                    float(scale) * float(point[1]) + offset[1],
+                )
+            ),
+        )
     elif isinstance(profile, BezierSurfaceProfile):
         payload = RenderIRNode(
             kind="profile_bezier_surface_2d",
@@ -426,6 +457,23 @@ def _build_profile_ir_node(
                 offset[0] + float(scale) * float(profile.offset[0]),
                 offset[1] + float(scale) * float(profile.offset[1]),
             ),
+        )
+    elif isinstance(profile, DistanceOffsetProfile):
+        payload = RenderIRNode(
+            kind="profile_distance_offset_2d",
+            object_id=0,
+            dimension=2,
+            children=(
+                _build_profile_ir_node(
+                    profile.child,
+                    nodes,
+                    ir_nodes,
+                    unsupported,
+                    scale,
+                    offset,
+                ),
+            ),
+            params=(float(scale) * float(profile.offset),),
         )
     elif isinstance(profile, BinaryProfile):
         payload = RenderIRNode(

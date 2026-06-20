@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import cos, radians, sin
 from typing import Iterator
 
@@ -1205,7 +1205,7 @@ class SceneDocument:
             for selector in selectors
             if (
                 root.dimension == 3
-                and isinstance(selector, (PlacedSDF1D, PlacedPolyline2D))
+                and isinstance(selector, SDFNode)
             )
             or (
                 root.dimension == 2
@@ -1245,6 +1245,7 @@ class SceneDocument:
         outside_direction: int | None = None,
         patch_id: str | None = None,
         patch_type: str | None = None,
+        selector: BoundarySelector | None = None,
     ) -> int:
         if self.fluid_domain is None:
             raise ValueError("select a FluidDomain root first")
@@ -1301,6 +1302,19 @@ class SceneDocument:
                 if patch_type is not None
                 else patch.patch_type
                 if patch is not None
+                else None
+            ),
+            selector_id=selector.selector_id if selector is not None else None,
+            selector_type=selector.selector_type if selector is not None else None,
+            selector_side=selector.side if selector is not None else "inside",
+            selector_start=(
+                selector.start
+                if isinstance(selector, BoundaryIntervalSelector)
+                else None
+            ),
+            selector_end=(
+                selector.end
+                if isinstance(selector, BoundaryIntervalSelector)
                 else None
             ),
         )
@@ -1388,6 +1402,7 @@ class SceneDocument:
             hit.outside_direction,
             hit.patch_id,
             hit.patch_type,
+            hit.selector,
         )
 
     def add_boundary_selector_region(
@@ -1412,7 +1427,7 @@ class SceneDocument:
         )
         if selector_metadata is None:
             raise ValueError(
-                "boundary selectors must be 1D segment, polyline, or bezier curve objects"
+                "boundary selectors must be compatible SDF cutter objects"
             )
         region = BoundaryRegion(
             name=f"{base_region.name} / {selector.name}",
@@ -1423,6 +1438,7 @@ class SceneDocument:
             patch_type=base_region.patch_type,
             selector_id=selector_metadata.selector_id,
             selector_type=selector_metadata.selector_type,
+            selector_side=selector_metadata.side,
             selector_start=(
                 selector_metadata.start
                 if isinstance(selector_metadata, BoundaryIntervalSelector)
@@ -1446,6 +1462,69 @@ class SceneDocument:
         )
         self.mark_changed()
         return self.handle_for(region)
+
+    def add_boundary_selector_split_regions(
+        self,
+        base_region: BoundaryRegion,
+        selector: SDFNode,
+    ) -> tuple[int, int]:
+        if self.fluid_domain is None:
+            raise ValueError("select a FluidDomain root first")
+        if base_region not in self.boundary_regions:
+            raise ValueError("base boundary region is not part of this document")
+        if base_region.patch_id is None:
+            raise ValueError("base boundary region must identify a boundary patch")
+        live_sdf_nodes = tuple(
+            node for root in self.objects for node in self._iter_nodes(root)
+        )
+        if all(node is not selector for node in live_sdf_nodes):
+            raise ValueError("boundary selector object is not part of this document")
+        selector_metadata = self._boundary_selector_metadata(
+            base_region,
+            selector,
+        )
+        if selector_metadata is None:
+            raise ValueError(
+                "boundary selectors must be compatible SDF cutter objects"
+            )
+        regions: list[BoundaryRegion] = []
+        for side in ("inside", "outside"):
+            side_selector = replace(selector_metadata, side=side)
+            regions.append(
+                BoundaryRegion(
+                    name=f"{base_region.name} / {selector.name} {side}",
+                    object_id=self._allocate_object_id(),
+                    owner_object_id=base_region.owner_object_id,
+                    outside_direction=base_region.outside_direction,
+                    patch_id=base_region.patch_id,
+                    patch_type=base_region.patch_type,
+                    selector_id=side_selector.selector_id,
+                    selector_type=side_selector.selector_type,
+                    selector_side=side_selector.side,
+                    selector_start=(
+                        side_selector.start
+                        if isinstance(side_selector, BoundaryIntervalSelector)
+                        else None
+                    ),
+                    selector_end=(
+                        side_selector.end
+                        if isinstance(side_selector, BoundaryIntervalSelector)
+                        else None
+                    ),
+                )
+            )
+        self.boundary_regions.extend(regions)
+        self._reindex()
+        selectors = self.fluid_domain.selector_objects
+        if selector not in selectors:
+            selectors = (*selectors, selector)
+        self.fluid_domain = FluidDomain(
+            self.fluid_domain.root,
+            (*self.fluid_domain.tag_objects, *regions),
+            selectors,
+        )
+        self.mark_changed()
+        return tuple(self.handle_for(region) for region in regions)
 
     def _boundary_selector_metadata(
         self,

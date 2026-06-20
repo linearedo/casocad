@@ -15,12 +15,15 @@ class BoundaryRegion:
     patch_type: str | None = None
     selector_id: str | None = None
     selector_type: str | None = None
+    selector_side: str = "inside"
     selector_start: float | None = None
     selector_end: float | None = None
 
     def __post_init__(self) -> None:
         if self.outside_direction is not None and not 0 <= self.outside_direction < 6:
             raise ValueError("outside_direction must be in the range 0..5")
+        if self.selector_side not in {"inside", "outside"}:
+            raise ValueError("selector_side must be 'inside' or 'outside'")
         if self.selector_start is not None and self.selector_end is None:
             raise ValueError("selector_end is required when selector_start is set")
         if self.selector_end is not None and self.selector_start is None:

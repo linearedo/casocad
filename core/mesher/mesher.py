@@ -8,6 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from core.boundary import BoundaryRegion
+from core.boundary_patches import SURFACE_SELECTOR_TYPES, surface_selector_values
 from core.boundary_direction import (
     owner_outside_direction_vector,
     world_axis_direction_from_vector,
@@ -223,14 +224,20 @@ def _selector_object_from_id(
 def _surface_split_selector_mask(
     selector_id: str,
     selector_by_id: dict[int, SDFNode],
+    root: SDFNode,
     positions: NDArray[np.float64],
     *,
+    side: str = "inside",
     tolerance: float,
 ) -> NDArray[np.bool_]:
     selector = _selector_object_from_id(selector_id, selector_by_id)
-    if not isinstance(selector, (PlacedSDF1D, PlacedPolyline2D)):
+    if selector is None:
         return np.zeros(positions.shape[0], dtype=np.bool_)
-    return selector.contains_points(positions, tolerance=tolerance)
+    values = surface_selector_values(root, selector, positions)
+    inside = np.asarray(values <= tolerance, dtype=np.bool_)
+    if side == "outside":
+        return np.asarray(~inside, dtype=np.bool_)
+    return inside
 
 
 class LatticeMesher:
@@ -528,13 +535,16 @@ class LatticeMesher:
                                 )
                         if (
                             tag.selector_id is not None
-                            and tag.selector_type == "surface_split_curve"
+                            and tag.selector_type
+                            in SURFACE_SELECTOR_TYPES
                             and self.domain.root.dimension == 3
                         ):
                             matched_samples &= _surface_split_selector_mask(
                                 tag.selector_id,
                                 selector_by_id,
+                                self.domain.root,
                                 face_samples.positions,
+                                side=tag.selector_side,
                                 tolerance=max(self.config.dx * 0.5, 1e-9),
                             )
                         matched_sample_indices = np.flatnonzero(

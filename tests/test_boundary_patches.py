@@ -24,13 +24,17 @@ from core.sdf import (
     Cylinder,
     Difference,
     EllipseProfile,
+    Intersection,
     PlacedPolyline2D,
     PlacedSDF1D,
     PlacedSDF2D,
+    PolygonProfile,
     PolylineProfile,
     RectangleProfile,
     SDFTree,
     SegmentProfile,
+    Sphere,
+    Torus,
 )
 
 
@@ -72,6 +76,38 @@ def test_pick_cylinder_side_and_cap_patches() -> None:
     assert cap.patch_id == "+Z_cap"
     assert cap.patch_type == "cap"
     assert cap.outside_direction == 5
+
+
+def test_pick_sphere_surface_patch() -> None:
+    sphere = Sphere(name="obstacle", object_id=2)
+
+    hit = pick_boundary_patch(
+        sphere,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+    )
+
+    assert hit is not None
+    assert hit.owner_object_id == sphere.object_id
+    assert hit.patch_id == "surface"
+    assert hit.patch_type == "surface"
+    assert hit.normal == pytest.approx((1.0, 0.0, 0.0))
+
+
+def test_pick_torus_surface_patch() -> None:
+    torus = Torus(name="ring", object_id=3)
+
+    hit = pick_boundary_patch(
+        torus,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+    )
+
+    assert hit is not None
+    assert hit.owner_object_id == torus.object_id
+    assert hit.patch_id == "surface"
+    assert hit.patch_type == "surface"
+    assert hit.normal == pytest.approx((1.0, 0.0, 0.0))
 
 
 def test_pick_difference_cut_surface_is_attributed_to_obstacle_patch() -> None:
@@ -257,6 +293,47 @@ def test_scene_2d_segment_selector_creates_boundary_interval_region() -> None:
     assert interval.selector_start == pytest.approx(((-0.2) + 0.35) / 0.7)
     assert interval.selector_end == pytest.approx((0.1 + 0.35) / 0.7)
     assert np.array_equal(before, after)
+
+
+def test_scene_planar_cutter_split_creates_inside_and_outside_regions() -> None:
+    rectangle = PlacedSDF2D(
+        name="section",
+        object_id=4,
+        profile=RectangleProfile(half_size=(0.5, 0.35)),
+    )
+    selector = PlacedSDF1D(
+        name="outlet_interval",
+        object_id=5,
+        profile=SegmentProfile(half_length=0.15),
+        origin=(0.5, -0.05, 0.0),
+        axis_u=(0.0, 1.0, 0.0),
+    )
+    document = SceneDocument(objects=[rectangle, selector])
+    document.fluid_domain = FluidDomain(rectangle)
+    hit = pick_boundary_patch(
+        rectangle,
+        np.asarray((0.5, 0.0, 2.0), dtype=np.float64),
+        np.asarray((0.0, 0.0, -1.0), dtype=np.float64),
+    )
+    assert hit is not None
+    base_handle = document.add_boundary_region_from_hit(hit)
+
+    split_handles = document.add_boundary_selector_split_regions(
+        document.node(base_handle),
+        selector,
+    )
+    inside = document.node(split_handles[0])
+    outside = document.node(split_handles[1])
+
+    assert inside.selector_side == "inside"
+    assert outside.selector_side == "outside"
+    assert inside.selector_id == f"selector:{selector.object_id}"
+    assert outside.selector_id == f"selector:{selector.object_id}"
+    assert inside.selector_type == "boundary_curve_interval"
+    assert outside.selector_type == "boundary_curve_interval"
+    assert inside.patch_id == "+U"
+    assert outside.patch_id == "+U"
+    assert selector in document.fluid_domain.selector_objects
 
 
 def test_2d_boundary_interval_mask_restricts_mesher_samples() -> None:
@@ -528,6 +605,355 @@ def test_scene_boundary_selector_region_stores_selector_without_cutting_geometry
     assert np.array_equal(before, after)
 
 
+def test_scene_3d_solid_selector_region_stores_sdf_subregion() -> None:
+    volume = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="inlet_half",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.3,
+    )
+    document = SceneDocument(objects=[volume, cutter])
+    document.fluid_domain = FluidDomain(volume)
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+    )
+    assert hit is not None
+    base_handle = document.add_boundary_region_from_hit(hit)
+    before = volume.to_numpy(
+        np.asarray([0.25], dtype=np.float64),
+        np.asarray([0.0], dtype=np.float64),
+        np.asarray([0.0], dtype=np.float64),
+    )
+
+    selector_region_handle = document.add_boundary_selector_region(
+        document.node(base_handle),
+        cutter,
+    )
+    selector_region = document.node(selector_region_handle)
+    after = volume.to_numpy(
+        np.asarray([0.25], dtype=np.float64),
+        np.asarray([0.0], dtype=np.float64),
+        np.asarray([0.0], dtype=np.float64),
+    )
+
+    assert selector_region.selector_id == f"selector:{cutter.object_id}"
+    assert selector_region.selector_type == "surface_sdf_subregion"
+    assert cutter in document.fluid_domain.selector_objects
+    assert np.array_equal(before, after)
+
+
+def test_scene_surface_cutter_split_creates_inside_and_outside_regions() -> None:
+    volume = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="inlet_half",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.3,
+    )
+    document = SceneDocument(objects=[volume, cutter])
+    document.fluid_domain = FluidDomain(volume)
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+    )
+    assert hit is not None
+    base_handle = document.add_boundary_region_from_hit(hit)
+
+    split_handles = document.add_boundary_selector_split_regions(
+        document.node(base_handle),
+        cutter,
+    )
+    inside = document.node(split_handles[0])
+    outside = document.node(split_handles[1])
+
+    assert inside.selector_side == "inside"
+    assert outside.selector_side == "outside"
+    assert inside.selector_id == f"selector:{cutter.object_id}"
+    assert outside.selector_id == f"selector:{cutter.object_id}"
+    assert inside.selector_type == "surface_sdf_subregion"
+    assert outside.selector_type == "surface_sdf_subregion"
+    assert inside.patch_id == "+X"
+    assert outside.patch_id == "+X"
+    assert cutter in document.fluid_domain.selector_objects
+
+
+def test_pick_boundary_patch_returns_3d_sdf_selector_hit() -> None:
+    volume = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="inlet_half",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.3,
+    )
+
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=(cutter,),
+    )
+
+    assert hit is not None
+    assert hit.patch_id == "+X"
+    assert hit.selector is not None
+    assert hit.selector.selector_id == f"selector:{cutter.object_id}"
+    assert hit.selector.selector_type == "surface_sdf_subregion"
+    assert hit.selector.side == "inside"
+
+
+def test_pick_boundary_patch_returns_outside_selector_hit() -> None:
+    volume = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="small_inlet",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.1,
+    )
+
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.3, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=(cutter,),
+    )
+
+    assert hit is not None
+    assert hit.patch_id == "+X"
+    assert hit.selector is not None
+    assert hit.selector.selector_id == f"selector:{cutter.object_id}"
+    assert hit.selector.selector_type == "surface_sdf_subregion"
+    assert hit.selector.side == "outside"
+
+
+def test_scene_boundary_region_from_selector_hit_stores_selector_metadata() -> None:
+    volume = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="inlet_half",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.3,
+    )
+    document = SceneDocument(objects=[volume, cutter])
+    document.fluid_domain = FluidDomain(volume, selector_objects=(cutter,))
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=document.fluid_domain.selector_objects,
+    )
+    assert hit is not None
+    assert hit.selector is not None
+
+    handle = document.add_boundary_region_from_hit(hit)
+    region = document.node(handle)
+
+    assert isinstance(region, BoundaryRegion)
+    assert region.patch_id == "+X"
+    assert region.selector_id == f"selector:{cutter.object_id}"
+    assert region.selector_type == "surface_sdf_subregion"
+    assert region.selector_side == "inside"
+
+
+def test_boundary_patch_preview_node_for_selector_hit_is_render_ir_supported() -> None:
+    volume = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="inlet_half",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.3,
+    )
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=(cutter,),
+    )
+    assert hit is not None
+    assert hit.selector is not None
+
+    preview = boundary_patch_preview_node(
+        volume,
+        hit,
+        selector_objects=(cutter,),
+    )
+    assert isinstance(preview, Intersection)
+    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
+
+    assert render_ir.supported
+    assert render_ir.root_indices
+
+
+def test_boundary_patch_preview_node_for_outside_selector_hit_is_render_ir_supported() -> None:
+    volume = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="small_inlet",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.1,
+    )
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.3, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=(cutter,),
+    )
+    assert hit is not None
+    assert hit.selector is not None
+    assert hit.selector.side == "outside"
+
+    preview = boundary_patch_preview_node(
+        volume,
+        hit,
+        selector_objects=(cutter,),
+    )
+    assert isinstance(preview, Difference)
+    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
+
+    assert render_ir.supported
+    assert render_ir.root_indices
+
+
+def test_boundary_patch_preview_node_for_1d_selector_hit_is_render_ir_supported() -> None:
+    volume = Box(name="volume", object_id=1)
+    selector = PlacedSDF1D(
+        name="split",
+        object_id=2,
+        profile=SegmentProfile(half_length=0.25),
+        origin=(0.5, 0.0, 0.0),
+        axis_u=(0.0, 1.0, 0.0),
+    )
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=(selector,),
+    )
+    assert hit is not None
+    assert hit.selector is not None
+    assert hit.selector.selector_type == "surface_split_curve"
+
+    preview = boundary_patch_preview_node(
+        volume,
+        hit,
+        selector_objects=(selector,),
+    )
+    assert isinstance(preview, Intersection)
+    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
+
+    assert render_ir.supported
+    assert render_ir.root_indices
+
+
+def test_boundary_patch_preview_node_for_polyline_selector_hit_is_render_ir_supported() -> None:
+    volume = Box(name="volume", object_id=1)
+    selector = PlacedPolyline2D(
+        name="split_curve",
+        object_id=2,
+        profile=PolylineProfile(points=((0.5, -0.3), (0.5, 0.3))),
+        origin=(0.0, 0.0, 0.0),
+        axis_u=(1.0, 0.0, 0.0),
+        axis_v=(0.0, 1.0, 0.0),
+    )
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=(selector,),
+    )
+    assert hit is not None
+    assert hit.selector is not None
+    assert hit.selector.selector_id == f"selector:{selector.object_id}"
+    assert hit.selector.selector_type == "surface_split_curve"
+
+    preview = boundary_patch_preview_node(
+        volume,
+        hit,
+        selector_objects=(selector,),
+    )
+    assert isinstance(preview, Intersection)
+    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
+
+    assert render_ir.supported
+    assert render_ir.root_indices
+
+
+def test_boundary_patch_preview_node_for_bezier_selector_hit_is_render_ir_supported() -> None:
+    volume = Box(name="volume", object_id=1)
+    selector = PlacedPolyline2D(
+        name="split_bezier",
+        object_id=2,
+        profile=BezierCurveProfile(points=((0.5, -0.3), (0.5, 0.0), (0.5, 0.3))),
+        origin=(0.0, 0.0, 0.0),
+        axis_u=(1.0, 0.0, 0.0),
+        axis_v=(0.0, 1.0, 0.0),
+    )
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=(selector,),
+    )
+    assert hit is not None
+    assert hit.selector is not None
+    assert hit.selector.selector_id == f"selector:{selector.object_id}"
+    assert hit.selector.selector_type == "surface_split_curve"
+
+    preview = boundary_patch_preview_node(
+        volume,
+        hit,
+        selector_objects=(selector,),
+    )
+    assert isinstance(preview, Intersection)
+    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
+
+    assert render_ir.supported
+    assert render_ir.root_indices
+
+
+def test_boundary_patch_preview_node_for_planar_profile_selector_is_render_ir_supported() -> None:
+    volume = Box(name="volume", object_id=1)
+    selector = PlacedSDF2D(
+        name="planar_cut",
+        object_id=2,
+        profile=PolygonProfile(
+            points=(
+                (-0.25, -0.25),
+                (0.25, -0.25),
+                (0.25, 0.25),
+                (-0.25, 0.25),
+            )
+        ),
+        origin=(0.5, 0.0, 0.0),
+        axis_u=(0.0, 1.0, 0.0),
+        axis_v=(0.0, 0.0, 1.0),
+    )
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=(selector,),
+    )
+    assert hit is not None
+    assert hit.selector is not None
+    assert hit.selector.selector_id == f"selector:{selector.object_id}"
+    assert hit.selector.selector_type == "surface_split_profile"
+
+    preview = boundary_patch_preview_node(
+        volume,
+        hit,
+        selector_objects=(selector,),
+    )
+    assert isinstance(preview, Intersection)
+    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
+
+    assert render_ir.supported
+    assert render_ir.root_indices
+
+
 def test_selector_backed_boundary_region_serializes_selector_objects(
     tmp_path: Path,
 ) -> None:
@@ -562,6 +988,42 @@ def test_selector_backed_boundary_region_serializes_selector_objects(
     assert len(selector_regions) == 1
     assert selector_regions[0].selector_id == "selector:2"
     assert selector_regions[0].selector_type == "surface_split_curve"
+    assert selector_regions[0].selector_side == "inside"
+
+
+def test_outside_selector_boundary_region_serializes_selector_side(
+    tmp_path: Path,
+) -> None:
+    volume = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="small_inlet",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.1,
+    )
+    document = SceneDocument(objects=[volume, cutter])
+    document.fluid_domain = FluidDomain(volume, selector_objects=(cutter,))
+    hit = pick_boundary_patch(
+        volume,
+        np.asarray((2.0, 0.3, 0.0), dtype=np.float64),
+        np.asarray((-1.0, 0.0, 0.0), dtype=np.float64),
+        selector_objects=document.fluid_domain.selector_objects,
+    )
+    assert hit is not None
+    assert hit.selector is not None
+    assert hit.selector.side == "outside"
+    document.add_boundary_region_from_hit(hit)
+    path = tmp_path / "outside_selector_region.casocad.json"
+
+    save_scene(document, path)
+    loaded = load_scene(path)
+
+    selector_regions = [
+        region for region in loaded.boundary_regions if region.selector_id is not None
+    ]
+    assert len(selector_regions) == 1
+    assert selector_regions[0].selector_id == "selector:2"
+    assert selector_regions[0].selector_side == "outside"
 
 
 def test_surface_split_selector_mask_restricts_3d_boundary_samples() -> None:
@@ -584,11 +1046,104 @@ def test_surface_split_selector_mask_restricts_3d_boundary_samples() -> None:
     mask = _surface_split_selector_mask(
         f"selector:{selector.object_id}",
         {selector.object_id: selector},
+        Box(name="volume", object_id=1),
         positions,
         tolerance=0.01,
     )
 
-    assert mask.tolist() == [True, False, False]
+    assert mask.tolist() == [True, False, True]
+
+
+def test_planar_profile_selector_mask_splits_surface_area_not_curve() -> None:
+    selector = PlacedSDF2D(
+        name="planar_cut",
+        object_id=7,
+        profile=PolygonProfile(
+            points=(
+                (-0.25, -0.25),
+                (0.25, -0.25),
+                (0.25, 0.25),
+                (-0.25, 0.25),
+            )
+        ),
+        origin=(0.5, 0.0, 0.0),
+        axis_u=(0.0, 1.0, 0.0),
+        axis_v=(0.0, 0.0, 1.0),
+    )
+    positions = np.asarray(
+        (
+            (0.5, 0.0, 0.0),
+            (0.5, 0.24, 0.24),
+            (0.5, 0.35, 0.0),
+            (0.5, 0.0, 0.35),
+        ),
+        dtype=np.float64,
+    )
+
+    mask = _surface_split_selector_mask(
+        f"selector:{selector.object_id}",
+        {selector.object_id: selector},
+        Box(name="volume", object_id=1),
+        positions,
+        tolerance=0.0,
+    )
+
+    assert mask.tolist() == [True, True, False, False]
+
+
+def test_surface_sdf_selector_mask_uses_universal_cutter_formula() -> None:
+    cutter = Sphere(
+        name="cut",
+        object_id=7,
+        center=(0.5, 0.0, 0.0),
+        radius=0.25,
+    )
+    positions = np.asarray(
+        (
+            (0.5, 0.0, 0.0),
+            (0.5, 0.35, 0.0),
+            (0.5, 0.0, 0.2),
+        ),
+        dtype=np.float64,
+    )
+
+    mask = _surface_split_selector_mask(
+        f"selector:{cutter.object_id}",
+        {cutter.object_id: cutter},
+        Box(name="volume", object_id=1),
+        positions,
+        tolerance=0.0,
+    )
+
+    assert mask.tolist() == [True, False, True]
+
+
+def test_surface_sdf_selector_mask_supports_outside_subregion() -> None:
+    cutter = Sphere(
+        name="cut",
+        object_id=7,
+        center=(0.5, 0.0, 0.0),
+        radius=0.25,
+    )
+    positions = np.asarray(
+        (
+            (0.5, 0.0, 0.0),
+            (0.5, 0.35, 0.0),
+            (0.5, 0.0, 0.2),
+        ),
+        dtype=np.float64,
+    )
+
+    mask = _surface_split_selector_mask(
+        f"selector:{cutter.object_id}",
+        {cutter.object_id: cutter},
+        Box(name="volume", object_id=1),
+        positions,
+        side="outside",
+        tolerance=0.0,
+    )
+
+    assert mask.tolist() == [False, True, False]
 
 
 def test_boundary_patch_preview_node_for_box_face_is_render_ir_supported() -> None:
@@ -682,6 +1237,69 @@ def test_boundary_region_preview_node_for_selected_box_face_is_render_ir_support
 
     preview = boundary_region_preview_node(box, region)
     assert preview is not None
+    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
+
+    assert render_ir.supported
+    assert render_ir.root_indices
+
+
+def test_boundary_region_preview_node_for_3d_sdf_selector_is_render_ir_supported() -> None:
+    box = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="face_subregion",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.25,
+    )
+    region = BoundaryRegion(
+        name="partial_outlet",
+        object_id=3,
+        owner_object_id=box.object_id,
+        outside_direction=1,
+        patch_id="+X",
+        patch_type="face",
+        selector_id=f"selector:{cutter.object_id}",
+        selector_type="surface_sdf_subregion",
+    )
+
+    preview = boundary_region_preview_node(
+        box,
+        region,
+        selector_objects=(cutter,),
+    )
+    assert isinstance(preview, Intersection)
+    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
+
+    assert render_ir.supported
+    assert render_ir.root_indices
+
+
+def test_boundary_region_preview_node_for_outside_3d_sdf_selector_is_render_ir_supported() -> None:
+    box = Box(name="volume", object_id=1)
+    cutter = Sphere(
+        name="face_subregion",
+        object_id=2,
+        center=(0.5, 0.0, 0.0),
+        radius=0.25,
+    )
+    region = BoundaryRegion(
+        name="base_outlet",
+        object_id=3,
+        owner_object_id=box.object_id,
+        outside_direction=1,
+        patch_id="+X",
+        patch_type="face",
+        selector_id=f"selector:{cutter.object_id}",
+        selector_type="surface_sdf_subregion",
+        selector_side="outside",
+    )
+
+    preview = boundary_region_preview_node(
+        box,
+        region,
+        selector_objects=(cutter,),
+    )
+    assert isinstance(preview, Difference)
     render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
 
     assert render_ir.supported

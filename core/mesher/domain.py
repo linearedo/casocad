@@ -90,10 +90,13 @@ class FluidDomain:
             existing = ids_to_objects.get(selector.object_id)
             if existing is not None and existing is not selector:
                 raise ValueError(f"duplicate FluidDomain object_id {selector.object_id}")
-            if not isinstance(selector, (PlacedSDF1D, PlacedPolyline2D)):
+            if self.root.dimension == 3:
+                valid_selector = isinstance(selector, SDFNode)
+            else:
+                valid_selector = isinstance(selector, (PlacedSDF1D, PlacedPolyline2D))
+            if not valid_selector:
                 raise ValueError(
-                    "FluidDomain boundary selectors must be 1D segment, polyline, "
-                    "or bezier curve objects"
+                    "FluidDomain boundary selectors must be SDF cutter objects"
                 )
             if (
                 self.root.dimension == 2

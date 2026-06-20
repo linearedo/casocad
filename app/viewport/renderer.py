@@ -376,6 +376,18 @@ class _ParameterizedIRSceneSource:
                         )
                     )
                 body.append("    return inside ? -distance_to_edge : distance_to_edge;")
+        elif node.kind == "profile_polyline_2d":
+            point_count = len(node.params) // 2
+            body = [
+                "    return "
+                f"{self._polyline_distance_2d(index, point_count, q_var='q')};"
+            ]
+        elif node.kind == "profile_bezier_curve_2d":
+            point_count = len(node.params) // 2
+            body = [
+                "    return "
+                f"{self._bezier_distance_2d(index, point_count, q_var='q')};"
+            ]
         elif node.kind == "profile_bezier_surface_2d":
             point_count = len(node.params) // 2
             if point_count < 3:
@@ -425,6 +437,12 @@ class _ParameterizedIRSceneSource:
                 f"    return {self._profile_sdf_name(child)}("
                 f"q - vec2({self._node_param(index, 0)},"
                 f" {self._node_param(index, 1)}));"
+            ]
+        elif node.kind == "profile_distance_offset_2d":
+            child = node.children[0]
+            body = [
+                f"    return {self._profile_sdf_name(child)}(q)"
+                f" - {self._node_param(index, 0)};"
             ]
         elif node.kind == "profile_union_2d":
             left, right = node.children

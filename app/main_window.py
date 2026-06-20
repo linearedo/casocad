@@ -570,20 +570,49 @@ class MainWindow(QMainWindow):
         parameters: dict[str, float] | None,
     ) -> None:
         undo_snapshot = self._history_snapshot()
-        handle = self.document.add_primitive_from_drag(
-            kind,
-            start,
-            end,
-            parameters=parameters,
+        base_region = self._selected_boundary_region_for_cutter()
+        try:
+            if self._active_planar_cutter_kind(kind) == "segment":
+                if base_region is None:
+                    raise ValueError(
+                        "Select a BoundaryRegion before creating a planar cutter."
+                    )
+                handle = self._add_planar_segment_cutter_region(
+                    base_region,
+                    start,
+                    end,
+                )
+            else:
+                handle = self.document.add_primitive_from_drag(
+                    kind,
+                    start,
+                    end,
+                    parameters=parameters,
+                )
+        except ValueError as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        split_handles = self._try_create_boundary_selector_split(
+            base_region,
+            self.document.node(handle),
         )
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
-        self.scene_tree.select_handle(handle)
+        if split_handles:
+            self.scene_tree.select_handles(list(split_handles))
+        else:
+            self.scene_tree.select_handle(handle)
         self.viewport.setFocus()
-        self.statusBar().showMessage(
-            viewport_shape_created_message(self.document.node(handle).name),
-            5000,
-        )
+        if split_handles:
+            self.statusBar().showMessage(
+                "Created cutter and split BoundaryRegion into inside/outside.",
+                5000,
+            )
+        else:
+            self.statusBar().showMessage(
+                viewport_shape_created_message(self.document.node(handle).name),
+                5000,
+            )
 
     @Slot(str, object, str)
     def _on_viewport_point_shape_drawn(
@@ -593,23 +622,140 @@ class MainWindow(QMainWindow):
         reference_plane: str,
     ) -> None:
         undo_snapshot = self._history_snapshot()
+        base_region = self._selected_boundary_region_for_cutter()
+        effective_kind = self._planar_point_cutter_kind(kind)
         try:
             handle = self.document.add_point_shape_from_world_points(
-                kind,
+                effective_kind,
                 points,
                 reference_plane,
             )
         except ValueError as error:
             signals.log_message.emit("warning", str(error))
             return
+        split_handles = self._try_create_boundary_selector_split(
+            base_region,
+            self.document.node(handle),
+        )
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
-        self.scene_tree.select_handle(handle)
+        if split_handles:
+            self.scene_tree.select_handles(list(split_handles))
+        else:
+            self.scene_tree.select_handle(handle)
         self.viewport.setFocus()
-        self.statusBar().showMessage(
-            viewport_shape_created_message(self.document.node(handle).name),
-            5000,
+        if split_handles:
+            self.statusBar().showMessage(
+                "Created cutter and split BoundaryRegion into inside/outside.",
+                5000,
+            )
+        else:
+            self.statusBar().showMessage(
+                viewport_shape_created_message(self.document.node(handle).name),
+                5000,
+            )
+
+    def _selected_boundary_region_for_cutter(self) -> BoundaryRegion | None:
+        handles = self.scene_tree.selected_handles()
+        if len(handles) != 1:
+            return None
+        try:
+            node = self.document.node(handles[0])
+        except KeyError:
+            return None
+        if isinstance(node, BoundaryRegion) and node.patch_id is not None:
+            return node
+        return None
+
+    def _active_planar_cutter_kind(self, kind: str) -> str | None:
+        active = self.viewport.active_boundary_cutter_tool()
+        if active is None:
+            return None
+        cutter_kind, shape_kind = active
+        if cutter_kind == "planar" and shape_kind == kind:
+            return shape_kind
+        return None
+
+    def _planar_point_cutter_kind(self, kind: str) -> str:
+        active = self._active_planar_cutter_kind(kind)
+        if active == "polyline":
+            return "polygon"
+        if active == "bezier_polycurve":
+            return "bezier_surface"
+        return kind
+
+    def _add_planar_segment_cutter_region(
+        self,
+        base_region: BoundaryRegion,
+        start: tuple[float, float, float],
+        end: tuple[float, float, float],
+    ) -> int:
+        _selectors, normals = self._viewport_boundary_region_entries([base_region])
+        normal = np.asarray(normals[0], dtype=np.float64)
+        normal_length = float(np.linalg.norm(normal))
+        if normal_length <= 1.0e-9:
+            raise ValueError(
+                "The selected BoundaryRegion has no planar normal for a segment cutter."
+            )
+        normal /= normal_length
+        start_array = np.asarray(start, dtype=np.float64)
+        end_array = np.asarray(end, dtype=np.float64)
+        line = end_array - start_array
+        line_length = float(np.linalg.norm(line))
+        if line_length <= 1.0e-9:
+            raise ValueError("Planar segment cutter length must be nonzero.")
+        line_axis = line / line_length
+        side_axis = np.cross(normal, line_axis)
+        side_length = float(np.linalg.norm(side_axis))
+        if side_length <= 1.0e-9:
+            raise ValueError(
+                "Planar segment cutter must lie across the selected boundary."
+            )
+        side_axis /= side_length
+        assert self.document.fluid_domain is not None
+        bounds = self.document.fluid_domain.root.bounding_box()
+        span = max(
+            bounds.x_max - bounds.x_min,
+            bounds.y_max - bounds.y_min,
+            bounds.z_max - bounds.z_min,
+            line_length,
+            1.0,
+        ) * 2.0
+        midpoint = 0.5 * (start_array + end_array)
+        origin = midpoint - line_axis * span
+        return self.document.add_polygon(
+            (
+                (0.0, 0.0),
+                (2.0 * span, 0.0),
+                (2.0 * span, 2.0 * span),
+                (0.0, 2.0 * span),
+            ),
+            name="planar_segment_cutter",
+            origin=tuple(float(value) for value in origin),
+            axis_u=tuple(float(value) for value in line_axis),
+            axis_v=tuple(float(value) for value in side_axis),
         )
+
+    def _try_create_boundary_selector_split(
+        self,
+        base_region: BoundaryRegion | None,
+        selector: SDFNode,
+    ) -> tuple[int, int] | None:
+        if base_region is None:
+            return None
+        try:
+            handles = self.document.add_boundary_selector_split_regions(
+                base_region,
+                selector,
+            )
+        except ValueError as error:
+            signals.log_message.emit("warning", str(error))
+            return None
+        signals.log_message.emit(
+            "info",
+            "Boundary cutter split created: inside and outside regions.",
+        )
+        return handles
 
     def _start_viewport_move(self) -> None:
         handles = self.scene_tree.selected_handles()
@@ -903,7 +1049,10 @@ class MainWindow(QMainWindow):
                 "Select a FluidDomain root before creating a boundary tag.",
             )
             return
-        self.viewport.begin_boundary_region_tool(self.document.fluid_domain.root)
+        self.viewport.begin_boundary_region_tool(
+            self.document.fluid_domain.root,
+            self.document.fluid_domain.selector_objects,
+        )
 
     @Slot(object)
     def _on_viewport_boundary_hovered(
@@ -931,8 +1080,13 @@ class MainWindow(QMainWindow):
             selection,
         )
         if owner is not None:
+            selector_suffix = (
+                f" / {selection.selector.side}"
+                if selection.selector is not None
+                else ""
+            )
             self.statusBar().showMessage(
-                f"Boundary patch: {owner.name} {selection.patch_id}"
+                f"Boundary patch: {owner.name} {selection.patch_id}{selector_suffix}"
             )
 
     @Slot(object)
@@ -976,7 +1130,7 @@ class MainWindow(QMainWindow):
             return
         undo_snapshot = self._history_snapshot()
         try:
-            handle = self.document.add_boundary_selector_region(
+            handles = self.document.add_boundary_selector_split_regions(
                 base_region,
                 selector,
             )
@@ -985,7 +1139,7 @@ class MainWindow(QMainWindow):
             return
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
-        self.scene_tree.select_handle(handle)
+        self.scene_tree.select_handles(list(handles))
 
     def _create_boundary_region(
         self,

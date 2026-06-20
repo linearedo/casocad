@@ -661,6 +661,29 @@ class OffsetProfile(Profile2D):
 
 
 @dataclass(frozen=True)
+class DistanceOffsetProfile(Profile2D):
+    child: Profile2D
+    offset: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.offset):
+            raise ValueError("distance offset must be finite")
+
+    def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
+        return np.asarray(self.child.to_numpy(U, V) - self.offset, dtype=np.float64)
+
+    def bounds(self) -> tuple[float, float, float, float]:
+        u_min, u_max, v_min, v_max = self.child.bounds()
+        padding = abs(float(self.offset))
+        return (
+            u_min - padding,
+            u_max + padding,
+            v_min - padding,
+            v_max + padding,
+        )
+
+
+@dataclass(frozen=True)
 class BinaryProfile(Profile2D):
     left: Profile2D
     right: Profile2D

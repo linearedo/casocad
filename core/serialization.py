@@ -76,6 +76,7 @@ def save_scene(document: SceneDocument, path: str | Path) -> None:
                 "patch_type": region.patch_type,
                 "selector_id": region.selector_id,
                 "selector_type": region.selector_type,
+                "selector_side": region.selector_side,
                 "selector_start": region.selector_start,
                 "selector_end": region.selector_end,
             }
@@ -157,6 +158,7 @@ def load_scene(path: str | Path) -> SceneDocument:
                 if item.get("selector_type") is not None
                 else None
             ),
+            selector_side=str(item.get("selector_side") or "inside"),
             selector_start=(
                 float(item["selector_start"])
                 if item.get("selector_start") is not None

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
-from math import atan2, degrees, radians
+from math import asin, atan2, degrees, radians
 from typing import Callable
 
 import moderngl
@@ -10,7 +10,15 @@ import numpy as np
 from PySide6.QtCore import QElapsedTimer, QPoint, QTimer, Qt
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QPushButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QPushButton,
+)
 
 from app.artifacts import RenderArtifactTimings
 from app.dimensions import (
@@ -709,6 +717,11 @@ def snap_status_text(snap_enabled: bool) -> str:
     return "Snap On" if snap_enabled else "Snap Off"
 
 
+def _reference_plane_for_normal(normal: np.ndarray) -> str:
+    axis = int(np.argmax(np.abs(normal)))
+    return ("yz", "xz", "xy")[axis]
+
+
 def bottom_center_overlay_position(
     viewport_width: int,
     viewport_height: int,
@@ -849,6 +862,7 @@ class ViewportWidget(QOpenGLWidget):
         self._view_animation_timer.setInterval(VIEW_ANIMATION_INTERVAL_MS)
         self._view_animation_timer.timeout.connect(self._advance_view_animation)
         self._view_buttons: dict[str, QPushButton] = {}
+        self._boundary_cutter_buttons: tuple[QPushButton, QPushButton] = ()
         self._view_panel = self._build_view_panel()
         self._command_panel = self._build_command_panel()
         self._position_overlays()
@@ -891,7 +905,9 @@ class ViewportWidget(QOpenGLWidget):
         self._last_mouse_position: QPoint | None = None
         self._scene_press_position: QPoint | None = None
         self._interaction_tool: tuple[str, object] | None = None
+        self._boundary_cutter_tool: tuple[str, str] | None = None
         self._boundary_pick_root: SDFNode | None = None
+        self._boundary_pick_selectors: tuple[SDFNode, ...] = ()
         self._boundary_selection_active = False
         self._boundary_hover_owner_id = 0
         self._boundary_hover_direction = -1
@@ -1017,9 +1033,10 @@ class ViewportWidget(QOpenGLWidget):
             "}"
         )
         panel.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        layout = QHBoxLayout(panel)
+        layout = QGridLayout(panel)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(6)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(6)
 
         move_button = QPushButton("Move", panel)
         move_button.setObjectName("viewportMoveButton")
@@ -1028,7 +1045,32 @@ class ViewportWidget(QOpenGLWidget):
             "Select one Scene object, then drag it on the active reference plane"
         )
         move_button.clicked.connect(signals.viewport_move_tool_requested.emit)
-        layout.addWidget(move_button)
+        layout.addWidget(move_button, 0, 0)
+
+        planar_cutter_button = QPushButton("Planar Cutter", panel)
+        planar_cutter_button.setObjectName("viewportPlanarBoundaryCutterButton")
+        planar_cutter_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        planar_cutter_button.setToolTip(
+            "Select a BoundaryRegion, then choose a planar cutter curve"
+        )
+        planar_cutter_button.setEnabled(False)
+        planar_cutter_button.setMenu(
+            self._build_planar_cutter_menu(planar_cutter_button)
+        )
+        layout.addWidget(planar_cutter_button, 0, 1)
+
+        surface_cutter_button = QPushButton("Surface Cutter", panel)
+        surface_cutter_button.setObjectName("viewportSurfaceBoundaryCutterButton")
+        surface_cutter_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        surface_cutter_button.setToolTip(
+            "Select a BoundaryRegion, then choose a 3D SDF cutter shape"
+        )
+        surface_cutter_button.setEnabled(False)
+        surface_cutter_button.setMenu(
+            self._build_surface_cutter_menu(surface_cutter_button)
+        )
+        layout.addWidget(surface_cutter_button, 1, 0)
+        self._boundary_cutter_buttons = (planar_cutter_button, surface_cutter_button)
 
         boundary_button = QPushButton("Boundary Region", panel)
         boundary_button.setObjectName("viewportBoundaryRegionButton")
@@ -1039,11 +1081,46 @@ class ViewportWidget(QOpenGLWidget):
         boundary_button.clicked.connect(
             signals.viewport_boundary_tool_requested.emit
         )
-        layout.addWidget(boundary_button)
+        layout.addWidget(boundary_button, 1, 1)
 
         panel.adjustSize()
         self._position_command_panel()
         return panel
+
+    def _build_planar_cutter_menu(self, parent: QPushButton) -> QMenu:
+        menu = QMenu(parent)
+        for label, shape_kind in (
+            ("Segment", "segment"),
+            ("Polyline", "polyline"),
+            ("Bezier Polycurve", "bezier_polycurve"),
+        ):
+            action = menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, kind=shape_kind: self.begin_boundary_cutter_tool(
+                    "planar",
+                    kind,
+                )
+            )
+        return menu
+
+    def _build_surface_cutter_menu(self, parent: QPushButton) -> QMenu:
+        menu = QMenu(parent)
+        for label, shape_kind in (
+            ("Sphere", "sphere"),
+            ("Box", "box"),
+            ("Cylinder", "cylinder"),
+            ("Cone", "cone"),
+            ("Capped Cone", "capped_cone"),
+            ("Torus", "torus"),
+        ):
+            action = menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, kind=shape_kind: self.begin_boundary_cutter_tool(
+                    "surface",
+                    kind,
+                )
+            )
+        return menu
 
     def _position_view_panel(self) -> None:
         if not hasattr(self, "_view_panel"):
@@ -1170,6 +1247,7 @@ class ViewportWidget(QOpenGLWidget):
 
     def begin_create_tool(self, kind: str) -> None:
         self._clear_scene_hover()
+        self._boundary_cutter_tool = None
         self._interaction_tool = ("create", kind)
         self._tool_start_screen = None
         self._tool_start_world = None
@@ -1197,6 +1275,88 @@ class ViewportWidget(QOpenGLWidget):
         signals.log_message.emit("info", message)
         self._update_measurement_readout()
         self.update()
+
+    def begin_boundary_cutter_tool(
+        self,
+        cutter_kind: str,
+        shape_kind: str | None = None,
+    ) -> None:
+        if not self._selected_boundary_region_objects:
+            signals.log_message.emit(
+                "warning",
+                "Select a BoundaryRegion before creating a boundary cutter.",
+            )
+            return
+        if cutter_kind == "planar":
+            if not self._align_planar_cutter_view_to_selected_boundary():
+                return
+            kind = shape_kind or "polyline"
+            if kind not in {"segment", "polyline", "bezier_polycurve"}:
+                raise ValueError(f"unknown planar boundary cutter kind: {kind}")
+            self.begin_create_tool(kind)
+            self._boundary_cutter_tool = ("planar", kind)
+            signals.log_message.emit(
+                "info",
+                "Planar boundary cutter active. Draw the cutter on the grid "
+                "to split the selected BoundaryRegion.",
+            )
+            return
+        if cutter_kind == "surface":
+            kind = shape_kind or "sphere"
+            self.begin_create_tool(kind)
+            self._boundary_cutter_tool = ("surface", kind)
+            signals.log_message.emit(
+                "info",
+                "Surface boundary cutter active. "
+                f"Create a {CREATE_LABELS[kind]} cutter, "
+                "then select it with a BoundaryRegion to isolate inside/outside.",
+            )
+            return
+        raise ValueError(f"unknown boundary cutter kind: {cutter_kind}")
+
+    def active_boundary_cutter_tool(self) -> tuple[str, str] | None:
+        return self._boundary_cutter_tool
+
+    def _align_planar_cutter_view_to_selected_boundary(self) -> bool:
+        if not self._selected_boundary_normals:
+            signals.log_message.emit(
+                "warning",
+                "The selected BoundaryRegion has no planar normal for a planar cutter.",
+            )
+            return False
+        normal = np.asarray(self._selected_boundary_normals[0], dtype=np.float64)
+        length = float(np.linalg.norm(normal))
+        if length <= 1.0e-9:
+            signals.log_message.emit(
+                "warning",
+                "The selected BoundaryRegion has no planar normal for a planar cutter.",
+            )
+            return False
+        normal /= length
+        if self._scene_tree is not None:
+            owner_id = self._selected_boundary_region_objects[0].owner_object_id
+            owner = next(
+                (
+                    node
+                    for node in self._scene_tree.components
+                    if node.object_id == owner_id
+                ),
+                None,
+            )
+            if owner is not None:
+                box = owner.bounding_box()
+                self.camera.target = (
+                    0.5 * (box.x_min + box.x_max),
+                    0.5 * (box.y_min + box.y_max),
+                    0.5 * (box.z_min + box.z_max),
+                )
+        target_yaw = degrees(atan2(float(normal[0]), float(normal[1])))
+        target_pitch = degrees(asin(max(-1.0, min(1.0, float(normal[2])))))
+        self._reference_view = "3d"
+        self._reference_plane = _reference_plane_for_normal(normal)
+        self._sync_view_buttons("3d")
+        self._animate_view_to(target_yaw, target_pitch)
+        return True
 
     def begin_move_tool(self, handle: int) -> None:
         self._clear_scene_hover()
@@ -1267,10 +1427,15 @@ class ViewportWidget(QOpenGLWidget):
         self._update_measurement_readout()
         self.update()
 
-    def begin_boundary_region_tool(self, root: SDFNode) -> None:
+    def begin_boundary_region_tool(
+        self,
+        root: SDFNode,
+        selector_objects: tuple[SDFNode, ...] = (),
+    ) -> None:
         self._clear_scene_hover()
         self._clear_boundary_preview_cache()
         self._boundary_pick_root = root
+        self._boundary_pick_selectors = selector_objects
         self._boundary_selection_active = True
         self._boundary_hover_owner_id = 0
         self._boundary_hover_direction = -1
@@ -1298,6 +1463,7 @@ class ViewportWidget(QOpenGLWidget):
 
     def cancel_interaction_tool(self) -> None:
         self._interaction_tool = None
+        self._boundary_cutter_tool = None
         self._tool_start_screen = None
         self._tool_start_world = None
         self._tool_current_world = None
@@ -1311,6 +1477,7 @@ class ViewportWidget(QOpenGLWidget):
         self._dimension_input = ""
         self.unsetCursor()
         self._boundary_selection_active = False
+        self._boundary_pick_selectors = ()
         self._boundary_hover_owner_id = 0
         self._boundary_hover_direction = -1
         self._boundary_hover_normal = (0.0, 0.0, 0.0)
@@ -1358,6 +1525,9 @@ class ViewportWidget(QOpenGLWidget):
             hit.patch_type,
             hit.outside_direction,
             tuple(round(float(value), 4) for value in hit.normal),
+            hit.selector.selector_id if hit.selector is not None else None,
+            hit.selector.selector_type if hit.selector is not None else None,
+            hit.selector.side if hit.selector is not None else None,
         )
 
     def _selected_boundary_key(self) -> tuple[object, ...]:
@@ -1369,6 +1539,7 @@ class ViewportWidget(QOpenGLWidget):
                 region.patch_type,
                 region.selector_id,
                 region.selector_type,
+                region.selector_side,
                 region.selector_start,
                 region.selector_end,
             )
@@ -1417,7 +1588,13 @@ class ViewportWidget(QOpenGLWidget):
         self._selected_boundary_region_objects = regions[:MAX_SELECTED_BOUNDARY_REGIONS]
         self._selected_boundary_preview_key = None
         self._selected_boundary_preview_render_ir = None
+        self._update_boundary_cutter_button_state()
         self.update()
+
+    def _update_boundary_cutter_button_state(self) -> None:
+        enabled = bool(self._selected_boundary_region_objects)
+        for button in self._boundary_cutter_buttons:
+            button.setEnabled(enabled)
 
     def _pick_boundary(self, position: object) -> BoundaryPatchHit | None:
         if self._boundary_pick_root is None:
@@ -1432,6 +1609,7 @@ class ViewportWidget(QOpenGLWidget):
             self._boundary_pick_root,
             origin,
             direction,
+            selector_objects=self._boundary_pick_selectors,
         )
 
     def _pick_2d_scene_object(
@@ -2538,6 +2716,7 @@ class ViewportWidget(QOpenGLWidget):
         preview = boundary_patch_preview_node(
             self._boundary_pick_root,
             self._boundary_hover_hit,
+            selector_objects=self._boundary_pick_selectors,
         )
         if preview is None:
             return None
@@ -2560,7 +2739,13 @@ class ViewportWidget(QOpenGLWidget):
         previews = [
             preview
             for region in self._selected_boundary_region_objects
-            if (preview := boundary_region_preview_node(self._scene_tree.root, region))
+            if (
+                preview := boundary_region_preview_node(
+                    self._scene_tree.root,
+                    region,
+                    selector_objects=self._scene_tree.components,
+                )
+            )
             is not None
         ]
         if not previews:

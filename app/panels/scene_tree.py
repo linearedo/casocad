@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QItemSelectionModel, Qt
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from app.signals import signals
 from core.boundary import BoundaryRegion
 from core.scene import SceneDocument
-from core.sdf import PlacedPolyline2D, PlacedSDF1D, PolylineProfile
+from core.sdf import PlacedPolyline2D, PlacedSDF1D, PlacedSDF2D, PolylineProfile
 from core.sdf.base import SDFNode
 HANDLE_ROLE = Qt.ItemDataRole.UserRole
 SDF_ICON_DIR = Path(__file__).resolve().parents[2] / "assets" / "icons"
@@ -165,12 +165,22 @@ class SceneTreePanel(QWidget):
 
     def select_handles(self, handles: list[int]) -> None:
         targets = set(handles)
+        first_item: QTreeWidgetItem | None = None
+        self.tree.blockSignals(True)
         self.tree.clearSelection()
         for handle in handles:
             item = self._items_by_handle.get(handle)
             if item is not None and handle in targets:
-                self.tree.setCurrentItem(item)
+                if first_item is None:
+                    first_item = item
                 item.setSelected(True)
+        if first_item is not None:
+            self.tree.selectionModel().setCurrentIndex(
+                self.tree.indexFromItem(first_item),
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+        self.tree.blockSignals(False)
+        self._on_selection_changed()
 
     def _on_selection_changed(self) -> None:
         handles = self.selected_handles()
@@ -330,14 +340,21 @@ class SceneTreePanel(QWidget):
             return False
         first = self._document.node(handles[0])
         second = self._document.node(handles[1])
-        return (
-            isinstance(first, BoundaryRegion)
-            and first.patch_id is not None
-            and isinstance(second, (PlacedSDF1D, PlacedPolyline2D))
-        ) or (
-            isinstance(second, BoundaryRegion)
-            and second.patch_id is not None
-            and isinstance(first, (PlacedSDF1D, PlacedPolyline2D))
+        if isinstance(first, BoundaryRegion):
+            region = first
+            selector = second
+        elif isinstance(second, BoundaryRegion):
+            region = second
+            selector = first
+        else:
+            return False
+        if region.patch_id is None or fluid_root is None:
+            return False
+        if fluid_root.dimension == 2:
+            return isinstance(selector, (PlacedSDF1D, PlacedPolyline2D))
+        return isinstance(selector, SDFNode) and (
+            selector.dimension == 3
+            or isinstance(selector, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D))
         )
 
     def _populate_object_boolean_menu(
