@@ -14,8 +14,14 @@ from core.boundary_direction import (
 )
 from core.io.arrow_writer import ArrowWriter
 from core.sdf.placed_1d import PlacedSDF1D
-from core.sdf.placed_2d import PlacedSDF2D
+from core.sdf.placed_2d import PlacedPolyline2D, PlacedSDF2D
 from core.sdf.base import SDFNode
+from core.sdf.primitives_2d import (
+    CircleProfile,
+    EllipseProfile,
+    RectangleProfile,
+    SquareProfile,
+)
 
 from .classifier import (
     evaluate_volume_attribution,
@@ -138,6 +144,95 @@ def _object_id_directory(root: SDFNode) -> dict[int, SDFNode]:
     }
 
 
+def _boundary_interval_mask(
+    tag: BoundaryRegion,
+    owner: PlacedSDF2D,
+    positions: NDArray[np.float64],
+) -> NDArray[np.bool_]:
+    profile = owner.profile
+    if isinstance(profile, SquareProfile):
+        profile = profile._rectangle()
+    assert tag.selector_start is not None and tag.selector_end is not None
+    u, v, _plane = owner.project_numpy(
+        positions[:, 0],
+        positions[:, 1],
+        positions[:, 2],
+    )
+    if isinstance(profile, CircleProfile) and tag.patch_id == "curve":
+        cu, cv = profile.center
+        parameter = np.mod(np.arctan2(v - cv, u - cu), 2.0 * np.pi) / (2.0 * np.pi)
+        return _interval_parameter_mask(parameter, tag.selector_start, tag.selector_end)
+    if isinstance(profile, EllipseProfile) and tag.patch_id == "curve":
+        cu, cv = profile.center
+        au, av = profile.semi_axes
+        parameter = (
+            np.mod(np.arctan2((v - cv) / av, (u - cu) / au), 2.0 * np.pi)
+            / (2.0 * np.pi)
+        )
+        return _interval_parameter_mask(parameter, tag.selector_start, tag.selector_end)
+    if not isinstance(profile, RectangleProfile):
+        return np.ones(positions.shape[0], dtype=np.bool_)
+    if tag.patch_id not in {"-U", "+U", "-V", "+V"}:
+        return np.ones(positions.shape[0], dtype=np.bool_)
+    start, end = sorted((tag.selector_start, tag.selector_end))
+    cu, cv = profile.center
+    hu, hv = profile.half_size
+    if tag.patch_id in {"-U", "+U"}:
+        parameter = (v - (cv - hv)) / (2.0 * hv)
+    else:
+        parameter = (u - (cu - hu)) / (2.0 * hu)
+    return np.asarray(
+        (parameter >= start - 1.0e-9) & (parameter <= end + 1.0e-9),
+        dtype=np.bool_,
+    )
+
+
+def _interval_parameter_mask(
+    parameter: NDArray[np.float64],
+    start: float,
+    end: float,
+) -> NDArray[np.bool_]:
+    parameter = np.where(np.isclose(parameter, 1.0, atol=1.0e-12), 0.0, parameter)
+    start = float(np.mod(start, 1.0))
+    end = float(np.mod(end, 1.0))
+    if start <= end:
+        return np.asarray(
+            (parameter >= start - 1.0e-9) & (parameter <= end + 1.0e-9),
+            dtype=np.bool_,
+        )
+    return np.asarray(
+        (parameter >= start - 1.0e-9) | (parameter <= end + 1.0e-9),
+        dtype=np.bool_,
+    )
+
+
+def _selector_object_from_id(
+    selector_id: str,
+    selector_by_id: dict[int, SDFNode],
+) -> SDFNode | None:
+    prefix = "selector:"
+    if not selector_id.startswith(prefix):
+        return None
+    try:
+        object_id = int(selector_id[len(prefix):])
+    except ValueError:
+        return None
+    return selector_by_id.get(object_id)
+
+
+def _surface_split_selector_mask(
+    selector_id: str,
+    selector_by_id: dict[int, SDFNode],
+    positions: NDArray[np.float64],
+    *,
+    tolerance: float,
+) -> NDArray[np.bool_]:
+    selector = _selector_object_from_id(selector_id, selector_by_id)
+    if not isinstance(selector, (PlacedSDF1D, PlacedPolyline2D)):
+        return np.zeros(positions.shape[0], dtype=np.bool_)
+    return selector.contains_points(positions, tolerance=tolerance)
+
+
 class LatticeMesher:
     def __init__(
         self,
@@ -155,6 +250,7 @@ class LatticeMesher:
             for node in (
                 *_walk_unique(self.domain.root),
                 *self.domain.tag_objects,
+                *self.domain.selector_objects,
             )
         }
         return {
@@ -189,6 +285,10 @@ class LatticeMesher:
                 "root_object_id": self.domain.root.object_id,
                 "tag_object_ids": [
                     tag.object_id for tag in self.domain.tag_objects
+                ],
+                "selector_object_ids": [
+                    selector.object_id
+                    for selector in self.domain.selector_objects
                 ],
             },
             "grid": {
@@ -315,6 +415,9 @@ class LatticeMesher:
         interior_count = 0
         tag_by_id = {tag.object_id: tag for tag in self.domain.tag_objects}
         owner_by_id = _object_id_directory(self.domain.root)
+        selector_by_id = {
+            selector.object_id: selector for selector in self.domain.selector_objects
+        }
 
         def tag_axis(object_id: int, attribute: str) -> tuple[float, float, float]:
             tag = tag_by_id.get(object_id)
@@ -411,6 +514,29 @@ class LatticeMesher:
                                         direction,
                                     )
                                     matched_samples &= alignment >= 0.90
+                        if (
+                            tag.selector_start is not None
+                            and tag.selector_end is not None
+                            and self.domain.root.dimension == 2
+                        ):
+                            owner = owner_by_id.get(tag.owner_object_id)
+                            if isinstance(owner, PlacedSDF2D):
+                                matched_samples &= _boundary_interval_mask(
+                                    tag,
+                                    owner,
+                                    face_samples.positions,
+                                )
+                        if (
+                            tag.selector_id is not None
+                            and tag.selector_type == "surface_split_curve"
+                            and self.domain.root.dimension == 3
+                        ):
+                            matched_samples &= _surface_split_selector_mask(
+                                tag.selector_id,
+                                selector_by_id,
+                                face_samples.positions,
+                                tolerance=max(self.config.dx * 0.5, 1e-9),
+                            )
                         matched_sample_indices = np.flatnonzero(
                             matched_samples
                         )
@@ -419,7 +545,7 @@ class LatticeMesher:
                         )
                         for sample_index in matched_sample_indices:
                             sample_tags[int(sample_index)].append(tag.object_id)
-                    elif isinstance(tag, PlacedSDF1D):
+                    elif isinstance(tag, (PlacedSDF1D, PlacedPolyline2D)):
                         matched_samples = tag.contains_points(
                             face_samples.positions,
                             tolerance=max(self.config.dx / 128.0, 1e-9),

@@ -37,10 +37,8 @@ from app.panels.scene_tree import SceneTreePanel
 from app.signals import signals
 from app.viewport.viewport_widget import ViewportWidget
 from core.boundary import BoundaryRegion
-from core.boundary_direction import (
-    owner_outside_direction_from_normal,
-    owner_outside_direction_vector,
-)
+from core.boundary_direction import owner_outside_direction_vector
+from core.boundary_patches import BoundaryPatchHit
 from core.sdf import PlacedSDF2D
 from core.sdf.base import BoundingBox3D, SDFNode
 from core.serialization import load_scene, save_scene
@@ -910,16 +908,14 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_viewport_boundary_hovered(
         self,
-        selection: tuple[int, tuple[float, float, float]] | None,
+        selection: BoundaryPatchHit | None,
     ) -> None:
         if selection is None:
+            self.viewport.set_boundary_hover(0, None, None, None)
             self.statusBar().showMessage("No FluidDomain boundary under cursor")
             return
-        owner_object_id, normal = selection
-        outside_direction = self._planar_outside_direction(
-            owner_object_id,
-            normal,
-        )
+        owner_object_id = selection.owner_object_id
+        outside_direction = selection.outside_direction
         owner = next(
             (
                 node
@@ -931,27 +927,26 @@ class MainWindow(QMainWindow):
         self.viewport.set_boundary_hover(
             owner_object_id,
             outside_direction,
-            self._viewport_outside_direction_normal(owner, outside_direction),
+            selection.normal,
+            selection,
         )
         if owner is not None:
             self.statusBar().showMessage(
-                f"Boundary owner: {owner.name} [ID {owner_object_id}]"
+                f"Boundary patch: {owner.name} {selection.patch_id}"
             )
 
     @Slot(object)
     def _on_viewport_boundary_region_requested(
         self,
-        selection: tuple[int, tuple[float, float, float]],
+        selection: BoundaryPatchHit,
     ) -> None:
-        owner_object_id, normal = selection
-        outside_direction = self._planar_outside_direction(
-            owner_object_id,
-            normal,
-        )
-        self._create_boundary_region(owner_object_id, outside_direction)
+        self._create_boundary_region_from_hit(selection)
 
     @Slot(object)
     def _on_create_boundary_region(self, handles: list[int]) -> None:
+        if len(handles) == 2:
+            self._create_boundary_selector_region(handles)
+            return
         if len(handles) != 1:
             return
         try:
@@ -965,6 +960,33 @@ class MainWindow(QMainWindow):
             return
         self._create_boundary_region(owner.object_id, None)
 
+    def _create_boundary_selector_region(self, handles: list[int]) -> None:
+        try:
+            first = self.document.node(handles[0])
+            second = self.document.node(handles[1])
+        except KeyError:
+            return
+        if isinstance(first, BoundaryRegion) and isinstance(second, SDFNode):
+            base_region = first
+            selector = second
+        elif isinstance(second, BoundaryRegion) and isinstance(first, SDFNode):
+            base_region = second
+            selector = first
+        else:
+            return
+        undo_snapshot = self._history_snapshot()
+        try:
+            handle = self.document.add_boundary_selector_region(
+                base_region,
+                selector,
+            )
+        except ValueError as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        self._record_undo_snapshot(undo_snapshot)
+        self._publish_document()
+        self.scene_tree.select_handle(handle)
+
     def _create_boundary_region(
         self,
         owner_object_id: int,
@@ -976,6 +998,17 @@ class MainWindow(QMainWindow):
                 owner_object_id,
                 outside_direction,
             )
+        except ValueError as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        self._record_undo_snapshot(undo_snapshot)
+        self._publish_document()
+        self.scene_tree.select_handle(handle)
+
+    def _create_boundary_region_from_hit(self, hit: BoundaryPatchHit) -> None:
+        undo_snapshot = self._history_snapshot()
+        try:
+            handle = self.document.add_boundary_region_from_hit(hit)
         except ValueError as error:
             signals.log_message.emit("warning", str(error))
             return
@@ -999,37 +1032,6 @@ class MainWindow(QMainWindow):
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
         self.scene_tree.select_handle(handle)
-
-    def _planar_outside_direction(
-        self,
-        owner_object_id: int,
-        normal: tuple[float, float, float],
-    ) -> int | None:
-        owner = next(
-            (
-                node
-                for _handle, node, _parent in self.document.walk()
-                if node.object_id == owner_object_id
-            ),
-            None,
-        )
-        if (
-            isinstance(owner, PlacedSDF2D)
-            and self.document.fluid_domain is not None
-            and self.document.fluid_domain.root.dimension == 2
-        ):
-            normal_array = np.asarray(normal, dtype=np.float64)
-            coordinates = (
-                float(np.dot(normal_array, owner.axis_u)),
-                float(np.dot(normal_array, owner.axis_v)),
-            )
-            axis = int(np.argmax(np.abs(coordinates)))
-            if abs(coordinates[axis]) < 0.95:
-                return None
-            return 2 * axis + int(coordinates[axis] > 0.0)
-        if owner is None:
-            return None
-        return owner_outside_direction_from_normal(owner, normal)
 
     def _viewport_outside_direction_normal(
         self,
@@ -1181,6 +1183,7 @@ class MainWindow(QMainWindow):
         self.viewport.set_boundary_region_selection_entries(
             boundary_selectors,
             boundary_normals,
+            tuple(boundary_regions),
         )
         self.viewport.set_scene_selection(scene_selection)
         self.viewport.set_lattice_filter(

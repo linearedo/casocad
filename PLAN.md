@@ -114,7 +114,26 @@ Examples:
 This is normal typed Python state. It is not required to be a universal
 intermediate file.
 
-### 3.3 Discretization
+### 3.3 CAD Boundary Patch Selection
+
+CAD boundary selection is an SDF-native patch layer derived from the scene
+graph, not from lattice classification. It describes selectable parts of the
+final fluid boundary without changing the SDF solid geometry:
+
+- 3D domains expose surface patches such as box faces, cylinder side walls,
+  caps, and boolean cut surfaces
+- 2D domains expose curve patches such as rectangle edges and stable curved
+  profile boundaries
+- 1D construction objects can act as boundary selectors or split curves over
+  selected patches
+
+Boundary patch IDs and selector IDs are CFD metadata over the final boundary.
+The viewport may use them for CAD selection and highlighting, and meshers may
+consume them later, but `to_numpy()` remains the authoritative geometry path.
+Mesher classifier internals must not be the conceptual source of CAD boundary
+picking.
+
+### 3.4 Discretization
 
 The mesher converts the SDF geometry and region assignments into the data
 needed by a solver family.
@@ -126,7 +145,7 @@ OpenLB / Palabos -> 2D or 3D regular lattice
 OpenFOAM / SU2   -> 2D planar mesh or 3D surface and volume mesh
 ```
 
-### 3.4 Case Generation
+### 3.5 Case Generation
 
 A solver case generator combines:
 

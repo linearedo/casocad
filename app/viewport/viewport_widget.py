@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from copy import deepcopy
 from math import atan2, degrees, radians
+from typing import Callable
 
 import moderngl
 import numpy as np
@@ -21,10 +22,16 @@ from app.dimensions import (
 from app.viewport.renderer_base import ViewportRenderer
 from app.signals import signals
 from core.boundary import BoundaryRegion
-from core.mesher.classifier import pick_boundary_owner, pick_sdf_surface
+from core.boundary_patches import (
+    BoundaryPatchHit,
+    boundary_patch_preview_node,
+    boundary_region_preview_node,
+    pick_boundary_patch,
+)
+from core.mesher.classifier import pick_sdf_surface
 from core.render_ir import RenderIR, build_render_ir
 from core.scene import SceneDocument
-from core.sdf import PlacedSDF2D, SDFTree
+from core.sdf import PlacedPolyline2D, PlacedSDF2D, SDFTree
 from core.sdf.base import BoundingBox3D, SDFNode
 
 from .camera import OrbitCamera
@@ -51,6 +58,7 @@ LATTICE_POINT_UPLOAD_CHUNK = 100_000
 LATTICE_SQUARE_UPLOAD_CHUNK = 25_000
 CREATE_CLICK_MAX_MANHATTAN = 4
 SCENE_CLICK_MAX_MANHATTAN = 4
+SCENE_2D_PICK_TOLERANCE_PX = 8.0
 ROTATION_GIZMO_PICK_TOLERANCE_PX = 12.0
 ROTATION_GIZMO_MIN_RADIUS = 0.25
 BOOLEAN_PREVIEW_OPERATIONS = {
@@ -743,6 +751,40 @@ def should_frame_scene_for_key(
     return key == Qt.Key.Key_F and modifiers == Qt.KeyboardModifier.NoModifier
 
 
+def pick_2d_scene_object_from_ray(
+    tree: SDFTree,
+    origin: np.ndarray,
+    direction: np.ndarray,
+    tolerance_for_travel: Callable[[float], float],
+) -> tuple[int, float] | None:
+    best: tuple[int, float] | None = None
+    for node in tree.components:
+        if not isinstance(node, (PlacedSDF2D, PlacedPolyline2D)):
+            continue
+        normal = np.asarray(node.normal, dtype=np.float64)
+        denominator = float(np.dot(direction, normal))
+        if abs(denominator) <= 1.0e-9:
+            continue
+        node_origin = np.asarray(node.origin, dtype=np.float64)
+        travel = float(np.dot(node_origin - origin, normal) / denominator)
+        if travel <= 0.0:
+            continue
+        point = origin + direction * travel
+        coordinates = tuple(
+            np.asarray([point[index]], dtype=np.float64) for index in range(3)
+        )
+        distance = float(node.to_numpy(*coordinates)[0])
+        tolerance = float(tolerance_for_travel(travel))
+        if isinstance(node, PlacedPolyline2D):
+            if abs(distance) > tolerance:
+                continue
+        elif distance > tolerance:
+            continue
+        if best is None or travel < best[1]:
+            best = (node.object_id, travel)
+    return best
+
+
 class ViewportWidget(QOpenGLWidget):
     def __init__(self, parent: object | None = None) -> None:
         super().__init__(parent)
@@ -854,10 +896,16 @@ class ViewportWidget(QOpenGLWidget):
         self._boundary_hover_owner_id = 0
         self._boundary_hover_direction = -1
         self._boundary_hover_normal = (0.0, 0.0, 0.0)
+        self._boundary_hover_hit: BoundaryPatchHit | None = None
+        self._boundary_hover_preview_key: tuple[object, ...] | None = None
+        self._boundary_hover_preview_render_ir: RenderIR | None = None
         self._selected_boundary_regions: tuple[tuple[int, int], ...] = ()
         self._selected_boundary_normals: tuple[
             tuple[float, float, float], ...
         ] = ()
+        self._selected_boundary_region_objects: tuple[BoundaryRegion, ...] = ()
+        self._selected_boundary_preview_key: tuple[object, ...] | None = None
+        self._selected_boundary_preview_render_ir: RenderIR | None = None
         self._boundary_press_position: QPoint | None = None
         self._boundary_camera_dragged = False
         self._tool_start_screen: QPoint | None = None
@@ -1221,11 +1269,13 @@ class ViewportWidget(QOpenGLWidget):
 
     def begin_boundary_region_tool(self, root: SDFNode) -> None:
         self._clear_scene_hover()
+        self._clear_boundary_preview_cache()
         self._boundary_pick_root = root
         self._boundary_selection_active = True
         self._boundary_hover_owner_id = 0
         self._boundary_hover_direction = -1
         self._boundary_hover_normal = (0.0, 0.0, 0.0)
+        self._boundary_hover_hit = None
         self._boundary_press_position = None
         self._boundary_camera_dragged = False
         self._tool_start_screen = None
@@ -1264,6 +1314,8 @@ class ViewportWidget(QOpenGLWidget):
         self._boundary_hover_owner_id = 0
         self._boundary_hover_direction = -1
         self._boundary_hover_normal = (0.0, 0.0, 0.0)
+        self._boundary_hover_hit = None
+        self._clear_boundary_preview_cache()
         signals.viewport_boundary_hovered.emit(None)
         self._update_measurement_readout()
         self.update()
@@ -1280,7 +1332,9 @@ class ViewportWidget(QOpenGLWidget):
         owner_object_id: int,
         outside_direction: int | None,
         direction_normal: tuple[float, float, float] | None = None,
+        hit: BoundaryPatchHit | None = None,
     ) -> None:
+        old_key = self._boundary_hover_key()
         self._boundary_hover_owner_id = owner_object_id
         self._boundary_hover_direction = (
             outside_direction if outside_direction is not None else -1
@@ -1288,7 +1342,44 @@ class ViewportWidget(QOpenGLWidget):
         self._boundary_hover_normal = (
             direction_normal if direction_normal is not None else (0.0, 0.0, 0.0)
         )
+        self._boundary_hover_hit = hit
+        if self._boundary_hover_key() != old_key:
+            self._boundary_hover_preview_key = None
+            self._boundary_hover_preview_render_ir = None
         self.update()
+
+    def _boundary_hover_key(self) -> tuple[object, ...] | None:
+        hit = self._boundary_hover_hit
+        if hit is None:
+            return None
+        return (
+            hit.owner_object_id,
+            hit.patch_id,
+            hit.patch_type,
+            hit.outside_direction,
+            tuple(round(float(value), 4) for value in hit.normal),
+        )
+
+    def _selected_boundary_key(self) -> tuple[object, ...]:
+        return tuple(
+            (
+                region.object_id,
+                region.owner_object_id,
+                region.patch_id,
+                region.patch_type,
+                region.selector_id,
+                region.selector_type,
+                region.selector_start,
+                region.selector_end,
+            )
+            for region in self._selected_boundary_region_objects
+        )
+
+    def _clear_boundary_preview_cache(self) -> None:
+        self._boundary_hover_preview_key = None
+        self._boundary_hover_preview_render_ir = None
+        self._selected_boundary_preview_key = None
+        self._selected_boundary_preview_render_ir = None
 
     def set_boundary_region_selection(
         self,
@@ -1313,6 +1404,7 @@ class ViewportWidget(QOpenGLWidget):
         self,
         selectors: tuple[tuple[int, int], ...],
         normals: tuple[tuple[float, float, float], ...],
+        regions: tuple[BoundaryRegion, ...] = (),
     ) -> None:
         if len(selectors) > MAX_SELECTED_BOUNDARY_REGIONS:
             signals.log_message.emit(
@@ -1322,11 +1414,12 @@ class ViewportWidget(QOpenGLWidget):
             )
         self._selected_boundary_regions = selectors[:MAX_SELECTED_BOUNDARY_REGIONS]
         self._selected_boundary_normals = normals[:MAX_SELECTED_BOUNDARY_REGIONS]
+        self._selected_boundary_region_objects = regions[:MAX_SELECTED_BOUNDARY_REGIONS]
+        self._selected_boundary_preview_key = None
+        self._selected_boundary_preview_render_ir = None
         self.update()
 
-    def _pick_boundary(
-        self, position: object
-    ) -> tuple[np.ndarray, int, np.ndarray] | None:
+    def _pick_boundary(self, position: object) -> BoundaryPatchHit | None:
         if self._boundary_pick_root is None:
             return None
         origin, direction = self.camera.screen_ray(
@@ -1335,10 +1428,33 @@ class ViewportWidget(QOpenGLWidget):
             self.width(),
             self.height(),
         )
-        return pick_boundary_owner(
+        return pick_boundary_patch(
             self._boundary_pick_root,
             origin,
             direction,
+        )
+
+    def _pick_2d_scene_object(
+        self,
+        origin: np.ndarray,
+        direction: np.ndarray,
+    ) -> tuple[int, float] | None:
+        if self._scene_tree is None:
+            return None
+        return pick_2d_scene_object_from_ray(
+            self._scene_tree,
+            origin,
+            direction,
+            self._scene_2d_pick_tolerance,
+        )
+
+    def _scene_2d_pick_tolerance(self, travel: float) -> float:
+        world_height = 2.0 * max(travel, 0.0) / self.camera.focal_length
+        return max(
+            0.005,
+            world_height
+            * SCENE_2D_PICK_TOLERANCE_PX
+            / max(float(self.height()), 1.0),
         )
 
     def _pick_scene_object(self, position: object) -> int:
@@ -1350,9 +1466,13 @@ class ViewportWidget(QOpenGLWidget):
             self.width(),
             self.height(),
         )
+        picked_2d = self._pick_2d_scene_object(origin, direction)
         point = pick_sdf_surface(self._scene_tree.root, origin, direction)
         if point is None:
-            return 0
+            return picked_2d[0] if picked_2d is not None else 0
+        picked_3d_travel = float(np.linalg.norm(point - origin))
+        if picked_2d is not None and picked_2d[1] < picked_3d_travel:
+            return picked_2d[0]
         coordinates = tuple(
             np.asarray([point[index]], dtype=np.float64) for index in range(3)
         )
@@ -1396,6 +1516,7 @@ class ViewportWidget(QOpenGLWidget):
             return
         self._scene_tree = tree
         self._scene_hover_object_id = 0
+        self._clear_boundary_preview_cache()
         self._update_measurement_readout()
         self._pending_scene = render_scene_key(render_ir)
         self._pending_render_ir = render_ir
@@ -2400,6 +2521,57 @@ class ViewportWidget(QOpenGLWidget):
             return None
         return self._preview_render_ir_from_document(preview_document)
 
+    def _boundary_patch_preview_render_ir(self) -> RenderIR | None:
+        if (
+            not self._boundary_selection_active
+            or self._boundary_pick_root is None
+            or self._boundary_hover_hit is None
+        ):
+            return None
+        key = self._boundary_hover_key()
+        if (
+            key is not None
+            and key == self._boundary_hover_preview_key
+            and self._boundary_hover_preview_render_ir is not None
+        ):
+            return self._boundary_hover_preview_render_ir
+        preview = boundary_patch_preview_node(
+            self._boundary_pick_root,
+            self._boundary_hover_hit,
+        )
+        if preview is None:
+            return None
+        render_ir = self._preview_render_ir_from_document(
+            SceneDocument(objects=[preview])
+        )
+        self._boundary_hover_preview_key = key
+        self._boundary_hover_preview_render_ir = render_ir
+        return render_ir
+
+    def _selected_boundary_regions_preview_render_ir(self) -> RenderIR | None:
+        if self._scene_tree is None or not self._selected_boundary_region_objects:
+            return None
+        key = self._selected_boundary_key()
+        if (
+            key == self._selected_boundary_preview_key
+            and self._selected_boundary_preview_render_ir is not None
+        ):
+            return self._selected_boundary_preview_render_ir
+        previews = [
+            preview
+            for region in self._selected_boundary_region_objects
+            if (preview := boundary_region_preview_node(self._scene_tree.root, region))
+            is not None
+        ]
+        if not previews:
+            return None
+        render_ir = self._preview_render_ir_from_document(
+            SceneDocument(objects=previews)
+        )
+        self._selected_boundary_preview_key = key
+        self._selected_boundary_preview_render_ir = render_ir
+        return render_ir
+
     def _preview_render_ir(self) -> RenderIR | None:
         return (
             self._active_create_preview_render_ir()
@@ -2407,6 +2579,8 @@ class ViewportWidget(QOpenGLWidget):
             or self._active_extrude_preview_render_ir()
             or self._active_revolve_preview_render_ir()
             or self._boolean_preview_render_ir()
+            or self._boundary_patch_preview_render_ir()
+            or self._selected_boundary_regions_preview_render_ir()
             or self._committed_create_preview_render_ir()
         )
 
@@ -3530,14 +3704,7 @@ class ViewportWidget(QOpenGLWidget):
             and not event.buttons()
         ):
             hit = self._pick_boundary(event.position())
-            signals.viewport_boundary_hovered.emit(
-                (
-                    hit[1],
-                    tuple(float(value) for value in hit[2]),
-                )
-                if hit is not None
-                else None
-            )
+            signals.viewport_boundary_hovered.emit(hit)
             return
         if self._interaction_tool is None and not event.buttons():
             object_id = self._pick_scene_object(event.position())
@@ -3661,14 +3828,7 @@ class ViewportWidget(QOpenGLWidget):
             self._last_mouse_position = None
             if dragged:
                 hit = self._pick_boundary(event.position())
-                signals.viewport_boundary_hovered.emit(
-                    (
-                        hit[1],
-                        tuple(float(value) for value in hit[2]),
-                    )
-                    if hit is not None
-                    else None
-                )
+                signals.viewport_boundary_hovered.emit(hit)
                 return
             hit = self._pick_boundary(event.position())
             if hit is None:
@@ -3676,11 +3836,8 @@ class ViewportWidget(QOpenGLWidget):
                     "warning", "No FluidDomain boundary is under the cursor."
                 )
                 return
-            _point, owner_object_id, normal = hit
             self.cancel_interaction_tool()
-            signals.viewport_boundary_region_requested.emit(
-                (owner_object_id, tuple(float(value) for value in normal))
-            )
+            signals.viewport_boundary_region_requested.emit(hit)
             return
         if (
             self._interaction_tool is not None

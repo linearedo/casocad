@@ -15,6 +15,16 @@ uniform bool u_show_grid;
 uniform bool u_render_preview_layer;
 uniform float u_grid_spacing;
 uniform int u_grid_plane;
+uniform int u_scene_selected_object_id;
+uniform bool u_boundary_selection_active;
+uniform int u_boundary_hover_owner_id;
+uniform int u_boundary_hover_node_index;
+uniform vec3 u_boundary_hover_normal;
+uniform int u_selected_boundary_count;
+uniform int u_selected_boundary_owner_ids[128];
+uniform int u_selected_boundary_node_indices[128];
+uniform int u_selected_boundary_whole_flags[128];
+uniform vec3 u_selected_boundary_normals[128];
 const vec3 PREVIEW_COLOR = vec3(0.15, 0.92, 1.0);
 const float PI = 3.14159265359;
 

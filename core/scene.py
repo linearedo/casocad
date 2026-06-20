@@ -8,8 +8,17 @@ from typing import Iterator
 import numpy as np
 
 from .boundary import BoundaryRegion
+from .boundary_patches import (
+    BoundaryPatchHit,
+    BoundaryCurvePatch,
+    BoundaryIntervalSelector,
+    BoundarySelector,
+    boundary_owner_ids,
+    boundary_interval_selector_from_node,
+    boundary_patches,
+    boundary_selector_from_node,
+)
 from .mesher import FluidDomain
-from .mesher.classifier import boundary_owner_ids
 from .sdf import (
     BezierCurveProfile,
     BezierSurfaceProfile,
@@ -952,6 +961,9 @@ class SceneDocument:
             )
         )
         domain_tags = current_domain.tag_objects if current_domain is not None else ()
+        domain_selectors = (
+            current_domain.selector_objects if current_domain is not None else ()
+        )
 
         label = operation.replace("_", " ")
         object_id = self._allocate_object_id()
@@ -1026,6 +1038,7 @@ class SceneDocument:
             self.fluid_domain = FluidDomain(
                 combined,
                 self._compatible_domain_tags(combined, domain_tags),
+                self._compatible_domain_selectors(combined, domain_selectors),
             )
         else:
             self._refresh_fluid_domain()
@@ -1065,11 +1078,14 @@ class SceneDocument:
             self.fluid_domain is not None and self.fluid_domain.root is node
         )
         tags = self.fluid_domain.tag_objects if self.fluid_domain is not None else ()
+        selectors = (
+            self.fluid_domain.selector_objects if self.fluid_domain is not None else ()
+        )
         index = self._detach(node)
         self.objects.insert(min(index, len(self.objects)), wrapped)
         self._reindex()
         if was_fluid_root:
-            self.fluid_domain = FluidDomain(wrapped, tags)
+            self.fluid_domain = FluidDomain(wrapped, tags, selectors)
         else:
             self._refresh_fluid_domain()
         self.mark_changed()
@@ -1134,7 +1150,15 @@ class SceneDocument:
             if self.fluid_domain is not None
             else ()
         )
-        self.fluid_domain = FluidDomain(node, tags)
+        selectors = (
+            self._compatible_domain_selectors(
+                node,
+                self.fluid_domain.selector_objects,
+            )
+            if self.fluid_domain is not None
+            else ()
+        )
+        self.fluid_domain = FluidDomain(node, tags, selectors)
         self.mark_changed()
 
     @staticmethod
@@ -1149,8 +1173,16 @@ class SceneDocument:
             if (
                 root.dimension == 2
                 and isinstance(root, PlacedSDF2D)
-                and isinstance(tag, (PlacedSDF1D, PlacedPolyline2D))
-                and tag.lies_in_plane_of(root)
+                and (
+                    (
+                        isinstance(tag, (PlacedSDF1D, PlacedPolyline2D))
+                        and tag.lies_in_plane_of(root)
+                    )
+                    or (
+                        isinstance(tag, BoundaryRegion)
+                        and tag.owner_object_id in valid_owner_ids
+                    )
+                )
             )
             or (
                 root.dimension == 3
@@ -1160,6 +1192,26 @@ class SceneDocument:
             or (
                 root.dimension == 3
                 and isinstance(tag, PlacedSDF2D)
+            )
+        )
+
+    @staticmethod
+    def _compatible_domain_selectors(
+        root: SDFNode,
+        selectors: tuple[SDFNode, ...],
+    ) -> tuple[SDFNode, ...]:
+        return tuple(
+            selector
+            for selector in selectors
+            if (
+                root.dimension == 3
+                and isinstance(selector, (PlacedSDF1D, PlacedPolyline2D))
+            )
+            or (
+                root.dimension == 2
+                and isinstance(root, PlacedSDF2D)
+                and isinstance(selector, (PlacedSDF1D, PlacedPolyline2D))
+                and selector.lies_in_plane_of(root)
             )
         )
 
@@ -1180,13 +1232,19 @@ class SceneDocument:
             tags.append(node)
         elif not enabled and node in tags:
             tags.remove(node)
-        self.fluid_domain = FluidDomain(self.fluid_domain.root, tuple(tags))
+        self.fluid_domain = FluidDomain(
+            self.fluid_domain.root,
+            tuple(tags),
+            self.fluid_domain.selector_objects,
+        )
         self.mark_changed()
 
     def add_boundary_region(
         self,
         owner_object_id: int,
         outside_direction: int | None = None,
+        patch_id: str | None = None,
+        patch_type: str | None = None,
     ) -> int:
         if self.fluid_domain is None:
             raise ValueError("select a FluidDomain root first")
@@ -1194,12 +1252,23 @@ class SceneDocument:
             return self._add_2d_boundary_region(
                 owner_object_id,
                 outside_direction,
+                patch_id,
+                patch_type,
             )
         owners = {
             node.object_id: node
             for node in self._iter_nodes(self.fluid_domain.root)
         }
         owner = owners.get(owner_object_id)
+        available_patches = {
+            (patch.owner_object_id, patch.patch_id): patch
+            for patch in boundary_patches(self.fluid_domain.root)
+        }
+        patch = (
+            available_patches.get((owner_object_id, patch_id))
+            if patch_id is not None
+            else None
+        )
         if (
             owner is None
             or owner_object_id not in boundary_owner_ids(self.fluid_domain.root)
@@ -1207,21 +1276,40 @@ class SceneDocument:
             raise ValueError(
                 "selected object does not directly control the FluidDomain boundary"
             )
+        if patch_id is not None and patch is None:
+            raise ValueError("selected boundary patch is not part of the FluidDomain")
         region = BoundaryRegion(
             name=(
-                f"{owner.name} boundary {outside_direction}"
+                f"{owner.name} {patch_id}"
+                if patch_id is not None
+                else f"{owner.name} boundary {outside_direction}"
                 if outside_direction is not None
                 else f"{owner.name} boundary"
             ),
             object_id=self._allocate_object_id(),
             owner_object_id=owner.object_id,
-            outside_direction=outside_direction,
+            outside_direction=(
+                outside_direction
+                if outside_direction is not None
+                else patch.outside_direction
+                if patch is not None
+                else None
+            ),
+            patch_id=patch_id,
+            patch_type=(
+                patch_type
+                if patch_type is not None
+                else patch.patch_type
+                if patch is not None
+                else None
+            ),
         )
         self.boundary_regions.append(region)
         self._reindex()
         self.fluid_domain = FluidDomain(
             self.fluid_domain.root,
             (*self.fluid_domain.tag_objects, region),
+            self.fluid_domain.selector_objects,
         )
         self.mark_changed()
         return self.handle_for(region)
@@ -1230,6 +1318,8 @@ class SceneDocument:
         self,
         owner_object_id: int,
         outside_direction: int | None,
+        patch_id: str | None,
+        patch_type: str | None,
     ) -> int:
         assert self.fluid_domain is not None
         root = self.fluid_domain.root
@@ -1238,10 +1328,6 @@ class SceneDocument:
         if owner_object_id not in boundary_owner_ids(root):
             raise ValueError(
                 "selected object does not directly control the FluidDomain boundary"
-            )
-        if outside_direction is None or not 0 <= outside_direction < 4:
-            raise ValueError(
-                "2D boundary regions require an outside direction in the range 0..3"
             )
         owner = next(
             (
@@ -1255,37 +1341,139 @@ class SceneDocument:
             raise ValueError(
                 "2D boundary owners must be placed 2D SDF objects"
             )
-        u_min, u_max, v_min, v_max = owner.profile.bounds()
-        axis_u = np.asarray(owner.axis_u, dtype=np.float64)
-        axis_v = np.asarray(owner.axis_v, dtype=np.float64)
-        origin = np.asarray(owner.origin, dtype=np.float64)
-        if outside_direction in {0, 1}:
-            side_u = u_min if outside_direction == 0 else u_max
-            center_v = 0.5 * (v_min + v_max)
-            line_origin = origin + side_u * axis_u + center_v * axis_v
-            line_axis = owner.axis_v
-            half_length = 0.5 * (v_max - v_min)
-        else:
-            side_v = v_min if outside_direction == 2 else v_max
-            center_u = 0.5 * (u_min + u_max)
-            line_origin = origin + center_u * axis_u + side_v * axis_v
-            line_axis = owner.axis_u
-            half_length = 0.5 * (u_max - u_min)
-        region = PlacedSDF1D(
-            name=f"{owner.name} boundary {outside_direction}",
-            object_id=self._allocate_object_id(),
-            profile=SegmentProfile(half_length=half_length),
-            origin=tuple(float(value) for value in line_origin),
-            axis_u=line_axis,
+        available_patches = {
+            (patch.owner_object_id, patch.patch_id): patch
+            for patch in boundary_patches(root)
+        }
+        patch = (
+            available_patches.get((owner_object_id, patch_id))
+            if patch_id is not None
+            else next(
+                (
+                    candidate
+                    for candidate in available_patches.values()
+                    if candidate.owner_object_id == owner_object_id
+                    and candidate.outside_direction == outside_direction
+                ),
+                None,
+            )
         )
-        self.objects.append(region)
+        if patch is None:
+            raise ValueError("selected boundary patch is not part of the FluidDomain")
+        region = BoundaryRegion(
+            name=(
+                f"{owner.name} {patch.patch_id}"
+                if patch.patch_id is not None
+                else f"{owner.name} boundary"
+            ),
+            object_id=self._allocate_object_id(),
+            owner_object_id=owner.object_id,
+            outside_direction=patch.outside_direction,
+            patch_id=patch.patch_id,
+            patch_type=patch_type if patch_type is not None else patch.patch_type,
+        )
+        self.boundary_regions.append(region)
         self._reindex()
         self.fluid_domain = FluidDomain(
             root,
             (*self.fluid_domain.tag_objects, region),
+            self.fluid_domain.selector_objects,
         )
         self.mark_changed()
         return self.handle_for(region)
+
+    def add_boundary_region_from_hit(self, hit: BoundaryPatchHit) -> int:
+        return self.add_boundary_region(
+            hit.owner_object_id,
+            hit.outside_direction,
+            hit.patch_id,
+            hit.patch_type,
+        )
+
+    def add_boundary_selector_region(
+        self,
+        base_region: BoundaryRegion,
+        selector: SDFNode,
+    ) -> int:
+        if self.fluid_domain is None:
+            raise ValueError("select a FluidDomain root first")
+        if base_region not in self.boundary_regions:
+            raise ValueError("base boundary region is not part of this document")
+        if base_region.patch_id is None:
+            raise ValueError("base boundary region must identify a boundary patch")
+        live_sdf_nodes = tuple(
+            node for root in self.objects for node in self._iter_nodes(root)
+        )
+        if all(node is not selector for node in live_sdf_nodes):
+            raise ValueError("boundary selector object is not part of this document")
+        selector_metadata = self._boundary_selector_metadata(
+            base_region,
+            selector,
+        )
+        if selector_metadata is None:
+            raise ValueError(
+                "boundary selectors must be 1D segment, polyline, or bezier curve objects"
+            )
+        region = BoundaryRegion(
+            name=f"{base_region.name} / {selector.name}",
+            object_id=self._allocate_object_id(),
+            owner_object_id=base_region.owner_object_id,
+            outside_direction=base_region.outside_direction,
+            patch_id=base_region.patch_id,
+            patch_type=base_region.patch_type,
+            selector_id=selector_metadata.selector_id,
+            selector_type=selector_metadata.selector_type,
+            selector_start=(
+                selector_metadata.start
+                if isinstance(selector_metadata, BoundaryIntervalSelector)
+                else None
+            ),
+            selector_end=(
+                selector_metadata.end
+                if isinstance(selector_metadata, BoundaryIntervalSelector)
+                else None
+            ),
+        )
+        self.boundary_regions.append(region)
+        self._reindex()
+        selectors = self.fluid_domain.selector_objects
+        if selector not in selectors:
+            selectors = (*selectors, selector)
+        self.fluid_domain = FluidDomain(
+            self.fluid_domain.root,
+            (*self.fluid_domain.tag_objects, region),
+            selectors,
+        )
+        self.mark_changed()
+        return self.handle_for(region)
+
+    def _boundary_selector_metadata(
+        self,
+        base_region: BoundaryRegion,
+        selector: SDFNode,
+    ) -> BoundarySelector | None:
+        assert self.fluid_domain is not None
+        root = self.fluid_domain.root
+        if root.dimension == 2:
+            patch = next(
+                (
+                    patch
+                    for patch in boundary_patches(root)
+                    if isinstance(patch, BoundaryCurvePatch)
+                    and patch.owner_object_id == base_region.owner_object_id
+                    and patch.patch_id == base_region.patch_id
+                ),
+                None,
+            )
+            if patch is None:
+                return None
+            interval = boundary_interval_selector_from_node(patch, selector)
+            if interval is not None:
+                return interval
+        return boundary_selector_from_node(
+            selector,
+            domain_dimension=root.dimension,
+        )
 
     def delete(self, handle: int) -> None:
         self.delete_many((handle,))
@@ -1902,6 +2090,7 @@ class SceneDocument:
             region
             for region in self.boundary_regions
             if region.owner_object_id in live_sdf_ids
+            and self._boundary_region_selector_is_live(region, live_sdf_ids)
         ]
         self._reindex()
         if self.fluid_domain is None:
@@ -1913,4 +2102,25 @@ class SceneDocument:
         tags = tuple(
             tag for tag in self.fluid_domain.tag_objects if id(tag) in live
         )
-        self.fluid_domain = FluidDomain(self.fluid_domain.root, tags)
+        selectors = tuple(
+            selector
+            for selector in self.fluid_domain.selector_objects
+            if id(selector) in live
+        )
+        self.fluid_domain = FluidDomain(self.fluid_domain.root, tags, selectors)
+
+    @staticmethod
+    def _boundary_region_selector_is_live(
+        region: BoundaryRegion,
+        live_sdf_ids: set[int],
+    ) -> bool:
+        if region.selector_id is None:
+            return True
+        prefix = "selector:"
+        if not region.selector_id.startswith(prefix):
+            return True
+        try:
+            selector_object_id = int(region.selector_id[len(prefix):])
+        except ValueError:
+            return True
+        return selector_object_id in live_sdf_ids

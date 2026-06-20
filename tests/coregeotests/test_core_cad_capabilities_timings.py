@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from time import perf_counter
 
+import numpy as np
 import pytest
 
 from core.boundary import BoundaryRegion
+from core.boundary_patches import boundary_patch_preview_node, pick_boundary_patch
+from core.render_ir import build_render_ir
 from core.scene import SceneDocument
 from core.serialization import load_scene, save_scene
 from core.sdf import (
@@ -29,6 +33,7 @@ from core.sdf import (
     RegularPolygonProfile,
     Rotate,
     RoundedRectangleProfile,
+    SDFTree,
     SegmentProfile,
     SmoothUnion,
     Sphere,
@@ -41,6 +46,8 @@ from ._benchmark import benchmark_scene_step
 from ._benchmark import RenderUploadProbe
 
 logger = logging.getLogger(__name__)
+BOUNDARY_PICK_BATCH_THRESHOLD_MS = 1000.0
+BOUNDARY_PREVIEW_BATCH_THRESHOLD_MS = 1000.0
 
 
 @pytest.fixture(scope="session")
@@ -505,7 +512,71 @@ def test_domain_tags_and_boundary_region_timing() -> None:
     )
 
     assert isinstance(document.node(region_handle), BoundaryRegion)
-    assert isinstance(section_document.node(boundary_handle), PlacedSDF1D)
+    assert isinstance(section_document.node(boundary_handle), BoundaryRegion)
+
+
+def test_boundary_patch_picking_timing_and_default_cut_surface_precision() -> None:
+    document = SceneDocument.default()
+    assert document.fluid_domain is not None
+    root = document.fluid_domain.root
+    rays: list[tuple[np.ndarray, np.ndarray]] = []
+    origins = (
+        np.asarray((0.7, -1.0, 1.2), dtype=np.float64),
+        np.asarray((0.0, -0.1, 1.5), dtype=np.float64),
+        np.asarray((2.0, 0.0, 0.0), dtype=np.float64),
+        np.asarray((0.0, 0.0, 2.0), dtype=np.float64),
+    )
+    targets = (
+        np.asarray((0.24, 0.0, 0.0), dtype=np.float64),
+        np.asarray((0.0, -0.24, 0.0), dtype=np.float64),
+        np.asarray((1.6, 0.0, 0.0), dtype=np.float64),
+        np.asarray((0.5, 0.0, 0.45), dtype=np.float64),
+    )
+    for index in range(240):
+        origin = origins[index % len(origins)]
+        direction = targets[index % len(targets)] - origin
+        direction /= np.linalg.norm(direction)
+        rays.append((origin, direction))
+
+    start = perf_counter()
+    hits = [pick_boundary_patch(root, origin, direction) for origin, direction in rays]
+    elapsed_ms = (perf_counter() - start) * 1000.0
+
+    logger.info(
+        "coregeotest boundary_patch_picking count=%d elapsed=%.3f ms",
+        len(rays),
+        elapsed_ms,
+    )
+    assert elapsed_ms < BOUNDARY_PICK_BATCH_THRESHOLD_MS
+    assert hits[0] is not None
+    assert hits[0].owner_object_id == 2
+    assert hits[0].patch_id == "cut_surface.side_wall"
+
+
+def test_boundary_patch_preview_render_ir_timing() -> None:
+    document = SceneDocument.default()
+    assert document.fluid_domain is not None
+    root = document.fluid_domain.root
+    origin = np.asarray((0.7, -1.0, 1.2), dtype=np.float64)
+    target = np.asarray((0.24, 0.0, 0.0), dtype=np.float64)
+    direction = target - origin
+    direction /= np.linalg.norm(direction)
+    hit = pick_boundary_patch(root, origin, direction)
+    assert hit is not None
+
+    start = perf_counter()
+    for _index in range(240):
+        preview = boundary_patch_preview_node(root, hit)
+        assert preview is not None
+        render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
+        assert render_ir.supported
+    elapsed_ms = (perf_counter() - start) * 1000.0
+
+    logger.info(
+        "coregeotest boundary_patch_preview_render_ir count=240 elapsed=%.3f ms",
+        elapsed_ms,
+    )
+    assert elapsed_ms < BOUNDARY_PREVIEW_BATCH_THRESHOLD_MS
 
 
 def test_scene_serialization_current_format_timing(tmp_path: Path) -> None:
@@ -540,7 +611,7 @@ def test_scene_serialization_current_format_timing(tmp_path: Path) -> None:
     assert loaded_section.fluid_domain is not None
     assert loaded_section.fluid_domain.root.dimension == 2
     assert all(
-        isinstance(tag, (PlacedSDF1D, PlacedPolyline2D))
+        isinstance(tag, BoundaryRegion)
         for tag in loaded_section.fluid_domain.tag_objects
     )
 

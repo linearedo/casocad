@@ -6,16 +6,17 @@ from core.boundary import BoundaryRegion
 from core.sdf.base import FloatArray
 from core.sdf.base import BoundingBox3D, SDFNode
 from core.sdf.placed_1d import PlacedSDF1D
-from core.sdf.placed_2d import PlacedSDF2D
+from core.sdf.placed_2d import PlacedPolyline2D, PlacedSDF2D
 from .classifier import boundary_owner_ids
 
-LatticeTag = PlacedSDF1D | PlacedSDF2D | BoundaryRegion
+LatticeTag = PlacedSDF1D | PlacedPolyline2D | PlacedSDF2D | BoundaryRegion
 
 
 @dataclass(frozen=True)
 class FluidDomain:
     root: SDFNode
     tag_objects: tuple[LatticeTag, ...] = ()
+    selector_objects: tuple[SDFNode, ...] = ()
 
     def __post_init__(self) -> None:
         if self.root.dimension not in {2, 3}:
@@ -53,8 +54,7 @@ class FluidDomain:
             if existing is not None and existing is not tag:
                 raise ValueError(f"duplicate FluidDomain object_id {tag.object_id}")
             if (
-                self.root.dimension == 3
-                and isinstance(tag, BoundaryRegion)
+                isinstance(tag, BoundaryRegion)
                 and tag.owner_object_id not in valid_boundary_owner_ids
             ):
                 raise ValueError(
@@ -62,14 +62,15 @@ class FluidDomain:
                 )
             if (
                 self.root.dimension == 2
-                and not isinstance(tag, PlacedSDF1D)
+                and not isinstance(tag, (PlacedSDF1D, PlacedPolyline2D, BoundaryRegion))
             ):
                 raise ValueError(
-                    "2D FluidDomain tags must be PlacedSDF1D objects"
+                    "2D FluidDomain tags must be PlacedSDF1D, PlacedPolyline2D, "
+                    "or BoundaryRegion objects"
                 )
             if (
                 self.root.dimension == 2
-                and isinstance(tag, PlacedSDF1D)
+                and isinstance(tag, (PlacedSDF1D, PlacedPolyline2D))
                 and not tag.lies_in_plane_of(self.root)
             ):
                 raise ValueError(
@@ -83,9 +84,32 @@ class FluidDomain:
                     "3D FluidDomain tags must be PlacedSDF2D or BoundaryRegion"
                 )
             ids_to_objects[tag.object_id] = tag
+        for selector in self.selector_objects:
+            if selector.object_id <= 0:
+                raise ValueError("FluidDomain objects require stable nonzero IDs")
+            existing = ids_to_objects.get(selector.object_id)
+            if existing is not None and existing is not selector:
+                raise ValueError(f"duplicate FluidDomain object_id {selector.object_id}")
+            if not isinstance(selector, (PlacedSDF1D, PlacedPolyline2D)):
+                raise ValueError(
+                    "FluidDomain boundary selectors must be 1D segment, polyline, "
+                    "or bezier curve objects"
+                )
+            if (
+                self.root.dimension == 2
+                and isinstance(self.root, PlacedSDF2D)
+                and not selector.lies_in_plane_of(self.root)
+            ):
+                raise ValueError(
+                    "2D FluidDomain boundary selectors must lie in the root workplane"
+                )
+            ids_to_objects[selector.object_id] = selector
         tag_ids = [tag.object_id for tag in self.tag_objects]
         if len(tag_ids) != len(set(tag_ids)):
             raise ValueError("FluidDomain tag object IDs must be unique")
+        selector_ids = [selector.object_id for selector in self.selector_objects]
+        if len(selector_ids) != len(set(selector_ids)):
+            raise ValueError("FluidDomain selector object IDs must be unique")
 
     def bounding_box(self) -> BoundingBox3D:
         # Provisional traversal strategy. Bounds are not SDF semantics.

@@ -72,6 +72,12 @@ def save_scene(document: SceneDocument, path: str | Path) -> None:
                 "name": region.name,
                 "owner_object_id": region.owner_object_id,
                 "outside_direction": region.outside_direction,
+                "patch_id": region.patch_id,
+                "patch_type": region.patch_type,
+                "selector_id": region.selector_id,
+                "selector_type": region.selector_type,
+                "selector_start": region.selector_start,
+                "selector_end": region.selector_end,
             }
             for region in sorted(
                 document.boundary_regions, key=lambda item: item.object_id
@@ -83,9 +89,17 @@ def save_scene(document: SceneDocument, path: str | Path) -> None:
                 "tag_object_ids": [
                     tag.object_id for tag in document.fluid_domain.tag_objects
                 ],
+                "selector_object_ids": [
+                    selector.object_id
+                    for selector in document.fluid_domain.selector_objects
+                ],
             }
             if document.fluid_domain is not None
-            else {"root_object_id": None, "tag_object_ids": []}
+            else {
+                "root_object_id": None,
+                "tag_object_ids": [],
+                "selector_object_ids": [],
+            }
         ),
     }
     Path(path).write_text(
@@ -123,6 +137,36 @@ def load_scene(path: str | Path) -> SceneDocument:
                 if item.get("outside_direction") is not None
                 else None
             ),
+            patch_id=(
+                str(item["patch_id"])
+                if item.get("patch_id") is not None
+                else None
+            ),
+            patch_type=(
+                str(item["patch_type"])
+                if item.get("patch_type") is not None
+                else None
+            ),
+            selector_id=(
+                str(item["selector_id"])
+                if item.get("selector_id") is not None
+                else None
+            ),
+            selector_type=(
+                str(item["selector_type"])
+                if item.get("selector_type") is not None
+                else None
+            ),
+            selector_start=(
+                float(item["selector_start"])
+                if item.get("selector_start") is not None
+                else None
+            ),
+            selector_end=(
+                float(item["selector_end"])
+                if item.get("selector_end") is not None
+                else None
+            ),
         )
         for item in payload.get("boundary_regions", [])
     ]
@@ -144,18 +188,21 @@ def load_scene(path: str | Path) -> SceneDocument:
                 if isinstance(tag, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D)):
                     tag_items.append(tag)
         tags = tuple(tag_items)
+        selector_items: list[SDFNode] = []
+        for object_id in (
+            int(item) for item in fluid.get("selector_object_ids", [])
+        ):
+            if object_id in records:
+                selector_items.append(build(object_id))
         if root.dimension == 2:
-            migrated: list[PlacedSDF1D] = []
+            migrated: list[PlacedSDF1D | PlacedPolyline2D | BoundaryRegion] = []
             for tag in tags:
-                if isinstance(tag, (PlacedSDF1D, PlacedPolyline2D)):
+                if isinstance(tag, (PlacedSDF1D, PlacedPolyline2D, BoundaryRegion)):
                     migrated.append(tag)
-                elif isinstance(tag, BoundaryRegion):
-                    raise ValueError(
-                        "2D fluid tag objects must be PlacedSDF1D or PlacedPolyline2D"
-                    )
                 else:
                     raise ValueError(
-                        "2D fluid tag objects must be PlacedSDF1D or PlacedPolyline2D"
+                        "2D fluid tag objects must be PlacedSDF1D, "
+                        "PlacedPolyline2D, or BoundaryRegion"
                     )
             tags = tuple(migrated)
         if not all(
@@ -175,6 +222,7 @@ def load_scene(path: str | Path) -> SceneDocument:
                     (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D, BoundaryRegion),
                 )
             ),
+            tuple(selector_items),
         )
     document._reindex()
     return document

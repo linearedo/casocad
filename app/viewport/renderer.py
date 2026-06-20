@@ -1362,6 +1362,82 @@ class SDFRenderer:
             )
             program["u_scene_material_node_indices"].value = padded
 
+    def _write_boundary_selection_uniforms(
+        self,
+        program: moderngl.Program | None,
+        render_ir: RenderIR | None,
+        boundary_selection_active: bool,
+        boundary_hover_owner_id: int,
+        boundary_hover_normal: tuple[float, float, float],
+        selected_boundary_regions: tuple[tuple[int, int], ...],
+        selected_boundary_normals: tuple[tuple[float, float, float], ...],
+    ) -> None:
+        if program is None:
+            return
+        node_indices_by_object_id = (
+            {
+                int(node.object_id): index
+                for index, node in enumerate(render_ir.nodes)
+                if node.object_id > 0
+            }
+            if render_ir is not None
+            else {}
+        )
+        count = min(len(selected_boundary_regions), MAX_SELECTED_BOUNDARY_OWNERS)
+        owner_ids = [
+            int(region[0])
+            for region in selected_boundary_regions[:count]
+        ]
+        node_indices = [
+            node_indices_by_object_id.get(owner_id, -1)
+            for owner_id in owner_ids
+        ]
+        whole_flags = [
+            int(region[1])
+            for region in selected_boundary_regions[:count]
+        ]
+        normals = [
+            tuple(float(value) for value in normal)
+            for normal in selected_boundary_normals[:count]
+        ]
+        normals.extend(
+            (0.0, 0.0, 0.0)
+            for _index in range(MAX_SELECTED_BOUNDARY_OWNERS - len(normals))
+        )
+        if "u_boundary_selection_active" in program:
+            program["u_boundary_selection_active"].value = boundary_selection_active
+        if "u_boundary_hover_owner_id" in program:
+            program["u_boundary_hover_owner_id"].value = int(boundary_hover_owner_id)
+        if "u_boundary_hover_node_index" in program:
+            program["u_boundary_hover_node_index"].value = (
+                node_indices_by_object_id.get(int(boundary_hover_owner_id), -1)
+            )
+        if "u_boundary_hover_normal" in program:
+            program["u_boundary_hover_normal"].value = boundary_hover_normal
+        if "u_selected_boundary_count" in program:
+            program["u_selected_boundary_count"].value = count
+        if "u_selected_boundary_owner_ids" in program:
+            padded = tuple(
+                owner_ids + [0] * (MAX_SELECTED_BOUNDARY_OWNERS - len(owner_ids))
+            )
+            program["u_selected_boundary_owner_ids"].value = padded
+        if "u_selected_boundary_node_indices" in program:
+            padded = tuple(
+                node_indices
+                + [-1] * (MAX_SELECTED_BOUNDARY_OWNERS - len(node_indices))
+            )
+            program["u_selected_boundary_node_indices"].value = padded
+        if "u_selected_boundary_whole_flags" in program:
+            padded = tuple(
+                whole_flags
+                + [0] * (MAX_SELECTED_BOUNDARY_OWNERS - len(whole_flags))
+            )
+            program["u_selected_boundary_whole_flags"].value = padded
+        if "u_selected_boundary_normals" in program:
+            program["u_selected_boundary_normals"].write(
+                np.asarray(normals, dtype=np.float32).tobytes()
+            )
+
     def has_scene_program(self) -> bool:
         return self._scene_layer.program is not None and self._scene_layer.vao is not None
 
@@ -1801,11 +1877,21 @@ class SDFRenderer:
                 "u_render_preview_layer": False,
                 "u_grid_spacing": grid_spacing,
                 "u_grid_plane": grid_plane,
+                "u_scene_selected_object_id": int(scene_selected_object_id),
             }
             if scene_program is not None and scene_vao is not None:
                 for name, value in uniform_values.items():
                     if name in scene_program:
                         scene_program[name].value = value
+                self._write_boundary_selection_uniforms(
+                    scene_program,
+                    self._scene_layer.render_ir,
+                    boundary_selection_active,
+                    boundary_hover_owner_id,
+                    boundary_hover_normal,
+                    selected_boundary_regions,
+                    selected_boundary_normals,
+                )
                 if self._scene_layer.render_ir is not None:
                     self._write_parameterized_scene_metadata(
                         scene_program,
@@ -1825,6 +1911,15 @@ class SDFRenderer:
                 for name, value in background_uniform_values.items():
                     if name in preview_program:
                         preview_program[name].value = value
+                self._write_boundary_selection_uniforms(
+                    preview_program,
+                    self._preview_layer.render_ir,
+                    boundary_selection_active,
+                    boundary_hover_owner_id,
+                    boundary_hover_normal,
+                    selected_boundary_regions,
+                    selected_boundary_normals,
+                )
                 assert self._preview_layer.render_ir is not None
                 self._write_parameterized_scene_metadata(
                     preview_program,
@@ -1845,6 +1940,15 @@ class SDFRenderer:
                     assert preview_program is not None
                     if name in preview_program:
                         preview_program[name].value = value
+                self._write_boundary_selection_uniforms(
+                    preview_program,
+                    self._preview_layer.render_ir,
+                    False,
+                    0,
+                    (0.0, 0.0, 0.0),
+                    (),
+                    (),
+                )
                 self._write_parameterized_scene_metadata(
                     preview_program,
                     self._preview_layer.render_ir,

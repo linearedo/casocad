@@ -271,7 +271,7 @@ class SceneTreePanel(QWidget):
             and (
                 (
                     isinstance(selected_node, BoundaryRegion)
-                    and fluid_root.dimension == 3
+                    and fluid_root.dimension in {2, 3}
                 )
                 or (
                     isinstance(selected_node, SDFNode)
@@ -291,10 +291,9 @@ class SceneTreePanel(QWidget):
                 self.selected_handles(), False
             )
         )
-        create_boundary = menu.addAction("Create Boundary SDF from Owner")
+        create_boundary = menu.addAction("Create Boundary Region")
         create_boundary.setEnabled(
-            isinstance(selected_node, SDFNode)
-            and selected_node.dimension == 3
+            self._can_create_boundary_region(selected)
         )
         create_boundary.triggered.connect(
             lambda: signals.create_boundary_region_requested.emit(
@@ -320,6 +319,26 @@ class SceneTreePanel(QWidget):
         menu.addAction(delete_action)
         menu.exec(self.tree.viewport().mapToGlobal(position))
         self._context_submenus.clear()
+
+    def _can_create_boundary_region(self, handles: list[int]) -> bool:
+        if self._document is None:
+            return False
+        if len(handles) == 1:
+            node = self._document.node(handles[0])
+            return isinstance(node, SDFNode) and node.dimension == 3
+        if len(handles) != 2:
+            return False
+        first = self._document.node(handles[0])
+        second = self._document.node(handles[1])
+        return (
+            isinstance(first, BoundaryRegion)
+            and first.patch_id is not None
+            and isinstance(second, (PlacedSDF1D, PlacedPolyline2D))
+        ) or (
+            isinstance(second, BoundaryRegion)
+            and second.patch_id is not None
+            and isinstance(first, (PlacedSDF1D, PlacedPolyline2D))
+        )
 
     def _populate_object_boolean_menu(
         self,

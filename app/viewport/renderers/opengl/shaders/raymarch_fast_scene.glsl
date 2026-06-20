@@ -116,9 +116,58 @@ vec3 shadeSceneSurface(vec3 point, vec3 ray_direction) {
     vec3 light_direction = normalize(vec3(0.7, 1.0, 0.45));
     float diffuse = max(dot(normal, light_direction), 0.0);
     float rim = pow(1.0 - abs(dot(normal, -ray_direction)), 2.5);
-    vec3 material = objectPalette(sceneObjectId(point));
+    int object_id = sceneObjectId(point);
+    vec3 material = objectPalette(object_id);
     vec3 surface_color = material * (0.24 + 0.76 * diffuse);
     surface_color += material * (0.25 * rim);
+    bool boundary_hovered = false;
+    bool boundary_selected = false;
+    float hover_normal_length = length(u_boundary_hover_normal);
+    if (
+        u_boundary_selection_active
+        && u_boundary_hover_node_index >= 0
+        && abs(irSceneNodeSDFByIndex(u_boundary_hover_node_index, point)) < 0.004
+        && (
+            hover_normal_length <= 0.0001
+            || dot(normal, normalize(u_boundary_hover_normal)) > 0.88
+        )
+    ) {
+        boundary_hovered = true;
+    }
+    for (int index = 0; index < 128; ++index) {
+        if (index >= u_selected_boundary_count) break;
+        int selected_node_index = u_selected_boundary_node_indices[index];
+        if (selected_node_index < 0) continue;
+        if (abs(irSceneNodeSDFByIndex(selected_node_index, point)) >= 0.004) {
+            continue;
+        }
+        float selected_normal_length = length(u_selected_boundary_normals[index]);
+        if (
+            u_selected_boundary_whole_flags[index] != 0
+            || (
+                selected_normal_length > 0.0001
+                && dot(normal, normalize(u_selected_boundary_normals[index])) > 0.88
+            )
+        ) {
+            boundary_selected = true;
+            break;
+        }
+    }
+    if (u_scene_selected_object_id > 0 && object_id == u_scene_selected_object_id) {
+        vec3 highlight = vec3(1.0, 0.94, 0.18);
+        surface_color = mix(surface_color, highlight, 0.72);
+        surface_color += highlight * (0.20 + 0.45 * rim);
+    }
+    if (boundary_selected) {
+        vec3 selected_boundary = vec3(0.25, 0.72, 1.0);
+        surface_color = mix(surface_color, selected_boundary, 0.50);
+        surface_color += selected_boundary * (0.12 + 0.25 * rim);
+    }
+    if (boundary_hovered) {
+        vec3 hover_boundary = vec3(1.0, 1.0, 0.92);
+        surface_color = mix(surface_color, hover_boundary, 0.92);
+        surface_color += vec3(1.0, 0.52, 0.08) * (0.45 + 0.55 * rim);
+    }
     return pow(surface_color, vec3(0.86));
 }
 
