@@ -7,8 +7,6 @@ from math import cos, pi, sin
 import numpy as np
 from numpy.typing import NDArray
 
-from .base import glsl_float
-
 FloatArray = NDArray[np.float64]
 
 
@@ -18,20 +16,12 @@ class Profile2D(ABC):
         return type(self).__name__.lower()
 
     @abstractmethod
-    def to_glsl(self, p_var: str = "q") -> str:
-        """Return a GLSL expression for a local vec2."""
-
-    @abstractmethod
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         """Evaluate a local filled-region signed distance."""
 
     @abstractmethod
     def bounds(self) -> tuple[float, float, float, float]:
         """Internal finite local bounds: u_min, u_max, v_min, v_max."""
-
-
-def _vec2(values: tuple[float, float]) -> str:
-    return f"vec2({glsl_float(values[0])}, {glsl_float(values[1])})"
 
 
 def _as_points(
@@ -59,19 +49,6 @@ def _segment_distance_numpy(
     return np.asarray(np.sqrt(dx * dx + dy * dy), dtype=np.float64)
 
 
-def _segment_distance_glsl(
-    p_var: str,
-    first: tuple[float, float],
-    second: tuple[float, float],
-) -> str:
-    a = _vec2(first)
-    b = _vec2(second)
-    pa = f"({p_var} - {a})"
-    ba = f"({b} - {a})"
-    h = f"clamp(dot({pa}, {ba}) / max(dot({ba}, {ba}), 1.0e-12), 0.0, 1.0)"
-    return f"length({pa} - {ba} * {h})"
-
-
 def _polyline_distance_numpy(
     U: FloatArray,
     V: FloatArray,
@@ -86,20 +63,6 @@ def _polyline_distance_numpy(
     if closed:
         distances.append(_segment_distance_numpy(U, V, points[-1], points[0]))
     return np.asarray(np.minimum.reduce(distances), dtype=np.float64)
-
-
-def _polyline_distance_glsl(
-    p_var: str,
-    points: tuple[tuple[float, float], ...],
-    closed: bool,
-) -> str:
-    pairs = list(zip(points, points[1:]))
-    if closed:
-        pairs.append((points[-1], points[0]))
-    expression = _segment_distance_glsl(p_var, pairs[0][0], pairs[0][1])
-    for first, second in pairs[1:]:
-        expression = f"min({expression}, {_segment_distance_glsl(p_var, first, second)})"
-    return expression
 
 
 def _quadratic_bezier_spans(
@@ -190,16 +153,155 @@ def _quadratic_bezier_distance_numpy(
     return np.asarray(np.sqrt(np.maximum(result, 0.0)), dtype=np.float64)
 
 
-def _quadratic_bezier_distance_glsl(
-    p_var: str,
+def _quadratic_bezier_ray_crossings_numpy(
+    U: FloatArray,
+    V: FloatArray,
     start: tuple[float, float],
     control: tuple[float, float],
     end: tuple[float, float],
-) -> str:
-    return (
-        f"quadraticBezierDistance({p_var}, {_vec2(start)}, "
-        f"{_vec2(control)}, {_vec2(end)})"
+) -> NDArray[np.bool_]:
+    ax, ay = start
+    bx, by = control
+    cx, cy = end
+    qa = ay - 2.0 * by + cy
+    qb = 2.0 * (by - ay)
+    qc = ay - V
+    result = np.full(np.shape(U), False, dtype=np.bool_)
+
+    def toggle_for_root(t: FloatArray, valid: NDArray[np.bool_]) -> None:
+        x = (
+            (1.0 - t) * (1.0 - t) * ax
+            + 2.0 * (1.0 - t) * t * bx
+            + t * t * cx
+        )
+        result[...] ^= valid & (x > U)
+
+    if abs(qa) <= 1.0e-12:
+        if abs(qb) <= 1.0e-12:
+            return result
+        t = -qc / qb
+        toggle_for_root(t, (t >= 0.0) & (t < 1.0))
+        return result
+
+    discriminant = qb * qb - 4.0 * qa * qc
+    valid_discriminant = discriminant > 1.0e-12
+    root = np.sqrt(np.maximum(discriminant, 0.0))
+    t0 = (-qb - root) / (2.0 * qa)
+    t1 = (-qb + root) / (2.0 * qa)
+    toggle_for_root(t0, valid_discriminant & (t0 >= 0.0) & (t0 < 1.0))
+    toggle_for_root(t1, valid_discriminant & (t1 >= 0.0) & (t1 < 1.0))
+    return result
+
+
+def _segment_ray_crossings_numpy(
+    U: FloatArray,
+    V: FloatArray,
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> NDArray[np.bool_]:
+    ax, ay = first
+    bx, by = second
+    active = (ay > V) != (by > V)
+    intersection = np.full(np.shape(U), ax, dtype=np.float64)
+    np.divide(
+        (bx - ax) * (V - ay),
+        by - ay,
+        out=intersection,
+        where=active,
     )
+    intersection += ax
+    return np.asarray(active & (U < intersection), dtype=np.bool_)
+
+
+def _bezier_surface_closed(
+    points: tuple[tuple[float, float], ...],
+    tolerance: float = 1.0e-12,
+) -> bool:
+    return bool(np.linalg.norm(np.asarray(points[0]) - np.asarray(points[-1])) <= tolerance)
+
+
+def _ellipse_distance_numpy(
+    U: FloatArray,
+    V: FloatArray,
+    center: tuple[float, float],
+    semi_axes: tuple[float, float],
+) -> FloatArray:
+    cu, cv = center
+    au, av = semi_axes
+    if abs(au - av) <= 1.0e-12:
+        return np.asarray(
+            np.sqrt((U - cu) ** 2 + (V - cv) ** 2) - au,
+            dtype=np.float64,
+        )
+
+    x = np.abs(U - cu)
+    y = np.abs(V - cv)
+    swap = x > y
+    px = np.where(swap, y, x)
+    py = np.where(swap, x, y)
+    ax = np.where(swap, av, au)
+    ay = np.where(swap, au, av)
+
+    length_delta = ay * ay - ax * ax
+    m = ax * px / length_delta
+    n = ay * py / length_delta
+    m2 = m * m
+    n2 = n * n
+    c = (m2 + n2 - 1.0) / 3.0
+    c3 = c * c * c
+    q = c3 + m2 * n2 * 2.0
+    d = c3 + m2 * n2
+    g = m + m * n2
+    co = np.empty(np.shape(px), dtype=np.float64)
+
+    three_roots = d < 0.0
+    if np.any(three_roots):
+        h = np.arccos(
+            np.clip(q[three_roots] / c3[three_roots], -1.0, 1.0)
+        ) / 3.0
+        s = np.cos(h)
+        t = np.sin(h) * np.sqrt(3.0)
+        rx = np.sqrt(
+            np.maximum(
+                -c[three_roots] * (s + t + 2.0) + m2[three_roots],
+                0.0,
+            )
+        )
+        ry = np.sqrt(
+            np.maximum(
+                -c[three_roots] * (s - t + 2.0) + m2[three_roots],
+                0.0,
+            )
+        )
+        denominator = np.maximum(rx * ry, 1.0e-24)
+        co[three_roots] = (
+            ry
+            + np.sign(length_delta[three_roots]) * rx
+            + np.abs(g[three_roots]) / denominator
+            - m[three_roots]
+        ) * 0.5
+
+    single_root = ~three_roots
+    if np.any(single_root):
+        h = 2.0 * m[single_root] * n[single_root] * np.sqrt(
+            np.maximum(d[single_root], 0.0)
+        )
+        s = np.cbrt(q[single_root] + h)
+        u = np.cbrt(q[single_root] - h)
+        rx = -s - u - c[single_root] * 4.0 + 2.0 * m2[single_root]
+        ry = (s - u) * np.sqrt(3.0)
+        rm = np.sqrt(rx * rx + ry * ry)
+        co[single_root] = (
+            ry / np.sqrt(np.maximum(rm - rx, 1.0e-24))
+            + 2.0 * g[single_root] / np.maximum(rm, 1.0e-24)
+            - m[single_root]
+        ) * 0.5
+
+    co = np.clip(co, 0.0, 1.0)
+    closest_x = ax * co
+    closest_y = ay * np.sqrt(np.maximum(1.0 - co * co, 0.0))
+    distance = np.sqrt((closest_x - px) ** 2 + (closest_y - py) ** 2)
+    return np.asarray(distance * np.sign(py - closest_y), dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -225,9 +327,6 @@ class PolylineProfile(Profile2D):
     @property
     def kind(self) -> str:
         return "polyline"
-
-    def to_glsl(self, p_var: str = "q") -> str:
-        return _polyline_distance_glsl(p_var, self.points, closed=False)
 
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         return _polyline_distance_numpy(U, V, self.points, closed=False)
@@ -270,21 +369,69 @@ class BezierCurveProfile(Profile2D):
     def kind(self) -> str:
         return "bezier_polycurve" if len(self.points) > 3 else "bezier_curve"
 
-    def to_glsl(self, p_var: str = "q") -> str:
-        spans = _quadratic_bezier_spans(self.points)
-        expression = _quadratic_bezier_distance_glsl(p_var, *spans[0])
-        for span in spans[1:]:
-            expression = (
-                f"min({expression}, {_quadratic_bezier_distance_glsl(p_var, *span)})"
-            )
-        return expression
-
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         distances = [
             _quadratic_bezier_distance_numpy(U, V, start, control, end)
             for start, control, end in _quadratic_bezier_spans(self.points)
         ]
         return np.asarray(np.minimum.reduce(distances), dtype=np.float64)
+
+    def bounds(self) -> tuple[float, float, float, float]:
+        points = np.asarray(self.points, dtype=np.float64)
+        return (
+            float(points[:, 0].min()),
+            float(points[:, 0].max()),
+            float(points[:, 1].min()),
+            float(points[:, 1].max()),
+        )
+
+
+@dataclass(frozen=True)
+class BezierSurfaceProfile(Profile2D):
+    points: tuple[tuple[float, float], ...] = (
+        (-0.65, -0.35),
+        (-0.25, 0.55),
+        (0.1, 0.25),
+        (0.45, -0.05),
+        (0.55, -0.45),
+    )
+
+    def __post_init__(self) -> None:
+        normalized = _as_points(self.points)
+        if len(normalized) < 3:
+            raise ValueError("bezier surface requires at least three points")
+        if len(normalized) % 2 == 0:
+            raise ValueError(
+                "bezier surface requires an odd point count: anchor, control, anchor"
+            )
+        if all(
+            np.linalg.norm(np.asarray(control) - np.asarray(start)) <= 1e-12
+            and np.linalg.norm(np.asarray(end) - np.asarray(start)) <= 1e-12
+            for start, control, end in _quadratic_bezier_spans(normalized)
+        ):
+            raise ValueError("bezier surface requires at least one nonzero span")
+        object.__setattr__(self, "points", normalized)
+
+    @property
+    def kind(self) -> str:
+        return "bezier_surface"
+
+    def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
+        spans = _quadratic_bezier_spans(self.points)
+        distances = [
+            _quadratic_bezier_distance_numpy(U, V, start, control, end)
+            for start, control, end in spans
+        ]
+        if not _bezier_surface_closed(self.points):
+            distances.append(_segment_distance_numpy(U, V, self.points[-1], self.points[0]))
+        distance = np.asarray(np.minimum.reduce(distances), dtype=np.float64)
+
+        inside = np.full(np.shape(distance), False, dtype=np.bool_)
+        for start, control, end in spans:
+            inside ^= _quadratic_bezier_ray_crossings_numpy(U, V, start, control, end)
+        if not _bezier_surface_closed(self.points):
+            inside ^= _segment_ray_crossings_numpy(U, V, self.points[-1], self.points[0])
+        return np.asarray(np.where(inside, -distance, distance), dtype=np.float64)
 
     def bounds(self) -> tuple[float, float, float, float]:
         points = np.asarray(self.points, dtype=np.float64)
@@ -316,25 +463,6 @@ class PolygonProfile(Profile2D):
     @property
     def kind(self) -> str:
         return "polygon"
-
-    def to_glsl(self, p_var: str = "q") -> str:
-        distance = _polyline_distance_glsl(p_var, self.points, closed=True)
-        inside = "false"
-        for first, second in zip(
-            self.points,
-            (*self.points[1:], self.points[0]),
-            strict=True,
-        ):
-            ax, ay = first
-            bx, by = second
-            condition = (
-                f"(({glsl_float(ay)} > {p_var}.y) != ({glsl_float(by)} > {p_var}.y))"
-                f" && ({p_var}.x < ({glsl_float(bx)} - {glsl_float(ax)})"
-                f" * ({p_var}.y - {glsl_float(ay)})"
-                f" / ({glsl_float(by)} - {glsl_float(ay)}) + {glsl_float(ax)})"
-            )
-            inside = f"(({inside}) != ({condition}))"
-        return f"(({inside}) ? -({distance}) : ({distance}))"
 
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         distance = _polyline_distance_numpy(U, V, self.points, closed=True)
@@ -378,12 +506,6 @@ class CircleProfile(Profile2D):
         if self.radius <= 0.0:
             raise ValueError("circle radius must be positive")
 
-    def to_glsl(self, p_var: str = "q") -> str:
-        return (
-            f"(length({p_var} - {_vec2(self.center)})"
-            f" - {glsl_float(self.radius)})"
-        )
-
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         cu, cv = self.center
         return np.asarray(
@@ -409,13 +531,6 @@ class RectangleProfile(Profile2D):
     def __post_init__(self) -> None:
         if any(value <= 0.0 for value in self.half_size):
             raise ValueError("rectangle half sizes must be positive")
-
-    def to_glsl(self, p_var: str = "q") -> str:
-        q = (
-            f"(abs({p_var} - {_vec2(self.center)})"
-            f" - {_vec2(self.half_size)})"
-        )
-        return f"(length(max({q}, vec2(0.0))) + min(max({q}.x, {q}.y), 0.0))"
 
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         cu, cv = self.center
@@ -443,9 +558,6 @@ class SquareProfile(RectangleProfile):
     def _rectangle(self) -> RectangleProfile:
         return RectangleProfile(self.center, (self.half_size, self.half_size))
 
-    def to_glsl(self, p_var: str = "q") -> str:
-        return self._rectangle().to_glsl(p_var)
-
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         return self._rectangle().to_numpy(U, V)
 
@@ -463,18 +575,6 @@ class RoundedRectangleProfile(RectangleProfile):
             raise ValueError("corner radius must be positive")
         if self.corner_radius > min(self.half_size):
             raise ValueError("corner radius exceeds rectangle half size")
-
-    def to_glsl(self, p_var: str = "q") -> str:
-        inner = (
-            self.half_size[0] - self.corner_radius,
-            self.half_size[1] - self.corner_radius,
-        )
-        q = f"(abs({p_var} - {_vec2(self.center)}) - {_vec2(inner)})"
-        return (
-            f"(length(max({q}, vec2(0.0)))"
-            f" + min(max({q}.x, {q}.y), 0.0)"
-            f" - {glsl_float(self.corner_radius)})"
-        )
 
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         cu, cv = self.center
@@ -496,17 +596,8 @@ class EllipseProfile(Profile2D):
         if any(value <= 0.0 for value in self.semi_axes):
             raise ValueError("ellipse semi-axes must be positive")
 
-    def to_glsl(self, p_var: str = "q") -> str:
-        # Stable implicit approximation; sign is exact for the ellipse.
-        axes = _vec2(self.semi_axes)
-        minimum = glsl_float(min(self.semi_axes))
-        return f"((length(({p_var} - {_vec2(self.center)}) / {axes}) - 1.0) * {minimum})"
-
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
-        cu, cv = self.center
-        au, av = self.semi_axes
-        normalized = np.sqrt(((U - cu) / au) ** 2 + ((V - cv) / av) ** 2)
-        return np.asarray((normalized - 1.0) * min(au, av), dtype=np.float64)
+        return _ellipse_distance_numpy(U, V, self.center, self.semi_axes)
 
     def bounds(self) -> tuple[float, float, float, float]:
         cu, cv = self.center
@@ -536,31 +627,10 @@ class RegularPolygonProfile(Profile2D):
             )
         )
 
-    def to_glsl(self, p_var: str = "q") -> str:
-        # Convex polygon as intersection of oriented half-planes.
-        vertices = self._vertices()
-        expressions: list[str] = []
-        for first, second in zip(vertices, np.roll(vertices, -1, axis=0), strict=True):
-            edge = second - first
-            normal = np.asarray((edge[1], -edge[0]))
-            normal /= np.linalg.norm(normal)
-            expressions.append(
-                f"dot({p_var} - {_vec2(tuple(first))}, {_vec2(tuple(normal))})"
-            )
-        expression = expressions[0]
-        for item in expressions[1:]:
-            expression = f"max({expression}, {item})"
-        return expression
-
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
-        vertices = self._vertices()
-        distances = []
-        for first, second in zip(vertices, np.roll(vertices, -1, axis=0), strict=True):
-            edge = second - first
-            normal = np.asarray((edge[1], -edge[0]))
-            normal /= np.linalg.norm(normal)
-            distances.append((U - first[0]) * normal[0] + (V - first[1]) * normal[1])
-        return np.asarray(np.maximum.reduce(distances), dtype=np.float64)
+        return PolygonProfile(
+            points=tuple(tuple(point) for point in self._vertices())
+        ).to_numpy(U, V)
 
     def bounds(self) -> tuple[float, float, float, float]:
         vertices = self._vertices()
@@ -576,9 +646,6 @@ class RegularPolygonProfile(Profile2D):
 class OffsetProfile(Profile2D):
     child: Profile2D
     offset: tuple[float, float] = (0.0, 0.0)
-
-    def to_glsl(self, p_var: str = "q") -> str:
-        return self.child.to_glsl(f"({p_var} - {_vec2(self.offset)})")
 
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         return self.child.to_numpy(U - self.offset[0], V - self.offset[1])
@@ -605,19 +672,6 @@ class BinaryProfile(Profile2D):
             raise ValueError(f"unsupported 2D boolean operation: {self.operation}")
         if self.operation == "smooth_union" and self.smoothing <= 0.0:
             raise ValueError("smooth union radius must be positive")
-
-    def to_glsl(self, p_var: str = "q") -> str:
-        left = self.left.to_glsl(p_var)
-        right = self.right.to_glsl(p_var)
-        if self.operation == "union":
-            return f"min({left}, {right})"
-        if self.operation == "intersection":
-            return f"max({left}, {right})"
-        if self.operation == "difference":
-            return f"max({left}, -({right}))"
-        k = glsl_float(self.smoothing)
-        h = f"clamp(0.5 + 0.5 * (({right}) - ({left})) / {k}, 0.0, 1.0)"
-        return f"(mix(({right}), ({left}), {h}) - {k} * {h} * (1.0 - {h}))"
 
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         left = self.left.to_numpy(U, V)

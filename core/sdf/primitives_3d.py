@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .base import BoundingBox3D, FloatArray, SDFNode, glsl_float, glsl_vec3
+from .base import BoundingBox3D, FloatArray, SDFNode
 
 
 def _normalized(vector: tuple[float, float, float]) -> np.ndarray:
@@ -33,23 +33,6 @@ def _orthonormal_frame(
         tuple(float(value) for value in u),
         tuple(float(value) for value in v),
         tuple(float(value) for value in w),
-    )
-
-
-def _oriented_local_glsl(
-    p_var: str,
-    center: tuple[float, float, float],
-    axis_u: tuple[float, float, float],
-    axis_v: tuple[float, float, float],
-    axis_w: tuple[float, float, float],
-) -> str:
-    local = f"({p_var} - {glsl_vec3(center)})"
-    return (
-        "vec3("
-        f"dot({local}, {glsl_vec3(axis_u)}), "
-        f"dot({local}, {glsl_vec3(axis_v)}), "
-        f"dot({local}, {glsl_vec3(axis_w)})"
-        ")"
     )
 
 
@@ -120,12 +103,6 @@ class Sphere(SDFNode):
         if self.radius <= 0.0:
             raise ValueError("sphere radius must be positive")
 
-    def to_glsl(self, p_var: str = "p") -> str:
-        return (
-            f"(length({p_var} - {glsl_vec3(self.center)})"
-            f" - {glsl_float(self.radius)})"
-        )
-
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -162,17 +139,6 @@ class Box(SDFNode):
             self.axis_v,
             self.axis_w,
         )
-
-    def to_glsl(self, p_var: str = "p") -> str:
-        local = _oriented_local_glsl(
-            p_var,
-            self.center,
-            self.axis_u,
-            self.axis_v,
-            self.axis_w,
-        )
-        q = f"(abs({local}) - {glsl_vec3(self.half_size)})"
-        return f"(length(max({q}, vec3(0.0))) + min(max({q}.x, max({q}.y, {q}.z)), 0.0))"
 
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
@@ -230,20 +196,6 @@ class Cylinder(SDFNode):
             self.axis_w,
         )
 
-    def to_glsl(self, p_var: str = "p") -> str:
-        local = _oriented_local_glsl(
-            p_var,
-            self.center,
-            self.axis_u,
-            self.axis_v,
-            self.axis_w,
-        )
-        d = (
-            f"(abs(vec2(length({local}.xy), {local}.z))"
-            f" - vec2({glsl_float(self.radius)}, {glsl_float(self.half_height)}))"
-        )
-        return f"(min(max({d}.x, {d}.y), 0.0) + length(max({d}, vec2(0.0))))"
-
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -273,6 +225,278 @@ class Cylinder(SDFNode):
 
 
 @dataclass
+class Cone(SDFNode):
+    center: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    radius: float = 0.5
+    half_height: float = 0.5
+    axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    axis_v: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    axis_w: tuple[float, float, float] = (0.0, 0.0, 1.0)
+
+    @property
+    def dimension(self) -> int:
+        return 3
+
+    def __post_init__(self) -> None:
+        if self.radius <= 0.0 or self.half_height <= 0.0:
+            raise ValueError("cone dimensions must be positive")
+        self.axis_u, self.axis_v, self.axis_w = _orthonormal_frame(
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+        )
+
+    def to_numpy(
+        self, X: FloatArray, Y: FloatArray, Z: FloatArray
+    ) -> FloatArray:
+        local_x, local_y, local_z = _oriented_local_numpy(
+            X,
+            Y,
+            Z,
+            self.center,
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+        )
+        wx = np.sqrt(local_x**2 + local_y**2)
+        wy = local_z - self.half_height
+        qx = self.radius
+        qy = -2.0 * self.half_height
+        denominator = qx * qx + qy * qy
+        h = np.clip((wx * qx + wy * qy) / denominator, 0.0, 1.0)
+        ax = wx - qx * h
+        ay = wy - qy * h
+        bx = wx - qx * np.clip(wx / qx, 0.0, 1.0)
+        by = wy - qy
+        d = np.minimum(ax * ax + ay * ay, bx * bx + by * by)
+        s = np.maximum(-(wx * qy - wy * qx), -(wy - qy))
+        return np.asarray(np.sqrt(d) * np.sign(s), dtype=np.float64)
+
+    def bounding_box(self) -> BoundingBox3D:
+        return _oriented_box_bounds(
+            self.center,
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+            (self.radius, self.radius, self.half_height),
+        )
+
+
+@dataclass
+class CappedCone(SDFNode):
+    center: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    radius_a: float = 0.5
+    radius_b: float = 0.25
+    half_height: float = 0.5
+    axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    axis_v: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    axis_w: tuple[float, float, float] = (0.0, 0.0, 1.0)
+
+    @property
+    def dimension(self) -> int:
+        return 3
+
+    def __post_init__(self) -> None:
+        if self.radius_a <= 0.0 or self.radius_b <= 0.0 or self.half_height <= 0.0:
+            raise ValueError("capped cone dimensions must be positive")
+        self.axis_u, self.axis_v, self.axis_w = _orthonormal_frame(
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+        )
+
+    def to_numpy(
+        self, X: FloatArray, Y: FloatArray, Z: FloatArray
+    ) -> FloatArray:
+        local_x, local_y, local_z = _oriented_local_numpy(
+            X,
+            Y,
+            Z,
+            self.center,
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+        )
+        qx = np.sqrt(local_x**2 + local_y**2)
+        qy = local_z
+        k1x = self.radius_b
+        k1y = self.half_height
+        k2x = self.radius_b - self.radius_a
+        k2y = 2.0 * self.half_height
+        cax = qx - np.minimum(qx, np.where(qy < 0.0, self.radius_a, self.radius_b))
+        cay = np.abs(qy) - self.half_height
+        dot_k2 = k2x * k2x + k2y * k2y
+        projection = ((k1x - qx) * k2x + (k1y - qy) * k2y) / dot_k2
+        f = np.clip(projection, 0.0, 1.0)
+        cbx = qx - k1x + k2x * f
+        cby = qy - k1y + k2y * f
+        sign = np.where((cbx < 0.0) & (cay < 0.0), -1.0, 1.0)
+        distance_squared = np.minimum(
+            cax * cax + cay * cay,
+            cbx * cbx + cby * cby,
+        )
+        return np.asarray(sign * np.sqrt(distance_squared), dtype=np.float64)
+
+    def bounding_box(self) -> BoundingBox3D:
+        radius = max(self.radius_a, self.radius_b)
+        return _oriented_box_bounds(
+            self.center,
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+            (radius, radius, self.half_height),
+        )
+
+
+@dataclass
+class Pyramid(SDFNode):
+    center: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    base_half_size: float = 0.5
+    half_height: float = 0.5
+    axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    axis_v: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    axis_w: tuple[float, float, float] = (0.0, 0.0, 1.0)
+
+    @property
+    def dimension(self) -> int:
+        return 3
+
+    def __post_init__(self) -> None:
+        if self.base_half_size <= 0.0 or self.half_height <= 0.0:
+            raise ValueError("pyramid dimensions must be positive")
+        self.axis_u, self.axis_v, self.axis_w = _orthonormal_frame(
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+        )
+
+    def to_numpy(
+        self, X: FloatArray, Y: FloatArray, Z: FloatArray
+    ) -> FloatArray:
+        local_x, local_y, local_z = _oriented_local_numpy(
+            X,
+            Y,
+            Z,
+            self.center,
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+        )
+        scale = 2.0 * self.base_half_size
+        px = np.abs(local_x / scale)
+        py = (local_z + self.half_height) / scale
+        pz = np.abs(local_y / scale)
+        swap = pz > px
+        old_px = px
+        px = np.where(swap, pz, px)
+        pz = np.where(swap, old_px, pz)
+        px = px - 0.5
+        pz = pz - 0.5
+        h = 2.0 * self.half_height / scale
+        m2 = h * h + 0.25
+        qx = pz
+        qy = h * py - 0.5 * px
+        qz = h * px + 0.5 * py
+        s = np.maximum(-qx, 0.0)
+        t = np.clip((qy - 0.5 * pz) / (m2 + 0.25), 0.0, 1.0)
+        a = m2 * (qx + s) * (qx + s) + qy * qy
+        b = m2 * (qx + 0.5 * t) * (qx + 0.5 * t) + (qy - m2 * t) * (qy - m2 * t)
+        d2 = np.where(
+            np.minimum(qy, -qx * m2 - qy * 0.5) > 0.0,
+            0.0,
+            np.minimum(a, b),
+        )
+        return np.asarray(
+            scale * np.sqrt((d2 + qz * qz) / m2) * np.sign(np.maximum(qz, -py)),
+            dtype=np.float64,
+        )
+
+    def bounding_box(self) -> BoundingBox3D:
+        return _oriented_box_bounds(
+            self.center,
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+            (self.base_half_size, self.base_half_size, self.half_height),
+        )
+
+
+@dataclass
+class BoxFrame(SDFNode):
+    center: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    half_size: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    thickness: float = 0.08
+    axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    axis_v: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    axis_w: tuple[float, float, float] = (0.0, 0.0, 1.0)
+
+    @property
+    def dimension(self) -> int:
+        return 3
+
+    def __post_init__(self) -> None:
+        if any(value <= 0.0 for value in self.half_size) or self.thickness <= 0.0:
+            raise ValueError("box frame dimensions must be positive")
+        self.axis_u, self.axis_v, self.axis_w = _orthonormal_frame(
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+        )
+
+    def to_numpy(
+        self, X: FloatArray, Y: FloatArray, Z: FloatArray
+    ) -> FloatArray:
+        local_x, local_y, local_z = _oriented_local_numpy(
+            X,
+            Y,
+            Z,
+            self.center,
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+        )
+        px = np.abs(local_x) - self.half_size[0]
+        py = np.abs(local_y) - self.half_size[1]
+        pz = np.abs(local_z) - self.half_size[2]
+        qx = np.abs(px + self.thickness) - self.thickness
+        qy = np.abs(py + self.thickness) - self.thickness
+        qz = np.abs(pz + self.thickness) - self.thickness
+
+        def box_distance(
+            ax: FloatArray,
+            ay: FloatArray,
+            az: FloatArray,
+        ) -> FloatArray:
+            outside = np.sqrt(
+                np.maximum(ax, 0.0) ** 2
+                + np.maximum(ay, 0.0) ** 2
+                + np.maximum(az, 0.0) ** 2
+            )
+            inside = np.minimum(np.maximum(ax, np.maximum(ay, az)), 0.0)
+            return np.asarray(outside + inside, dtype=np.float64)
+
+        return np.asarray(
+            np.minimum(
+                np.minimum(
+                    box_distance(px, qy, qz),
+                    box_distance(qx, py, qz),
+                ),
+                box_distance(qx, qy, pz),
+            ),
+            dtype=np.float64,
+        )
+
+    def bounding_box(self) -> BoundingBox3D:
+        return _oriented_box_bounds(
+            self.center,
+            self.axis_u,
+            self.axis_v,
+            self.axis_w,
+            self.half_size,
+        )
+
+
+@dataclass
 class Torus(SDFNode):
     center: tuple[float, float, float] = (0.0, 0.0, 0.0)
     major_radius: float = 0.5
@@ -292,19 +516,6 @@ class Torus(SDFNode):
             self.axis_u,
             self.axis_v,
             self.axis_w,
-        )
-
-    def to_glsl(self, p_var: str = "p") -> str:
-        local = _oriented_local_glsl(
-            p_var,
-            self.center,
-            self.axis_u,
-            self.axis_v,
-            self.axis_w,
-        )
-        return (
-            f"(length(vec2(length({local}.xy) - {glsl_float(self.major_radius)},"
-            f" {local}.z)) - {glsl_float(self.minor_radius)})"
         )
 
     def to_numpy(

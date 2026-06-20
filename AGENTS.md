@@ -32,13 +32,17 @@ the path from editable SDF geometry to solver-oriented discrete output.
 
 Current and planned execution paths are:
 
-- GPU CAD visualization from `to_glsl()`
+- CAD visualization from `RenderIR` consumed by viewport backends
 - CPU analysis evaluation from `to_numpy()`
 - integrated meshing and classification
 - typed simulation setup stored as normal Python state
 - lattice meshing for OpenLB and Palabos
 - future surface and volume meshing for OpenFOAM and SU2
 - solver-specific case generators
+
+Viewport Baseline:
+
+- Viewport rendering uses `RenderIR` with cached backend programs; do not replace the current cached-topology design with a larger renderer rewrite unless timing evidence or backend requirements justify it.
 
 Core product invariants:
 
@@ -117,7 +121,8 @@ Follow the existing style and keep changes narrow.
   `SCREAMING_SNAKE_CASE` for constants
 - Keep `core/` free of Qt, OpenGL, and GUI dependencies
 - Keep `app/` responsible for widgets, signals, OpenGL, and worker wiring
-- Keep geometry formulas in `to_glsl()` and `to_numpy()` structurally aligned
+- Keep `to_numpy()` as the authoritative SDF evaluation path for CPU analysis
+  and meshing; viewport backends render the same scene through `RenderIR`
 - Use `float64` for CPU analysis and meshing data, and convert to `float32`
   only at GPU upload boundaries
 - Prefer vectorized NumPy operations over Python loops for lattice/node work
@@ -139,7 +144,6 @@ Design guardrails:
 If you introduce a new geometric operation, it is incomplete until:
 
 - `to_numpy()` is implemented
-- `to_glsl()` is implemented
 - parity or regression tests cover the behavior
 
 If you introduce a new solver output capability, keep the split explicit:

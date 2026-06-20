@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
-import math
 import re
 
 import numpy as np
@@ -23,17 +22,25 @@ from core.boundary import BoundaryRegion
 from core.scene import SceneDocument
 from core.sdf import (
     BezierCurveProfile,
+    BezierSurfaceProfile,
+    BezierTube,
     Box,
+    BoxFrame,
+    CappedCone,
     CircleProfile,
+    Cone,
     Cylinder,
     EllipseProfile,
     Extrude,
     PolygonProfile,
+    PolylineTube,
     PolylineProfile,
     PlacedSDF1D,
     PlacedSDF2D,
+    Pyramid,
     RectangleProfile,
     RegularPolygonProfile,
+    Revolve,
     Rotate,
     RoundedRectangleProfile,
     Scale,
@@ -41,7 +48,6 @@ from core.sdf import (
     SmoothUnion,
     Sphere,
     SquareProfile,
-    Sweep,
     Torus,
     Translate,
     PlacedPolyline2D,
@@ -77,37 +83,6 @@ def rounded_rectangle_corner_radius_maximum(
 
 def rounded_rectangle_full_size_minimum(corner_radius: float) -> float:
     return 2.0 * corner_radius
-
-
-def vector_distance(
-    first: tuple[float, float, float],
-    second: tuple[float, float, float],
-) -> float:
-    return sum(
-        (second[index] - first[index]) ** 2
-        for index in range(3)
-    ) ** 0.5
-
-
-def sweep_end_from_length(
-    origin: tuple[float, float, float],
-    normal: tuple[float, float, float],
-    current_end: tuple[float, float, float],
-    length: float,
-) -> tuple[float, float, float]:
-    if length <= 0.0:
-        raise ValueError("sweep path length must be positive")
-    normal_length = vector_distance((0.0, 0.0, 0.0), normal)
-    if normal_length <= 1e-12 or not math.isfinite(normal_length):
-        raise ValueError("sweep path normal must be finite and nonzero")
-    unit_normal = tuple(component / normal_length for component in normal)
-    current_delta = tuple(current_end[index] - origin[index] for index in range(3))
-    dot = sum(current_delta[index] * unit_normal[index] for index in range(3))
-    direction = -1.0 if dot < 0.0 else 1.0
-    return tuple(
-        float(origin[index] + direction * length * unit_normal[index])
-        for index in range(3)
-    )
 
 
 def standard_workplane_label(
@@ -429,7 +404,7 @@ class PropertiesPanel(QWidget):
             )
             return
         self._add_bounding_box_summary(node)
-        if isinstance(node, (Sphere, Box, Cylinder, Torus)):
+        if isinstance(node, (Sphere, Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Torus)):
             self._add_vector(
                 "Center",
                 node.center,
@@ -460,6 +435,68 @@ class PropertiesPanel(QWidget):
                     "half_height",
                     half_length_from_full_length(value),
                 ),
+                0.001,
+            )
+        elif isinstance(node, CappedCone):
+            self._add_full_length(
+                "Bottom diameter",
+                node.radius_a,
+                lambda value: self._set_value("radius_a", value),
+            )
+            self._add_full_length(
+                "Top diameter",
+                node.radius_b,
+                lambda value: self._set_value("radius_b", value),
+            )
+            self._add_float(
+                "Height",
+                full_length_from_half_length(node.half_height),
+                lambda value: self._set_value(
+                    "half_height",
+                    half_length_from_full_length(value),
+                ),
+                0.001,
+            )
+        elif isinstance(node, Cone):
+            self._add_full_length(
+                "Base diameter",
+                node.radius,
+                lambda value: self._set_value("radius", value),
+            )
+            self._add_float(
+                "Height",
+                full_length_from_half_length(node.half_height),
+                lambda value: self._set_value(
+                    "half_height",
+                    half_length_from_full_length(value),
+                ),
+                0.001,
+            )
+        elif isinstance(node, Pyramid):
+            self._add_full_length(
+                "Base size",
+                node.base_half_size,
+                lambda value: self._set_value("base_half_size", value),
+            )
+            self._add_float(
+                "Height",
+                full_length_from_half_length(node.half_height),
+                lambda value: self._set_value(
+                    "half_height",
+                    half_length_from_full_length(value),
+                ),
+                0.001,
+            )
+        elif isinstance(node, BoxFrame):
+            self._add_full_size(
+                "Size",
+                node.half_size,
+                lambda value: self._set_value("half_size", value),
+            )
+            self._add_float(
+                "Edge thickness",
+                node.thickness,
+                lambda value: self._set_value("thickness", value),
                 0.001,
             )
         elif isinstance(node, Torus):
@@ -525,6 +562,66 @@ class PropertiesPanel(QWidget):
                 lambda control=scale: self._set_value("factor", control.value())
             )
             self._layout.addRow("Factor", scale)
+        elif isinstance(node, Revolve):
+            if (
+                node.axis_origin is not None
+                or node.axis_direction is not None
+                or node.radial_direction is not None
+            ):
+                self._layout.addRow("Revolve axis", QLabel("Custom"))
+                if node.axis_origin is not None:
+                    self._layout.addRow(
+                        "Axis origin",
+                        QLabel(read_only_vector_text(node.axis_origin)),
+                    )
+                if node.axis_direction is not None:
+                    self._layout.addRow(
+                        "Axis direction",
+                        QLabel(read_only_vector_text(node.axis_direction)),
+                    )
+            else:
+                axis = QComboBox()
+                axis.addItems(("u", "v"))
+                axis.setCurrentText(node.axis)
+                axis.currentTextChanged.connect(
+                    lambda value: self._set_value("axis", value)
+                )
+                self._layout.addRow("Revolve axis", axis)
+            angle = CadScalarSpinBox(parse_suffixes=("deg",))
+            angle.setDecimals(3)
+            angle.setRange(0.1, 360.0)
+            angle.setSuffix(" deg")
+            angle.setKeyboardTracking(False)
+            angle.setValue(node.angle_degrees)
+            angle.editingFinished.connect(
+                lambda control=angle: self._set_value(
+                    "angle_degrees",
+                    control.value(),
+                )
+            )
+            self._layout.addRow("Angle", angle)
+        elif isinstance(node, (PolylineTube, BezierTube)):
+            minimum = 3 if isinstance(node, BezierTube) else 2
+            self._add_tube_point_fields(node, minimum)
+            caps = QComboBox()
+            caps.addItems(("round", "flat"))
+            caps.setCurrentText(node.caps)
+            caps.currentTextChanged.connect(
+                lambda value: self._set_value("caps", value)
+            )
+            self._layout.addRow("Caps", caps)
+            self._add_float(
+                "Radius",
+                node.radius,
+                lambda value: self._set_value("radius", value),
+                0.001,
+            )
+            self._add_float(
+                "Inner radius",
+                node.inner_radius,
+                lambda value: self._set_value("inner_radius", value),
+                0.0,
+            )
         elif isinstance(node, PlacedSDF1D):
             axis_label = standard_axis_label(node.axis_u) or "Custom"
             self._layout.addRow("Reference axis", QLabel(axis_label))
@@ -545,7 +642,7 @@ class PropertiesPanel(QWidget):
                 minimum = 3 if isinstance(node.profile, BezierCurveProfile) else 2
                 self._add_point_profile_fields(node, node.profile, minimum)
         elif isinstance(node, PlacedSDF2D):
-            if not isinstance(node.profile, PolygonProfile):
+            if not isinstance(node.profile, (BezierSurfaceProfile, PolygonProfile)):
                 self._layout.addRow(
                     "Workplane",
                     QLabel(standard_workplane_label(node.axis_u, node.axis_v)),
@@ -566,33 +663,17 @@ class PropertiesPanel(QWidget):
                     lambda value: self._set_placed_axes("axis_v", value),
                 )
             self._add_profile_fields(node)
-        elif isinstance(node, Sweep):
-            assert node.section is not None
-            self._add_float(
-                "Path length",
-                vector_distance(node.section.origin, node.end),
-                lambda value: self._set_value(
-                    "end",
-                    sweep_end_from_length(
-                        node.section.origin,
-                        node.section.normal,
-                        node.end,
-                        value,
-                    ),
-                ),
-                0.001,
-            )
-            self._add_vector(
-                "Path end",
-                node.end,
-                lambda value: self._set_value("end", value),
-            )
         elif isinstance(node, Extrude):
             self._add_float(
                 "Height",
                 node.height,
                 lambda value: self._set_value("height", value),
                 0.001,
+            )
+            self._add_float(
+                "Center offset",
+                node.center_offset,
+                lambda value: self._set_value("center_offset", value),
             )
 
     def _add_profile_1d_fields(self, node: PlacedSDF1D) -> None:
@@ -682,13 +763,13 @@ class PropertiesPanel(QWidget):
                 )
             )
             self._layout.addRow("Sides", sides)
-        if isinstance(profile, PolygonProfile):
+        if isinstance(profile, (PolygonProfile, BezierSurfaceProfile)):
             self._add_point_profile_fields(node, profile, 3)
 
     def _add_point_profile_fields(
         self,
         node: PlacedPolyline2D | PlacedSDF2D,
-        profile: BezierCurveProfile | PolylineProfile | PolygonProfile,
+        profile: BezierCurveProfile | BezierSurfaceProfile | PolylineProfile | PolygonProfile,
         minimum_points: int,
     ) -> None:
         editor = QLineEdit(
@@ -713,6 +794,40 @@ class PropertiesPanel(QWidget):
             )
         )
         self._layout.addRow("Points", editor)
+
+    def _add_tube_point_fields(
+        self,
+        node: PolylineTube | BezierTube,
+        minimum_points: int,
+    ) -> None:
+        editor = QLineEdit(format_point_list_text(node.points))
+        editor.setToolTip(
+            "Ordered world points as {x;y;z} entries. "
+            "Bezier tube points alternate anchor, control, anchor."
+        )
+        editor.editingFinished.connect(
+            lambda control=editor, minimum=minimum_points: self._set_tube_points(
+                control.text(),
+                minimum,
+            )
+        )
+        self._layout.addRow("Points", editor)
+
+    def _set_tube_points(self, text: str, minimum_points: int) -> None:
+        if not isinstance(self._node, (PolylineTube, BezierTube)):
+            return
+        undo_snapshot = self._undo_snapshot()
+        previous = self._node.points
+        try:
+            self._node.points = parse_point_list_text(text, minimum_points)
+            self._node.__post_init__()
+        except ValueError as error:
+            self._node.points = previous
+            signals.log_message.emit("warning", str(error))
+            self._build_form()
+            return
+        self._emit_undo_snapshot(undo_snapshot)
+        signals.node_edited.emit()
 
     def _set_point_profile(self, text: str, minimum_points: int) -> None:
         if not isinstance(self._node, (PlacedPolyline2D, PlacedSDF2D)):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from core.sdf import Box, Cylinder, PlacedSDF2D, Torus
+from core.sdf import Box, BoxFrame, CappedCone, Cone, Cylinder, PlacedSDF2D, Pyramid, Torus
 from core.sdf.base import SDFNode
 
 AXIS_ALIGNED_DIRECTIONS = (
@@ -64,7 +64,7 @@ def owner_outside_direction_vectors(owner: SDFNode) -> tuple[np.ndarray, ...] | 
         axis_u = np.asarray(owner.axis_u, dtype=np.float64)
         axis_v = np.asarray(owner.axis_v, dtype=np.float64)
         return (-axis_u, axis_u, -axis_v, axis_v)
-    if isinstance(owner, (Box, Cylinder, Torus)):
+    if isinstance(owner, (Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Torus)):
         axis_u = np.asarray(owner.axis_u, dtype=np.float64)
         axis_v = np.asarray(owner.axis_v, dtype=np.float64)
         axis_w = np.asarray(owner.axis_w, dtype=np.float64)

@@ -4,9 +4,10 @@ from core.sdf.base import SDFNode
 from core.sdf.csg import BinaryCSG, SmoothUnion
 from core.sdf.placed_1d import PlacedSDF1D
 from core.sdf.placed_2d import PlacedSDF2D
-from core.sdf.primitives_3d import Box, Cylinder, Sphere, Torus
-from core.sdf.solid_from_2d import Extrude, LoftImplicit, Revolve, Sweep
+from core.sdf.primitives_3d import Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Sphere, Torus
+from core.sdf.solid_from_2d import Extrude, Revolve
 from core.sdf.transforms import Scale, UnaryTransform
+from core.sdf.tubes import BezierTube, PolylineTube
 
 FEATURE_INTERVALS = 6.0
 
@@ -29,8 +30,16 @@ def minimum_feature_size(node: SDFNode) -> float:
         return 2.0 * node.radius
     if isinstance(node, Box):
         return 2.0 * min(node.half_size)
+    if isinstance(node, BoxFrame):
+        return node.thickness
     if isinstance(node, Cylinder):
         return 2.0 * min(node.radius, node.half_height)
+    if isinstance(node, CappedCone):
+        return 2.0 * min(node.radius_a, node.radius_b, node.half_height)
+    if isinstance(node, Cone):
+        return 2.0 * min(node.radius, node.half_height)
+    if isinstance(node, Pyramid):
+        return 2.0 * min(node.base_half_size, node.half_height)
     if isinstance(node, Torus):
         return 2.0 * node.minor_radius
     if isinstance(node, Scale):
@@ -51,15 +60,16 @@ def minimum_feature_size(node: SDFNode) -> float:
     if isinstance(node, Extrude):
         assert node.section is not None
         return min(node.height, _profile_feature_size(node.section))
-    if isinstance(node, Sweep):
-        assert node.section is not None
-        _midpoint, _direction, length = node._path()
-        return min(length, _profile_feature_size(node.section))
+    if isinstance(node, (PolylineTube, BezierTube)):
+        wall = (
+            node.radius - node.inner_radius
+            if node.inner_radius > 0.0
+            else 2.0 * node.radius
+        )
+        return min(2.0 * node.radius, wall)
     if isinstance(node, Revolve):
         assert node.section is not None
         return _profile_feature_size(node.section)
-    if isinstance(node, LoftImplicit):
-        return min(_profile_feature_size(section) for section in node.sections)
     box = node.bounding_box()
     spans = (
         box.x_max - box.x_min,

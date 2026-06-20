@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
-from .base import BoundingBox3D, FloatArray, SDFNode, glsl_float, glsl_vec3
+from .base import BoundingBox3D, FloatArray, SDFNode
 from .primitives_2d import BezierCurveProfile, PolylineProfile, Profile2D
 
 CurveProfile2D = BezierCurveProfile | PolylineProfile
@@ -38,20 +38,6 @@ def _project_to_workplane(
         np.asarray(v, dtype=np.float64),
         np.asarray(plane, dtype=np.float64),
     )
-
-
-def _project_to_workplane_glsl(
-    origin: tuple[float, float, float],
-    axis_u: tuple[float, float, float],
-    axis_v: tuple[float, float, float],
-    normal: tuple[float, float, float],
-    p_var: str,
-) -> tuple[str, str, str]:
-    local = f"({p_var} - {glsl_vec3(origin)})"
-    u = f"dot({local}, {glsl_vec3(axis_u)})"
-    v = f"dot({local}, {glsl_vec3(axis_v)})"
-    plane = f"dot({local}, {glsl_vec3(normal)})"
-    return u, v, plane
 
 
 def _workplane_normal(
@@ -173,23 +159,6 @@ class PlacedSDF2D(SDFNode):
             Z,
         )
 
-    def _project_glsl(self, p_var: str) -> tuple[str, str, str]:
-        return _project_to_workplane_glsl(
-            self.origin,
-            self.axis_u,
-            self.axis_v,
-            self.normal,
-            p_var,
-        )
-
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.profile is not None
-        u, v, plane = self._project_glsl(p_var)
-        profile = self.profile.to_glsl(f"vec2({u}, {v})")
-        # Visualization-only thin sheet. Tagging uses the exact zero-thickness plane.
-        thickness = glsl_float(0.002)
-        return f"max({profile}, abs({plane}) - {thickness})"
-
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -270,23 +239,6 @@ class PlacedPolyline2D(SDFNode):
             Y,
             Z,
         )
-
-    def _project_glsl(self, p_var: str) -> tuple[str, str, str]:
-        return _project_to_workplane_glsl(
-            self.origin,
-            self.axis_u,
-            self.axis_v,
-            self.normal,
-            p_var,
-        )
-
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.profile is not None
-        u, v, plane = self._project_glsl(p_var)
-        profile = self.profile.to_glsl(f"vec2({u}, {v})")
-        thickness = glsl_float(0.004)
-        sheet = glsl_float(0.002)
-        return f"max({profile} - {thickness}, abs({plane}) - {sheet})"
 
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray

@@ -9,7 +9,7 @@ The application provides:
 - Union, intersection, difference, and smooth-union CSG operations.
 - Nested CSG graph editing: any operation result can feed another operation.
 - Translate, rotate, and scale controls for moving and editing geometry.
-- Extrude, revolve, straight sweep, and implicit loft from placed 2D sections.
+- Extrude, revolve, and straight sweep from placed 2D sections.
 - Versioned JSON scene open/save.
 - A real-time ModernGL raymarched SDF preview.
 - Coloured component/X-ray overlays for enclosed and subtracted SDF operands.
@@ -50,6 +50,15 @@ toolbar shape buttons or **Draw on Grid** in the Scene dock, then drag on the
 `Z=0` XY reference grid to place and size a new 2D or 3D object. Select one
 object and press **Move**, then drag on the same grid to reposition it. Exact
 positions, workplanes, and dimensions remain editable in Properties.
+
+Drawing and preview commit behavior:
+
+- Simple drag-create tools may finalize on mouse release when one drag fully
+  defines the object.
+- Stateful tools such as extrude, revolve, move/rotate previews, boolean
+  previews, and multi-point curves keep a transient preview active.
+- Stateful previews are committed with **Enter**, so dragging updates the
+  preview but does not necessarily finalize the operation.
 
 For booleans, either select two independent nodes and use the toolbar, or
 right-click one SDF object and choose **Boolean → Union with / Intersect with /

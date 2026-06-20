@@ -4,30 +4,34 @@ import json
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from .boundary import BoundaryRegion
 from .mesher import FluidDomain
 from .scene import SceneDocument
 from .sdf import (
     BezierCurveProfile,
+    BezierSurfaceProfile,
+    BezierTube,
     BinaryProfile1D,
     BinaryProfile,
     Box,
+    BoxFrame,
+    CappedCone,
     CircleProfile,
+    Cone,
     Cylinder,
     Difference,
     EllipseProfile,
     Extrude,
     Intersection,
-    LoftImplicit,
     OffsetProfile,
     OffsetProfile1D,
     PlacedSDF1D,
     PlacedPolyline2D,
     PlacedSDF2D,
     PolygonProfile,
+    PolylineTube,
     PolylineProfile,
+    Pyramid,
     RectangleProfile,
     RegularPolygonProfile,
     Revolve,
@@ -38,7 +42,6 @@ from .sdf import (
     SmoothUnion,
     Sphere,
     SquareProfile,
-    Sweep,
     Torus,
     Translate,
     Union,
@@ -147,10 +150,9 @@ def load_scene(path: str | Path) -> SceneDocument:
                 if isinstance(tag, (PlacedSDF1D, PlacedPolyline2D)):
                     migrated.append(tag)
                 elif isinstance(tag, BoundaryRegion):
-                    converted = _legacy_2d_boundary_tag(root, tag)
-                    migrated.append(converted)
-                    document.objects.append(converted)
-                    document.boundary_regions.remove(tag)
+                    raise ValueError(
+                        "2D fluid tag objects must be PlacedSDF1D or PlacedPolyline2D"
+                    )
                 else:
                     raise ValueError(
                         "2D fluid tag objects must be PlacedSDF1D or PlacedPolyline2D"
@@ -198,10 +200,47 @@ def _node_to_record(node: SDFNode) -> dict[str, Any]:
             axis_v=list(node.axis_v),
             axis_w=list(node.axis_w),
         )
+    elif isinstance(node, BoxFrame):
+        data.update(
+            center=list(node.center),
+            half_size=list(node.half_size),
+            thickness=node.thickness,
+            axis_u=list(node.axis_u),
+            axis_v=list(node.axis_v),
+            axis_w=list(node.axis_w),
+        )
     elif isinstance(node, Cylinder):
         data.update(
             center=list(node.center),
             radius=node.radius,
+            half_height=node.half_height,
+            axis_u=list(node.axis_u),
+            axis_v=list(node.axis_v),
+            axis_w=list(node.axis_w),
+        )
+    elif isinstance(node, CappedCone):
+        data.update(
+            center=list(node.center),
+            radius_a=node.radius_a,
+            radius_b=node.radius_b,
+            half_height=node.half_height,
+            axis_u=list(node.axis_u),
+            axis_v=list(node.axis_v),
+            axis_w=list(node.axis_w),
+        )
+    elif isinstance(node, Cone):
+        data.update(
+            center=list(node.center),
+            radius=node.radius,
+            half_height=node.half_height,
+            axis_u=list(node.axis_u),
+            axis_v=list(node.axis_v),
+            axis_w=list(node.axis_w),
+        )
+    elif isinstance(node, Pyramid):
+        data.update(
+            center=list(node.center),
+            base_half_size=node.base_half_size,
             half_height=node.half_height,
             axis_u=list(node.axis_u),
             axis_v=list(node.axis_v),
@@ -255,17 +294,38 @@ def _node_to_record(node: SDFNode) -> dict[str, Any]:
             data.update(axis=node.axis, angle_degrees=node.angle_degrees)
         elif isinstance(node, Scale):
             data["factor"] = node.factor
-    elif isinstance(node, Extrude) and not isinstance(node, Sweep):
+    elif isinstance(node, Extrude):
         assert node.section is not None
-        data.update(section_id=node.section.object_id, height=node.height)
-    elif isinstance(node, Sweep):
-        assert node.section is not None
-        data.update(section_id=node.section.object_id, end=list(node.end))
+        data.update(
+            section_id=node.section.object_id,
+            height=node.height,
+            center_offset=node.center_offset,
+        )
     elif isinstance(node, Revolve):
         assert node.section is not None
         data["section_id"] = node.section.object_id
-    elif isinstance(node, LoftImplicit):
-        data["section_ids"] = [section.object_id for section in node.sections]
+        data["axis"] = node.axis
+        data["angle_degrees"] = node.angle_degrees
+        if node.axis_origin is not None:
+            data["axis_origin"] = list(node.axis_origin)
+        if node.axis_direction is not None:
+            data["axis_direction"] = list(node.axis_direction)
+        if node.radial_direction is not None:
+            data["radial_direction"] = list(node.radial_direction)
+    elif isinstance(node, PolylineTube):
+        data.update(
+            points=[list(point) for point in node.points],
+            radius=node.radius,
+            inner_radius=node.inner_radius,
+            caps=node.caps,
+        )
+    elif isinstance(node, BezierTube):
+        data.update(
+            points=[list(point) for point in node.points],
+            radius=node.radius,
+            inner_radius=node.inner_radius,
+            caps=node.caps,
+        )
     else:
         raise TypeError(f"cannot serialize {type(node).__name__}")
     return data
@@ -290,11 +350,52 @@ def _node_from_record(
             axis_v=tuple(data.get("axis_v", (0.0, 1.0, 0.0))),
             axis_w=tuple(data.get("axis_w", (0.0, 0.0, 1.0))),
         )
+    if node_type == "BoxFrame":
+        return BoxFrame(
+            **common,
+            center=tuple(data["center"]),
+            half_size=tuple(data["half_size"]),
+            thickness=float(data["thickness"]),
+            axis_u=tuple(data.get("axis_u", (1.0, 0.0, 0.0))),
+            axis_v=tuple(data.get("axis_v", (0.0, 1.0, 0.0))),
+            axis_w=tuple(data.get("axis_w", (0.0, 0.0, 1.0))),
+        )
     if node_type == "Cylinder":
         return Cylinder(
             **common,
             center=tuple(data["center"]),
             radius=float(data["radius"]),
+            half_height=float(data["half_height"]),
+            axis_u=tuple(data.get("axis_u", (1.0, 0.0, 0.0))),
+            axis_v=tuple(data.get("axis_v", (0.0, 1.0, 0.0))),
+            axis_w=tuple(data.get("axis_w", (0.0, 0.0, 1.0))),
+        )
+    if node_type == "CappedCone":
+        return CappedCone(
+            **common,
+            center=tuple(data["center"]),
+            radius_a=float(data["radius_a"]),
+            radius_b=float(data["radius_b"]),
+            half_height=float(data["half_height"]),
+            axis_u=tuple(data.get("axis_u", (1.0, 0.0, 0.0))),
+            axis_v=tuple(data.get("axis_v", (0.0, 1.0, 0.0))),
+            axis_w=tuple(data.get("axis_w", (0.0, 0.0, 1.0))),
+        )
+    if node_type == "Cone":
+        return Cone(
+            **common,
+            center=tuple(data["center"]),
+            radius=float(data["radius"]),
+            half_height=float(data["half_height"]),
+            axis_u=tuple(data.get("axis_u", (1.0, 0.0, 0.0))),
+            axis_v=tuple(data.get("axis_v", (0.0, 1.0, 0.0))),
+            axis_w=tuple(data.get("axis_w", (0.0, 0.0, 1.0))),
+        )
+    if node_type == "Pyramid":
+        return Pyramid(
+            **common,
+            center=tuple(data["center"]),
+            base_half_size=float(data["base_half_size"]),
             half_height=float(data["half_height"]),
             axis_u=tuple(data.get("axis_u", (1.0, 0.0, 0.0))),
             axis_v=tuple(data.get("axis_v", (0.0, 1.0, 0.0))),
@@ -370,18 +471,49 @@ def _node_from_record(
     if section is not None and not isinstance(section, PlacedSDF2D):
         raise ValueError(f"{node_type} section must be PlacedSDF2D")
     if node_type == "Extrude":
-        return Extrude(**common, section=section, height=float(data["height"]))
-    if node_type == "Sweep":
-        return Sweep(**common, section=section, end=tuple(data["end"]))
-    if node_type == "Revolve":
-        return Revolve(**common, section=section)
-    if node_type == "LoftImplicit":
-        sections = tuple(build(int(item)) for item in data["section_ids"])
-        if not all(isinstance(item, PlacedSDF2D) for item in sections):
-            raise ValueError("loft sections must be PlacedSDF2D")
-        return LoftImplicit(
+        return Extrude(
             **common,
-            sections=tuple(item for item in sections if isinstance(item, PlacedSDF2D)),
+            section=section,
+            height=float(data["height"]),
+            center_offset=float(data.get("center_offset", 0.0)),
+        )
+    if node_type == "Revolve":
+        return Revolve(
+            **common,
+            section=section,
+            axis=str(data.get("axis", "v")),
+            axis_origin=(
+                tuple(data["axis_origin"])
+                if data.get("axis_origin") is not None
+                else None
+            ),
+            axis_direction=(
+                tuple(data["axis_direction"])
+                if data.get("axis_direction") is not None
+                else None
+            ),
+            radial_direction=(
+                tuple(data["radial_direction"])
+                if data.get("radial_direction") is not None
+                else None
+            ),
+            angle_degrees=float(data.get("angle_degrees", 360.0)),
+        )
+    if node_type == "PolylineTube":
+        return PolylineTube(
+            **common,
+            points=tuple(tuple(point) for point in data["points"]),
+            radius=float(data["radius"]),
+            inner_radius=float(data.get("inner_radius", 0.0)),
+            caps=str(data.get("caps", "round")),
+        )
+    if node_type == "BezierTube":
+        return BezierTube(
+            **common,
+            points=tuple(tuple(point) for point in data["points"]),
+            radius=float(data["radius"]),
+            inner_radius=float(data.get("inner_radius", 0.0)),
+            caps=str(data.get("caps", "round")),
         )
     raise ValueError(f"unknown SDF node type: {node_type}")
 
@@ -407,6 +539,7 @@ def _profile_from_dict(data: dict[str, Any]) -> Profile2D:
         "EllipseProfile": EllipseProfile,
         "RegularPolygonProfile": RegularPolygonProfile,
         "BezierCurveProfile": BezierCurveProfile,
+        "BezierSurfaceProfile": BezierSurfaceProfile,
         "PolylineProfile": PolylineProfile,
         "PolygonProfile": PolygonProfile,
         "OffsetProfile": OffsetProfile,
@@ -455,42 +588,3 @@ def _profile_1d_from_dict(data: dict[str, Any]) -> Profile1D:
         if key in kwargs:
             kwargs[key] = _profile_1d_from_dict(kwargs[key])
     return constructor(**kwargs)
-
-
-def _legacy_2d_boundary_tag(
-    root: SDFNode,
-    region: BoundaryRegion,
-) -> PlacedSDF1D:
-    if (
-        not isinstance(root, PlacedSDF2D)
-        or root.profile is None
-        or region.outside_direction is None
-        or not 0 <= region.outside_direction < 4
-    ):
-        raise ValueError(
-            "legacy 2D BoundaryRegion cannot be migrated without direction"
-        )
-    u_min, u_max, v_min, v_max = root.profile.bounds()
-    axis_u = np.asarray(root.axis_u, dtype=np.float64)
-    axis_v = np.asarray(root.axis_v, dtype=np.float64)
-    origin = np.asarray(root.origin, dtype=np.float64)
-    direction = region.outside_direction
-    if direction in {0, 1}:
-        side_u = u_min if direction == 0 else u_max
-        center_v = 0.5 * (v_min + v_max)
-        line_origin = origin + side_u * axis_u + center_v * axis_v
-        line_axis = root.axis_v
-        half_length = 0.5 * (v_max - v_min)
-    else:
-        side_v = v_min if direction == 2 else v_max
-        center_u = 0.5 * (u_min + u_max)
-        line_origin = origin + center_u * axis_u + side_v * axis_v
-        line_axis = root.axis_u
-        half_length = 0.5 * (u_max - u_min)
-    return PlacedSDF1D(
-        name=region.name,
-        object_id=region.object_id,
-        profile=SegmentProfile(half_length=half_length),
-        origin=tuple(float(value) for value in line_origin),
-        axis_u=line_axis,
-    )

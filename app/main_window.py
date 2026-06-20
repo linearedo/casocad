@@ -9,7 +9,7 @@ import sys
 import tempfile
 
 import numpy as np
-from PySide6.QtCore import QProcess, Qt, Slot
+from PySide6.QtCore import QProcess, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QColorDialog,
@@ -26,8 +26,8 @@ from PySide6.QtWidgets import (
 from app.artifacts import (
     ArtifactManager,
     RenderArtifact,
+    RenderSceneSnapshot,
     build_render_artifact,
-    empty_render_scene_source,
 )
 from app.panels.export_panel import ExportPanel
 from app.panels.log_panel import LogPanel
@@ -35,7 +35,7 @@ from app.panels.mesher_panel import MesherPanel
 from app.panels.properties import CadDimensionSpinBox, PropertiesPanel
 from app.panels.scene_tree import SceneTreePanel
 from app.signals import signals
-from app.viewport.gl_widget import GLWidget
+from app.viewport.viewport_widget import ViewportWidget
 from core.boundary import BoundaryRegion
 from core.boundary_direction import (
     owner_outside_direction_from_normal,
@@ -57,6 +57,19 @@ REDO_SHORTCUTS = ("Ctrl+Y", "Ctrl+Shift+Z")
 SELECT_ALL_SHORTCUT = "Ctrl+A"
 DUPLICATE_SHORTCUT = "Ctrl+D"
 RENAME_SHORTCUT = "F2"
+
+
+def _format_render_artifact_ready_message(artifact: RenderArtifact) -> str:
+    timings = artifact.timings
+    ir_support = "yes" if timings.render_ir_supported else "no"
+    return (
+        "Render artifact built: "
+        f"total={timings.total_ms:.1f} ms, "
+        f"render_ir={timings.render_ir_ms:.1f} ms, "
+        f"tree_nodes={timings.tree_node_count}, "
+        f"ir_nodes={timings.render_ir_node_count}, "
+        f"ir_supported={ir_support}"
+    )
 FRAME_SHORTCUTS = ("Home",)
 FRAME_VIEW_KEY = "F"
 CLEAR_SELECTION_SHORTCUT = "Esc"
@@ -116,7 +129,7 @@ class MainWindow(QMainWindow):
         self._undo_stack: list[SceneDocument] = []
         self._redo_stack: list[SceneDocument] = []
         self._clipboard_nodes: list[SDFNode] = []
-        self.viewport = GLWidget()
+        self.viewport = ViewportWidget()
         self._background_color = QColor(DEFAULT_BACKGROUND_HEX)
         self.setCentralWidget(self.viewport)
         self.artifacts = ArtifactManager(self)
@@ -134,6 +147,9 @@ class MainWindow(QMainWindow):
         self._mesh_preview_chunk_paths: list[Path] = []
         self._mesh_stdout_buffer = ""
         self._mesh_error_message: str | None = None
+        self._render_request_timer = QTimer(self)
+        self._render_request_timer.setSingleShot(True)
+        self._render_request_timer.timeout.connect(self._flush_render_request)
         self._build_docks()
         self._build_menu()
         self._build_toolbar()
@@ -322,6 +338,12 @@ class MainWindow(QMainWindow):
         signals.viewport_transform_requested.connect(
             self._on_viewport_transform_requested
         )
+        signals.viewport_extrude_requested.connect(
+            self._on_viewport_extrude_requested
+        )
+        signals.viewport_revolve_requested.connect(
+            self._on_viewport_revolve_requested
+        )
         signals.viewport_frame_requested.connect(self._frame_scene)
         signals.viewport_scene_object_selected.connect(
             self._on_viewport_scene_object_selected
@@ -334,6 +356,7 @@ class MainWindow(QMainWindow):
         )
         signals.delete_nodes_requested.connect(self._on_delete_nodes)
         signals.csg_requested.connect(self._on_csg_requested)
+        signals.csg_preview_requested.connect(self._on_csg_preview_requested)
         signals.transform_requested.connect(self._on_transform_requested)
         signals.solid_from_2d_requested.connect(self._on_solid_from_2d)
         signals.set_fluid_root_requested.connect(self._on_set_fluid_root)
@@ -358,32 +381,27 @@ class MainWindow(QMainWindow):
         frame: bool = False,
         clear_selection: bool = True,
         render: bool = True,
+        notify_document: bool = True,
     ) -> None:
-        signals.document_changed.emit(self.document)
+        if notify_document:
+            signals.document_changed.emit(self.document)
         if clear_selection:
             signals.node_selected.emit(None)
         if not self.document.objects:
-            self.viewport.set_scene_artifact(None, empty_render_scene_source())
+            render_timer = getattr(self, "_render_request_timer", None)
+            if render_timer is not None:
+                render_timer.stop()
+            self.viewport.set_scene_artifact(None, None)
             self._sdf_action.setChecked(True)
             self.viewport.set_mode("sdf")
             self.viewport.configure_default_grid()
             self.viewport.frame_default_grid()
             self._sync_grid_spacing_control()
             return
-        snapshot = None
         if render:
-            try:
-                snapshot = self.document.snapshot()
-            except ValueError as error:
-                signals.log_message.emit("warning", str(error))
-                return
-            self.artifacts.request_render(snapshot)
+            self._schedule_render_artifact()
         if self.document.fluid_domain is not None:
-            domain = (
-                snapshot.fluid_domain
-                if snapshot is not None
-                else self.document.fluid_domain
-            )
+            domain = self.document.fluid_domain
             assert domain is not None
             box = domain.bounding_box()
             self.viewport.configure_grid(box, self.mesher_panel.config().dx)
@@ -391,15 +409,38 @@ class MainWindow(QMainWindow):
             if frame:
                 self.viewport.frame_box(box)
 
+    def _schedule_render_artifact(self) -> None:
+        if not self._render_request_timer.isActive():
+            self._render_request_timer.start(0)
+
+    @Slot()
+    def _flush_render_request(self) -> None:
+        if not self.document.objects:
+            return
+        try:
+            version, tree = self.document.visual_snapshot()
+        except ValueError as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        self.artifacts.request_render(
+            RenderSceneSnapshot(version=version, tree=tree)
+        )
+
     def _seed_initial_viewport_scene(self) -> None:
         if not self.document.objects:
             return
         try:
-            artifact = build_render_artifact(self.document.snapshot())
+            version, tree = self.document.visual_snapshot()
+            artifact = build_render_artifact(
+                RenderSceneSnapshot(version=version, tree=tree)
+            )
         except ValueError as error:
             signals.log_message.emit("warning", str(error))
             return
-        self.viewport.set_scene_artifact(artifact.tree, artifact.scene_source)
+        self.viewport.set_scene_artifact(
+            artifact.tree,
+            artifact.render_ir,
+        )
 
     def _sync_grid_spacing_control(self) -> None:
         if not hasattr(self, "_grid_spacing_spin"):
@@ -498,7 +539,15 @@ class MainWindow(QMainWindow):
     def _on_render_artifact_ready(self, artifact: RenderArtifact) -> None:
         if artifact.version != self.document.version:
             return
-        self.viewport.set_scene_artifact(artifact.tree, artifact.scene_source)
+        logger.info(_format_render_artifact_ready_message(artifact))
+        signals.log_message.emit(
+            "info",
+            _format_render_artifact_ready_message(artifact),
+        )
+        self.viewport.set_scene_artifact(
+            artifact.tree,
+            artifact.render_ir,
+        )
 
     @Slot(int, str)
     def _on_render_artifact_failed(self, version: int, message: str) -> None:
@@ -652,9 +701,12 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _delete_selection(self) -> None:
+        handles = self.scene_tree.selected_handles()
+        if handles:
+            self._on_delete_nodes(handles)
+            return
         if MainWindow._cancel_viewport_tool(self):
             return
-        self._on_delete_nodes(self.scene_tree.selected_handles())
 
     @Slot()
     def _select_all_scene_items(self) -> None:
@@ -692,14 +744,22 @@ class MainWindow(QMainWindow):
         undo_snapshot = self._history_snapshot()
         try:
             moved_handle = self.document.move_object(handle, delta)
-            self.document.refresh_derived_geometry()
         except (KeyError, ValueError) as error:
             signals.log_message.emit("warning", str(error))
             return
+        moved_node = self.document.node(moved_handle)
+        if (
+            moved_handle == handle
+            and isinstance(moved_node, SDFNode)
+            and self.viewport.has_scene_object_id(moved_node.object_id)
+            and self.viewport.can_defer_committed_move(moved_node.object_id)
+        ):
+            self.viewport.apply_committed_move_preview(moved_node.object_id, delta)
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document(
             clear_selection=False,
             render=True,
+            notify_document=False,
         )
         self.scene_tree.select_handle(moved_handle)
         self.statusBar().showMessage(
@@ -724,7 +784,6 @@ class MainWindow(QMainWindow):
                 angle_degrees,
                 pivot,
             )
-            self.document.refresh_derived_geometry()
         except (KeyError, ValueError, NotImplementedError) as error:
             signals.log_message.emit("warning", str(error))
             return
@@ -732,6 +791,7 @@ class MainWindow(QMainWindow):
         self._publish_document(
             clear_selection=False,
             render=True,
+            notify_document=False,
         )
         self.scene_tree.select_handle(rotated_handle)
         self.statusBar().showMessage(
@@ -762,7 +822,6 @@ class MainWindow(QMainWindow):
                         angle_degrees,
                         pivot,
                     )
-            self.document.refresh_derived_geometry()
         except (KeyError, ValueError, NotImplementedError) as error:
             signals.log_message.emit("warning", str(error))
             return
@@ -770,9 +829,64 @@ class MainWindow(QMainWindow):
         self._publish_document(
             clear_selection=False,
             render=True,
+            notify_document=False,
         )
         self.scene_tree.select_handle(transformed_handle)
         self.statusBar().showMessage("Object transform applied", 5000)
+
+    @Slot(int, float)
+    def _on_viewport_extrude_requested(
+        self,
+        handle: int,
+        signed_height: float,
+    ) -> None:
+        undo_snapshot = self._history_snapshot()
+        try:
+            solid_handle = self.document.solid_from_2d(
+                [handle],
+                "extrude",
+                signed_height=signed_height,
+            )
+        except (ValueError, KeyError) as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        self._record_undo_snapshot(undo_snapshot)
+        self._publish_document(clear_selection=False)
+        self.scene_tree.select_handle(solid_handle)
+        self.statusBar().showMessage(
+            f"Extruded {abs(signed_height):.5g} m",
+            5000,
+        )
+
+    @Slot(int, object, object, object, float)
+    def _on_viewport_revolve_requested(
+        self,
+        handle: int,
+        axis_origin: tuple[float, float, float],
+        axis_direction: tuple[float, float, float],
+        radial_direction: tuple[float, float, float],
+        angle_degrees: float,
+    ) -> None:
+        undo_snapshot = self._history_snapshot()
+        try:
+            solid_handle = self.document.solid_from_2d(
+                [handle],
+                "revolve",
+                revolve_axis_origin=axis_origin,
+                revolve_axis_direction=axis_direction,
+                revolve_radial_direction=radial_direction,
+                revolve_angle_degrees=angle_degrees,
+            )
+        except (ValueError, KeyError) as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        self._record_undo_snapshot(undo_snapshot)
+        self._publish_document(clear_selection=False)
+        self.scene_tree.select_handle(solid_handle)
+        self.statusBar().showMessage(
+            f"Revolved {angle_degrees:.5g} degrees",
+            5000,
+        )
 
     @Slot(int)
     def _on_viewport_scene_object_selected(self, object_id: int) -> None:
@@ -961,46 +1075,41 @@ class MainWindow(QMainWindow):
     def _on_delete_nodes(self, handles: list[int]) -> None:
         if not handles:
             return
-        selected_nodes = []
-        for handle in handles:
-            try:
-                selected_nodes.append(self.document.node(handle))
-            except KeyError:
-                continue
-        selected_ids = {id(node) for node in selected_nodes}
-        roots = [
-            node
-            for node in selected_nodes
-            if not self._has_selected_ancestor(node, selected_ids)
-        ]
-        if not roots:
-            return
         undo_snapshot = self._history_snapshot()
-        deleted = False
-        for node in roots:
-            try:
-                self.document.delete(self.document.handle_for(node))
-                deleted = True
-            except KeyError:
-                continue
-        if not deleted:
+        deleted = self.document.delete_many(handles)
+        if deleted <= 0:
             return
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
 
-    def _has_selected_ancestor(
-        self, target: object, selected_ids: set[int]
-    ) -> bool:
-        parent_by_child: dict[int, object] = {}
-        for handle, node, parent_handle in self.document.walk():
-            if parent_handle is not None:
-                parent_by_child[id(node)] = self.document.node(parent_handle)
-        parent = parent_by_child.get(id(target))
-        while parent is not None:
-            if id(parent) in selected_ids:
-                return True
-            parent = parent_by_child.get(id(parent))
-        return False
+    @Slot(str, object)
+    def _on_csg_preview_requested(self, operation: str, handles: list[int]) -> None:
+        if not operation:
+            self.viewport.clear_boolean_preview()
+            return
+        if len(handles) != 2:
+            self.viewport.clear_boolean_preview()
+            return
+        try:
+            first = self.document.node(handles[0])
+            second = self.document.node(handles[1])
+        except KeyError:
+            self.viewport.clear_boolean_preview()
+            return
+        if (
+            not isinstance(first, SDFNode)
+            or not isinstance(second, SDFNode)
+            or first.dimension != 3
+            or second.dimension != 3
+            or not self.document.can_combine(handles[0], handles[1])
+        ):
+            self.viewport.clear_boolean_preview()
+            return
+        self.viewport.set_boolean_preview(
+            operation,
+            first.object_id,
+            second.object_id,
+        )
 
     @Slot(str, object)
     def _on_csg_requested(self, operation: str, handles: list[int]) -> None:
@@ -1009,18 +1118,38 @@ class MainWindow(QMainWindow):
                 "warning", "Select exactly two independent SDF nodes."
             )
             return
+        preview_ids: tuple[int, int] | None = None
+        try:
+            first = self.document.node(handles[0])
+            second = self.document.node(handles[1])
+            if (
+                isinstance(first, SDFNode)
+                and isinstance(second, SDFNode)
+                and first.dimension == 3
+                and second.dimension == 3
+            ):
+                preview_ids = (first.object_id, second.object_id)
+        except KeyError:
+            preview_ids = None
         undo_snapshot = self._history_snapshot()
         try:
             handle = self.document.combine(handles[0], handles[1], operation)
         except ValueError as error:
             signals.log_message.emit("warning", str(error))
             return
+        if preview_ids is not None:
+            self.viewport.apply_committed_boolean_preview(
+                operation,
+                preview_ids[0],
+                preview_ids[1],
+            )
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
         self.scene_tree.select_handle(handle)
 
     @Slot(object)
     def _on_selection_changed(self, handles: list[int]) -> None:
+        self.viewport.clear_boolean_preview()
         object_ids: set[int] = set()
         selected_names: list[str] = []
         geometry_filter = None
@@ -1097,6 +1226,29 @@ class MainWindow(QMainWindow):
 
     @Slot(str, object)
     def _on_solid_from_2d(self, method: str, handles: list[int]) -> None:
+        if method in {"extrude", "revolve"}:
+            if len(handles) != 1:
+                signals.log_message.emit(
+                    "warning",
+                    f"Select exactly one placed 2D SDF before using {method.title()}.",
+                )
+                return
+            try:
+                node = self.document.node(handles[0])
+            except KeyError as error:
+                signals.log_message.emit("warning", str(error))
+                return
+            if not isinstance(node, PlacedSDF2D):
+                signals.log_message.emit(
+                    "warning",
+                    f"{method.title()} requires one placed 2D SDF.",
+                )
+                return
+            if method == "extrude":
+                self.viewport.begin_extrude_tool(handles[0], node)
+            else:
+                self.viewport.begin_revolve_tool(handles[0], node)
+            return
         undo_snapshot = self._history_snapshot()
         try:
             handle = self.document.solid_from_2d(handles, method)
@@ -1138,11 +1290,6 @@ class MainWindow(QMainWindow):
         # Property editors emit from inside Qt widget callbacks. Preserve the
         # editor and selection until that callback returns; deleting the
         # emitting widget here can crash Qt's accessibility event handling.
-        try:
-            self.document.refresh_derived_geometry()
-        except ValueError as error:
-            signals.log_message.emit("warning", str(error))
-            return
         self.document.mark_changed()
         self._publish_document(clear_selection=False)
 
@@ -1505,5 +1652,6 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        self._render_request_timer.stop()
         self.artifacts.shutdown()
         super().closeEvent(event)

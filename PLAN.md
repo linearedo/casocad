@@ -151,7 +151,7 @@ SceneDocument
     |                       |                         |
     v                       v                         v
 CAD viewport            integrated mesher         project save/load
-to_glsl()               to_numpy()                scene JSON
+RenderIR                to_numpy()                scene JSON
                             |
                   +---------+---------+
                   |                   |
@@ -203,7 +203,7 @@ RenderArtifact         MeshPreviewArtifact          ExportArtifact
 
 Rules:
 
-- the GUI thread never waits for SDF graph traversal, GLSL generation,
+- the GUI thread never waits for SDF graph traversal, RenderIR generation,
   meshing, Arrow writing, or large preview preparation
 - workers operate only on snapshots, never on the live `SceneDocument`
 - every artifact records the document version that produced it
@@ -211,8 +211,9 @@ Rules:
   document
 - the viewport keeps the last valid artifact visible while a newer artifact is
   being built
-- viewport draw and move interactions use temporary preview state until the
-  user commits the edit
+- viewport draw and move interactions use transient preview state until the
+  user commits the edit; CAD-geometry previews are represented as transient
+  `RenderIR`, while non-CAD visual helpers remain overlay primitives
 - meshing must be cancellable or stale-discardable when the document changes
 - large lattice previews should be streamed or uploaded with a per-frame
   budget rather than pushed to the GPU in one blocking step
@@ -224,12 +225,156 @@ Implementation should proceed incrementally:
 3. mesh/export jobs tagged with the snapshot version and discarded when stale
 4. process-isolated meshing for CPU-heavy lattice generation
 5. streamed mesh preview chunks and frame-budgeted viewport upload
-6. long-term replacement of per-scene GLSL recompilation with a stable shader
-   plus GPU scene-node buffers
+6. cached RenderIR viewport uploads where normal edits update parameter data
+   and new graph shapes may compile once, then reuse the cached program
 
 The final target is not merely threaded code. The target is a responsive
 artifact architecture where editing, visualization, meshing, and export are
 separate stages connected by versioned immutable data.
+
+### 4.2 Viewport Render Engine And Backend Boundary
+
+The viewport renderer must be fast without becoming a second geometry kernel.
+The authoritative geometry remains the `SceneDocument` SDF graph. Rendering
+uses backend-independent `RenderIR`, and `RenderIR` is only a serialized view of
+the same exact SDF scene.
+
+Accepted current baseline:
+
+- the OpenGL backend consumes `RenderIR`, not geometry-owned shader snippets
+- shader programs are cached by RenderIR graph shape
+- moving, previewing, rotating, scaling, and compatible parameter edits update
+  numeric parameter buffers without recompiling
+- a newly seen graph shape may compile once, then subsequent uses reuse the
+  cached program
+- measured coregeotest timings show no second-scale viewport updates; current
+  first-time graph-shape compiles in the tens to low hundreds of milliseconds
+  are acceptable
+
+The intended split is:
+
+```text
+SceneDocument / SDF graph
+    |
+    v
+RenderIR
+    |
+    +--> OpenGL renderer
+    +--> future Vulkan renderer
+    +--> future WebGPU renderer
+```
+
+Viewport rendering has three distinct input layers:
+
+```text
+Static/committed RenderIR
+Preview/transient RenderIR
+Overlay/UI primitives
+```
+
+Static/committed `RenderIR` is the real scene: committed objects, saved
+document state, and solver-visible geometry.
+
+Preview/transient `RenderIR` is temporary CAD geometry: a rectangle while
+dragging, a moved-object ghost, extrusion preview, revolve preview, boolean
+preview, and similar operations. It is not saved and is not part of the scene
+tree.
+
+Drawing and preview commit behavior:
+
+- Simple drag-create tools may finalize on mouse release when one drag fully
+  defines the object.
+- Stateful tools such as extrude, revolve, move/rotate previews, boolean
+  previews, and multi-point curves keep a transient preview active.
+- Stateful previews are committed with Enter, so dragging updates the preview
+  but does not necessarily finalize the operation.
+
+Overlay/UI primitives are non-CAD helpers: control points, guide lines, gizmo
+rings, selection outlines, cursor markers, grid, labels, and other visual UI
+state.
+
+Anything that represents CAD geometry should be represented as `RenderIR`, even
+when temporary. Only visual UI helpers may remain backend-specific overlays.
+
+The intended directory shape is:
+
+```text
+core/
+    scene.py
+    sdf/
+    render_ir.py             backend-independent render data contract
+
+app/viewport/
+    renderer_base.py         abstract viewport renderer boundary
+
+    renderers/
+        opengl/
+            renderer.py
+            shaders/
+                scene.glsl
+
+        vulkan/              future backend, added only when implemented
+            renderer.py
+            shaders/
+                scene.comp.spv
+```
+
+Rules:
+
+- exact SDF semantics are invariant; the renderer must not silently replace an
+  SDF with an approximation
+- existing SDF primitives, transforms, booleans, operations, scene behavior,
+  serialization, and GUI workflows must remain supported and semantically
+  unchanged unless a separate geometry-kernel change is explicitly requested
+- renderer optimization must not add new SDF primitives, transforms, or
+  operations unless the user explicitly requests that geometry feature
+- if a node cannot be represented exactly by a backend, that backend must use
+  a correct fallback path or keep the last valid artifact instead of displaying
+  different geometry
+- CPU `to_numpy()`, GPU rendering, meshing, and export must continue to
+  describe the same SDF field
+- `RenderIR` contains numeric opcodes, stable object IDs, child indices,
+  component indices, and flat parameter arrays
+- `RenderIR` must not contain GLSL snippets, OpenGL buffer structs, Qt types,
+  Vulkan handles, or API-specific projection matrices
+- backend renderers own their shader code, GPU buffers, clip-space
+  conventions, synchronization, and surface binding
+- the abstract renderer boundary receives scene data, camera state, viewport
+  size, selection state, and dirty ranges; it must not assume an active global
+  OpenGL context
+
+The performance contract is dirty updates, not speculative renderer rewrites.
+A move, preview, parameter edit, selection change, or deletion should reuse the
+existing RenderIR program whenever the graph shape is unchanged or already
+cached. Full scene artifact rebuild is fallback behavior for unsupported edits,
+not the normal interactive path.
+
+Backend shader code belongs in the backend, and scene topology plus parameters
+flow through `RenderIR`.
+
+A fully data-driven evaluator where every topology change is only a buffer
+update is no longer an active near-term requirement. Treat it as future backend
+research only if measured timings regress, first-time graph-shape compiles
+become user-visible lag again, or a new backend needs that design.
+
+Current maintenance priorities:
+
+1. keep `RenderIR` as a pure data contract derived from the SDF graph
+2. keep the OpenGL renderer consuming `RenderIR` for supported exact SDF nodes
+3. reject or keep the last valid artifact for exact nodes not yet represented
+   by `RenderIR`
+4. preserve cached-program reuse for move, preview, create, delete, parameter
+   edit, and selection workflows
+5. keep coregeotests timing coverage for creation, move, delete, booleans,
+   transforms, extrude, revolve, tubes, boundary tags, and serialization
+6. add backend parity tests against the canonical CPU SDF behavior where
+   practical
+7. add Vulkan or WebGPU only after the renderer boundary is demonstrably not
+   OpenGL-shaped
+
+Do not build a universal shader transpiler. Backend shader code may be
+duplicated when needed. The shared contract is the SDF graph and `RenderIR`,
+not one shader language.
 
 ## 5. Code Organization
 
@@ -302,9 +447,8 @@ Every visible SDF object has:
 - a `kind`
 - graph children where applicable
 - `to_numpy()` for CPU evaluation
-- `to_glsl()` for GPU visualization
 
-The CPU and GPU implementations must describe the same field.
+The CPU evaluation and viewport rendering must describe the same field.
 
 Bounding boxes are traversal aids only. They must never replace SDF evaluation
 for geometric classification.
@@ -327,7 +471,8 @@ definitions.
 
 CAD rendering:
 
-- calls `SDFNode.to_glsl()`
+- normally uploads exact `RenderIR` parameter data to a cached viewport program
+  for the current graph shape
 - runs in ModernGL on the main thread
 - uses `float32`
 - is visualization-only
@@ -643,7 +788,7 @@ Exit criterion:
 Geometry changes require:
 
 - NumPy formula tests
-- GLSL/NumPy parity checks where practical
+- RenderIR/backend parity checks against NumPy where practical
 - graph and serialization regression tests
 
 Mesher changes require:

@@ -12,24 +12,30 @@ from .mesher import FluidDomain
 from .mesher.classifier import boundary_owner_ids
 from .sdf import (
     BezierCurveProfile,
+    BezierSurfaceProfile,
+    BezierTube,
     BinaryProfile1D,
     BinaryProfile,
     BoundingBox3D,
     Box,
+    BoxFrame,
+    CappedCone,
+    Cone,
     CircleProfile,
     Cylinder,
     Difference,
     EllipseProfile,
     Extrude,
     Intersection,
-    LoftImplicit,
     OffsetProfile,
     OffsetProfile1D,
     PlacedSDF1D,
     PlacedPolyline2D,
     PlacedSDF2D,
     PolygonProfile,
+    PolylineTube,
     PolylineProfile,
+    Pyramid,
     RectangleProfile,
     RegularPolygonProfile,
     Rotate,
@@ -46,10 +52,21 @@ from .sdf import (
     Union,
 )
 from .sdf.csg import BinaryCSG
-from .sdf.solid_from_2d import Revolve, Sweep
+from .sdf.solid_from_2d import Revolve
 from .sdf.transforms import UnaryTransform
 
-Primitive3D = Sphere | Box | Cylinder | Torus
+Primitive3D = (
+    Sphere
+    | Box
+    | BoxFrame
+    | CappedCone
+    | Cone
+    | Cylinder
+    | Pyramid
+    | Torus
+    | PolylineTube
+    | BezierTube
+)
 SceneItem = SDFNode | BoundaryRegion
 DEFAULT_BEZIER_POLYCURVE_POINTS = (
     (-0.65, -0.35),
@@ -154,7 +171,26 @@ class SceneDocument:
             "sphere": lambda: Sphere(**common, radius=0.5),
             "box": lambda: Box(**common, half_size=(0.5, 0.5, 0.5)),
             "cylinder": lambda: Cylinder(**common, radius=0.4, half_height=0.6),
+            "capped_cone": lambda: CappedCone(
+                **common,
+                radius_a=0.45,
+                radius_b=0.25,
+                half_height=0.6,
+            ),
+            "cone": lambda: Cone(**common, radius=0.45, half_height=0.6),
+            "pyramid": lambda: Pyramid(
+                **common,
+                base_half_size=0.45,
+                half_height=0.6,
+            ),
+            "box_frame": lambda: BoxFrame(
+                **common,
+                half_size=(0.5, 0.5, 0.5),
+                thickness=0.08,
+            ),
             "torus": lambda: Torus(**common, major_radius=0.5, minor_radius=0.15),
+            "polyline_tube": lambda: PolylineTube(**common),
+            "bezier_tube": lambda: BezierTube(**common),
         }
         if kind not in factories:
             raise ValueError(f"unknown 3D primitive type: {kind}")
@@ -172,6 +208,7 @@ class SceneDocument:
             "ellipse": EllipseProfile,
             "regular_polygon": RegularPolygonProfile,
             "polygon": PolygonProfile,
+            "bezier_surface": BezierSurfaceProfile,
         }
         if kind not in factories:
             raise ValueError(f"unknown 2D profile type: {kind}")
@@ -246,6 +283,28 @@ class SceneDocument:
             axis_v=axis_v,
         )
 
+    def add_placed_2d_profile(
+        self,
+        profile: PolygonProfile | BezierSurfaceProfile,
+        name: str | None = None,
+        origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0),
+        axis_v: tuple[float, float, float] = (0.0, 1.0, 0.0),
+    ) -> int:
+        object_id = self._allocate_object_id()
+        node = PlacedSDF2D(
+            name=name or f"{profile.kind}_{object_id}",
+            object_id=object_id,
+            profile=profile,
+            origin=origin,
+            axis_u=axis_u,
+            axis_v=axis_v,
+        )
+        self.objects.append(node)
+        self._reindex()
+        self.mark_changed()
+        return self.handle_for(node)
+
     def add_polyline(
         self,
         points: tuple[tuple[float, float], ...] | list[tuple[float, float]],
@@ -274,6 +333,46 @@ class SceneDocument:
         self.mark_changed()
         return self.handle_for(node)
 
+    def add_polyline_tube(
+        self,
+        points: tuple[tuple[float, float, float], ...] | list[tuple[float, float, float]],
+        name: str | None = None,
+        radius: float = 0.12,
+        inner_radius: float = 0.0,
+    ) -> int:
+        object_id = self._allocate_object_id()
+        node = PolylineTube(
+            name=name or f"polyline_tube_{object_id}",
+            object_id=object_id,
+            points=tuple(points),
+            radius=radius,
+            inner_radius=inner_radius,
+        )
+        self.objects.append(node)
+        self._reindex()
+        self.mark_changed()
+        return self.handle_for(node)
+
+    def add_bezier_tube(
+        self,
+        points: tuple[tuple[float, float, float], ...] | list[tuple[float, float, float]],
+        name: str | None = None,
+        radius: float = 0.12,
+        inner_radius: float = 0.0,
+    ) -> int:
+        object_id = self._allocate_object_id()
+        node = BezierTube(
+            name=name or f"bezier_tube_{object_id}",
+            object_id=object_id,
+            points=tuple(points),
+            radius=radius,
+            inner_radius=inner_radius,
+        )
+        self.objects.append(node)
+        self._reindex()
+        self.mark_changed()
+        return self.handle_for(node)
+
     def add_polygon(
         self,
         points: tuple[tuple[float, float], ...] | list[tuple[float, float]],
@@ -296,13 +395,22 @@ class SceneDocument:
     ) -> int:
         if reference_plane not in REFERENCE_PLANE_AXES_3D:
             raise ValueError(f"unknown reference plane: {reference_plane}")
-        if kind not in {"polyline", "bezier_curve", "bezier_polycurve", "polygon"}:
+        if kind not in {
+            "polyline",
+            "bezier_curve",
+            "bezier_polycurve",
+            "polyline_tube",
+            "bezier_tube",
+            "bezier_surface",
+            "polygon",
+        }:
             raise ValueError(f"unsupported point shape: {kind}")
-        minimum_points = 2 if kind == "polyline" else 3
+        minimum_points = 2 if kind in {"polyline", "polyline_tube"} else 3
         if len(points) < minimum_points:
+            label = "polyline tube" if kind == "polyline_tube" else "polyline"
             raise ValueError(
-                "polyline requires at least two points"
-                if kind == "polyline"
+                f"{label} requires at least two points"
+                if kind in {"polyline", "polyline_tube"}
                 else f"{kind} requires at least three points"
             )
         if kind == "bezier_curve" and len(points) != 3:
@@ -310,6 +418,16 @@ class SceneDocument:
         if kind == "bezier_polycurve" and len(points) % 2 == 0:
             raise ValueError(
                 "bezier polycurve requires an odd point count: "
+                "anchor, control, anchor"
+            )
+        if kind == "bezier_tube" and len(points) % 2 == 0:
+            raise ValueError(
+                "bezier tube requires an odd point count: "
+                "anchor, control, anchor"
+            )
+        if kind == "bezier_surface" and len(points) % 2 == 0:
+            raise ValueError(
+                "bezier surface requires an odd point count: "
                 "anchor, control, anchor"
             )
         axis_u, axis_v = REFERENCE_PLANE_AXES_3D[reference_plane]
@@ -331,9 +449,21 @@ class SceneDocument:
                 axis_u=axis_u,
                 axis_v=axis_v,
             )
+        if kind == "polyline_tube":
+            return self.add_polyline_tube(points)
+        if kind == "bezier_tube":
+            return self.add_bezier_tube(points)
         if kind in {"bezier_curve", "bezier_polycurve"}:
             return self.add_bezier_curve(
                 local_points,
+                origin=origin,
+                axis_u=axis_u,
+                axis_v=axis_v,
+            )
+        if kind == "bezier_surface":
+            return self.add_placed_2d_profile(
+                BezierSurfaceProfile(points=local_points),
+                name=None,
                 origin=origin,
                 axis_u=axis_u,
                 axis_v=axis_v,
@@ -354,6 +484,12 @@ class SceneDocument:
             node = self.create_bezier_curve(BezierCurveProfile().points)
         elif kind == "bezier_polycurve":
             node = self.create_bezier_curve(DEFAULT_BEZIER_POLYCURVE_POINTS)
+        elif kind == "polyline_tube":
+            node = self.create_primitive(kind)
+        elif kind == "bezier_tube":
+            node = self.create_primitive(kind)
+        elif kind == "bezier_surface":
+            node = self.create_placed_2d(kind)
         elif kind in {
             "circle",
             "rectangle",
@@ -435,6 +571,30 @@ class SceneDocument:
                 axis_u=axis_u,
                 axis_v=axis_v,
             )
+        elif kind == "polyline_tube":
+            node = PolylineTube(
+                name=f"polyline_tube_{self._next_object_id}",
+                object_id=self._allocate_object_id(),
+                points=(
+                    tuple(float(value) for value in start_array),
+                    tuple(float(value) for value in end_array),
+                ),
+                radius=float(parameters.get("radius", 0.12)),
+            )
+        elif kind == "bezier_tube":
+            control = 0.5 * (start_array + end_array)
+            axis_offset = np.zeros(3, dtype=np.float64)
+            axis_offset[axis_b] = extent_b
+            node = BezierTube(
+                name=f"bezier_tube_{self._next_object_id}",
+                object_id=self._allocate_object_id(),
+                points=(
+                    tuple(float(value) for value in start_array),
+                    tuple(float(value) for value in control + axis_offset),
+                    tuple(float(value) for value in end_array),
+                ),
+                radius=float(parameters.get("radius", 0.12)),
+            )
         elif kind in {
             "circle",
             "rectangle",
@@ -472,6 +632,16 @@ class SceneDocument:
                         (-extent_a, extent_b),
                     )
                 )
+            elif kind == "bezier_surface":
+                node.profile = BezierSurfaceProfile(
+                    points=(
+                        (-extent_a, -extent_b),
+                        (-0.35 * extent_a, extent_b),
+                        (0.25 * extent_a, 0.35 * extent_b),
+                        (0.85 * extent_a, -0.25 * extent_b),
+                        (extent_a, -extent_b),
+                    )
+                )
             else:
                 node.profile = RegularPolygonProfile(radius=radius)
             node.__post_init__()
@@ -505,6 +675,56 @@ class SceneDocument:
                     if height_delta > 1e-9
                     else max(extent_a, extent_b)
                 )
+            elif isinstance(node, CappedCone):
+                node.center = world_center
+                radial_delta = float(np.linalg.norm((end_array - start_array)[:2]))
+                height_delta = abs(float(end_array[2] - start_array[2]))
+                node.radius_a = max(0.5 * radial_delta, 0.05)
+                top_diameter = parameters.get("top_diameter")
+                node.radius_b = (
+                    max(0.5 * float(top_diameter), 0.02)
+                    if top_diameter is not None
+                    else max(node.radius_a * 0.45, 0.025)
+                )
+                node.half_height = (
+                    max(0.5 * height_delta, 0.05)
+                    if height_delta > 1e-9
+                    else max(extent_a, extent_b)
+                )
+            elif isinstance(node, Cone):
+                node.center = world_center
+                radial_delta = float(np.linalg.norm((end_array - start_array)[:2]))
+                height_delta = abs(float(end_array[2] - start_array[2]))
+                node.radius = max(0.5 * radial_delta, 0.05)
+                node.half_height = (
+                    max(0.5 * height_delta, 0.05)
+                    if height_delta > 1e-9
+                    else max(extent_a, extent_b)
+                )
+            elif isinstance(node, Pyramid):
+                node.center = world_center
+                box_delta = np.abs(end_array - start_array)
+                node.base_half_size = max(extent_a, extent_b, 0.05)
+                node.half_height = (
+                    max(0.5 * float(box_delta[2]), 0.05)
+                    if box_delta[2] > 1e-9
+                    else max(extent_a, extent_b)
+                )
+            elif isinstance(node, BoxFrame):
+                node.center = world_center
+                box_delta = np.abs(end_array - start_array)
+                if np.count_nonzero(box_delta > 1e-9) == 3:
+                    half_size = [
+                        float(max(0.5 * value, 0.05))
+                        for value in box_delta
+                    ]
+                else:
+                    fallback = max(extent_a, extent_b)
+                    half_size = [fallback, fallback, fallback]
+                    half_size[axis_a] = extent_a
+                    half_size[axis_b] = extent_b
+                node.half_size = tuple(half_size)
+                node.thickness = max(min(node.half_size) * 0.14, 0.015)
             elif isinstance(node, Torus):
                 node.center = world_center
                 node.major_radius = radius
@@ -612,9 +832,16 @@ class SceneDocument:
             node.__post_init__()
             self.mark_changed()
             return handle
-        if isinstance(node, (Sphere, Box, Cylinder, Torus)):
+        if isinstance(node, (Sphere, Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Torus)):
             node.center = tuple(
                 node.center[index] + delta[index] for index in range(3)
+            )
+            self.mark_changed()
+            return handle
+        if isinstance(node, (PolylineTube, BezierTube)):
+            node.points = tuple(
+                tuple(point[index] + delta[index] for index in range(3))
+                for point in node.points
             )
             self.mark_changed()
             return handle
@@ -848,7 +1075,17 @@ class SceneDocument:
         self.mark_changed()
         return self.handle_for(wrapped)
 
-    def solid_from_2d(self, handles: list[int], method: str) -> int:
+    def solid_from_2d(
+        self,
+        handles: list[int],
+        method: str,
+        signed_height: float | None = None,
+        revolve_axis: str = "v",
+        revolve_axis_origin: tuple[float, float, float] | None = None,
+        revolve_axis_direction: tuple[float, float, float] | None = None,
+        revolve_radial_direction: tuple[float, float, float] | None = None,
+        revolve_angle_degrees: float = 360.0,
+    ) -> int:
         sections = tuple(self.node(handle) for handle in handles)
         if not sections or not all(isinstance(node, PlacedSDF2D) for node in sections):
             raise ValueError("Solid From 2D requires placed 2D objects")
@@ -858,18 +1095,26 @@ class SceneDocument:
             "object_id": self._allocate_object_id(),
         }
         if method == "extrude" and len(placed) == 1:
-            result: SDFNode = Extrude(**common, section=placed[0], height=1.0)
-        elif method == "revolve" and len(placed) == 1:
-            result = Revolve(**common, section=placed[0])
-        elif method == "sweep" and len(placed) == 1:
-            normal = placed[0].normal
-            end = tuple(
-                placed[0].origin[index] + normal[index]
-                for index in range(3)
+            height = 1.0 if signed_height is None else abs(float(signed_height))
+            if height <= 0.0 or not np.isfinite(height):
+                raise ValueError("extrude height must be finite and positive")
+            center_offset = 0.0 if signed_height is None else float(signed_height) * 0.5
+            result: SDFNode = Extrude(
+                **common,
+                section=placed[0],
+                height=height,
+                center_offset=center_offset,
             )
-            result = Sweep(**common, section=placed[0], end=end)
-        elif method == "loft_implicit" and len(placed) >= 2:
-            result = LoftImplicit(**common, sections=placed)
+        elif method == "revolve" and len(placed) == 1:
+            result = Revolve(
+                **common,
+                section=placed[0],
+                axis=revolve_axis,
+                axis_origin=revolve_axis_origin,
+                axis_direction=revolve_axis_direction,
+                radial_direction=revolve_radial_direction,
+                angle_degrees=revolve_angle_degrees,
+            )
         else:
             raise ValueError(f"invalid section count for {method}")
         self.objects.append(result)
@@ -1043,17 +1288,57 @@ class SceneDocument:
         return self.handle_for(region)
 
     def delete(self, handle: int) -> None:
-        target = self.node(handle)
-        if isinstance(target, BoundaryRegion):
-            self.boundary_regions.remove(target)
-            self._reindex()
-            self._refresh_fluid_domain()
-            self.mark_changed()
-            return
-        self._detach(target)
-        self._reindex()
+        self.delete_many((handle,))
+
+    def delete_many(self, handles: list[int] | tuple[int, ...]) -> int:
+        selected_nodes: list[SceneItem] = []
+        for handle in handles:
+            try:
+                selected_nodes.append(self.node(handle))
+            except KeyError:
+                continue
+        if not selected_nodes:
+            return 0
+
+        selected_ids = {id(node) for node in selected_nodes}
+        boundary_region_ids = {
+            id(node)
+            for node in selected_nodes
+            if isinstance(node, BoundaryRegion)
+        }
+        root_targets = [
+            node
+            for node in selected_nodes
+            if isinstance(node, SDFNode)
+            and not self._contains_selected_ancestor(node, selected_ids)
+        ]
+        target_ids = {id(node) for node in root_targets}
+        deleted_count = 0
+
+        if boundary_region_ids:
+            original_count = len(self.boundary_regions)
+            self.boundary_regions = [
+                region
+                for region in self.boundary_regions
+                if id(region) not in boundary_region_ids
+            ]
+            deleted_count += original_count - len(self.boundary_regions)
+
+        if target_ids:
+            remaining_objects: list[SDFNode] = []
+            for root in self.objects:
+                replacement, removed = self._remove_targets_from(root, target_ids)
+                deleted_count += removed
+                if replacement is not None:
+                    remaining_objects.append(replacement)
+            self.objects = remaining_objects
+
+        if deleted_count <= 0:
+            return 0
+
         self._refresh_fluid_domain()
         self.mark_changed()
+        return deleted_count
 
     def _remove_from(
         self, current: SDFNode, target: SDFNode
@@ -1083,6 +1368,81 @@ class SceneDocument:
                 return current, True
         return current, False
 
+    def _remove_targets_from(
+        self,
+        current: SDFNode,
+        target_ids: set[int],
+    ) -> tuple[SDFNode | None, int]:
+        if id(current) in target_ids:
+            return None, 1
+        if isinstance(current, UnaryTransform):
+            assert current.child is not None
+            replacement, removed = self._remove_targets_from(
+                current.child,
+                target_ids,
+            )
+            if removed <= 0:
+                return current, 0
+            if replacement is None:
+                return None, removed
+            current.child = replacement
+            return current, removed
+        if isinstance(current, BinaryCSG):
+            assert current.left is not None and current.right is not None
+            left, left_removed = self._remove_targets_from(current.left, target_ids)
+            right, right_removed = self._remove_targets_from(
+                current.right,
+                target_ids,
+            )
+            removed = left_removed + right_removed
+            if removed <= 0:
+                return current, 0
+            if left is None and right is None:
+                return None, removed
+            if left is None:
+                return right, removed
+            if right is None:
+                return left, removed
+            current.left = left
+            current.right = right
+            return current, removed
+        if isinstance(current, (PlacedSDF1D, PlacedSDF2D)):
+            if not current.sources:
+                return current, 0
+            replacements: list[SDFNode] = []
+            removed = 0
+            for source in current.sources:
+                replacement, source_removed = self._remove_targets_from(
+                    source,
+                    target_ids,
+                )
+                removed += source_removed
+                if replacement is not None:
+                    replacements.append(replacement)
+            if removed <= 0:
+                return current, 0
+            if not replacements:
+                return None, removed
+            if len(replacements) == 1:
+                return replacements[0], removed
+            current.sources = tuple(replacements)
+            return current, removed
+        if isinstance(current, (Extrude, Revolve)):
+            assert current.section is not None
+            replacement, removed = self._remove_targets_from(
+                current.section,
+                target_ids,
+            )
+            if removed <= 0:
+                return current, 0
+            if replacement is None:
+                return None, removed
+            if not isinstance(replacement, PlacedSDF2D):
+                return None, removed
+            current.section = replacement
+            return current, removed
+        return current, 0
+
     def _detach(self, target: SDFNode) -> int:
         if target in self.objects:
             index = self.objects.index(target)
@@ -1102,6 +1462,41 @@ class SceneDocument:
     def _contains(root: SDFNode, target: SDFNode) -> bool:
         return root is target or any(
             SceneDocument._contains(child, target) for child in root.children()
+        )
+
+    def _contains_selected_ancestor(
+        self,
+        target: SDFNode,
+        selected_ids: set[int],
+    ) -> bool:
+        for root in self.objects:
+            if self._contains_selected_ancestor_in_subtree(
+                root,
+                target,
+                selected_ids,
+                ancestor_selected=False,
+            ):
+                return True
+        return False
+
+    def _contains_selected_ancestor_in_subtree(
+        self,
+        current: SDFNode,
+        target: SDFNode,
+        selected_ids: set[int],
+        ancestor_selected: bool,
+    ) -> bool:
+        current_selected = id(current) in selected_ids
+        if current is target:
+            return ancestor_selected
+        return any(
+            self._contains_selected_ancestor_in_subtree(
+                child,
+                target,
+                selected_ids,
+                ancestor_selected or current_selected,
+            )
+            for child in current.children()
         )
 
     def _assign_fresh_object_ids(self, root: SDFNode) -> None:
@@ -1139,15 +1534,27 @@ class SceneDocument:
                     return False
             node.__post_init__()
             return True
-        if isinstance(node, (Sphere, Box, Cylinder, Torus)):
+        if isinstance(node, (Sphere, Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Torus)):
             node.center = tuple(
                 node.center[index] + delta[index] for index in range(3)
             )
             return True
-        if isinstance(node, Sweep):
-            node.end = tuple(
-                node.end[index] + delta[index] for index in range(3)
+        if isinstance(node, (PolylineTube, BezierTube)):
+            node.points = tuple(
+                tuple(point[index] + delta[index] for index in range(3))
+                for point in node.points
             )
+            return True
+        if isinstance(node, Revolve):
+            if node.axis_origin is not None:
+                node.axis_origin = tuple(
+                    node.axis_origin[index] + delta[index] for index in range(3)
+                )
+            for child in node.children():
+                if not self._translate_copy_in_place(child, delta, seen):
+                    return False
+            node.__post_init__()
+            return True
         for child in node.children():
             if not self._translate_copy_in_place(child, delta, seen):
                 return False
@@ -1219,22 +1626,56 @@ class SceneDocument:
         if isinstance(node, Sphere):
             node.center = self._rotate_point(node.center, axis, angle_degrees, pivot)
             return True
-        if isinstance(node, (Box, Cylinder, Torus)):
+        if isinstance(node, (Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Torus)):
             node.center = self._rotate_point(node.center, axis, angle_degrees, pivot)
             node.axis_u = self._rotate_vector(node.axis_u, axis, angle_degrees)
             node.axis_v = self._rotate_vector(node.axis_v, axis, angle_degrees)
             node.axis_w = self._rotate_vector(node.axis_w, axis, angle_degrees)
             node.__post_init__()
             return True
-        if isinstance(node, Sweep):
-            node.end = self._rotate_point(node.end, axis, angle_degrees, pivot)
+        if isinstance(node, (PolylineTube, BezierTube)):
+            node.points = tuple(
+                self._rotate_point(point, axis, angle_degrees, pivot)
+                for point in node.points
+            )
+            return True
+        if isinstance(node, Revolve):
+            if node.axis_origin is not None:
+                node.axis_origin = self._rotate_point(
+                    node.axis_origin,
+                    axis,
+                    angle_degrees,
+                    pivot,
+                )
+            if node.axis_direction is not None:
+                node.axis_direction = self._rotate_vector(
+                    node.axis_direction,
+                    axis,
+                    angle_degrees,
+                )
+            if node.radial_direction is not None:
+                node.radial_direction = self._rotate_vector(
+                    node.radial_direction,
+                    axis,
+                    angle_degrees,
+                )
+            for child in node.children():
+                if not self._rotate_node_in_place(
+                    child,
+                    axis,
+                    angle_degrees,
+                    pivot,
+                    seen,
+                ):
+                    return False
+            node.__post_init__()
+            return True
         for child in node.children():
             if not self._rotate_node_in_place(child, axis, angle_degrees, pivot, seen):
                 return False
         return True
 
-    def visual_tree(self) -> SDFTree:
-        self.refresh_derived_geometry()
+    def _build_visual_tree(self) -> SDFTree:
         three_dimensional = [node for node in self.objects if node.dimension == 3]
         if not three_dimensional:
             root: SDFNode = Sphere(
@@ -1256,17 +1697,54 @@ class SceneDocument:
                     components.append(tag)
         return SDFTree(root, components=tuple(components))
 
+    def visual_tree(self) -> SDFTree:
+        self.refresh_derived_geometry()
+        return self._build_visual_tree()
+
     def tree(self) -> SDFTree:
         return self.visual_tree()
 
-    def snapshot(self) -> SceneDocument:
+    def _snapshot_bundle(
+        self,
+    ) -> tuple[
+        list[SDFNode],
+        FluidDomain | None,
+        list[BoundaryRegion],
+        int,
+        int,
+    ]:
         self.refresh_derived_geometry()
-        snapshot = deepcopy(self)
-        snapshot._handles.clear()
-        snapshot._node_handles.clear()
-        snapshot._reindex()
-        snapshot._refresh_fluid_domain()
+        return deepcopy(
+            (
+                self.objects,
+                self.fluid_domain,
+                self.boundary_regions,
+                self.version,
+                self._next_object_id,
+            )
+        )
+
+    def snapshot(self) -> SceneDocument:
+        (
+            objects,
+            fluid_domain,
+            boundary_regions,
+            version,
+            next_object_id,
+        ) = self._snapshot_bundle()
+        snapshot = SceneDocument(
+            objects=objects,
+            fluid_domain=fluid_domain,
+            boundary_regions=boundary_regions,
+            version=version,
+        )
+        snapshot._next_object_id = next_object_id
         return snapshot
+
+    def visual_snapshot(self) -> tuple[int, SDFTree | None]:
+        self.refresh_derived_geometry()
+        tree = deepcopy(self._build_visual_tree()) if self.objects else None
+        return self.version, tree
 
     def node(self, handle: int) -> SceneItem:
         try:

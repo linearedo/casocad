@@ -5,7 +5,7 @@ from math import cos, radians, sin
 
 import numpy as np
 
-from .base import BoundingBox3D, FloatArray, SDFNode, glsl_float, glsl_vec3
+from .base import BoundingBox3D, FloatArray, SDFNode
 
 
 @dataclass
@@ -29,10 +29,6 @@ class UnaryTransform(SDFNode):
 @dataclass
 class Translate(UnaryTransform):
     offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
-
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.child is not None
-        return self.child.to_glsl(f"({p_var} - {glsl_vec3(self.offset)})")
 
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
@@ -63,11 +59,6 @@ class Scale(UnaryTransform):
         super().__post_init__()
         if self.factor <= 0.0:
             raise ValueError("scale factor must be positive")
-
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.child is not None
-        factor = glsl_float(self.factor)
-        return f"({self.child.to_glsl(f'({p_var} / {factor})')} * {factor})"
 
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
@@ -101,22 +92,6 @@ class Rotate(UnaryTransform):
         super().__post_init__()
         if self.axis not in {"x", "y", "z"}:
             raise ValueError("rotation axis must be x, y, or z")
-
-    def _inverse_components(self, x: str, y: str, z: str) -> tuple[str, str, str]:
-        c = glsl_float(cos(radians(self.angle_degrees)))
-        s = glsl_float(sin(radians(self.angle_degrees)))
-        if self.axis == "x":
-            return x, f"({c}*{y} + {s}*{z})", f"(-{s}*{y} + {c}*{z})"
-        if self.axis == "y":
-            return f"({c}*{x} - {s}*{z})", y, f"({s}*{x} + {c}*{z})"
-        return f"({c}*{x} + {s}*{y})", f"(-{s}*{x} + {c}*{y})", z
-
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.child is not None
-        components = self._inverse_components(
-            f"{p_var}.x", f"{p_var}.y", f"{p_var}.z"
-        )
-        return self.child.to_glsl(f"vec3({', '.join(components)})")
 
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray

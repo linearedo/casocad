@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from math import atan2, degrees, radians
 
 import moderngl
@@ -10,20 +11,35 @@ from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QPushButton
 
-from app.artifacts import empty_render_scene_source
+from app.artifacts import RenderArtifactTimings
 from app.dimensions import (
     dimension_entry_text,
     parse_dimension_entry,
     parse_displacement_entry,
+    parse_scalar_entry,
 )
+from app.viewport.renderer_base import ViewportRenderer
 from app.signals import signals
 from core.boundary import BoundaryRegion
 from core.mesher.classifier import pick_boundary_owner, pick_sdf_surface
-from core.sdf import SDFTree
+from core.render_ir import RenderIR, build_render_ir
+from core.scene import SceneDocument
+from core.sdf import PlacedSDF2D, SDFTree
 from core.sdf.base import BoundingBox3D, SDFNode
 
 from .camera import OrbitCamera
-from .renderer import ROTATION_GIZMO_SEGMENTS, SDFRenderer
+from .renderers.opengl.renderer import OpenGLRenderer
+from .renderers.opengl.renderer import (
+    MAX_SELECTED_BOUNDARY_OWNERS,
+    POINT_VERTEX_WIDTH,
+    SDFRenderer,
+    SQUARE_INSTANCE_WIDTH,
+    X_AXIS_COLOR,
+    Y_AXIS_COLOR,
+    Z_AXIS_COLOR,
+    WORLD_AXIS_LENGTH,
+    ROTATION_GIZMO_SEGMENTS,
+)
 
 logger = logging.getLogger(__name__)
 MAX_SELECTED_BOUNDARY_REGIONS = 128
@@ -37,22 +53,11 @@ CREATE_CLICK_MAX_MANHATTAN = 4
 SCENE_CLICK_MAX_MANHATTAN = 4
 ROTATION_GIZMO_PICK_TOLERANCE_PX = 12.0
 ROTATION_GIZMO_MIN_RADIUS = 0.25
-CREATE_PREVIEW_KINDS = {
-    "segment": 1,
-    "polyline": 12,
-    "bezier_curve": 14,
-    "bezier_polycurve": 14,
-    "circle": 2,
-    "rectangle": 3,
-    "square": 4,
-    "rounded_rectangle": 5,
-    "ellipse": 6,
-    "regular_polygon": 7,
-    "polygon": 13,
-    "sphere": 8,
-    "box": 9,
-    "cylinder": 10,
-    "torus": 11,
+BOOLEAN_PREVIEW_OPERATIONS = {
+    "union": 1,
+    "intersection": 2,
+    "difference": 3,
+    "smooth_union": 4,
 }
 REFERENCE_PLANE_IDS = {"xy": 0, "xz": 1, "yz": 2}
 REFERENCE_PLANE_SEQUENCE = ("xy", "xz", "yz")
@@ -73,18 +78,65 @@ CREATE_LABELS = {
     "ellipse": "Ellipse",
     "regular_polygon": "Regular Polygon",
     "polygon": "Polygon",
+    "bezier_surface": "Bezier Surface",
     "sphere": "Sphere",
     "box": "Box",
+    "box_frame": "Box Frame",
     "cylinder": "Cylinder",
+    "capped_cone": "Capped Cone",
+    "cone": "Cone",
+    "pyramid": "Pyramid",
     "torus": "Torus",
+    "polyline_tube": "Polyline Tube",
+    "bezier_tube": "Bezier Tube",
 }
-RADIAL_CREATE_KINDS = {"circle", "regular_polygon", "sphere", "cylinder", "torus"}
+RADIAL_CREATE_KINDS = {"circle", "regular_polygon", "sphere", "cylinder", "capped_cone", "cone", "torus"}
 SINGLE_DIAMETER_CREATE_KINDS = {"circle", "regular_polygon", "sphere"}
-POINT_CREATE_KINDS = {"polyline", "bezier_curve", "bezier_polycurve", "polygon"}
+POINT_CREATE_KINDS = {
+    "polyline",
+    "bezier_curve",
+    "bezier_polycurve",
+    "polyline_tube",
+    "bezier_tube",
+    "bezier_surface",
+    "polygon",
+}
+
+EMPTY_RENDER_SCENE_KEY = ("empty-render-ir-scene",)
 
 
-def empty_scene_source() -> str:
-    return empty_render_scene_source()
+def render_scene_key(
+    render_ir: RenderIR | None,
+) -> object:
+    if render_ir is None:
+        return EMPTY_RENDER_SCENE_KEY
+    return (render_ir.topology_signature, render_ir.parameter_values)
+
+
+def _format_render_artifact_timings(timings: RenderArtifactTimings) -> str:
+    ir_support = "yes" if timings.render_ir_supported else "no"
+    return (
+        "Render artifact built: "
+        f"total={timings.total_ms:.1f} ms, "
+        f"render_ir={timings.render_ir_ms:.1f} ms, "
+        f"tree_nodes={timings.tree_node_count}, "
+        f"ir_nodes={timings.render_ir_node_count}, "
+        f"ir_supported={ir_support}"
+    )
+
+
+def _format_scene_update_stats(stats: object) -> str:
+    path = getattr(stats, "path", "unknown")
+    return (
+        "Viewport scene update: "
+        f"path={path}, "
+        f"total={getattr(stats, 'total_ms', 0.0):.1f} ms, "
+        f"shader_build={getattr(stats, 'shader_build_ms', 0.0):.1f} ms, "
+        f"program_compile={getattr(stats, 'program_compile_ms', 0.0):.1f} ms, "
+        f"vao_build={getattr(stats, 'vao_build_ms', 0.0):.1f} ms, "
+        f"ir_nodes={getattr(stats, 'render_ir_nodes', 0)}, "
+        f"reused_program={getattr(stats, 'reused_program', False)}"
+    )
 
 
 def constrain_reference_point(
@@ -100,7 +152,14 @@ def constrain_reference_point(
     )
     first_delta = values[first_axis] - start_values[first_axis]
     second_delta = values[second_axis] - start_values[second_axis]
-    if kind in {"segment", "polyline", "bezier_curve", "bezier_polycurve"}:
+    if kind in {
+        "segment",
+        "polyline",
+        "bezier_curve",
+        "bezier_polycurve",
+        "polyline_tube",
+        "bezier_tube",
+    }:
         if abs(first_delta) >= abs(second_delta):
             values[second_axis] = start_values[second_axis]
         else:
@@ -173,7 +232,14 @@ def apply_typed_create_dimensions(
             values[second_axis] += diameter * second_delta / length
         return tuple(float(value) for value in values)
 
-    if kind in {"segment", "polyline", "bezier_curve", "bezier_polycurve"}:
+    if kind in {
+        "segment",
+        "polyline",
+        "bezier_curve",
+        "bezier_polycurve",
+        "polyline_tube",
+        "bezier_tube",
+    }:
         length = dimensions[0]
         first_delta = current_values[first_axis] - values[first_axis]
         second_delta = current_values[second_axis] - values[second_axis]
@@ -187,7 +253,25 @@ def apply_typed_create_dimensions(
         return apply_diameter_along_drag(dimensions[0])
     if kind == "torus" and len(dimensions) >= 2:
         return apply_diameter_along_drag(dimensions[0])
-    if kind == "cylinder" and len(dimensions) >= 2:
+    if kind == "capped_cone" and len(dimensions) >= 3:
+        radial_delta_x = current_values[0] - values[0]
+        radial_delta_y = current_values[1] - values[1]
+        radial_length = float(
+            (radial_delta_x * radial_delta_x + radial_delta_y * radial_delta_y)
+            ** 0.5
+        )
+        if radial_length <= 1e-12:
+            fallback_axis = first_axis if first_axis in {0, 1} else second_axis
+            radial_delta_x = 1.0 if fallback_axis == 0 else 0.0
+            radial_delta_y = 1.0 if fallback_axis == 1 else 0.0
+            radial_length = 1.0
+        height_delta = current_values[2] - values[2]
+        height_sign = -1.0 if height_delta < 0.0 else 1.0
+        values[0] += dimensions[0] * radial_delta_x / radial_length
+        values[1] += dimensions[0] * radial_delta_y / radial_length
+        values[2] += height_sign * dimensions[2]
+        return tuple(float(value) for value in values)
+    if kind in {"cylinder", "cone", "pyramid"} and len(dimensions) >= 2:
         radial_delta_x = current_values[0] - values[0]
         radial_delta_y = current_values[1] - values[1]
         radial_length = float(
@@ -205,7 +289,7 @@ def apply_typed_create_dimensions(
         values[1] += dimensions[0] * radial_delta_y / radial_length
         values[2] += height_sign * dimensions[1]
         return tuple(float(value) for value in values)
-    if kind == "box" and len(dimensions) >= 3:
+    if kind in {"box", "box_frame"} and len(dimensions) >= 3:
         inactive_axis = next(
             axis for axis in range(3) if axis not in {first_axis, second_axis}
         )
@@ -280,9 +364,20 @@ def create_typed_parameters(
     kind: str,
     dimensions: tuple[float, ...] | None,
 ) -> dict[str, float]:
+    if kind == "capped_cone" and dimensions is not None and len(dimensions) >= 3:
+        return {"top_diameter": float(dimensions[1])}
     if kind == "torus" and dimensions is not None and len(dimensions) >= 2:
         return {"minor_diameter": float(dimensions[1])}
     return {}
+
+
+def create_preview_secondary_radius(
+    kind: str,
+    dimensions: tuple[float, ...] | None,
+) -> float:
+    if kind == "capped_cone" and dimensions is not None and len(dimensions) >= 3:
+        return max(0.5 * float(dimensions[1]), 0.02)
+    return -1.0
 
 
 def create_preview_torus_minor_radius(
@@ -303,19 +398,43 @@ def create_measurement_components(
     delta: tuple[float, float, float] | None = None,
     typed_dimensions: tuple[float, ...] | None = None,
 ) -> tuple[tuple[str, float], ...]:
-    if kind == "box" and delta is not None:
+    if kind in {"box", "box_frame"} and delta is not None:
         x_size = abs(float(delta[0]))
         y_size = abs(float(delta[1]))
         z_size = abs(float(delta[2]))
         if min(x_size, y_size, z_size) > 1e-12:
             return (("X", x_size), ("Y", y_size), ("Z", z_size))
-    if kind == "cylinder" and delta is not None:
+    if kind in {"cylinder", "cone"} and delta is not None:
         diameter = float((delta[0] * delta[0] + delta[1] * delta[1]) ** 0.5)
         height = abs(float(delta[2]))
         return (
             (first_label, first_size),
             (second_label, second_size),
             ("D", diameter),
+            ("H", height),
+        )
+    if kind == "capped_cone" and delta is not None:
+        diameter = float((delta[0] * delta[0] + delta[1] * delta[1]) ** 0.5)
+        top_diameter = (
+            typed_dimensions[1]
+            if typed_dimensions is not None and len(typed_dimensions) >= 3
+            else max(diameter * 0.45, 0.05)
+        )
+        height = abs(float(delta[2]))
+        return (
+            (first_label, first_size),
+            (second_label, second_size),
+            ("D1", diameter),
+            ("D2", top_diameter),
+            ("H", height),
+        )
+    if kind == "pyramid" and delta is not None:
+        base = max(abs(float(delta[0])), abs(float(delta[1])))
+        height = abs(float(delta[2]))
+        return (
+            (first_label, first_size),
+            (second_label, second_size),
+            ("Base", base),
             ("H", height),
         )
     diagonal = float((first_size * first_size + second_size * second_size) ** 0.5)
@@ -438,18 +557,31 @@ def create_start_prompt(first_label: str, second_label: str) -> str:
 
 
 def create_size_prompt(kind: str, first_label: str, second_label: str) -> str:
-    if kind in {"segment", "polyline", "bezier_curve", "bezier_polycurve"}:
+    if kind in {
+        "segment",
+        "polyline",
+        "bezier_curve",
+        "bezier_polycurve",
+        "polyline_tube",
+        "bezier_tube",
+    }:
         return "Type Length"
+    if kind == "bezier_surface":
+        return "Type point coordinates"
     if kind in {"circle", "regular_polygon", "sphere"}:
         return "Type D"
     if kind == "square":
         return "Type Size"
     if kind in {"rectangle", "rounded_rectangle", "ellipse", "polygon"}:
         return f"Type {first_label} x {second_label}"
-    if kind == "box":
+    if kind in {"box", "box_frame"}:
         return "Type X x Y x Z"
-    if kind == "cylinder":
+    if kind in {"cylinder", "cone"}:
         return "Type D x H"
+    if kind == "capped_cone":
+        return "Type D1 x D2 x H"
+    if kind == "pyramid":
+        return "Type Base x H"
     if kind == "torus":
         return "Type D x d"
     return "Type Size"
@@ -468,6 +600,10 @@ def create_modifier_status_text(
 
 def move_dimension_prompt(first_label: str = "X", second_label: str = "Y") -> str:
     return f"Type d{first_label},d{second_label} or dX,dY,dZ"
+
+
+def extrude_dimension_prompt() -> str:
+    return "Type signed length or drag/QE along normal"
 
 
 def reference_view_for_key(key: int) -> str | None:
@@ -523,6 +659,34 @@ def keyboard_move_delta(
     return deltas.get(key)
 
 
+def keyboard_extrude_delta(
+    key: int,
+    step: float,
+    modifiers: Qt.KeyboardModifier | Qt.KeyboardModifiers,
+) -> float | None:
+    if key not in {Qt.Key.Key_Q, Qt.Key.Key_E}:
+        return None
+    multiplier = 1.0
+    if modifiers & Qt.KeyboardModifier.ShiftModifier:
+        multiplier *= 10.0
+    if modifiers & Qt.KeyboardModifier.AltModifier:
+        multiplier *= 0.1
+    direction = -1.0 if key == Qt.Key.Key_Q else 1.0
+    return direction * float(step) * multiplier
+
+
+def snap_scalar(
+    value: float,
+    spacing: float,
+    enabled: bool,
+    modifiers: Qt.KeyboardModifier | Qt.KeyboardModifiers,
+) -> float:
+    if not enabled or modifiers & Qt.KeyboardModifier.AltModifier:
+        return float(value)
+    step = max(float(spacing), 1.0e-9)
+    return float(round(value / step) * step)
+
+
 def reference_plane_label(reference_plane: str) -> str:
     if reference_plane not in REFERENCE_PLANE_AXES:
         raise ValueError(f"unknown reference plane: {reference_plane}")
@@ -562,7 +726,7 @@ def should_refresh_create_modifier_preview_for_key(key: int) -> bool:
 
 
 def point_shape_minimum_points(kind: str) -> int:
-    return 2 if kind == "polyline" else 3
+    return 2 if kind in {"polyline", "polyline_tube"} else 3
 
 
 def should_clear_idle_selection_for_key(
@@ -579,7 +743,7 @@ def should_frame_scene_for_key(
     return key == Qt.Key.Key_F and modifiers == Qt.KeyboardModifier.NoModifier
 
 
-class GLWidget(QOpenGLWidget):
+class ViewportWidget(QOpenGLWidget):
     def __init__(self, parent: object | None = None) -> None:
         super().__init__(parent)
         self.setMinimumSize(640, 480)
@@ -647,13 +811,26 @@ class GLWidget(QOpenGLWidget):
         self._command_panel = self._build_command_panel()
         self._position_overlays()
         self._context: moderngl.Context | None = None
-        self._renderer: SDFRenderer | None = None
-        self._pending_scene: str | None = empty_scene_source()
+        self._renderer: ViewportRenderer | None = None
+        self._pending_scene: object | None = EMPTY_RENDER_SCENE_KEY
+        self._pending_render_ir: RenderIR | None = None
+        self._compiled_scene: object | None = None
+        self._compiled_preview_scene: object | None = EMPTY_RENDER_SCENE_KEY
         self._scene_tree: SDFTree | None = None
         self._scene_hover_object_id = 0
         self._scene_selected_object_id = 0
         self._committed_move_object_id = 0
         self._committed_move_delta = (0.0, 0.0, 0.0)
+        self._committed_create_preview: tuple[
+            str,
+            tuple[float, float, float],
+            tuple[float, float, float],
+            tuple[tuple[float, float, float], ...],
+            bool,
+            float,
+            float,
+        ] | None = None
+        self._boolean_preview: tuple[int, int, int, float, bool] | None = None
         self._pending_lattice: object | None = None
         self._pending_lattice_upload: tuple[np.ndarray, np.ndarray, float] | None = None
         self._pending_lattice_stream_chunks: list[object] = []
@@ -689,6 +866,11 @@ class GLWidget(QOpenGLWidget):
         self._tool_hover_world: tuple[float, float, float] | None = None
         self._point_shape_points: list[tuple[float, float, float]] = []
         self._move_preview_delta = (0.0, 0.0, 0.0)
+        self._extrude_preview_height = 0.0
+        self._extrude_drag_start_height = 0.0
+        self._revolve_axis = "v"
+        self._revolve_axis_angle_degrees = 90.0
+        self._revolve_angle_degrees = 360.0
         self._rotation_drag_axis: str | None = None
         self._rotation_drag_start: tuple[float, float, float] | None = None
         self._rotation_drag_center: tuple[float, float, float] | None = None
@@ -948,14 +1130,20 @@ class GLWidget(QOpenGLWidget):
         self._tool_hover_world = None
         self._point_shape_points = []
         self._move_preview_delta = (0.0, 0.0, 0.0)
-        GLWidget._clear_rotation_drag(self)
+        ViewportWidget._clear_rotation_drag(self)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setFocus()
         if kind in POINT_CREATE_KINDS:
-            message = (
-                f"Click grid points to draw {kind}. Enter creates, "
-                "Backspace removes the last point, Esc cancels."
-            )
+            if kind == "bezier_curve":
+                message = (
+                    "Click start, control, and end points to create Bezier Curve. "
+                    "Backspace removes the last point, Esc cancels."
+                )
+            else:
+                message = (
+                    f"Click grid points to draw {kind}. Enter creates, "
+                    "Backspace removes the last point, Esc cancels."
+                )
         else:
             message = f"Drag on the reference grid to create {kind}. Esc cancels."
         signals.log_message.emit("info", message)
@@ -972,12 +1160,61 @@ class GLWidget(QOpenGLWidget):
         self._tool_hover_world = None
         self._point_shape_points = []
         self._dimension_input = ""
-        GLWidget._clear_rotation_drag(self)
+        ViewportWidget._clear_rotation_drag(self)
         self.setCursor(Qt.CursorShape.SizeAllCursor)
         self.setFocus()
         signals.log_message.emit(
             "info",
             "Move preview active. Drag or use WASD/QE, Enter applies, Esc cancels.",
+        )
+        self._update_measurement_readout()
+        self.update()
+
+    def begin_extrude_tool(self, handle: int, node: PlacedSDF2D) -> None:
+        self._clear_scene_hover()
+        self._interaction_tool = ("extrude", handle)
+        self._scene_selected_object_id = node.object_id
+        self._tool_start_screen = None
+        self._tool_start_world = None
+        self._tool_current_world = None
+        self._tool_hover_world = None
+        self._point_shape_points = []
+        self._move_preview_delta = (0.0, 0.0, 0.0)
+        self._extrude_preview_height = 0.0
+        self._extrude_drag_start_height = 0.0
+        ViewportWidget._clear_rotation_drag(self)
+        self._dimension_input = ""
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setFocus()
+        signals.log_message.emit(
+            "info",
+            "Extrude preview active. Drag the normal handle or use Q/E, "
+            "Enter applies, Esc cancels.",
+        )
+        self._update_measurement_readout()
+        self.update()
+
+    def begin_revolve_tool(self, handle: int, node: PlacedSDF2D) -> None:
+        self._clear_scene_hover()
+        self._interaction_tool = ("revolve", handle)
+        self._scene_selected_object_id = node.object_id
+        self._tool_start_screen = None
+        self._tool_start_world = None
+        self._tool_current_world = None
+        self._tool_hover_world = None
+        self._point_shape_points = []
+        self._move_preview_delta = (0.0, 0.0, 0.0)
+        self._revolve_axis = "v"
+        self._revolve_axis_angle_degrees = 90.0
+        self._revolve_angle_degrees = 360.0
+        ViewportWidget._clear_rotation_drag(self)
+        self._dimension_input = ""
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus()
+        signals.log_message.emit(
+            "info",
+            "Revolve preview active. A/D rotates the axis, Q/E changes angle, "
+            "U/V snaps the axis, Enter applies, Esc cancels.",
         )
         self._update_measurement_readout()
         self.update()
@@ -997,7 +1234,9 @@ class GLWidget(QOpenGLWidget):
         self._tool_hover_world = None
         self._point_shape_points = []
         self._move_preview_delta = (0.0, 0.0, 0.0)
-        GLWidget._clear_rotation_drag(self)
+        self._extrude_preview_height = 0.0
+        self._extrude_drag_start_height = 0.0
+        ViewportWidget._clear_rotation_drag(self)
         self._dimension_input = ""
         self._interaction_tool = ("boundary_region", root.object_id)
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -1015,7 +1254,10 @@ class GLWidget(QOpenGLWidget):
         self._tool_hover_world = None
         self._point_shape_points = []
         self._move_preview_delta = (0.0, 0.0, 0.0)
-        GLWidget._clear_rotation_drag(self)
+        self._revolve_axis = "v"
+        self._revolve_axis_angle_degrees = 90.0
+        self._revolve_angle_degrees = 360.0
+        ViewportWidget._clear_rotation_drag(self)
         self._dimension_input = ""
         self.unsetCursor()
         self._boundary_selection_active = False
@@ -1134,27 +1376,29 @@ class GLWidget(QOpenGLWidget):
         self.update()
 
     def set_scene(self, tree: SDFTree | None) -> None:
-        source = (
-            f"{tree.to_glsl()}\n{tree.components_to_glsl()}"
-            if tree is not None
-            else empty_scene_source()
+        render_ir = build_render_ir(tree) if tree is not None else None
+        self.set_scene_artifact(
+            tree,
+            render_ir if render_ir is not None and render_ir.supported else None,
         )
-        self.set_scene_artifact(tree, source)
 
-    def set_scene_artifact(self, tree: SDFTree | None, scene_source: str) -> None:
-        if tree is not None and not scene_source.strip():
-            logger.warning("ignored empty render artifact for a non-empty scene")
+    def set_scene_artifact(
+        self,
+        tree: SDFTree | None,
+        render_ir: RenderIR | None = None,
+    ) -> None:
+        if tree is not None and render_ir is None:
+            logger.warning("ignored non-RenderIR artifact for a non-empty scene")
             signals.log_message.emit(
                 "warning",
-                "Ignored an empty render artifact and kept the previous viewport.",
+                "Ignored a non-RenderIR render artifact and kept the previous viewport.",
             )
             return
         self._scene_tree = tree
         self._scene_hover_object_id = 0
-        self._committed_move_object_id = 0
-        self._committed_move_delta = (0.0, 0.0, 0.0)
         self._update_measurement_readout()
-        self._pending_scene = scene_source or empty_scene_source()
+        self._pending_scene = render_scene_key(render_ir)
+        self._pending_render_ir = render_ir
         self.update()
 
     def set_lattice(self, result: object) -> None:
@@ -1407,6 +1651,122 @@ class GLWidget(QOpenGLWidget):
             return False, (0.0, 0.0, 0.0), 1.0
         return True, center, radius
 
+    def _extrude_gizmo_state(
+        self,
+    ) -> tuple[bool, tuple[float, float, float], tuple[float, float, float]]:
+        if (
+            self._interaction_tool is None
+            or self._interaction_tool[0] != "extrude"
+            or self._scene_tree is None
+            or self._scene_selected_object_id == 0
+        ):
+            return False, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)
+        try:
+            node = next(
+                item
+                for item in self._scene_tree.nodes
+                if item.object_id == self._scene_selected_object_id
+            )
+        except StopIteration:
+            return False, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)
+        if not isinstance(node, PlacedSDF2D):
+            return False, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)
+        center, _radius = self._box_center_and_radius(node.bounding_box())
+        return True, center, node.normal
+
+    def _revolve_section(self) -> PlacedSDF2D | None:
+        if (
+            self._interaction_tool is None
+            or self._interaction_tool[0] != "revolve"
+            or self._scene_tree is None
+            or self._scene_selected_object_id == 0
+        ):
+            return None
+        try:
+            node = next(
+                item
+                for item in self._scene_tree.nodes
+                if item.object_id == self._scene_selected_object_id
+            )
+        except StopIteration:
+            return None
+        return node if isinstance(node, PlacedSDF2D) else None
+
+    def _revolve_axis_frame(
+        self,
+    ) -> tuple[
+        bool,
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ]:
+        node = self._revolve_section()
+        if node is None or node.profile is None:
+            return (
+                False,
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+            )
+        angle = radians(self._revolve_axis_angle_degrees)
+        axis_u = np.asarray(node.axis_u, dtype=np.float64)
+        axis_v = np.asarray(node.axis_v, dtype=np.float64)
+        axis = np.cos(angle) * axis_u + np.sin(angle) * axis_v
+        axis /= max(float(np.linalg.norm(axis)), 1.0e-12)
+        u_min, u_max, v_min, v_max = node.profile.bounds()
+        profile_center = (
+            np.asarray(node.origin, dtype=np.float64)
+            + 0.5 * (u_min + u_max) * axis_u
+            + 0.5 * (v_min + v_max) * axis_v
+        )
+        origin = np.asarray(node.origin, dtype=np.float64)
+        center_delta = profile_center - origin
+        radial = center_delta - axis * float(np.dot(center_delta, axis))
+        if float(np.linalg.norm(radial)) <= 1.0e-9:
+            radial = -np.sin(angle) * axis_u + np.cos(angle) * axis_v
+        radial /= max(float(np.linalg.norm(radial)), 1.0e-12)
+        return (
+            True,
+            tuple(float(value) for value in origin),
+            tuple(float(value) for value in axis),
+            tuple(float(value) for value in radial),
+        )
+
+    def _revolve_axis_segment(
+        self,
+    ) -> tuple[bool, tuple[float, float, float], tuple[float, float, float]]:
+        node = self._revolve_section()
+        if node is None or node.profile is None:
+            return False, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+        u_min, u_max, v_min, v_max = node.profile.bounds()
+        active, origin_tuple, axis_tuple, _radial = self._revolve_axis_frame()
+        if not active:
+            return False, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+        origin = np.asarray(origin_tuple, dtype=np.float64)
+        axis = np.asarray(axis_tuple, dtype=np.float64)
+        axis_u = np.asarray(node.axis_u, dtype=np.float64)
+        axis_v = np.asarray(node.axis_v, dtype=np.float64)
+        corners = np.asarray(
+            [
+                origin + u * axis_u + v * axis_v
+                for u in (u_min, u_max)
+                for v in (v_min, v_max)
+            ],
+            dtype=np.float64,
+        )
+        coordinates = (corners - origin) @ axis
+        minimum = float(coordinates.min())
+        maximum = float(coordinates.max())
+        length = max(abs(maximum - minimum), self._grid_spacing)
+        padding = max(0.15 * length, self._grid_spacing)
+        start = origin + (minimum - padding) * axis
+        end = origin + (maximum + padding) * axis
+        return (
+            True,
+            tuple(float(value) for value in start),
+            tuple(float(value) for value in end),
+        )
+
     def _project_world_to_screen(
         self,
         point: tuple[float, float, float] | np.ndarray,
@@ -1502,6 +1862,130 @@ class GLWidget(QOpenGLWidget):
         self._update_measurement_readout()
         self.update()
 
+    def _clear_committed_move_preview(self) -> None:
+        if self._committed_move_object_id == 0:
+            return
+        self._committed_move_object_id = 0
+        self._committed_move_delta = (0.0, 0.0, 0.0)
+        self._update_measurement_readout()
+
+    def apply_committed_create_preview(
+        self,
+        kind: str,
+        start: tuple[float, float, float],
+        current: tuple[float, float, float],
+        *,
+        points: tuple[tuple[float, float, float], ...] = (),
+        polygon_closed: bool = False,
+        secondary_radius: float = -1.0,
+        torus_minor_radius: float = -1.0,
+    ) -> None:
+        self._committed_create_preview = (
+            kind,
+            start,
+            current,
+            points[:32],
+            polygon_closed,
+            float(secondary_radius),
+            float(torus_minor_radius),
+        )
+        self.update()
+
+    def _clear_committed_create_preview(self) -> None:
+        if self._committed_create_preview is None:
+            return
+        self._committed_create_preview = None
+        self.update()
+
+    def set_boolean_preview(
+        self,
+        operation: str,
+        first_object_id: int,
+        second_object_id: int,
+        *,
+        smoothing: float = 0.1,
+    ) -> None:
+        opcode = BOOLEAN_PREVIEW_OPERATIONS.get(operation, 0)
+        if opcode == 0 or first_object_id <= 0 or second_object_id <= 0:
+            self.clear_boolean_preview()
+            return
+        self._boolean_preview = (
+            opcode,
+            int(first_object_id),
+            int(second_object_id),
+            float(smoothing),
+            False,
+        )
+        self.update()
+
+    def apply_committed_boolean_preview(
+        self,
+        operation: str,
+        first_object_id: int,
+        second_object_id: int,
+        *,
+        smoothing: float = 0.1,
+    ) -> None:
+        opcode = BOOLEAN_PREVIEW_OPERATIONS.get(operation, 0)
+        if opcode == 0 or first_object_id <= 0 or second_object_id <= 0:
+            return
+        self._boolean_preview = (
+            opcode,
+            int(first_object_id),
+            int(second_object_id),
+            float(smoothing),
+            True,
+        )
+        self.update()
+
+    def clear_boolean_preview(self, *, include_committed: bool = False) -> None:
+        if self._boolean_preview is None:
+            return
+        if self._boolean_preview[4] and not include_committed:
+            return
+        self._boolean_preview = None
+        self.update()
+
+    def _clear_committed_boolean_preview(self) -> None:
+        self.clear_boolean_preview(include_committed=True)
+
+    def _boolean_preview_values(self) -> tuple[int, int, int, float]:
+        if self._boolean_preview is None:
+            return (0, 0, 0, 0.1)
+        operation, first, second, smoothing, _committed = self._boolean_preview
+        return (operation, first, second, smoothing)
+
+    def _committed_boolean_preview_object_ids(self) -> tuple[int, int] | None:
+        if self._boolean_preview is None or not self._boolean_preview[4]:
+            return None
+        _operation, first, second, _smoothing, _committed = self._boolean_preview
+        return (first, second)
+
+    def _accept_committed_boolean_pending_scene(self) -> bool:
+        if (
+            self._renderer is None
+            or self._pending_scene is None
+            or self._pending_render_ir is None
+        ):
+            return False
+        object_ids = self._committed_boolean_preview_object_ids()
+        if object_ids is None:
+            return False
+        if not self._renderer.update_render_ir_object_parameters(
+            self._pending_render_ir,
+            object_ids,
+        ):
+            return False
+        stats = self._renderer.last_scene_update_stats()
+        if stats is not None:
+            logger.info(_format_scene_update_stats(stats))
+            signals.log_message.emit("info", _format_scene_update_stats(stats))
+        self._compiled_scene = self._pending_scene
+        self._pending_scene = None
+        self._pending_render_ir = None
+        self._clear_viewport_error()
+        return True
+
     def has_scene_object_id(self, object_id: int) -> bool:
         return (
             self._scene_tree is not None
@@ -1529,6 +2013,16 @@ class GLWidget(QOpenGLWidget):
         self._update_measurement_readout()
         self.update()
 
+    def nudge_extrude_preview(self, delta: float) -> None:
+        self._extrude_preview_height = snap_scalar(
+            self._extrude_preview_height + delta,
+            self._grid_spacing,
+            self._snap_enabled,
+            QApplication.keyboardModifiers(),
+        )
+        self._update_measurement_readout()
+        self.update()
+
     def _keyboard_move_delta(
         self,
         key: int,
@@ -1544,7 +2038,7 @@ class GLWidget(QOpenGLWidget):
             return
         _action, value = self._interaction_tool
         delta = self._preview_move_delta()
-        rotations = GLWidget._rotation_preview_commands(self)
+        rotations = ViewportWidget._rotation_preview_commands(self)
         if rotations:
             self.cancel_interaction_tool()
             has_move = max(abs(component) for component in delta) > 1.0e-12
@@ -1563,6 +2057,35 @@ class GLWidget(QOpenGLWidget):
             signals.log_message.emit("info", "Move preview had no displacement.")
             return
         signals.viewport_move_requested.emit(int(value), delta)
+
+    def _commit_extrude_preview(self) -> None:
+        if (
+            self._interaction_tool is None
+            or self._interaction_tool[0] != "extrude"
+        ):
+            return
+        _action, value = self._interaction_tool
+        height = float(self._extrude_preview_height)
+        if abs(height) <= 1.0e-9:
+            signals.log_message.emit("warning", "Extrude length must be nonzero.")
+            return
+        self.cancel_interaction_tool()
+        signals.viewport_extrude_requested.emit(int(value), height)
+
+    def _commit_revolve_preview(self) -> None:
+        if (
+            self._interaction_tool is None
+            or self._interaction_tool[0] != "revolve"
+        ):
+            return
+        _action, value = self._interaction_tool
+        active, origin, axis, radial = self._revolve_axis_frame()
+        if not active:
+            signals.log_message.emit("warning", "Revolve axis is not available.")
+            return
+        angle = float(self._revolve_angle_degrees)
+        self.cancel_interaction_tool()
+        signals.viewport_revolve_requested.emit(int(value), origin, axis, radial, angle)
 
     def _apply_typed_move_preview(self) -> bool:
         if (
@@ -1599,16 +2122,26 @@ class GLWidget(QOpenGLWidget):
             self._commit_point_shape_preview()
             return
         try:
+            dimensions = (
+                parse_dimension_entry(self._dimension_input)
+                if self._dimension_input
+                else None
+            )
             start, end = self._create_effective_points(centered=centered)
             parameters = create_typed_parameters(
                 str(kind),
-                parse_dimension_entry(self._dimension_input)
-                if self._dimension_input
-                else None,
+                dimensions,
             )
         except ValueError as error:
             signals.log_message.emit("warning", str(error))
             return
+        self.apply_committed_create_preview(
+            str(kind),
+            start,
+            end,
+            secondary_radius=create_preview_secondary_radius(str(kind), dimensions),
+            torus_minor_radius=create_preview_torus_minor_radius(str(kind), dimensions),
+        )
         self._reset_create_preview(str(kind))
         signals.viewport_shape_drawn.emit(str(kind), start, end, parameters)
 
@@ -1639,6 +2172,244 @@ class GLWidget(QOpenGLWidget):
                 points.append(self._tool_hover_world)
         return tuple(points[:32])
 
+    @staticmethod
+    def _preview_render_ir_from_document(document: SceneDocument) -> RenderIR | None:
+        tree = document.visual_tree()
+        render_ir = build_render_ir(tree)
+        if render_ir is None or not render_ir.supported:
+            return None
+        return render_ir
+
+    def _scene_node_by_object_id(self, object_id: int) -> SDFNode | None:
+        if self._scene_tree is None or object_id <= 0:
+            return None
+        return next(
+            (
+                node
+                for node in self._scene_tree.nodes
+                if int(node.object_id) == int(object_id)
+            ),
+            None,
+        )
+
+    def _preview_document_for_node(self, node: SDFNode) -> tuple[SceneDocument, int]:
+        clone = deepcopy(node)
+        document = SceneDocument(objects=[clone])
+        return document, document.handle_for(clone)
+
+    def _active_create_preview_render_ir(self) -> RenderIR | None:
+        if (
+            self._interaction_tool is None
+            or self._interaction_tool[0] != "create"
+        ):
+            return None
+        kind = str(self._interaction_tool[1])
+        if kind in POINT_CREATE_KINDS:
+            points = self._point_shape_preview_points()
+            minimum = point_shape_minimum_points(kind)
+            if len(points) < minimum:
+                return None
+            if kind == "bezier_curve" and len(points) != 3:
+                return None
+            if kind in {"bezier_polycurve", "bezier_tube", "bezier_surface"} and len(
+                points
+            ) % 2 == 0:
+                return None
+            try:
+                document = SceneDocument()
+                document.add_point_shape_from_world_points(
+                    kind,
+                    points,
+                    self._reference_plane,
+                )
+            except ValueError:
+                return None
+            return self._preview_render_ir_from_document(document)
+        if self._tool_start_world is None or self._tool_current_world is None:
+            return None
+        try:
+            dimensions = (
+                parse_dimension_entry(self._dimension_input)
+                if self._dimension_input
+                else None
+            )
+            start, end = self._create_effective_points()
+            parameters = create_typed_parameters(kind, dimensions)
+            document = SceneDocument()
+            document.add_primitive_from_drag(
+                kind,
+                start,
+                end,
+                parameters=parameters,
+            )
+        except ValueError:
+            return None
+        return self._preview_render_ir_from_document(document)
+
+    def _committed_create_preview_render_ir(self) -> RenderIR | None:
+        if self._committed_create_preview is None:
+            return None
+        (
+            kind,
+            start,
+            end,
+            points,
+            _polygon_closed,
+            secondary_radius,
+            torus_minor_radius,
+        ) = self._committed_create_preview
+        try:
+            document = SceneDocument()
+            if points:
+                document.add_point_shape_from_world_points(
+                    kind,
+                    points,
+                    self._reference_plane,
+                )
+            else:
+                parameters: dict[str, float] = {}
+                if kind == "capped_cone" and secondary_radius > 0.0:
+                    parameters["top_diameter"] = 2.0 * secondary_radius
+                if kind == "torus" and torus_minor_radius > 0.0:
+                    parameters["minor_diameter"] = 2.0 * torus_minor_radius
+                document.add_primitive_from_drag(
+                    kind,
+                    start,
+                    end,
+                    parameters=parameters,
+                )
+        except ValueError:
+            return None
+        return self._preview_render_ir_from_document(document)
+
+    def _active_move_preview_render_ir(self) -> RenderIR | None:
+        if (
+            self._interaction_tool is None
+            or self._interaction_tool[0] != "move"
+        ):
+            return None
+        node = self._scene_node_by_object_id(self._scene_selected_object_id)
+        if node is None:
+            return None
+        delta = self._preview_move_delta()
+        rotations = ViewportWidget._rotation_preview_commands(self)
+        if (
+            max(abs(component) for component in delta) <= 1.0e-12
+            and not rotations
+        ):
+            return None
+        try:
+            document, handle = self._preview_document_for_node(node)
+            if max(abs(component) for component in delta) > 1.0e-12:
+                handle = document.move_object(handle, delta)
+            for axis, angle_degrees, pivot in rotations:
+                if abs(angle_degrees) > 1.0e-6:
+                    handle = document.rotate_object(
+                        handle,
+                        axis,
+                        angle_degrees,
+                        pivot,
+                    )
+        except (KeyError, ValueError, NotImplementedError):
+            return None
+        return self._preview_render_ir_from_document(document)
+
+    def _active_extrude_preview_render_ir(self) -> RenderIR | None:
+        if (
+            self._interaction_tool is None
+            or self._interaction_tool[0] != "extrude"
+        ):
+            return None
+        node = self._scene_node_by_object_id(self._scene_selected_object_id)
+        if not isinstance(node, PlacedSDF2D):
+            return None
+        height = float(self._extrude_preview_height)
+        if abs(height) <= 1.0e-9:
+            return None
+        try:
+            document, handle = self._preview_document_for_node(node)
+            solid_handle = document.solid_from_2d(
+                [handle],
+                "extrude",
+                signed_height=height,
+            )
+            solid = deepcopy(document.node(solid_handle))
+            preview_document = SceneDocument(objects=[solid])
+        except (KeyError, ValueError):
+            return None
+        return self._preview_render_ir_from_document(preview_document)
+
+    def _active_revolve_preview_render_ir(self) -> RenderIR | None:
+        if (
+            self._interaction_tool is None
+            or self._interaction_tool[0] != "revolve"
+        ):
+            return None
+        node = self._scene_node_by_object_id(self._scene_selected_object_id)
+        if not isinstance(node, PlacedSDF2D):
+            return None
+        active, origin, axis, radial = self._revolve_axis_frame()
+        if not active:
+            return None
+        try:
+            document, handle = self._preview_document_for_node(node)
+            solid_handle = document.solid_from_2d(
+                [handle],
+                "revolve",
+                revolve_axis_origin=origin,
+                revolve_axis_direction=axis,
+                revolve_radial_direction=radial,
+                revolve_angle_degrees=float(self._revolve_angle_degrees),
+            )
+            solid = deepcopy(document.node(solid_handle))
+            preview_document = SceneDocument(objects=[solid])
+        except (KeyError, ValueError):
+            return None
+        return self._preview_render_ir_from_document(preview_document)
+
+    def _boolean_preview_render_ir(self) -> RenderIR | None:
+        if self._boolean_preview is None:
+            return None
+        opcode, first_id, second_id, _smoothing, _committed = self._boolean_preview
+        operation = next(
+            (
+                name
+                for name, value in BOOLEAN_PREVIEW_OPERATIONS.items()
+                if value == opcode
+            ),
+            "",
+        )
+        if not operation:
+            return None
+        first = self._scene_node_by_object_id(first_id)
+        second = self._scene_node_by_object_id(second_id)
+        if first is None or second is None:
+            return None
+        try:
+            first_clone = deepcopy(first)
+            second_clone = deepcopy(second)
+            document = SceneDocument(objects=[first_clone, second_clone])
+            combined_handle = document.combine(
+                document.handle_for(first_clone),
+                document.handle_for(second_clone),
+                operation,
+            )
+            combined = deepcopy(document.node(combined_handle))
+            preview_document = SceneDocument(objects=[combined])
+        except (KeyError, ValueError):
+            return None
+        return self._preview_render_ir_from_document(preview_document)
+
+    def _preview_render_ir(self) -> RenderIR | None:
+        return (
+            self._active_create_preview_render_ir()
+            or self._active_move_preview_render_ir()
+            or self._active_extrude_preview_render_ir()
+            or self._active_revolve_preview_render_ir()
+            or self._boolean_preview_render_ir()
+            or self._committed_create_preview_render_ir()
+        )
+
     def _commit_point_shape_preview(self) -> None:
         kind = self._point_shape_kind()
         if kind is None:
@@ -1656,14 +2427,23 @@ class GLWidget(QOpenGLWidget):
                 "Bezier Curve requires exactly three points.",
             )
             return
-        if kind == "bezier_polycurve" and len(self._point_shape_points) % 2 == 0:
+        if kind in {"bezier_polycurve", "bezier_tube", "bezier_surface"} and len(
+            self._point_shape_points
+        ) % 2 == 0:
             signals.log_message.emit(
                 "warning",
-                "Bezier Polycurve requires an odd point count: "
+                f"{CREATE_LABELS[kind]} requires an odd point count: "
                 "anchor, control, anchor.",
             )
             return
         points = tuple(self._point_shape_points)
+        self.apply_committed_create_preview(
+            kind,
+            points[0],
+            points[-1],
+            points=points,
+            polygon_closed=kind in {"bezier_surface", "polygon"},
+        )
         self._reset_create_preview(kind)
         signals.viewport_point_shape_drawn.emit(kind, points, self._reference_plane)
 
@@ -1716,11 +2496,35 @@ class GLWidget(QOpenGLWidget):
     def _handle_dimension_key(self, event: QKeyEvent) -> bool:
         if (
             self._interaction_tool is None
-            or self._interaction_tool[0] not in {"create", "move"}
+            or self._interaction_tool[0] not in {"create", "move", "extrude", "revolve"}
         ):
             return False
         action = self._interaction_tool[0]
         if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
+            if action == "revolve" and self._dimension_input:
+                try:
+                    angle = parse_scalar_entry(self._dimension_input)
+                except ValueError as error:
+                    signals.log_message.emit("warning", str(error))
+                    return True
+                self._revolve_angle_degrees = min(360.0, max(0.1, angle))
+                self._dimension_input = ""
+                self._update_measurement_readout()
+                self.update()
+                self._commit_revolve_preview()
+                return True
+            if action == "extrude" and self._dimension_input:
+                try:
+                    height = parse_displacement_entry(self._dimension_input)[0]
+                except ValueError as error:
+                    signals.log_message.emit("warning", str(error))
+                    return True
+                self._extrude_preview_height = height
+                self._dimension_input = ""
+                self._update_measurement_readout()
+                self.update()
+                self._commit_extrude_preview()
+                return True
             if action == "move" and self._dimension_input:
                 if self._apply_typed_move_preview():
                     self._commit_move_preview()
@@ -1748,7 +2552,7 @@ class GLWidget(QOpenGLWidget):
             return False
         text = dimension_entry_text(
             event.text(),
-            action,
+            "move" if action == "extrude" else action,
             self._tool_start_world is not None,
             self._dimension_input,
         )
@@ -1804,7 +2608,9 @@ class GLWidget(QOpenGLWidget):
     def initializeGL(self) -> None:
         try:
             self._context = moderngl.create_context(require=330)
-            self._renderer = SDFRenderer(self._context)
+            self._renderer = OpenGLRenderer(self._context)
+            self._compiled_scene = None
+            self._compiled_preview_scene = EMPTY_RENDER_SCENE_KEY
             logger.info(
                 "OpenGL initialized: %s",
                 self._context.info.get("GL_RENDERER", "unknown renderer"),
@@ -1835,21 +2641,60 @@ class GLWidget(QOpenGLWidget):
             )
             return
         if self._pending_scene is not None:
-            try:
-                self._renderer.compile_scene(self._pending_scene)
+            if self._accept_committed_boolean_pending_scene():
+                pass
+            elif self._pending_scene == self._compiled_scene:
                 self._pending_scene = None
+                self._pending_render_ir = None
+                self._clear_committed_move_preview()
+                self._clear_committed_create_preview()
+                self._clear_committed_boolean_preview()
                 self._clear_viewport_error()
+            else:
+                try:
+                    if self._scene_tree is None and self._pending_render_ir is None:
+                        self._renderer.clear_scene()
+                    elif not self._renderer.upload_render_ir(self._pending_render_ir):
+                        raise RuntimeError("RenderIR upload failed")
+                    stats = self._renderer.last_scene_update_stats()
+                    if stats is not None:
+                        logger.info(_format_scene_update_stats(stats))
+                        signals.log_message.emit(
+                            "info",
+                            _format_scene_update_stats(stats),
+                        )
+                    self._compiled_scene = self._pending_scene
+                    self._pending_scene = None
+                    self._pending_render_ir = None
+                    self._clear_committed_move_preview()
+                    self._clear_committed_create_preview()
+                    self._clear_committed_boolean_preview()
+                    self._clear_viewport_error()
+                except Exception as error:
+                    logger.exception("shader compilation failed")
+                    signals.log_message.emit(
+                        "error", f"Shader compilation failed: {error}"
+                    )
+                    self._show_viewport_error(f"Shader compilation failed: {error}")
+                    self._pending_scene = None
+                    self._pending_render_ir = None
+                    return
+        preview_render_ir = self._preview_render_ir()
+        preview_scene_key = render_scene_key(preview_render_ir)
+        if preview_scene_key != self._compiled_preview_scene:
+            try:
+                if preview_render_ir is None:
+                    self._renderer.clear_preview_render_ir()
+                elif not self._renderer.upload_preview_render_ir(preview_render_ir):
+                    raise RuntimeError("Preview RenderIR upload failed")
+                self._compiled_preview_scene = preview_scene_key
             except Exception as error:
-                logger.exception("shader compilation failed")
-                signals.log_message.emit("error", f"Shader compilation failed: {error}")
-                self._show_viewport_error(f"Shader compilation failed: {error}")
-                self._pending_scene = None
-                if not self._renderer.has_scene_program():
-                    try:
-                        self._renderer.compile_scene(empty_scene_source())
-                    except Exception:
-                        logger.exception("fallback shader compilation failed")
-                        return
+                logger.exception("preview shader compilation failed")
+                signals.log_message.emit(
+                    "error", f"Preview shader compilation failed: {error}"
+                )
+                self._renderer.clear_preview_render_ir()
+                self._compiled_preview_scene = EMPTY_RENDER_SCENE_KEY
         self._append_lattice_stream_chunks()
         self._advance_lattice_upload()
         width = max(1, round(self.width() * self.devicePixelRatio()))
@@ -1885,21 +2730,10 @@ class GLWidget(QOpenGLWidget):
                 self._boundary_hover_normal,
                 self._scene_hover_object_id,
                 scene_selected_object_id,
-                self._selected_boundary_regions,
-                self._selected_boundary_normals,
-                self._preview_kind(),
-                self._preview_start(),
-                self._preview_current(),
-                self._preview_move_delta(),
-                self._preview_rotation_axes(),
-                self._preview_rotation_angles(),
-                self._preview_rotation_pivots(),
-                self._preview_cursor_active(),
-                self._preview_cursor(),
-                self._preview_torus_minor_radius(),
+                tuple(self._selected_boundary_regions),
+                tuple(self._selected_boundary_normals),
                 self._preview_point_count(),
                 self._preview_points(),
-                self._preview_polygon_closed(),
                 rotation_gizmo_visible,
                 rotation_gizmo_center,
                 rotation_gizmo_radius,
@@ -1986,57 +2820,15 @@ class GLWidget(QOpenGLWidget):
         self._fps_timer.restart()
         self._position_measure_label()
 
-    def _preview_kind(self) -> int:
-        if (
-            self._interaction_tool is not None
-            and self._interaction_tool[0] == "create"
-            and (
-                (
-                    self._tool_start_world is not None
-                    and self._tool_current_world is not None
-                )
-                or bool(self._point_shape_points)
-            )
-        ):
-            return CREATE_PREVIEW_KINDS.get(str(self._interaction_tool[1]), 0)
-        return 0
-
     def _preview_points(self) -> tuple[tuple[float, float, float], ...]:
         if self._point_shape_kind() is None:
+            if self._committed_create_preview is not None:
+                return self._committed_create_preview[3]
             return ()
         return self._point_shape_preview_points()
 
     def _preview_point_count(self) -> int:
         return len(self._preview_points())
-
-    def _preview_polygon_closed(self) -> bool:
-        return self._point_shape_kind() == "polygon"
-
-    def _preview_start(self) -> tuple[float, float, float]:
-        if (
-            self._interaction_tool is not None
-            and self._interaction_tool[0] == "create"
-            and self._tool_start_world is not None
-            and self._tool_current_world is not None
-        ):
-            try:
-                return self._create_effective_points()[0]
-            except ValueError:
-                return self._tool_start_world
-        return self._tool_start_world or (0.0, 0.0, 0.0)
-
-    def _preview_current(self) -> tuple[float, float, float]:
-        if (
-            self._interaction_tool is not None
-            and self._interaction_tool[0] == "create"
-            and self._tool_start_world is not None
-            and self._tool_current_world is not None
-        ):
-            try:
-                return self._create_effective_points()[1]
-            except ValueError:
-                return self._tool_current_world
-        return self._tool_current_world or self._preview_start()
 
     def _preview_move_delta(self) -> tuple[float, float, float]:
         if (
@@ -2054,19 +2846,10 @@ class GLWidget(QOpenGLWidget):
             return self._committed_move_delta
         return (0.0, 0.0, 0.0)
 
-    def _preview_rotation_active(self) -> bool:
-        return bool(self._rotation_preview_commands())
-
-    def _preview_rotation_axis(self) -> int:
-        return {"x": 0, "y": 1, "z": 2}.get(self._rotation_drag_axis or "", 2)
-
-    def _preview_rotation_angle(self) -> float:
-        return radians(self._rotation_preview_angle)
-
     def _preview_rotation_pivot(self) -> tuple[float, float, float]:
         if self._rotation_drag_center is None:
             return (0.0, 0.0, 0.0)
-        return GLWidget._rotation_step_pivot(
+        return ViewportWidget._rotation_step_pivot(
             self,
             self._rotation_drag_center,
             self._rotation_drag_move_delta,
@@ -2092,7 +2875,7 @@ class GLWidget(QOpenGLWidget):
             (
                 axis,
                 angle,
-                GLWidget._rotation_step_pivot(self, center, move_delta),
+                ViewportWidget._rotation_step_pivot(self, center, move_delta),
             )
             for axis, angle, center, move_delta in getattr(
                 self,
@@ -2112,61 +2895,8 @@ class GLWidget(QOpenGLWidget):
                     self._rotation_preview_angle,
                     self._preview_rotation_pivot(),
                 )
-            )
+        )
         return tuple(commands)
-
-    def _preview_rotation_axes(self) -> tuple[int, ...]:
-        axis_ids = {"x": 0, "y": 1, "z": 2}
-        return tuple(
-            axis_ids.get(axis, 2)
-            for axis, _angle, _pivot in self._rotation_preview_commands()
-        )
-
-    def _preview_rotation_angles(self) -> tuple[float, ...]:
-        return tuple(
-            radians(angle)
-            for _axis, angle, _pivot in self._rotation_preview_commands()
-        )
-
-    def _preview_rotation_pivots(
-        self,
-    ) -> tuple[tuple[float, float, float], ...]:
-        return tuple(
-            pivot
-            for _axis, _angle, pivot in self._rotation_preview_commands()
-        )
-
-    def _preview_cursor_active(self) -> bool:
-        action = (
-            str(self._interaction_tool[0])
-            if self._interaction_tool is not None
-            else None
-        )
-        return cursor_preview_active(
-            action,
-            self._tool_start_world,
-            self._tool_hover_world,
-        )
-
-    def _preview_cursor(self) -> tuple[float, float, float]:
-        return self._tool_hover_world or (0.0, 0.0, 0.0)
-
-    def _preview_torus_minor_radius(self) -> float:
-        if (
-            self._interaction_tool is None
-            or self._interaction_tool[0] != "create"
-        ):
-            return -1.0
-        _action, kind = self._interaction_tool
-        try:
-            dimensions = (
-                parse_dimension_entry(self._dimension_input)
-                if self._dimension_input
-                else None
-            )
-        except ValueError:
-            return -1.0
-        return create_preview_torus_minor_radius(str(kind), dimensions)
 
     def _reference_axes(self) -> tuple[tuple[int, str], tuple[int, str]]:
         return REFERENCE_PLANE_AXES[self._reference_plane]
@@ -2296,6 +3026,13 @@ class GLWidget(QOpenGLWidget):
                 input_text=input_text,
                 modifier_text=modifier_status,
             )
+        if action == "extrude":
+            return self._extrude_measurement_text(
+                self._extrude_preview_height,
+                input_text=self._dimension_input or extrude_dimension_prompt(),
+            )
+        if action == "revolve":
+            return self._revolve_measurement_text()
         if (
             action != "create"
             or self._tool_start_world is None
@@ -2324,15 +3061,18 @@ class GLWidget(QOpenGLWidget):
             minimum = point_shape_minimum_points(point_kind)
             label = CREATE_LABELS.get(point_kind, point_kind)
             count = len(self._point_shape_points)
+            limit_suffix = "" if point_kind == "bezier_curve" else "+"
             base = (
                 f"{label} | {reference_plane_context(self._reference_plane)} | "
-                f"Points {count}/{minimum}+  {self._grid_measurement_text()}"
+                f"Points {count}/{minimum}{limit_suffix}  {self._grid_measurement_text()}"
             )
             if self._tool_hover_world is not None:
                 base = (
                     f"{base} | Cursor "
                     f"{self._reference_coordinate_text(self._tool_hover_world)}"
                 )
+            if point_kind == "bezier_curve":
+                return f"{base} | Third point creates  Backspace removes"
             return f"{base} | Enter creates  Backspace removes"
         try:
             start, current = self._create_effective_points()
@@ -2514,6 +3254,92 @@ class GLWidget(QOpenGLWidget):
             for label, value in rows
         )
 
+    def _extrude_measurement_text(
+        self,
+        height: float,
+        *,
+        input_text: str = "",
+    ) -> str:
+        active, anchor, normal = self._extrude_gizmo_state()
+        rows = [
+            ("Tool", "Extrude"),
+            ("Base point", self._xyz_measurement_text(anchor if active else None)),
+            ("Direction", self._xyz_measurement_text(normal if active else None)),
+            ("Signed length", self._format_measure(height)),
+            ("Grid spacing", self._format_measure(self._grid_spacing)),
+            ("Snap", "On" if self._snap_enabled else "Off"),
+        ]
+        if input_text:
+            rows.append(("Entry", input_text))
+        label_width = max(len(label) for label, _value in rows)
+        return "\n".join(
+            f"{label:<{label_width}}  {value}"
+            for label, value in rows
+        )
+
+    def _revolve_measurement_text(self) -> str:
+        active, start, end = self._revolve_axis_segment()
+        frame_active, _origin, axis, radial = self._revolve_axis_frame()
+        rows = [
+            ("Tool", "Revolve"),
+            ("Axis", self._revolve_axis.upper()),
+            ("Axis angle", f"{self._revolve_axis_angle_degrees:.5g} deg"),
+                ("Revolve angle", f"{self._revolve_angle_degrees:.5g} deg"),
+            ("Start", self._xyz_measurement_text(start if active else None)),
+            ("End", self._xyz_measurement_text(end if active else None)),
+            ("Direction", self._xyz_measurement_text(axis if frame_active else None)),
+            ("Radial ref", self._xyz_measurement_text(radial if frame_active else None)),
+            ("Grid spacing", self._format_measure(self._grid_spacing)),
+            ("Entry", "Type angle in degrees"),
+        ]
+        label_width = max(len(label) for label, _value in rows)
+        return "\n".join(
+            f"{label:<{label_width}}  {value}"
+            for label, value in rows
+        )
+
+    def _extrude_height_from_screen(
+        self,
+        x: float,
+        y: float,
+    ) -> float | None:
+        if self._tool_start_screen is None:
+            return None
+        active, anchor, normal = self._extrude_gizmo_state()
+        if not active:
+            return None
+        start = self._project_world_to_screen(anchor)
+        end = self._project_world_to_screen(
+            tuple(anchor[index] + normal[index] * self._grid_spacing for index in range(3))
+        )
+        if start is None or end is None:
+            axis = np.asarray((0.0, -1.0), dtype=np.float64)
+            pixels_per_step = 40.0
+        else:
+            axis = np.asarray((end[0] - start[0], end[1] - start[1]), dtype=np.float64)
+            pixels_per_step = float(np.linalg.norm(axis))
+            if pixels_per_step <= 1.0e-6:
+                axis = np.asarray((0.0, -1.0), dtype=np.float64)
+                pixels_per_step = 40.0
+            else:
+                axis /= pixels_per_step
+        drag = np.asarray(
+            (
+                x - float(self._tool_start_screen.x()),
+                y - float(self._tool_start_screen.y()),
+            ),
+            dtype=np.float64,
+        )
+        height = self._extrude_drag_start_height + (
+            float(np.dot(drag, axis)) / max(pixels_per_step, 1.0)
+        ) * self._grid_spacing
+        return snap_scalar(
+            height,
+            self._grid_spacing,
+            self._snap_enabled,
+            QApplication.keyboardModifiers(),
+        )
+
     def _reference_coordinate_text(
         self,
         point: tuple[float, float, float],
@@ -2572,6 +3398,33 @@ class GLWidget(QOpenGLWidget):
                     return
         if (
             self._interaction_tool is not None
+            and self._interaction_tool[0] == "extrude"
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._tool_start_screen = event.position().toPoint()
+            self._extrude_drag_start_height = self._extrude_preview_height
+            self._update_measurement_readout()
+            self.update()
+            return
+        if (
+            self._interaction_tool is not None
+            and self._interaction_tool[0] == "revolve"
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._revolve_axis = "u" if self._revolve_axis == "v" else "v"
+            self._revolve_axis_angle_degrees = (
+                0.0 if self._revolve_axis == "u" else 90.0
+            )
+            self._update_measurement_readout()
+            self.update()
+            signals.log_message.emit(
+                "info",
+                f"Revolve axis set to {self._revolve_axis.upper()}. "
+                "Press Enter to apply.",
+            )
+            return
+        if (
+            self._interaction_tool is not None
             and event.button() == Qt.MouseButton.LeftButton
         ):
             if self._point_shape_kind() is not None:
@@ -2589,11 +3442,23 @@ class GLWidget(QOpenGLWidget):
                 self._tool_hover_world = point
                 self._update_measurement_readout()
                 self.update()
-                signals.log_message.emit(
-                    "info",
-                    "Point added. Move to preview next edge, Enter creates, "
-                    "Backspace removes last point, Esc cancels.",
-                )
+                if (
+                    self._point_shape_kind() == "bezier_curve"
+                    and len(self._point_shape_points) == 3
+                ):
+                    self._commit_point_shape_preview()
+                    return
+                if self._point_shape_kind() == "bezier_curve":
+                    point_message = (
+                        "Point added. Click the remaining Bezier point, "
+                        "Backspace removes last point, Esc cancels."
+                    )
+                else:
+                    point_message = (
+                        "Point added. Move to preview next edge, Enter creates, "
+                        "Backspace removes last point, Esc cancels."
+                    )
+                signals.log_message.emit("info", point_message)
                 return
             point = self._tool_point_from_event(event)
             if point is None:
@@ -2647,6 +3512,20 @@ class GLWidget(QOpenGLWidget):
             return
         if (
             self._interaction_tool is not None
+            and self._interaction_tool[0] == "extrude"
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            height = self._extrude_height_from_screen(
+                event.position().x(),
+                event.position().y(),
+            )
+            if height is not None:
+                self._extrude_preview_height = height
+                self._update_measurement_readout()
+                self.update()
+            return
+        if (
+            self._interaction_tool is not None
             and self._interaction_tool[0] == "boundary_region"
             and not event.buttons()
         ):
@@ -2682,6 +3561,25 @@ class GLWidget(QOpenGLWidget):
                     self._tool_current_world = None
             self._update_measurement_readout()
             self.update()
+            return
+        if (
+            self._interaction_tool is not None
+            and self._interaction_tool[0] == "extrude"
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            height = self._extrude_height_from_screen(
+                event.position().x(),
+                event.position().y(),
+            )
+            if height is not None:
+                self._extrude_preview_height = height
+            self._tool_start_screen = None
+            self._update_measurement_readout()
+            self.update()
+            signals.log_message.emit(
+                "info",
+                "Extrude preview updated. Press Enter to apply or Esc to cancel.",
+            )
             return
         if (
             self._interaction_tool is not None
@@ -2742,7 +3640,7 @@ class GLWidget(QOpenGLWidget):
                         self._rotation_drag_move_delta,
                     )
                 )
-            GLWidget._clear_active_rotation_drag(self)
+            ViewportWidget._clear_active_rotation_drag(self)
             self._tool_start_screen = None
             self._update_measurement_readout()
             self.update()
@@ -2916,6 +3814,84 @@ class GLWidget(QOpenGLWidget):
                     self.nudge_move_preview(delta)
                     return
         if (
+            self._interaction_tool is not None
+            and self._interaction_tool[0] == "extrude"
+        ):
+            if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
+                self._commit_extrude_preview()
+                return
+            allowed_modifiers = (
+                Qt.KeyboardModifier.NoModifier
+                | Qt.KeyboardModifier.ShiftModifier
+                | Qt.KeyboardModifier.AltModifier
+            )
+            if event.modifiers() & ~allowed_modifiers == Qt.KeyboardModifier.NoModifier:
+                delta = keyboard_extrude_delta(
+                    event.key(),
+                    self._grid_spacing,
+                    event.modifiers(),
+                )
+                if delta is not None:
+                    self.nudge_extrude_preview(delta)
+                    return
+        if (
+            self._interaction_tool is not None
+            and self._interaction_tool[0] == "revolve"
+        ):
+            if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
+                self._commit_revolve_preview()
+                return
+            if event.modifiers() == Qt.KeyboardModifier.NoModifier:
+                if event.key() == Qt.Key.Key_U:
+                    self._revolve_axis = "u"
+                    self._revolve_axis_angle_degrees = 0.0
+                    self._update_measurement_readout()
+                    self.update()
+                    signals.log_message.emit(
+                        "info",
+                        "Revolve axis set to U. Press Enter to apply.",
+                    )
+                    return
+                if event.key() == Qt.Key.Key_V:
+                    self._revolve_axis = "v"
+                    self._revolve_axis_angle_degrees = 90.0
+                    self._update_measurement_readout()
+                    self.update()
+                    signals.log_message.emit(
+                        "info",
+                        "Revolve axis set to V. Press Enter to apply.",
+                    )
+                    return
+            allowed_modifiers = (
+                Qt.KeyboardModifier.NoModifier
+                | Qt.KeyboardModifier.ShiftModifier
+                | Qt.KeyboardModifier.AltModifier
+            )
+            if event.modifiers() & ~allowed_modifiers == Qt.KeyboardModifier.NoModifier:
+                step = 5.0
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    step = 15.0
+                if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+                    step = 1.0
+                if event.key() in {Qt.Key.Key_A, Qt.Key.Key_D}:
+                    direction = -1.0 if event.key() == Qt.Key.Key_A else 1.0
+                    self._revolve_axis = "custom"
+                    self._revolve_axis_angle_degrees = (
+                        self._revolve_axis_angle_degrees + direction * step
+                    ) % 180.0
+                    self._update_measurement_readout()
+                    self.update()
+                    return
+                if event.key() in {Qt.Key.Key_Q, Qt.Key.Key_E}:
+                    direction = -1.0 if event.key() == Qt.Key.Key_Q else 1.0
+                    self._revolve_angle_degrees = min(
+                        360.0,
+                        max(0.1, self._revolve_angle_degrees + direction * step),
+                    )
+                    self._update_measurement_readout()
+                    self.update()
+                    return
+        if (
             self._interaction_tool is None
             and event.modifiers() == Qt.KeyboardModifier.NoModifier
         ):
@@ -2936,5 +3912,16 @@ class GLWidget(QOpenGLWidget):
         self.update()
 
     def closeEvent(self, event: object) -> None:
-        self._renderer = None
+        if self._renderer is not None:
+            try:
+                self._renderer.release()
+            except Exception:
+                logger.exception("failed to release renderer resources")
+            self._renderer = None
+        self._compiled_scene = None
+        self._context = None
         super().closeEvent(event)
+
+
+# Compatibility alias while imports migrate.
+GLWidget = ViewportWidget

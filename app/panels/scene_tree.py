@@ -33,15 +33,22 @@ SDF_MENU_ITEMS: tuple[tuple[str, str], ...] = (
     ("Ellipse 2D", "ellipse"),
     ("Regular Polygon 2D", "regular_polygon"),
     ("Polygon 2D", "polygon"),
+    ("Bezier Surface 2D", "bezier_surface"),
     ("Sphere", "sphere"),
     ("Box", "box"),
+    ("Box Frame", "box_frame"),
     ("Cylinder", "cylinder"),
+    ("Capped Cone", "capped_cone"),
+    ("Cone", "cone"),
+    ("Pyramid", "pyramid"),
     ("Torus", "torus"),
+    ("Polyline Tube", "polyline_tube"),
+    ("Bezier Tube", "bezier_tube"),
 )
 SDF_MENU_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("1D", SDF_MENU_ITEMS[:4]),
-    ("2D", SDF_MENU_ITEMS[4:11]),
-    ("3D", SDF_MENU_ITEMS[11:]),
+    ("2D", SDF_MENU_ITEMS[4:12]),
+    ("3D", SDF_MENU_ITEMS[12:]),
 )
 
 
@@ -73,6 +80,7 @@ class SceneTreePanel(QWidget):
         super().__init__(parent)
         self._document: SceneDocument | None = None
         self._context_submenus: list[QMenu] = []
+        self._items_by_handle: dict[int, QTreeWidgetItem] = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         add_button = QPushButton("Add SDF")
@@ -98,6 +106,11 @@ class SceneTreePanel(QWidget):
     def set_document(self, document: SceneDocument) -> None:
         self._document = document
         selected = set(self.selected_handles())
+        expanded = {
+            handle
+            for handle, item in self._items_by_handle.items()
+            if item.isExpanded()
+        }
         self.tree.blockSignals(True)
         self.tree.clear()
         items: dict[int, QTreeWidgetItem] = {}
@@ -126,9 +139,20 @@ class SceneTreePanel(QWidget):
             items[handle] = item
             if handle in selected:
                 item.setSelected(True)
-        self.tree.expandAll()
-        self.tree.resizeColumnToContents(0)
+        self._items_by_handle = items
+        if expanded:
+            for handle in expanded:
+                item = self._items_by_handle.get(handle)
+                if item is not None:
+                    item.setExpanded(True)
+        elif len(items) <= 64:
+            self.tree.expandAll()
+        else:
+            for index in range(self.tree.topLevelItemCount()):
+                self.tree.topLevelItem(index).setExpanded(True)
         self.tree.blockSignals(False)
+        if len(items) <= 128:
+            self.tree.resizeColumnToContents(0)
 
     def selected_handles(self) -> list[int]:
         return [
@@ -141,12 +165,10 @@ class SceneTreePanel(QWidget):
 
     def select_handles(self, handles: list[int]) -> None:
         targets = set(handles)
-        iterator = self.tree.findItems(
-            "*", Qt.MatchFlag.MatchWildcard | Qt.MatchFlag.MatchRecursive, 0
-        )
         self.tree.clearSelection()
-        for item in iterator:
-            if item.data(0, HANDLE_ROLE) in targets:
+        for handle in handles:
+            item = self._items_by_handle.get(handle)
+            if item is not None and handle in targets:
                 self.tree.setCurrentItem(item)
                 item.setSelected(True)
 
@@ -163,6 +185,9 @@ class SceneTreePanel(QWidget):
             self.tree.setCurrentItem(clicked_item)
             clicked_item.setSelected(True)
         menu = QMenu(self)
+        menu.aboutToHide.connect(
+            lambda: signals.csg_preview_requested.emit("", [])
+        )
         add_menu = menu.addMenu("Add SDF")
         add_sdf_menu_actions(add_menu, signals.add_primitive_requested)
         selected = self.selected_handles()
@@ -183,6 +208,11 @@ class SceneTreePanel(QWidget):
             ):
                 action = boolean_menu.addAction(label)
                 action.setEnabled(len(selected) == 2)
+                action.hovered.connect(
+                    lambda value=operation: signals.csg_preview_requested.emit(
+                        value, self.selected_handles()
+                    )
+                )
                 action.triggered.connect(
                     lambda checked=False, value=operation: signals.csg_requested.emit(
                         value, self.selected_handles()
@@ -205,8 +235,6 @@ class SceneTreePanel(QWidget):
         for label, method in (
             ("Extrude", "extrude"),
             ("Revolve", "revolve"),
-            ("Sweep", "sweep"),
-            ("Loft Implicit", "loft_implicit"),
         ):
             action = solid_menu.addAction(label)
             action.setEnabled(
@@ -323,6 +351,13 @@ class SceneTreePanel(QWidget):
                 action = operation_menu.addAction(
                     f"{other.name}  [ID {other.object_id}]"
                 )
+                action.hovered.connect(
+                    lambda op=operation,
+                    first=base_handle,
+                    second=other_handle: signals.csg_preview_requested.emit(
+                        op, [first, second]
+                    )
+                )
                 action.triggered.connect(
                     lambda checked=False,
                     op=operation,
@@ -337,6 +372,12 @@ class SceneTreePanel(QWidget):
         for other_handle, other in candidates:
             label = f"{other.name}  [ID {other.object_id}]"
             subtract = subtract_menu.addAction(label)
+            subtract.hovered.connect(
+                lambda first=base_handle,
+                second=other_handle: signals.csg_preview_requested.emit(
+                    "difference", [first, second]
+                )
+            )
             subtract.triggered.connect(
                 lambda checked=False,
                 first=base_handle,
@@ -345,6 +386,12 @@ class SceneTreePanel(QWidget):
                 )
             )
             reverse = reverse_menu.addAction(label)
+            reverse.hovered.connect(
+                lambda first=other_handle,
+                second=base_handle: signals.csg_preview_requested.emit(
+                    "difference", [first, second]
+                )
+            )
             reverse.triggered.connect(
                 lambda checked=False,
                 first=other_handle,

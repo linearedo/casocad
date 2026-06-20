@@ -69,10 +69,6 @@ class SDFNode(ABC):
         return ()
 
     @abstractmethod
-    def to_glsl(self, p_var: str = "p") -> str:
-        """Return a pure GLSL signed-distance expression."""
-
-    @abstractmethod
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -87,12 +83,3 @@ class SDFNode(ABC):
         if not children:
             return (self,)
         return tuple(leaf for child in children for leaf in child.leaves())
-
-
-def glsl_float(value: float) -> str:
-    text = f"{float(value):.9g}"
-    return text if "." in text or "e" in text.lower() else f"{text}.0"
-
-
-def glsl_vec3(values: tuple[float, float, float]) -> str:
-    return f"vec3({', '.join(glsl_float(value) for value in values)})"

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
-from .base import BoundingBox3D, FloatArray, SDFNode, glsl_float, glsl_vec3
+from .base import BoundingBox3D, FloatArray, SDFNode
 from .primitives_1d import Profile1D
 
 
@@ -91,21 +91,6 @@ class PlacedSDF1D(SDFNode):
                 dtype=np.float64,
             ),
         )
-
-    def _project_glsl(self, p_var: str) -> tuple[str, str]:
-        local = f"({p_var} - {glsl_vec3(self.origin)})"
-        coordinate = f"dot({local}, {glsl_vec3(self.axis_u)})"
-        radial = (
-            f"length({local} - {coordinate} * {glsl_vec3(self.axis_u)})"
-        )
-        return coordinate, radial
-
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.profile is not None
-        coordinate, radial = self._project_glsl(p_var)
-        profile = self.profile.to_glsl(coordinate)
-        thickness = glsl_float(0.004)
-        return f"max({profile}, {radial} - {thickness})"
 
     def to_numpy(
         self,

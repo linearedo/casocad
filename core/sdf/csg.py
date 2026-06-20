@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .base import BoundingBox3D, FloatArray, SDFNode, glsl_float
+from .base import BoundingBox3D, FloatArray, SDFNode
 
 
 @dataclass
@@ -30,10 +30,6 @@ class BinaryCSG(SDFNode):
 
 @dataclass
 class Union(BinaryCSG):
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.left is not None and self.right is not None
-        return f"min({self.left.to_glsl(p_var)}, {self.right.to_glsl(p_var)})"
-
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -49,10 +45,6 @@ class Union(BinaryCSG):
 
 @dataclass
 class Intersection(BinaryCSG):
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.left is not None and self.right is not None
-        return f"max({self.left.to_glsl(p_var)}, {self.right.to_glsl(p_var)})"
-
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -73,10 +65,6 @@ class Intersection(BinaryCSG):
 
 @dataclass
 class Difference(BinaryCSG):
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.left is not None and self.right is not None
-        return f"max({self.left.to_glsl(p_var)}, -({self.right.to_glsl(p_var)}))"
-
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -98,14 +86,6 @@ class SmoothUnion(BinaryCSG):
         super().__post_init__()
         if self.smoothing <= 0.0:
             raise ValueError("smooth union radius must be positive")
-
-    def to_glsl(self, p_var: str = "p") -> str:
-        assert self.left is not None and self.right is not None
-        a = self.left.to_glsl(p_var)
-        b = self.right.to_glsl(p_var)
-        k = glsl_float(self.smoothing)
-        h = f"clamp(0.5 + 0.5 * (({b}) - ({a})) / {k}, 0.0, 1.0)"
-        return f"(mix(({b}), ({a}), {h}) - {k} * {h} * (1.0 - {h}))"
 
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray

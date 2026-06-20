@@ -6,8 +6,6 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from .base import glsl_float
-
 FloatArray = NDArray[np.float64]
 
 
@@ -15,10 +13,6 @@ class Profile1D(ABC):
     @property
     def kind(self) -> str:
         return type(self).__name__.lower()
-
-    @abstractmethod
-    def to_glsl(self, p_var: str = "t") -> str:
-        """Return a GLSL expression for one intrinsic coordinate."""
 
     @abstractmethod
     def to_numpy(self, T: FloatArray) -> FloatArray:
@@ -42,12 +36,6 @@ class SegmentProfile(Profile1D):
     def kind(self) -> str:
         return "segment"
 
-    def to_glsl(self, p_var: str = "t") -> str:
-        return (
-            f"(abs({p_var} - {glsl_float(self.center)})"
-            f" - {glsl_float(self.half_length)})"
-        )
-
     def to_numpy(self, T: FloatArray) -> FloatArray:
         return np.asarray(
             np.abs(T - self.center) - self.half_length,
@@ -62,11 +50,6 @@ class SegmentProfile(Profile1D):
 class OffsetProfile1D(Profile1D):
     child: Profile1D
     offset: float = 0.0
-
-    def to_glsl(self, p_var: str = "t") -> str:
-        return self.child.to_glsl(
-            f"({p_var} - {glsl_float(self.offset)})"
-        )
 
     def to_numpy(self, T: FloatArray) -> FloatArray:
         return self.child.to_numpy(T - self.offset)
@@ -95,25 +78,6 @@ class BinaryProfile1D(Profile1D):
             )
         if self.operation == "smooth_union" and self.smoothing <= 0.0:
             raise ValueError("smooth union radius must be positive")
-
-    def to_glsl(self, p_var: str = "t") -> str:
-        left = self.left.to_glsl(p_var)
-        right = self.right.to_glsl(p_var)
-        if self.operation == "union":
-            return f"min({left}, {right})"
-        if self.operation == "intersection":
-            return f"max({left}, {right})"
-        if self.operation == "difference":
-            return f"max({left}, -({right}))"
-        smoothing = glsl_float(self.smoothing)
-        blend = (
-            f"clamp(0.5 + 0.5 * (({right}) - ({left}))"
-            f" / {smoothing}, 0.0, 1.0)"
-        )
-        return (
-            f"(mix(({right}), ({left}), {blend})"
-            f" - {smoothing} * {blend} * (1.0 - {blend}))"
-        )
 
     def to_numpy(self, T: FloatArray) -> FloatArray:
         left = self.left.to_numpy(T)

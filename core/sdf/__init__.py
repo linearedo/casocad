@@ -10,6 +10,7 @@ from .primitives_1d import (
 )
 from .primitives_2d import (
     BezierCurveProfile,
+    BezierSurfaceProfile,
     BinaryProfile,
     CircleProfile,
     EllipseProfile,
@@ -22,33 +23,40 @@ from .primitives_2d import (
     RoundedRectangleProfile,
     SquareProfile,
 )
-from .primitives_3d import Box, Cylinder, Sphere, Torus
-from .solid_from_2d import Extrude, LoftImplicit, Revolve, Sweep
+from .primitives_3d import Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Sphere, Torus
+from .solid_from_2d import Extrude, Revolve
 from .transforms import Rotate, Scale, Translate
 from .tree import SDFTree
+from .tubes import BezierTube, PolylineTube
 
 __all__ = [
     "BoundingBox3D",
     "Box",
+    "BoxFrame",
     "BezierCurveProfile",
+    "BezierSurfaceProfile",
+    "BezierTube",
     "BinaryProfile1D",
     "BinaryProfile",
+    "CappedCone",
     "CircleProfile",
+    "Cone",
     "Cylinder",
     "Difference",
     "EllipseProfile",
     "OffsetProfile",
     "Extrude",
     "Intersection",
-    "LoftImplicit",
     "OffsetProfile1D",
     "PlacedPolyline2D",
     "PlacedSDF2D",
     "PlacedSDF1D",
     "PolygonProfile",
     "PolylineProfile",
+    "PolylineTube",
     "Profile1D",
     "Profile2D",
+    "Pyramid",
     "RectangleProfile",
     "RegularPolygonProfile",
     "Revolve",
@@ -61,7 +69,6 @@ __all__ = [
     "SmoothUnion",
     "Sphere",
     "SquareProfile",
-    "Sweep",
     "Torus",
     "Translate",
     "Union",
