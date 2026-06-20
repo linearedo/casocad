@@ -9,6 +9,7 @@ from .base import FloatArray, SDFNode
 class SDFTree:
     root: SDFNode
     components: tuple[SDFNode, ...] = ()
+    selector_objects: tuple[SDFNode, ...] = ()
     _nodes: dict[int, SDFNode] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
@@ -18,6 +19,11 @@ class SDFTree:
                 descendant
                 for component in self.components
                 for descendant in self._walk(component)
+            ),
+            *(
+                descendant
+                for selector in self.selector_objects
+                for descendant in self._walk(selector)
             ),
         )
         for node in (item for item in nodes if item.object_id > 0):

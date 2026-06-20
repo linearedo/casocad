@@ -186,9 +186,14 @@ def test_planar_segment_cutter_draw_flow_creates_two_scene_tree_regions() -> Non
             node.name == "__boundary_selector_planar_segment_cutter"
             for node in window.document.objects
         )
-        assert all(
-            component.name != "__boundary_selector_planar_segment_cutter"
-            for component in window.document.visual_tree().components
+        tree = window.document.visual_tree()
+        assert not any(
+            component.name == "__boundary_selector_planar_segment_cutter"
+            for component in tree.components
+        )
+        assert any(
+            selector.name == "__boundary_selector_planar_segment_cutter"
+            for selector in tree.selector_objects
         )
     finally:
         window.close()

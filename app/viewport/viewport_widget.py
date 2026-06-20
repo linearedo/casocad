@@ -2743,7 +2743,10 @@ class ViewportWidget(QOpenGLWidget):
                 preview := boundary_region_preview_node(
                     self._scene_tree.root,
                     region,
-                    selector_objects=self._scene_tree.components,
+                    selector_objects=(
+                        *self._scene_tree.components,
+                        *self._scene_tree.selector_objects,
+                    ),
                 )
             )
             is not None

@@ -305,15 +305,7 @@ def boundary_region_preview_node(
     selector_objects: Sequence[SDFNode] = (),
     thickness: float = 0.006,
 ) -> SDFNode | None:
-    patch = next(
-        (
-            patch
-            for patch in boundary_patches(root)
-            if patch.owner_object_id == region.owner_object_id
-            and patch.patch_id == region.patch_id
-        ),
-        None,
-    )
+    patch = _region_boundary_patch(root, region)
     if patch is None:
         return None
     if (
@@ -323,17 +315,7 @@ def boundary_region_preview_node(
         and region.selector_end is not None
     ):
         return _curve_interval_preview_node(patch, region, thickness)
-    normal = _region_patch_normal(patch)
-    hit = BoundaryPatchHit(
-        point=(0.0, 0.0, 0.0),
-        owner_object_id=region.owner_object_id,
-        patch_id=patch.patch_id,
-        patch_type=patch.patch_type,
-        normal=normal,
-        outside_direction=patch.outside_direction,
-        selector=patch.selector,
-    )
-    preview = boundary_patch_preview_node(root, hit, thickness=thickness)
+    preview = _region_patch_preview_node(root, region, thickness)
     if preview is None:
         return None
     if root.dimension == 3 and region.selector_id is not None:
@@ -347,6 +329,85 @@ def boundary_region_preview_node(
             name=f"{region.name}_selector_highlight",
         )
     return preview
+
+
+def _region_boundary_patch(
+    root: SDFNode,
+    region: BoundaryRegion,
+) -> BoundaryPatch | None:
+    return next(
+        (
+            patch
+            for patch in boundary_patches(root)
+            if patch.owner_object_id == region.owner_object_id
+            and patch.patch_id == region.patch_id
+        ),
+        None,
+    )
+
+
+def _region_patch_preview_node(
+    root: SDFNode,
+    region: BoundaryRegion,
+    thickness: float,
+) -> SDFNode | None:
+    patch = _region_boundary_patch(root, region)
+    if patch is None:
+        return None
+    normal = _region_patch_normal(patch)
+    hit = BoundaryPatchHit(
+        point=(0.0, 0.0, 0.0),
+        owner_object_id=region.owner_object_id,
+        patch_id=patch.patch_id,
+        patch_type=patch.patch_type,
+        normal=normal,
+        outside_direction=patch.outside_direction,
+        selector=patch.selector,
+    )
+    return boundary_patch_preview_node(root, hit, thickness=thickness)
+
+
+def _region_patch_scope_volume(
+    root: SDFNode,
+    region: BoundaryRegion,
+    thickness: float,
+) -> SDFNode | None:
+    patch = _region_boundary_patch(root, region)
+    if patch is None:
+        return None
+    if isinstance(patch, BoundarySurfacePatch) and isinstance(patch.owner, Box):
+        face = patch.patch_id.split(".")[-1]
+        axis_index = {
+            "-X": 0,
+            "+X": 0,
+            "-Y": 1,
+            "+Y": 1,
+            "-Z": 2,
+            "+Z": 2,
+        }.get(face)
+        if axis_index is not None:
+            sign = -1.0 if face.startswith("-") else 1.0
+            axes = (
+                np.asarray(patch.owner.axis_u, dtype=np.float64),
+                np.asarray(patch.owner.axis_v, dtype=np.float64),
+                np.asarray(patch.owner.axis_w, dtype=np.float64),
+            )
+            half_size = list(patch.owner.half_size)
+            half_size[axis_index] = thickness
+            center = (
+                np.asarray(patch.owner.center, dtype=np.float64)
+                + sign * patch.owner.half_size[axis_index] * axes[axis_index]
+            )
+            return Box(
+                name=f"{patch.owner.name}_{patch.patch_id}_scope",
+                object_id=0,
+                center=_tuple(center),
+                half_size=tuple(half_size),
+                axis_u=patch.owner.axis_u,
+                axis_v=patch.owner.axis_v,
+                axis_w=patch.owner.axis_w,
+            )
+    return _region_patch_preview_node(root, region, thickness)
 
 
 def _surface_patches_for_node(
@@ -585,13 +646,18 @@ def _clip_surface_selector_preview(
     selector_objects: Sequence[SDFNode],
     *,
     name: str,
+    scope_region: BoundaryRegion | None = None,
 ) -> SDFNode:
     if selector_type not in SURFACE_SELECTOR_TYPES:
         return preview
     selector = _find_selector_node(root, selector_id, selector_objects)
     if selector is None:
         return preview
-    selector_volume = surface_selector_volume(root, selector)
+    selector_volume = surface_selector_volume(
+        root,
+        selector,
+        scope_region=scope_region,
+    )
     if selector_volume is None:
         return preview
     if selector_side == "outside":
@@ -604,41 +670,63 @@ def _clip_surface_selector_preview(
     return Intersection(name=name, object_id=0, left=preview, right=selector_volume)
 
 
-def surface_selector_volume(root: SDFNode, selector: SDFNode) -> SDFNode | None:
+def surface_selector_volume(
+    root: SDFNode,
+    selector: SDFNode,
+    *,
+    scope_region: BoundaryRegion | None = None,
+) -> SDFNode | None:
     """Return the 3D SDF field used to classify boundary subregions."""
 
     if selector.dimension == 3:
-        return deepcopy(selector)
-    if isinstance(selector, PlacedSDF2D):
-        return _placed_2d_selector_volume(root, selector)
-    if isinstance(selector, PlacedPolyline2D):
-        return _polyline_selector_volume(root, selector)
-    if not isinstance(selector, PlacedSDF1D):
-        return None
-    if not isinstance(selector.profile, SegmentProfile):
-        return None
-    lower, upper = selector.profile.bounds()
-    half_length = max(0.5 * (upper - lower), PATCH_TOLERANCE)
-    center_offset = 0.5 * (upper + lower)
-    axis_u = np.asarray(selector.axis_u, dtype=np.float64)
-    axis_u /= max(np.linalg.norm(axis_u), 1.0e-12)
-    axis_v, axis_w = _orthonormal_completion(axis_u)
-    bounds = root.bounding_box()
-    span = max(
-        bounds.x_max - bounds.x_min,
-        bounds.y_max - bounds.y_min,
-        bounds.z_max - bounds.z_min,
-        1.0,
+        volume: SDFNode | None = deepcopy(selector)
+    elif isinstance(selector, PlacedSDF2D):
+        volume = _placed_2d_selector_volume(root, selector)
+    elif isinstance(selector, PlacedPolyline2D):
+        volume = _polyline_selector_volume(root, selector)
+    elif isinstance(selector, PlacedSDF1D) and isinstance(
+        selector.profile,
+        SegmentProfile,
+    ):
+        lower, upper = selector.profile.bounds()
+        half_length = max(0.5 * (upper - lower), PATCH_TOLERANCE)
+        center_offset = 0.5 * (upper + lower)
+        axis_u = np.asarray(selector.axis_u, dtype=np.float64)
+        axis_u /= max(np.linalg.norm(axis_u), 1.0e-12)
+        axis_v, axis_w = _orthonormal_completion(axis_u)
+        bounds = root.bounding_box()
+        span = max(
+            bounds.x_max - bounds.x_min,
+            bounds.y_max - bounds.y_min,
+            bounds.z_max - bounds.z_min,
+            1.0,
+        )
+        center = np.asarray(selector.origin, dtype=np.float64) + center_offset * axis_u
+        volume = Box(
+            name=f"{selector.name}_extruded_selector",
+            object_id=0,
+            center=_tuple(center),
+            half_size=(half_length, span * 2.0, span * 2.0),
+            axis_u=_tuple(axis_u),
+            axis_v=_tuple(axis_v),
+            axis_w=_tuple(axis_w),
+        )
+    else:
+        volume = None
+    if volume is None or scope_region is None:
+        return volume
+    scope = _region_patch_scope_volume(
+        root,
+        scope_region,
+        max(PATCH_TOLERANCE * 4.0, 0.006),
     )
-    center = np.asarray(selector.origin, dtype=np.float64) + center_offset * axis_u
-    return Box(
-        name=f"{selector.name}_extruded_selector",
+    if scope is None:
+        return volume
+    return Intersection(
+        name=f"{selector.name}_scoped_selector",
         object_id=0,
-        center=_tuple(center),
-        half_size=(half_length, span * 2.0, span * 2.0),
-        axis_u=_tuple(axis_u),
-        axis_v=_tuple(axis_v),
-        axis_w=_tuple(axis_w),
+        left=volume,
+        right=scope,
     )
 
 
@@ -646,8 +734,14 @@ def surface_selector_values(
     root: SDFNode,
     selector: SDFNode,
     positions: NDArray[np.float64],
+    *,
+    scope_region: BoundaryRegion | None = None,
 ) -> NDArray[np.float64]:
-    selector_volume = surface_selector_volume(root, selector)
+    selector_volume = surface_selector_volume(
+        root,
+        selector,
+        scope_region=scope_region,
+    )
     if selector_volume is None:
         return np.full(positions.shape[0], np.inf, dtype=np.float64)
     return selector_volume.to_numpy(

@@ -227,13 +227,19 @@ def _surface_split_selector_mask(
     root: SDFNode,
     positions: NDArray[np.float64],
     *,
+    region: BoundaryRegion | None = None,
     side: str = "inside",
     tolerance: float,
 ) -> NDArray[np.bool_]:
     selector = _selector_object_from_id(selector_id, selector_by_id)
     if selector is None:
         return np.zeros(positions.shape[0], dtype=np.bool_)
-    values = surface_selector_values(root, selector, positions)
+    values = surface_selector_values(
+        root,
+        selector,
+        positions,
+        scope_region=region,
+    )
     inside = np.asarray(values <= tolerance, dtype=np.bool_)
     if side == "outside":
         return np.asarray(~inside, dtype=np.bool_)
@@ -544,6 +550,7 @@ class LatticeMesher:
                                 selector_by_id,
                                 self.domain.root,
                                 face_samples.positions,
+                                region=tag,
                                 side=tag.selector_side,
                                 tolerance=max(self.config.dx * 0.5, 1e-9),
                             )

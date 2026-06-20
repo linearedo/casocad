@@ -1051,7 +1051,11 @@ class MainWindow(QMainWindow):
             return
         self.viewport.begin_boundary_region_tool(
             self.document.fluid_domain.root,
-            self.document.fluid_domain.selector_objects,
+            tuple(
+                selector
+                for selector in self.document.fluid_domain.selector_objects
+                if not self.document.is_internal_scene_node(selector)
+            ),
         )
 
     @Slot(object)

@@ -19,6 +19,7 @@ from core.scene import SceneDocument
 from core.serialization import load_scene, save_scene
 from core.sdf import (
     BezierCurveProfile,
+    BezierSurfaceProfile,
     Box,
     CircleProfile,
     Cylinder,
@@ -1091,6 +1092,86 @@ def test_planar_profile_selector_mask_splits_surface_area_not_curve() -> None:
     assert mask.tolist() == [True, True, False, False]
 
 
+def test_planar_selector_mask_is_limited_to_selected_boundary_region() -> None:
+    root = Box(name="volume", object_id=1)
+    region = BoundaryRegion(
+        name="volume +X / planar_cut inside",
+        object_id=8,
+        owner_object_id=root.object_id,
+        outside_direction=1,
+        patch_id="+X",
+        patch_type="face",
+        selector_id="selector:7",
+        selector_type="surface_split_profile",
+        selector_side="inside",
+    )
+    positions = np.asarray(
+        (
+            (0.5, 0.0, 0.0),
+            (-0.5, 0.0, 0.0),
+        ),
+        dtype=np.float64,
+    )
+    selectors = (
+        PlacedSDF2D(
+            name="__boundary_selector_planar_segment_cutter",
+            object_id=7,
+            profile=PolygonProfile(
+                points=(
+                    (-2.0, 0.0),
+                    (2.0, 0.0),
+                    (2.0, 2.0),
+                    (-2.0, 2.0),
+                )
+            ),
+            origin=(0.5, 0.0, 0.0),
+            axis_u=(0.0, 1.0, 0.0),
+            axis_v=(0.0, 0.0, 1.0),
+        ),
+        PlacedSDF2D(
+            name="planar_polygon_cut",
+            object_id=7,
+            profile=PolygonProfile(
+                points=(
+                    (-0.25, -0.25),
+                    (0.25, -0.25),
+                    (0.25, 0.25),
+                    (-0.25, 0.25),
+                )
+            ),
+            origin=(0.5, 0.0, 0.0),
+            axis_u=(0.0, 1.0, 0.0),
+            axis_v=(0.0, 0.0, 1.0),
+        ),
+        PlacedSDF2D(
+            name="planar_bezier_cut",
+            object_id=7,
+            profile=BezierSurfaceProfile(
+                points=(
+                    (-0.25, -0.25),
+                    (0.0, 0.35),
+                    (0.25, -0.25),
+                )
+            ),
+            origin=(0.5, 0.0, 0.0),
+            axis_u=(0.0, 1.0, 0.0),
+            axis_v=(0.0, 0.0, 1.0),
+        ),
+    )
+
+    for selector in selectors:
+        mask = _surface_split_selector_mask(
+            f"selector:{selector.object_id}",
+            {selector.object_id: selector},
+            root,
+            positions,
+            region=region,
+            tolerance=0.0,
+        )
+
+        assert mask.tolist() == [True, False]
+
+
 def test_surface_sdf_selector_mask_uses_universal_cutter_formula() -> None:
     cutter = Sphere(
         name="cut",
@@ -1304,6 +1385,78 @@ def test_boundary_region_preview_node_for_outside_3d_sdf_selector_is_render_ir_s
 
     assert render_ir.supported
     assert render_ir.root_indices
+
+
+def test_boundary_region_preview_node_shows_both_planar_segment_split_sides() -> None:
+    box = Box(name="volume", object_id=1)
+    selector = PlacedSDF2D(
+        name="__boundary_selector_planar_segment_cutter",
+        object_id=2,
+        profile=PolygonProfile(
+            points=(
+                (0.0, 0.0),
+                (2.0, 0.0),
+                (2.0, 2.0),
+                (0.0, 2.0),
+            )
+        ),
+        origin=(0.5, -1.0, 0.0),
+        axis_u=(0.0, 1.0, 0.0),
+        axis_v=(0.0, 0.0, 1.0),
+    )
+    inside = BoundaryRegion(
+        name="volume +X / segment inside",
+        object_id=3,
+        owner_object_id=box.object_id,
+        outside_direction=1,
+        patch_id="+X",
+        patch_type="face",
+        selector_id=f"selector:{selector.object_id}",
+        selector_type="surface_split_profile",
+        selector_side="inside",
+    )
+    outside = BoundaryRegion(
+        name="volume +X / segment outside",
+        object_id=4,
+        owner_object_id=box.object_id,
+        outside_direction=1,
+        patch_id="+X",
+        patch_type="face",
+        selector_id=f"selector:{selector.object_id}",
+        selector_type="surface_split_profile",
+        selector_side="outside",
+    )
+
+    inside_preview = boundary_region_preview_node(
+        box,
+        inside,
+        selector_objects=(selector,),
+    )
+    outside_preview = boundary_region_preview_node(
+        box,
+        outside,
+        selector_objects=(selector,),
+    )
+    assert inside_preview is not None
+    assert outside_preview is not None
+    render_ir = build_render_ir(
+        SDFTree(
+            inside_preview,
+            components=(inside_preview, outside_preview),
+        )
+    )
+
+    assert render_ir.supported
+    assert inside_preview.to_numpy(
+        np.asarray([0.512], dtype=np.float64),
+        np.asarray([0.0], dtype=np.float64),
+        np.asarray([0.25], dtype=np.float64),
+    )[0] <= 0.0
+    assert outside_preview.to_numpy(
+        np.asarray([0.512], dtype=np.float64),
+        np.asarray([0.0], dtype=np.float64),
+        np.asarray([-0.25], dtype=np.float64),
+    )[0] <= 0.0
 
 
 def test_boundary_region_preview_node_for_2d_interval_is_visible_strip() -> None:

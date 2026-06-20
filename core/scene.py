@@ -1959,6 +1959,7 @@ class SceneDocument:
             for node in three_dimensional[1:]:
                 root = Union(name="visual_union", left=root, right=node)
         components = list(visible_objects)
+        internal_selectors: list[SDFNode] = []
         if self.fluid_domain is not None:
             for tag in self.fluid_domain.tag_objects:
                 if (
@@ -1967,7 +1968,17 @@ class SceneDocument:
                     and all(existing is not tag for existing in components)
                 ):
                     components.append(tag)
-        return SDFTree(root, components=tuple(components))
+            for selector in self.fluid_domain.selector_objects:
+                if self.is_internal_scene_node(selector):
+                    if all(existing is not selector for existing in internal_selectors):
+                        internal_selectors.append(selector)
+                elif all(existing is not selector for existing in components):
+                    components.append(selector)
+        return SDFTree(
+            root,
+            components=tuple(components),
+            selector_objects=tuple(internal_selectors),
+        )
 
     def visual_tree(self) -> SDFTree:
         self.refresh_derived_geometry()

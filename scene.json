@@ -1,0 +1,197 @@
+{
+  "boundary_regions": [
+    {
+      "name": "inlet",
+      "object_id": 4,
+      "outside_direction": 0,
+      "owner_object_id": 1,
+      "patch_id": null,
+      "patch_type": null,
+      "selector_end": null,
+      "selector_id": null,
+      "selector_side": "inside",
+      "selector_start": null,
+      "selector_type": null
+    },
+    {
+      "name": "outlet",
+      "object_id": 5,
+      "outside_direction": 1,
+      "owner_object_id": 1,
+      "patch_id": null,
+      "patch_type": null,
+      "selector_end": null,
+      "selector_id": null,
+      "selector_side": "inside",
+      "selector_start": null,
+      "selector_type": null
+    },
+    {
+      "name": "flow_volume -Y",
+      "object_id": 6,
+      "outside_direction": 2,
+      "owner_object_id": 1,
+      "patch_id": "-Y",
+      "patch_type": "face",
+      "selector_end": null,
+      "selector_id": null,
+      "selector_side": "inside",
+      "selector_start": null,
+      "selector_type": null
+    },
+    {
+      "name": "flow_volume -Y / __boundary_selector_planar_segment_cutter inside",
+      "object_id": 8,
+      "outside_direction": 2,
+      "owner_object_id": 1,
+      "patch_id": "-Y",
+      "patch_type": "face",
+      "selector_end": null,
+      "selector_id": "selector:7",
+      "selector_side": "inside",
+      "selector_start": null,
+      "selector_type": "surface_split_profile"
+    },
+    {
+      "name": "flow_volume -Y / __boundary_selector_planar_segment_cutter outside",
+      "object_id": 9,
+      "outside_direction": 2,
+      "owner_object_id": 1,
+      "patch_id": "-Y",
+      "patch_type": "face",
+      "selector_end": null,
+      "selector_id": "selector:7",
+      "selector_side": "outside",
+      "selector_start": null,
+      "selector_type": "surface_split_profile"
+    }
+  ],
+  "fluid_domain": {
+    "root_object_id": 3,
+    "selector_object_ids": [
+      7
+    ],
+    "tag_object_ids": [
+      4,
+      5,
+      6,
+      8,
+      9
+    ]
+  },
+  "format": "casocad_scene",
+  "objects": [
+    {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "axis_w": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "center": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "half_size": [
+        1.6,
+        0.7,
+        0.45
+      ],
+      "name": "flow_volume",
+      "object_id": 1,
+      "type": "Box"
+    },
+    {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "axis_w": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "center": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "half_height": 0.55,
+      "name": "cylinder_obstacle",
+      "object_id": 2,
+      "radius": 0.24,
+      "type": "Cylinder"
+    },
+    {
+      "left_id": 1,
+      "name": "von_karman_fluid",
+      "object_id": 3,
+      "right_id": 2,
+      "type": "Difference"
+    },
+    {
+      "axis_u": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "axis_v": [
+        -1.0,
+        0.0,
+        0.0
+      ],
+      "name": "__boundary_selector_planar_segment_cutter",
+      "object_id": 7,
+      "origin": [
+        1.0,
+        0.0,
+        -6.4
+      ],
+      "profile": {
+        "points": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            12.8,
+            0.0
+          ],
+          [
+            12.8,
+            12.8
+          ],
+          [
+            0.0,
+            12.8
+          ]
+        ],
+        "type": "PolygonProfile"
+      },
+      "source_ids": [],
+      "type": "PlacedSDF2D"
+    }
+  ],
+  "root_object_ids": [
+    3,
+    7
+  ],
+  "unit": "m",
+  "version": 4
+}
