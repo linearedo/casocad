@@ -17,7 +17,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QHideEvent, QShowEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -51,6 +51,36 @@ from app.flow_sim_view import (
 )
 
 
+class _SimBuilder(QThread):
+    """Builds a FlowMapSimulation off the main thread.
+
+    ``FlowMapSimulation.from_lattice`` re-seeds particles and warms up the JAX
+    backend, which is slow enough to freeze the UI when run inline. Running it
+    here keeps the window responsive (and the previous simulation animating)
+    until the new one is ready to swap in.
+    """
+
+    done = Signal(object, str)  # (simulation | None, error_message)
+
+    def __init__(
+        self,
+        lattice: FlowLatticeData,
+        kwargs: dict,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._lattice = lattice
+        self._kwargs = kwargs
+
+    def run(self) -> None:
+        try:
+            sim = FlowMapSimulation.from_lattice(self._lattice, **self._kwargs)
+        except Exception as e:  # noqa: BLE001 - reported to the UI verbatim
+            self.done.emit(None, str(e))
+            return
+        self.done.emit(sim, "")
+
+
 class FlowSimPanel(QWidget):
     """Independent floating window for the casoCAD flow simulation."""
 
@@ -75,6 +105,24 @@ class FlowSimPanel(QWidget):
         self._tag_colors: dict[int, QColor] = {}
         self._tag_color_btns: dict[int, QPushButton] = {}
 
+        # Per-node tag ids packed into a padded int array so lattice toggles can
+        # be resolved with vectorised numpy instead of a per-node Python loop.
+        self._tags_padded: np.ndarray = np.zeros((0, 1), dtype=np.int32)
+
+        # Coalesce rapid spin-box edits (particle count / streamline length)
+        # into a single simulation rebuild once the user settles.
+        self._rebuild_timer = QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.setInterval(220)
+        self._rebuild_timer.timeout.connect(self._restart_simulation)
+        self._load_pending = False
+
+        # Off-thread simulation builder (so changing particle count doesn't
+        # freeze the UI). At most one runs at a time; _build_again coalesces
+        # further changes that arrive while a build is in flight.
+        self._builder: _SimBuilder | None = None
+        self._build_again = False
+
         # Color state
         self._bg_color = QColor(DEFAULT_BACKGROUND)
         self._lat_color = QColor(DEFAULT_LATTICE_COLOR)
@@ -91,12 +139,20 @@ class FlowSimPanel(QWidget):
         self._view = FlowSimView()
         root.addWidget(self._view, stretch=1)
 
+        # The whole control column lives inside a scroll area so it stays
+        # usable no matter how many tagged objects the lattice contains.
         side = QWidget()
-        side.setFixedWidth(320)
         side_lay = QVBoxLayout(side)
-        side_lay.setContentsMargins(0, 0, 0, 0)
+        side_lay.setContentsMargins(0, 0, 6, 0)
         side_lay.setSpacing(10)
-        root.addWidget(side)
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        side_scroll.setFixedWidth(344)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        side_scroll.setWidget(side)
+        root.addWidget(side_scroll)
 
         # --- File section ---
         self._path_edit = QLineEdit()
@@ -130,6 +186,12 @@ class FlowSimPanel(QWidget):
         self._diffusion.setSingleStep(0.005)
         self._diffusion.setValue(0.08)
 
+        self._viscosity = QDoubleSpinBox()
+        self._viscosity.setRange(0.0, 1.0)
+        self._viscosity.setDecimals(3)
+        self._viscosity.setSingleStep(0.05)
+        self._viscosity.setValue(0.35)
+
         self._particle_size = QSpinBox()
         self._particle_size.setRange(1, 8)
         self._particle_size.setValue(2)
@@ -150,6 +212,7 @@ class FlowSimPanel(QWidget):
         ctrl.addRow("Particle size", self._particle_size)
         ctrl.addRow("Velocity", self._velocity)
         ctrl.addRow("Diffusion", self._diffusion)
+        ctrl.addRow("Viscosity", self._viscosity)
         ctrl.addRow("Show streamlines", self._sl_check)
         ctrl.addRow("Streamline length", sl_sub)
         ctrl_box = QGroupBox("Simulation")
@@ -186,16 +249,16 @@ class FlowSimPanel(QWidget):
         for cb in (self._show_lat, self._show_bnd, self._show_ubnd):
             cb.toggled.connect(lambda _: self._push_lattice_filters())
 
+        self._tag_label = QLabel("Tagged mesh points")
+        vis_lay.addWidget(self._tag_label)
         self._tag_host = QWidget()
         self._tag_lay = QVBoxLayout(self._tag_host)
         self._tag_lay.setContentsMargins(0, 0, 0, 0)
         self._tag_lay.setSpacing(4)
         self._tag_lay.addStretch(1)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll.setWidget(self._tag_host)
-        vis_lay.addWidget(scroll)
+        # Tag rows grow with the number of tagged objects; the side scroll
+        # area scrolls them into view rather than squeezing each row.
+        vis_lay.addWidget(self._tag_host)
         side_lay.addWidget(vis_box)
 
         # --- Status line ---
@@ -209,11 +272,15 @@ class FlowSimPanel(QWidget):
         side_lay.addWidget(self._debug_frames_btn)
         side_lay.addStretch(1)
 
-        # Wire signals
-        self._particle_count.valueChanged.connect(self._on_settings_changed)
+        # Wire signals.
+        # Particle count and streamline length change array sizes, so they need
+        # a (debounced) rebuild. Particle size is a pure render uniform. Velocity
+        # / diffusion / viscosity are applied live on the running simulation.
+        self._particle_count.valueChanged.connect(self._schedule_rebuild)
         self._particle_size.valueChanged.connect(self._view.set_particle_size)
-        self._velocity.valueChanged.connect(self._on_settings_changed)
-        self._diffusion.valueChanged.connect(self._on_settings_changed)
+        self._velocity.valueChanged.connect(self._apply_live_params)
+        self._diffusion.valueChanged.connect(self._apply_live_params)
+        self._viscosity.valueChanged.connect(self._apply_live_params)
         self._sl_check.toggled.connect(self._on_streamlines_toggled)
         self._sl_len.valueChanged.connect(self._on_sl_len_changed)
 
@@ -242,9 +309,23 @@ class FlowSimPanel(QWidget):
             self._path_edit.setText(str(p))
             return
         self._path_edit.setText(str(p))
-        self._load()
+        # Defer the heavy load (arrow parse + simulation build) to the next
+        # event-loop tick so the window can paint immediately on open.
+        self._schedule_load()
+
+    def _schedule_load(self) -> None:
+        if self._load_pending:
+            return
+        self._load_pending = True
+        self._status.setText("Loading…")
+        QTimer.singleShot(0, self._load)
 
     def stop_simulation(self) -> None:
+        self._rebuild_timer.stop()
+        self._build_again = False
+        if self._builder is not None:
+            self._builder.wait(5000)
+            self._builder = None
         self._running = False
         self._simulation = None
         self._view.set_simulation(None, self._sl_check.isChecked())
@@ -264,6 +345,7 @@ class FlowSimPanel(QWidget):
             self._load()
 
     def _load(self) -> None:
+        self._load_pending = False
         text = self._path_edit.text().strip()
         if not text:
             self._status.setText("No .arrow path provided.")
@@ -278,6 +360,7 @@ class FlowSimPanel(QWidget):
             self._status.setText(f"Failed to load {path.name}: {e}")
             return
         self._lattice = lattice
+        self._precompute_tag_arrays()
         self._rebuild_tag_ui()
         self._push_lattice_filters()
         self._view.frame_points(lattice.positions)
@@ -291,9 +374,21 @@ class FlowSimPanel(QWidget):
     # Simulation lifecycle
     # -----------------------------------------------------------------------
 
-    def _on_settings_changed(self) -> None:
-        if self._running:
-            self._restart_simulation()
+    def _schedule_rebuild(self) -> None:
+        """Debounce a full simulation rebuild for size-changing settings."""
+        if self._lattice is None:
+            return
+        self._rebuild_timer.start()
+
+    def _apply_live_params(self) -> None:
+        """Push velocity / diffusion / viscosity to the running sim, no rebuild."""
+        if not self._running:
+            return
+        self._view.set_sim_params(
+            velocity=self._velocity.value(),
+            diffusion=self._diffusion.value(),
+            viscosity=self._viscosity.value(),
+        )
 
     def _on_streamlines_toggled(self, checked: bool) -> None:
         self._view.set_streamlines_visible(checked)
@@ -302,8 +397,7 @@ class FlowSimPanel(QWidget):
 
     def _on_sl_len_changed(self, value: int) -> None:
         self._sl_len_label.setText(str(value))
-        if self._running:
-            self._restart_simulation()
+        self._schedule_rebuild()
 
     def _debug_frame_compare(self) -> None:
         if self._simulation is None:
@@ -325,22 +419,49 @@ class FlowSimPanel(QWidget):
         self._debug_frames_btn.setEnabled(self._running and self._simulation is not None)
 
     def _restart_simulation(self) -> None:
+        self._rebuild_timer.stop()
         if self._lattice is None:
             return
-        self._running = False
-        try:
-            sim = FlowMapSimulation.from_lattice(
-                self._lattice,
-                particle_count=self._particle_count.value(),
-                velocity=self._velocity.value(),
-                diffusion=self._diffusion.value(),
-                streamline_length=self._sl_len.value(),
-            )
-        except Exception as e:
-            self._simulation = None
-            self._view.set_simulation(None, self._sl_check.isChecked())
-            self._status.setText(f"Simulation error: {e}")
+        # If a build is already running, let it finish, then rebuild once more
+        # with the latest values — never stack builders or block the UI.
+        if self._builder is not None and self._builder.isRunning():
+            self._build_again = True
             return
+        self._build_again = False
+        kwargs = {
+            "particle_count": self._particle_count.value(),
+            "velocity": self._velocity.value(),
+            "diffusion": self._diffusion.value(),
+            "viscosity": self._viscosity.value(),
+            "streamline_length": self._sl_len.value(),
+        }
+        self._status.setText("Rebuilding simulation…")
+        builder = _SimBuilder(self._lattice, kwargs, self)
+        builder.done.connect(self._on_sim_built)
+        self._builder = builder
+        builder.start()
+
+    def _on_sim_built(self, sim: object, error: str) -> None:
+        # Ignore results from a builder that was superseded or stopped (its
+        # done signal may already have been queued before we dropped it).
+        if self.sender() is not self._builder:
+            return
+        self._builder.deleteLater()
+        self._builder = None
+
+        # Settings changed again mid-build: discard this (stale) sim and rebuild.
+        if self._build_again:
+            self._restart_simulation()
+            return
+
+        if sim is None:
+            self._simulation = None
+            self._running = False
+            self._view.set_simulation(None, self._sl_check.isChecked())
+            self._status.setText(f"Simulation error: {error}")
+            self._refresh_debug_button_state()
+            return
+
         self._simulation = sim
         self._running = True
         self._view.set_simulation(sim, self._sl_check.isChecked())
@@ -364,10 +485,15 @@ class FlowSimPanel(QWidget):
         self._tag_checks.clear()
         self._tag_color_btns.clear()
         if self._lattice is None:
+            self._tag_label.setText("Tagged mesh points")
             return
         tag_ids = sorted({
             int(t) for tags in self._lattice.tag_ids for t in tags if int(t) > 0
         })
+        self._tag_label.setText(
+            f"Tagged mesh points ({len(tag_ids)})" if tag_ids
+            else "Tagged mesh points (none)"
+        )
         for tid in tag_ids:
             label = self._lattice.object_names.get(tid, f"Tag {tid}")
             cb = QCheckBox(label)
@@ -386,6 +512,26 @@ class FlowSimPanel(QWidget):
             self._tag_checks[tid] = cb
             self._tag_color_btns[tid] = btn
 
+    def _precompute_tag_arrays(self) -> None:
+        """Pack per-node tag ids into a padded int matrix once, on load.
+
+        ``tag_ids`` is a tuple of variable-length tuples; resolving it per
+        toggle in pure Python is what made lattice toggles lag. With the padded
+        matrix the toggle handler becomes a couple of vectorised numpy ops.
+        """
+        lat = self._lattice
+        if lat is None:
+            self._tags_padded = np.zeros((0, 1), dtype=np.int32)
+            return
+        tag_ids = lat.tag_ids
+        n = len(tag_ids)
+        max_k = max((len(tags) for tags in tag_ids), default=0)
+        padded = np.zeros((n, max(max_k, 1)), dtype=np.int32)
+        for i, tags in enumerate(tag_ids):
+            if tags:
+                padded[i, : len(tags)] = tags
+        self._tags_padded = padded
+
     def _push_lattice_filters(self) -> None:
         lat = self._lattice
         if lat is None:
@@ -393,14 +539,25 @@ class FlowSimPanel(QWidget):
             self._view.set_lattice_points(empty, empty, empty, empty, np.empty(0, np.uint16))
             return
 
-        active = {tid for tid, cb in self._tag_checks.items() if cb.isChecked()}
+        active = [tid for tid, cb in self._tag_checks.items() if cb.isChecked()]
+        padded = self._tags_padded
+        n = padded.shape[0]
 
-        tagged_mask = np.array(
-            [self._node_visible(tags, active) for tags in lat.tag_ids], dtype=np.bool_
-        )
-        primary_ids = np.array(
-            [self._primary_tag(tags, active) for tags in lat.tag_ids], dtype=np.uint16
-        )
+        if active and padded.size:
+            max_tag = int(padded.max())
+            lut = np.zeros(max_tag + 1, dtype=np.bool_)
+            for tid in active:
+                if 0 < tid <= max_tag:
+                    lut[tid] = True
+            slot_active = lut[padded]              # (N, K) bool
+            tagged_mask = slot_active.any(axis=1)  # any active tag → node shown
+            # Primary tag = first active tag in the node's stored order.
+            first = slot_active.argmax(axis=1)
+            primary_ids = padded[np.arange(n), first].astype(np.uint16)
+            primary_ids[~tagged_mask] = 0
+        else:
+            tagged_mask = np.zeros(n, dtype=np.bool_)
+            primary_ids = np.zeros(n, dtype=np.uint16)
 
         self._view.set_lattice_points(
             lat.positions[~lat.boundary_mask] if self._show_lat.isChecked()
@@ -413,18 +570,6 @@ class FlowSimPanel(QWidget):
             primary_ids[tagged_mask],
         )
         self._view.set_tag_colors(self._tag_colors)
-
-    def _node_visible(self, tags: tuple[int, ...], active: set[int]) -> bool:
-        # Untagged nodes belong to fluid/boundary layers, not the tagged layer.
-        if not tags:
-            return False
-        return any(t in active for t in tags)
-
-    def _primary_tag(self, tags: tuple[int, ...], active: set[int]) -> int:
-        for t in tags:
-            if t in active:
-                return t
-        return 0
 
     # -----------------------------------------------------------------------
     # Color pickers

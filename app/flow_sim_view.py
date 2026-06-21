@@ -174,6 +174,30 @@ class _SimThread(QThread):
         with self._lock:
             self._want_sl = enabled
 
+    def update_params(
+        self,
+        velocity: float | None = None,
+        diffusion: float | None = None,
+        viscosity: float | None = None,
+    ) -> None:
+        """Mutate the running simulation's flow parameters in place.
+
+        These are the same attributes FlowMapSimulation.step() reads each
+        iteration, so changing them avoids rebuilding the simulation (no
+        re-seeding particles, no JAX warmup) — that is what removes the lag
+        when the user nudges velocity / diffusion / viscosity.
+        """
+        with self._lock:
+            sim = self._sim
+            if sim is None:
+                return
+            if velocity is not None:
+                sim.speed = max(float(velocity), 0.001)
+            if diffusion is not None:
+                sim.diffusion = max(float(diffusion), 0.0)
+            if viscosity is not None:
+                sim.viscosity = float(min(1.0, max(0.0, viscosity)))
+
     def take(
         self,
     ) -> tuple[NDArray[np.float32] | None, NDArray[np.float32] | None]:
@@ -288,7 +312,8 @@ class FlowSimView(QOpenGLWidget):
         # Camera
         self._camera = OrbitCamera()
         self._camera.set_standard_view()
-        self._drag: QPoint | None = None
+        self._drag: QPoint | None = None  # left-drag → orbit
+        self._pan: QPoint | None = None   # right/middle-drag (or shift+left) → pan
 
         # Simulation reference (read-only on main thread, only for status display)
         self._simulation: FlowMapSimulation | None = None
@@ -450,6 +475,17 @@ class FlowSimView(QOpenGLWidget):
                 self._timer.start()
         else:
             self._timer.stop()
+
+    def set_sim_params(
+        self,
+        velocity: float | None = None,
+        diffusion: float | None = None,
+        viscosity: float | None = None,
+    ) -> None:
+        """Apply live flow-parameter changes without restarting the simulation."""
+        self._sim_thread.update_params(
+            velocity=velocity, diffusion=diffusion, viscosity=viscosity
+        )
 
     def set_streamlines_visible(self, visible: bool) -> None:
         self._sl_visible = visible
@@ -856,25 +892,50 @@ class FlowSimView(QOpenGLWidget):
     # -----------------------------------------------------------------------
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+        btn = event.button()
+        pan_btn = btn in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton)
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if btn == Qt.MouseButton.LeftButton and not shift:
             self._drag = event.position().toPoint()
+            event.accept()
+        elif pan_btn or (btn == Qt.MouseButton.LeftButton and shift):
+            # Right / middle drag — or Shift+Left for trackpads — pans the scene.
+            self._pan = event.position().toPoint()
             event.accept()
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag is None:
-            super().mouseMoveEvent(event)
-            return
         cur = event.position().toPoint()
-        self._camera.orbit(float(cur.x() - self._drag.x()), float(cur.y() - self._drag.y()))
-        self._drag = cur
-        self.update()
-        event.accept()
+        if self._drag is not None:
+            self._camera.orbit(
+                float(cur.x() - self._drag.x()), float(cur.y() - self._drag.y())
+            )
+            self._drag = cur
+            self.update()
+            event.accept()
+            return
+        if self._pan is not None:
+            self._camera.pan(
+                float(cur.x() - self._pan.x()), float(cur.y() - self._pan.y())
+            )
+            self._pan = cur
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+        btn = event.button()
+        if btn == Qt.MouseButton.LeftButton and self._drag is not None:
             self._drag = None
+            event.accept()
+        elif self._pan is not None and btn in (
+            Qt.MouseButton.RightButton,
+            Qt.MouseButton.MiddleButton,
+            Qt.MouseButton.LeftButton,
+        ):
+            self._pan = None
             event.accept()
         else:
             super().mouseReleaseEvent(event)

@@ -60,25 +60,37 @@ if _JAX and jax is not None and jnp is not None:
 
     @jax.jit
     def _jax_step(
-        positions: Any, speed_scale: Any,
+        positions: Any, speed_scale: Any, diffusion_state: Any,
         source_positions: Any, fluid_keys: Any,
         origin: Any, axis_i: Any, axis_j: Any, axis_k: Any,
         low: Any, high: Any, direction: Any, key: Any,
         axis_tolerance: Any, outlet_tolerance: Any,
         axis_mask: Any, cross_centroid: Any, cross_max_r: float,
-        flow_axis: int,
-        speed: float, diffusion: float, dt: float, dx: float,
+        flow_axis: int, flow_axis_min: int, flow_axis_max: int,
+        speed: float, diffusion: float, viscosity: float, dt: float, dx: float,
         nx: int, ny: int, nz: int, proj_min: float, proj_max: float,
-    ) -> tuple[Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, Any, Any]:
         n = positions.shape[0]
-        key, k_drift, k_respawn, k_source, k_speed = jax.random.split(key, 5)
+        key, k_drift, k_respawn, k_source, _ = jax.random.split(key, 5)
+        viscosity = jnp.clip(viscosity, 0.0, 1.0)
+        diff_state_mix = 0.08 + 0.9 * viscosity
+        diff_state_amp = 1.0 - 0.75 * viscosity
 
         # Advect + diffuse (tangent only – no through-boundary drift)
         noise = jax.random.normal(k_drift, positions.shape, dtype=jnp.float32)
         tangent = noise - jnp.sum(noise * direction, axis=1, keepdims=True) * direction
         tangent = tangent * axis_mask[None, :]
+        raw_tang = (
+            tangent
+            * jnp.sqrt(jnp.maximum(dt, 0.0))
+            * diffusion
+            * dx
+        )
+        diffusion_state = (
+            (1.0 - diff_state_mix) * raw_tang + diff_state_mix * diffusion_state
+        )
         adv = direction * (speed * speed_scale[:, None] * dt)
-        cand = positions + adv + tangent * jnp.sqrt(jnp.maximum(dt, 0.0)) * diffusion * dx
+        cand = positions + adv + diff_state_amp * diffusion_state
 
         # Outlet wrap (particles that pass outlet reappear at inlet)
         proj = jnp.sum(cand * direction, axis=1)
@@ -86,11 +98,8 @@ if _JAX and jax is not None and jnp is not None:
             proj_max - proj_min,
             jnp.float32(1e-12),
         )
-        needs_wrap = (proj < proj_min) | (proj > proj_max)
-        wrapped_proj = proj_min + jnp.mod(proj - proj_min, flow_span)
-        wrapped_delta = (wrapped_proj - proj) * needs_wrap.astype(jnp.float32)
-        cand = cand + wrapped_delta[:, None] * direction
-
+        out_tol = jnp.maximum(jnp.float32(outlet_tolerance), jnp.float32(1e-12))
+        proj_out = (proj < (proj_min - out_tol)) | (proj > (proj_max + out_tol))
         # Fluid-cell membership via sorted-key binary search
         rel = cand - origin
         ci = jnp.rint(jnp.sum(rel * axis_i, axis=1) / dx).astype(jnp.int32)
@@ -106,22 +115,98 @@ if _JAX and jax is not None and jnp is not None:
         clipped = jnp.clip(idx, 0, jnp.maximum(fluid_keys.shape[0] - 1, 0))
         occupied = (idx < fluid_keys.shape[0]) & (fluid_keys[clipped] == keys)
 
+        flow_axis_idx = jnp.where(
+            jnp.int32(flow_axis) == 0,
+            ci,
+            jnp.where(jnp.int32(flow_axis) == 1, cj, ck),
+        )
+        axis_out = (
+            flow_axis_idx < jnp.int32(flow_axis_min)
+        ) | (
+            flow_axis_idx > jnp.int32(flow_axis_max)
+        )
+        needs_wrap = proj_out | axis_out
+        wrapped_proj = proj_min + jnp.mod(proj - proj_min, flow_span)
+        wrapped_delta = (wrapped_proj - proj) * needs_wrap.astype(jnp.float32)
+        cand = cand + wrapped_delta[:, None] * direction
+
         in_fluid = in_bounds & occupied
 
         # Separate wall hits from outlet wraps
-        hit_wall = ~in_fluid & ~needs_wrap   # lateral → follow wall
-        hit_outlet = ~in_fluid & needs_wrap   # passed outlet → respawn
+        # Lateral wall interaction only applies to in-domain candidates that are not
+        # crossing the outlet/inlet slabs.
+        hit_wall = ~in_fluid & ~needs_wrap
+        hit_outlet = needs_wrap
 
-        # Wall hits: slide along wall tangent (project flow onto wall surface)
+        # Wall hits: try flow direction, then axis-aligned tangential candidates.
         move = cand - positions
         move_len = jnp.sqrt(jnp.sum(move ** 2, axis=1, keepdims=True))
         wall_normal = move / jnp.maximum(move_len, jnp.float32(1e-12))
-        # Remove wall-normal component from flow direction → tangent flow
-        flow_dot_n = jnp.sum(direction * wall_normal, axis=1, keepdims=True)
-        tang_dir = direction - flow_dot_n * wall_normal
-        t_len = jnp.sqrt(jnp.sum(tang_dir ** 2, axis=1, keepdims=True))
-        tang_dir = jnp.where(t_len > jnp.float32(1e-6), tang_dir / t_len, jnp.float32(0.0))
-        wall_pos = positions + tang_dir * (jnp.float32(_WALL_FRICTION) * speed * speed_scale[:, None] * dt)
+        base_step = (
+            jnp.float32(_WALL_FRICTION) * speed * speed_scale[:, None] * dt
+        )
+
+        flow_axis_mask = 1.0 - jax.nn.one_hot(flow_axis, 3, dtype=jnp.float32)
+        side_mask = axis_mask * flow_axis_mask
+
+        candidates = jnp.stack(
+            (
+                direction,
+                axis_i,
+                -axis_i,
+                axis_j,
+                -axis_j,
+                axis_k,
+                -axis_k,
+            ),
+            axis=0,
+        )
+        candidate_active = jnp.array(
+            (1.0, side_mask[0], side_mask[0], side_mask[1], side_mask[1], side_mask[2], side_mask[2]),
+            dtype=jnp.float32,
+        )
+
+        cand_rep = jnp.broadcast_to(candidates[None, :, :], (n, 7, 3))
+        tang = cand_rep - jnp.sum(
+            cand_rep * wall_normal[:, None, :],
+            axis=2,
+            keepdims=True,
+        ) * wall_normal[:, None, :]
+        tang_len = jnp.sqrt(jnp.sum(tang ** 2, axis=2, keepdims=True))
+        tang_unit = jnp.where(
+            tang_len > jnp.float32(1e-8),
+            tang / jnp.maximum(tang_len, jnp.float32(1e-12)),
+            jnp.float32(0.0),
+        )
+        cand_len_ok = tang_len > jnp.float32(1e-8)
+        cand_active_ok = cand_len_ok[:, :, 0] & (candidate_active[None, :] > 0.0)
+        cand_pos = positions[:, None, :] + tang_unit * base_step[:, None, :]
+
+        flat = cand_pos.reshape((n * 7, 3))
+        rel = flat - origin[None, :]
+        cix = jnp.rint(jnp.sum(rel * axis_i, axis=1) / dx).astype(jnp.int32)
+        cjy = jnp.rint(jnp.sum(rel * axis_j, axis=1) / dx).astype(jnp.int32)
+        ckz = jnp.rint(jnp.sum(rel * axis_k, axis=1) / dx).astype(jnp.int32)
+        in_bounds = (
+            (cix >= 0) & (cix < jnp.int32(nx)) &
+            (cjy >= 0) & (cjy < jnp.int32(ny)) &
+            (ckz >= 0) & (ckz < jnp.int32(nz))
+        )
+        ckeys = cix + jnp.int32(nx) * (cjy + jnp.int32(ny) * ckz)
+        cidx = jnp.searchsorted(fluid_keys, ckeys, side='left')
+        clipped = jnp.clip(cidx, 0, jnp.maximum(fluid_keys.shape[0] - 1, 0))
+        occupied = (cidx < fluid_keys.shape[0]) & (fluid_keys[clipped] == ckeys)
+        in_candidate = (in_bounds & occupied).reshape((n, 7))
+        good = cand_active_ok & in_candidate
+        has_good = jnp.any(good, axis=1)
+        first = jnp.argmax(good, axis=1)
+        first = jnp.where(has_good, first, 0)
+        candidate_step = jnp.take_along_axis(
+            cand_pos,
+            first[:, None, None],
+            axis=1,
+        )[:, 0, :]
+        wall_pos = jnp.where(has_good[:, None], candidate_step, positions)
 
         # Validate wall_pos is in fluid; fall back to current position if not
         wrel = wall_pos - origin
@@ -152,20 +237,44 @@ if _JAX and jax is not None and jnp is not None:
             hit_outlet[:, None], replacement,
             jnp.where(hit_wall[:, None], wall_final, cand),
         )
+        rel_next = next_pos - origin
+        nci = jnp.rint(jnp.sum(rel_next * axis_i, axis=1) / dx).astype(jnp.int32)
+        ncj = jnp.rint(jnp.sum(rel_next * axis_j, axis=1) / dx).astype(jnp.int32)
+        nck = jnp.rint(jnp.sum(rel_next * axis_k, axis=1) / dx).astype(jnp.int32)
+        next_axis_idx = jnp.where(
+            jnp.int32(flow_axis) == 0,
+            nci,
+            jnp.where(jnp.int32(flow_axis) == 1, ncj, nck),
+        )
+        final_proj = jnp.sum(next_pos * direction, axis=1)
+        final_wrap = (
+            (final_proj < (proj_min - out_tol))
+            | (final_proj > (proj_max + out_tol))
+            | (next_axis_idx < jnp.int32(flow_axis_min))
+            | (next_axis_idx > jnp.int32(flow_axis_max))
+        )
+        next_pos = jnp.where(final_wrap[:, None], replacement, next_pos)
+        next_diff = jnp.where(
+            final_wrap[:, None],
+            jnp.zeros_like(diffusion_state),
+            diffusion_state,
+        )
+        next_reset = jnp.logical_or(hit_outlet, final_wrap)
         # Laminar profile for respawned particles
         rep_proj = jnp.sum(replacement * direction, axis=1, keepdims=True)
         rep_cross = replacement - rep_proj * direction
         rep_r = jnp.sqrt(jnp.sum((rep_cross - cross_centroid) ** 2, axis=1))
         rep_t = jnp.clip(rep_r / jnp.maximum(cross_max_r, jnp.float32(1e-12)), 0.0, 1.0)
         rep_profile = jnp.clip(1.0 - rep_t * rep_t, 0.05, 1.0)
-        next_scale = jnp.where(hit_outlet, rep_profile, speed_scale)
-        return next_pos, next_scale, key
+        next_scale = jnp.where(final_wrap, rep_profile, speed_scale)
+        return next_pos, next_scale, next_diff, next_reset, key
 
     class _JaxEngine:
         def __init__(
             self,
             positions: F32Array,
             speed_scale: F32Array,
+            diffusion_state: F32Array,
             source_positions: F32Array,
             fluid_keys: NDArray[np.uint64],
             origin: FloatArray,
@@ -178,6 +287,8 @@ if _JAX and jax is not None and jnp is not None:
             cross_centroid: F32Array,
             cross_max_r: float,
             flow_axis: int,
+            flow_axis_min: int,
+            flow_axis_max: int,
             dx: float, nx: int, ny: int, nz: int,
             proj_min: float, proj_max: float, seed: int,
         ) -> None:
@@ -186,6 +297,7 @@ if _JAX and jax is not None and jnp is not None:
                 raise OverflowError("lattice keys exceed int32 — too large for JAX kernel")
             self._p = jnp.asarray(positions, dtype=jnp.float32)
             self._s = jnp.asarray(speed_scale, dtype=jnp.float32)
+            self._d = jnp.asarray(diffusion_state, dtype=jnp.float32)
             self._src = jnp.asarray(source_positions, dtype=jnp.float32)
             self._fk = jnp.asarray(int_keys.astype(np.int32), dtype=jnp.int32)
             self._orig = jnp.asarray(origin, dtype=jnp.float32)
@@ -201,6 +313,8 @@ if _JAX and jax is not None and jnp is not None:
             self._cross_centroid = jnp.asarray(cross_centroid, dtype=jnp.float32)
             self._cross_max_r = float(cross_max_r)
             self._flow_axis = int(flow_axis)
+            self._flow_axis_min = int(flow_axis_min)
+            self._flow_axis_max = int(flow_axis_max)
             self._dx = float(dx)
             self._nx = int(nx)
             self._ny = int(ny)
@@ -209,18 +323,18 @@ if _JAX and jax is not None and jnp is not None:
             self._pmn = float(proj_min)
             self._key = jax.random.PRNGKey(seed)
 
-        def step(self, speed: float, diffusion: float, dt: float) -> F32Array:
-            self._p, self._s, self._key = _jax_step(
-                self._p, self._s, self._src, self._fk,
+        def step(self, speed: float, diffusion: float, viscosity: float, dt: float) -> tuple[F32Array, NDArray[np.bool_]]:
+            self._p, self._s, self._d, reset, self._key = _jax_step(
+                self._p, self._s, self._d, self._src, self._fk,
                 self._orig, self._ai, self._aj, self._ak,
                 self._low, self._high, self._dir, self._key,
                 self._axis_tol, self._out_tol,
                 self._axis_mask, self._cross_centroid, self._cross_max_r,
-                self._flow_axis,
-                float(speed), float(diffusion), float(dt),
+                self._flow_axis, self._flow_axis_min, self._flow_axis_max,
+                float(speed), float(diffusion), float(viscosity), float(dt),
                 self._dx, self._nx, self._ny, self._nz, self._pmn, self._pm,
             )
-            return np.asarray(self._p, dtype=np.float32)
+            return np.asarray(self._p, dtype=np.float32), np.asarray(reset)
 
 else:
 
@@ -314,15 +428,20 @@ class FlowMapSimulation:
     proj_min: float
     proj_max: float
     outlet_tolerance: float
+    flow_axis_min: int
+    flow_axis_max: int
     speed: float
     diffusion: float
+    viscosity: float
     cross_centroid: F32Array   # cross-section centroid (perpendicular to flow)
     cross_max_r: float         # max radius in cross-section
     trail_length: int
     streamlines_enabled: bool
     speed_scale: F32Array
+    diffusion_state: F32Array
     positions: F32Array
     trail_positions: F32Array
+    trail_continuation: NDArray[np.bool_]
     trail_particle_indices: NDArray[np.intp]
     trail_cursor: int
     trail_count: int
@@ -351,6 +470,7 @@ class FlowMapSimulation:
         particle_count: int = 1800,
         velocity: float = 5.0,
         diffusion: float = 0.08,
+        viscosity: float = 0.0,
         streamline_length: int = _DEFAULT_SL_STEPS,
         seed: int = 11,
     ) -> "FlowMapSimulation":
@@ -383,6 +503,28 @@ class FlowMapSimulation:
             (lattice.nx, lattice.ny, lattice.nz)[flow_axis]
             if 0 <= flow_axis < 3 else None
         )
+        if fluid_pos.size:
+            flow_proj = fluid_pos @ direction
+            proj_min = float(flow_proj.min())
+            proj_max = float(flow_proj.max())
+        else:
+            proj_min = float(proj_min)
+            proj_max = float(proj_max)
+        if 0 <= flow_axis < 3:
+            flow_axis_cells = (
+                lattice.i[fluid_mask],
+                lattice.j[fluid_mask],
+                lattice.k[fluid_mask],
+            )[flow_axis]
+            if flow_axis_cells.size:
+                flow_axis_min = int(flow_axis_cells.min())
+                flow_axis_max = int(flow_axis_cells.max())
+            else:
+                flow_axis_min = 0
+                flow_axis_max = 0
+        else:
+            flow_axis_min = 0
+            flow_axis_max = 0
         inlet_pos = _inlet_positions(
             fluid_pos,
             direction,
@@ -431,15 +573,20 @@ class FlowMapSimulation:
             low=low, high=high,
             proj_min=proj_min, proj_max=proj_max,
             outlet_tolerance=_outlet_tolerance(proj_max - proj_min),
+            flow_axis_min=flow_axis_min,
+            flow_axis_max=flow_axis_max,
             speed=max(float(velocity), 0.001),
             diffusion=max(float(diffusion), 0.0),
+            viscosity=float(np.clip(viscosity, 0.0, 1.0)),
             cross_centroid=cross_centroid,
             cross_max_r=cross_max_r,
             trail_length=steps,
             streamlines_enabled=False,
             speed_scale=np.ones(n, dtype=np.float32),  # set by _update_speed_profile
+            diffusion_state=np.zeros((n, 3), dtype=np.float32),
             positions=np.empty((n, 3), dtype=np.float32),
             trail_positions=np.empty((1, 0, 3), dtype=np.float32),
+            trail_continuation=np.empty((1, 0), dtype=np.bool_),
             trail_particle_indices=np.empty(0, dtype=np.intp),
             trail_cursor=0, trail_count=0,
             fluid_positions=fluid_pos,
@@ -459,59 +606,87 @@ class FlowMapSimulation:
 
     def step(self, dt: float = 0.016) -> None:
         if self._jax is not None:
-            self.positions[:] = self._jax.step(self.speed, self.diffusion, float(dt))
+            pos, reset_mask = self._jax.step(
+                self.speed,
+                self.diffusion,
+                self.viscosity,
+                float(dt),
+            )
+            self.positions[:] = pos
             if self.streamlines_enabled:
-                self._record_trail()
+                self._record_trail(reset_mask=reset_mask.astype(np.bool_))
             return
 
         # NumPy fallback
         base_vel = self.direction[None, :] * (self.speed * self.speed_scale[:, None])
         noise = self._diffusion_noise(dt)
         cand = self.positions + base_vel * float(dt) + noise
+        cand = self._clamp_to_side_axes(cand)
         proj = cand @ self.direction
         flow_span = float(self.proj_max - self.proj_min)
         if flow_span <= 0.0:
             flow_span = 1e-12
-        needs_wrap = (proj < self.proj_min) | (proj > self.proj_max)
+        rel = cand - self.origin[None, :]
+        if self.flow_axis == 0:
+            axis_cells = np.rint(np.sum(rel * self.axis_i, axis=1) / self.lattice.dx).astype(np.int64)
+        elif self.flow_axis == 1:
+            axis_cells = np.rint(np.sum(rel * self.axis_j, axis=1) / self.lattice.dx).astype(np.int64)
+        else:
+            axis_cells = np.rint(np.sum(rel * self.axis_k, axis=1) / self.lattice.dx).astype(np.int64)
+        needs_wrap = (
+            (proj < (self.proj_min - self.outlet_tolerance))
+            | (proj > (self.proj_max + self.outlet_tolerance))
+            | (axis_cells < self.flow_axis_min)
+            | (axis_cells > self.flow_axis_max)
+        )
         wrapped_proj = self.proj_min + np.mod(proj - self.proj_min, flow_span)
         wrapped_delta = (wrapped_proj - proj) * needs_wrap
         cand = cand + wrapped_delta[:, None] * self.direction
 
         in_fluid = self._in_fluid(cand)
         hit_wall = ~in_fluid & ~needs_wrap
-        hit_outlet = ~in_fluid & needs_wrap
+        hit_outlet = needs_wrap
 
-        # Wall hits: slide along wall tangent with reduced speed
+        # Wall hits: slide along wall with side-aware tangential candidates
         if hit_wall.any():
             hw_idx = np.where(hit_wall)[0]
             hw_pos = self.positions[hw_idx]
             hw_cand = cand[hw_idx]
-            # Wall normal estimate from failed movement direction
             move = hw_cand - hw_pos
-            move_len = np.sqrt(np.sum(move ** 2, axis=1, keepdims=True))
-            wall_normal = move / np.maximum(move_len, 1e-12)
-            # Project flow direction onto wall tangent plane
-            d = self.direction_f32[None, :]
-            flow_dot_n = np.sum(d * wall_normal, axis=1, keepdims=True)
-            tang_dir = d - flow_dot_n * wall_normal
-            t_len = np.sqrt(np.sum(tang_dir ** 2, axis=1, keepdims=True))
-            tang_dir = np.where(t_len > 1e-6, tang_dir / t_len, 0.0)
-            # Slide along tangent with friction
-            wall_slide = hw_pos + tang_dir * (
-                _WALL_FRICTION * self.speed * self.speed_scale[hw_idx, None] * float(dt)
+            wall_slide = self._wall_slide_positions(
+                hw_pos=hw_pos,
+                wall_normal=move,
+                local_speed_scale=self.speed_scale[hw_idx],
+                dt=float(dt),
             )
-            wall_slide = wall_slide.astype(np.float32)
-            # Only accept if the slid position is in fluid
-            slide_ok = self._in_fluid(wall_slide)
-            cand[hw_idx] = np.where(slide_ok[:, None], wall_slide, hw_pos)
+            cand[hw_idx] = wall_slide
 
         # Outlet hits: respawn at inlet
+        respawn_mask = np.zeros(self.positions.shape[0], dtype=np.bool_)
         if hit_outlet.any():
-            self._respawn(cand, hit_outlet)
+            respawn_mask = self._respawn(cand, hit_outlet)
+
+        post_proj = cand @ self.direction
+        post_rel = cand - self.origin[None, :]
+        if self.flow_axis == 0:
+            post_axis = np.rint(np.sum(post_rel * self.axis_i, axis=1) / self.lattice.dx).astype(np.int64)
+        elif self.flow_axis == 1:
+            post_axis = np.rint(np.sum(post_rel * self.axis_j, axis=1) / self.lattice.dx).astype(np.int64)
+        else:
+            post_axis = np.rint(np.sum(post_rel * self.axis_k, axis=1) / self.lattice.dx).astype(np.int64)
+        post_out = (
+            (post_proj < (self.proj_min - self.outlet_tolerance))
+            | (post_proj > (self.proj_max + self.outlet_tolerance))
+            | (post_axis < self.flow_axis_min)
+            | (post_axis > self.flow_axis_max)
+        )
+        leftover = np.logical_and(post_out, ~respawn_mask)
+        if leftover.any():
+            respawn_mask = np.logical_or(respawn_mask, self._respawn(cand, leftover))
 
         self.positions[:] = cand
         if self.streamlines_enabled:
-            self._record_trail()
+            self._record_trail(reset_mask=respawn_mask)
 
     # ------------------------------------------------------------------
     # Streamlines
@@ -523,11 +698,13 @@ class FlowMapSimulation:
             self.trail_count = 0
             self.trail_cursor = 0
             self.trail_positions = np.empty((1, 0, 3), dtype=np.float32)
+            self.trail_continuation = np.empty((1, 0), dtype=np.bool_)
             self.trail_particle_indices = np.empty(0, dtype=np.intp)
             return
         n = self.positions.shape[0]
         if n == 0:
             self.trail_positions = np.empty((1, 0, 3), dtype=np.float32)
+            self.trail_continuation = np.empty((1, 0), dtype=np.bool_)
             self.trail_particle_indices = np.empty(0, dtype=np.intp)
             self.trail_count = 0
             return
@@ -535,6 +712,8 @@ class FlowMapSimulation:
         self.trail_particle_indices = np.linspace(0, n - 1, tracked, dtype=np.intp)
         self.trail_positions = np.empty((self.trail_length, tracked, 3), dtype=np.float32)
         self.trail_positions[:] = self.positions[self.trail_particle_indices][None]
+        self.trail_continuation = np.zeros((self.trail_length, tracked), dtype=np.bool_)
+        self.trail_continuation[0, :] = True
         self.trail_cursor = 0
         self.trail_count = 1
 
@@ -561,6 +740,11 @@ class FlowMapSimulation:
         ps = sample % tracked
         start = self.trail_positions[order[ts], ps]
         stop = self.trail_positions[order[ts + 1], ps]
+        cont = self.trail_continuation[order[ts + 1], ps]
+        if not np.any(cont):
+            return np.empty((0, 2, 3), dtype=np.float32)
+        start = start[cont]
+        stop = stop[cont]
         return np.stack((start.astype(np.float32), stop.astype(np.float32)), axis=1)
 
     def particle_vertices(self) -> F32Array:
@@ -577,6 +761,7 @@ class FlowMapSimulation:
             self._jax = _JaxEngine(
                 positions=self.positions,
                 speed_scale=self.speed_scale,
+                diffusion_state=self.diffusion_state,
                 source_positions=self.inlet_positions,
                 fluid_keys=self.fluid_keys,
                 origin=self.origin,
@@ -591,6 +776,8 @@ class FlowMapSimulation:
                 cross_centroid=self.cross_centroid,
                 cross_max_r=self.cross_max_r,
                 flow_axis=int(self.flow_axis),
+                flow_axis_min=self.flow_axis_min,
+                flow_axis_max=self.flow_axis_max,
                 dx=float(self.lattice.dx),
                 nx=self.lattice.nx, ny=self.lattice.ny, nz=self.lattice.nz,
                 proj_min=self.proj_min, proj_max=self.proj_max, seed=seed,
@@ -604,7 +791,7 @@ class FlowMapSimulation:
             return
         try:
             for _ in range(3):
-                self._jax.step(self.speed, self.diffusion, 0.016)
+                self._jax.step(self.speed, self.diffusion, self.viscosity, 0.016)
         except Exception:
             self._jax = None
 
@@ -624,30 +811,106 @@ class FlowMapSimulation:
     def _seed_particles(self) -> None:
         source = self.inlet_positions if self.inlet_positions.size else self.fluid_positions
         self.positions[:] = self._sample(source, self.positions.shape[0])
+        self.diffusion_state[:] = 0.0
 
-    def _record_trail(self) -> None:
+    def _record_trail(self, reset_mask: NDArray[np.bool_] | None = None) -> None:
         if self.trail_particle_indices.size == 0:
             return
         self.trail_cursor = (self.trail_cursor + 1) % self.trail_length
         self.trail_positions[self.trail_cursor] = self.positions[self.trail_particle_indices]
+        if reset_mask is None:
+            self.trail_continuation[self.trail_cursor] = True
+        else:
+            cont = ~reset_mask[self.trail_particle_indices]
+            self.trail_continuation[self.trail_cursor] = cont
         if self.trail_count < self.trail_length:
             self.trail_count += 1
 
-    def _respawn(self, cand: F32Array, mask: NDArray[np.bool_]) -> None:
+    def _wall_slide_positions(
+        self,
+        hw_pos: F32Array,
+        wall_normal: F32Array,
+        local_speed_scale: F32Array,
+        dt: float,
+    ) -> F32Array:
+        if hw_pos.size == 0:
+            return hw_pos
+        wall_normal = wall_normal.astype(np.float32)
+        move_len = np.sqrt(np.sum(wall_normal * wall_normal, axis=1, keepdims=True))
+        wall_normal = wall_normal / np.maximum(move_len, np.float32(1e-12))
+        base_step = _WALL_FRICTION * self.speed * local_speed_scale[:, None] * dt
+
+        axis_i = np.asarray(self.axis_i, dtype=np.float32)
+        axis_j = np.asarray(self.axis_j, dtype=np.float32)
+        axis_k = np.asarray(self.axis_k, dtype=np.float32)
+        side_mask = self._movement_side_axes()
+
+        def _project(vec: F32Array) -> tuple[F32Array, NDArray[np.bool_]]:
+            tang = vec - np.sum(vec * wall_normal, axis=1, keepdims=True) * wall_normal
+            t_len = np.sqrt(np.sum(tang * tang, axis=1, keepdims=True))
+            keep = t_len[:, 0] > 1e-8
+            out = np.zeros_like(tang)
+            out[keep] = tang[keep] / np.maximum(t_len[keep], np.float32(1e-12))
+            return out, keep
+
+        slide = hw_pos.astype(np.float32)
+        picked = np.zeros(hw_pos.shape[0], dtype=np.bool_)
+
+        candidates = [np.repeat(self.direction_f32[None, :], len(hw_pos), axis=0)]
+        if side_mask[0]:
+            candidates.append(np.repeat(axis_i[None, :], len(hw_pos), axis=0))
+            candidates.append(np.repeat(-axis_i[None, :], len(hw_pos), axis=0))
+        if side_mask[1]:
+            candidates.append(np.repeat(axis_j[None, :], len(hw_pos), axis=0))
+            candidates.append(np.repeat(-axis_j[None, :], len(hw_pos), axis=0))
+        if side_mask[2]:
+            candidates.append(np.repeat(axis_k[None, :], len(hw_pos), axis=0))
+            candidates.append(np.repeat(-axis_k[None, :], len(hw_pos), axis=0))
+
+        for base in candidates:
+            if picked.all():
+                break
+            tang, valid = _project(base.astype(np.float32))
+            if not np.any(valid):
+                continue
+            target = hw_pos + tang * base_step
+            ok = self._in_fluid(target)
+            update = np.logical_and.reduce((valid, ~picked, ok))
+            if np.any(update):
+                picked[update] = True
+                slide[update] = target[update]
+
+        return slide
+
+    def _respawn(self, cand: F32Array, mask: NDArray[np.bool_]) -> NDArray[np.bool_]:
         n = int(mask.sum())
         if n == 0:
-            return
+            return np.zeros(cand.shape[0], dtype=np.bool_)
         pts = self._sample(self.inlet_positions, n)
         cand[mask] = pts
         self.positions[mask] = pts
+        self.diffusion_state[mask] = 0.0
         self.speed_scale[mask] = self._laminar_profile(pts)
+        return mask
 
     def _diffusion_noise(self, dt: float) -> F32Array:
         noise = self.rng.standard_normal(self.positions.shape).astype(np.float32)
+        visc = float(np.clip(self.viscosity, 0.0, 1.0))
+        diff_state_mix = 0.08 + 0.9 * visc
+        diff_state_amp = 1.0 - 0.75 * visc
         d = self.direction_f32
         tang = noise - (noise @ d)[:, None] * d[None, :]
         tang = tang * self.axis_motion_mask.astype(np.float32)[None, :]
-        return tang * sqrt(max(float(dt), 0.0)) * self.diffusion * float(self.lattice.dx)
+        raw = (
+            tang
+            * sqrt(max(float(dt), 0.0))
+            * self.diffusion
+            * float(self.lattice.dx)
+        )
+        self.diffusion_state = (
+            (1.0 - diff_state_mix) * raw + diff_state_mix * self.diffusion_state
+        )
+        return self.diffusion_state * diff_state_amp
 
     def _movement_side_axes(self) -> NDArray[np.bool_]:
         side = np.array(self.axis_motion_mask, copy=True)
