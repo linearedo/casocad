@@ -15,10 +15,18 @@ dependencies = [
     "glcontext==3.0.0",
     "pyarrow==24.0.0",
     "numpy>=2.0.0",
-    "jax>=0.10.2",
 ]
 
 [project.optional-dependencies]
+# Flow "Sim" animation is an opt-in feature. Without it the simulation panel
+# stays disabled; everything else (modelling, meshing, Arrow export) works.
+sim = [
+    "jax>=0.10.2",
+]
+# Same feature, accelerated on an NVIDIA GPU (CUDA 12 jaxlib).
+sim-cuda = [
+    "jax[cuda12]>=0.10.2",
+]
 dev = [
     "pytest>=8.0.0",
 ]
