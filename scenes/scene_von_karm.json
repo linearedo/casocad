@@ -1,0 +1,107 @@
+{
+  "boundary_regions": [
+    {
+      "name": "inlet",
+      "object_id": 13,
+      "outside_direction": 0,
+      "owner_object_id": 7,
+      "patch_id": "-X",
+      "patch_type": "face",
+      "selector_end": null,
+      "selector_id": null,
+      "selector_side": "inside",
+      "selector_start": null,
+      "selector_type": null
+    },
+    {
+      "name": "outlet",
+      "object_id": 14,
+      "outside_direction": 1,
+      "owner_object_id": 7,
+      "patch_id": "+X",
+      "patch_type": "face",
+      "selector_end": null,
+      "selector_id": null,
+      "selector_side": "inside",
+      "selector_start": null,
+      "selector_type": null
+    }
+  ],
+  "fluid_domain": {
+    "root_object_id": 16,
+    "selector_object_ids": [],
+    "tag_object_ids": []
+  },
+  "format": "casocad_scene",
+  "objects": [
+    {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "axis_w": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "center": [
+        5.5,
+        4.0,
+        2.5
+      ],
+      "half_size": [
+        5.5,
+        4.0,
+        2.5
+      ],
+      "name": "box_7",
+      "object_id": 7,
+      "type": "Box"
+    },
+    {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        0.004224617122389617,
+        0.9999910762652681
+      ],
+      "axis_w": [
+        0.0,
+        -0.9999910762652681,
+        0.004224617122389617
+      ],
+      "center": [
+        6.25,
+        4.0,
+        1.75
+      ],
+      "half_height": 1.75,
+      "name": "cylinder_15",
+      "object_id": 15,
+      "radius": 0.4,
+      "type": "Cylinder"
+    },
+    {
+      "left_id": 7,
+      "name": "difference: box_7, cylinder_15",
+      "object_id": 16,
+      "right_id": 15,
+      "type": "Difference"
+    }
+  ],
+  "root_object_ids": [
+    16
+  ],
+  "unit": "m",
+  "version": 4
+}
