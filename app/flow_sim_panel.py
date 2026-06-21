@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.flow_sim_arrow import FlowLatticeData, load_arrow_lattice
-from app.flow_sim_map import FlowMapSimulation
+from app.flow_sim_map import FlowMapSimulation, jax_backend_name
 from app.flow_sim_view import (
     DEFAULT_BACKGROUND,
     DEFAULT_BOUNDARY_COLOR,
@@ -167,6 +167,13 @@ class FlowSimPanel(QWidget):
         btn_row.addWidget(load_btn)
         fl.addRow("", btn_row)
         side_lay.addLayout(fl)
+
+        # --- Compute backend indicator (GPU/CUDA vs CPU) ---
+        self._backend_label = QLabel()
+        self._backend_label.setWordWrap(True)
+        self._backend_label.setObjectName("simBackendLabel")
+        side_lay.addWidget(self._backend_label)
+        self._refresh_backend_label()
 
         # --- Simulation controls ---
         self._particle_count = QSpinBox()
@@ -415,6 +422,33 @@ class FlowSimPanel(QWidget):
             )
         )
 
+    def _refresh_backend_label(self, backend_name: str | None = None) -> None:
+        """Show whether the sim computes on the GPU (CUDA), CPU JAX, or NumPy.
+
+        Before a simulation exists we report JAX's default backend; once one is
+        running we use its authoritative ``backend_name``. JAX selects CUDA
+        automatically when a CUDA-enabled jaxlib is installed, so this is purely
+        a status read-out (plus an install hint when the GPU is idle).
+        """
+        if backend_name is None:
+            backend_name = jax_backend_name()
+        label, color, hint = self._backend_descriptor(backend_name)
+        text = f"Compute: {label}"
+        if hint:
+            text += f"  ·  {hint}"
+        self._backend_label.setText(text)
+        self._backend_label.setStyleSheet(f"color:{color};")
+
+    @staticmethod
+    def _backend_descriptor(name: str | None) -> tuple[str, str, str]:
+        low = (name or "").lower()
+        if "gpu" in low or "cuda" in low:
+            return ("GPU (CUDA)", "#34d399", "")
+        if name is None or "numpy" in low:
+            return ("CPU (NumPy)", "#fbbf24", "install jax[cuda12] for GPU")
+        # JAX present but running on CPU.
+        return ("CPU (JAX)", "#fbbf24", "GPU idle — install jax[cuda12]")
+
     def _refresh_debug_button_state(self) -> None:
         self._debug_frames_btn.setEnabled(self._running and self._simulation is not None)
 
@@ -466,6 +500,7 @@ class FlowSimPanel(QWidget):
         self._running = True
         self._view.set_simulation(sim, self._sl_check.isChecked())
         self._refresh_debug_button_state()
+        self._refresh_backend_label(sim.backend_name)
         self._status.setText(
             "Simulating"
             + (" with streamlines" if self._sl_check.isChecked() else "")
