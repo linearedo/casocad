@@ -15,6 +15,7 @@ dependencies = [
     "glcontext==3.0.0",
     "pyarrow==24.0.0",
     "numpy>=2.0.0",
+    "jax>=0.10.2",
 ]
 
 [project.optional-dependencies]

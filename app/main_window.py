@@ -29,6 +29,7 @@ from app.artifacts import (
     RenderSceneSnapshot,
     build_render_artifact,
 )
+from app.flow_sim_panel import FlowSimPanel
 from app.panels.export_panel import ExportPanel
 from app.panels.log_panel import LogPanel
 from app.panels.mesher_panel import MesherPanel
@@ -136,6 +137,7 @@ class MainWindow(QMainWindow):
         self.mesher_panel = MesherPanel()
         self.export_panel = ExportPanel()
         self.log_panel = LogPanel()
+        self.sim_panel = FlowSimPanel(parent=self)
         self._thread: QProcess | None = None
         self._meshing_mode: str | None = None
         self._meshing_version: int | None = None
@@ -230,6 +232,14 @@ class MainWindow(QMainWindow):
         auto_snap_action.setObjectName("autoGridSpacingAction")
         auto_snap_action.setToolTip("Return snap spacing to the scene-based grid")
         auto_snap_action.triggered.connect(self._reset_grid_spacing)
+        sim_action = QAction("Sim", self)
+        sim_action.setObjectName("openSimPanelAction")
+        sim_action.setCheckable(True)
+        sim_action.toggled.connect(self._toggle_sim_panel)
+        toolbar.addAction(sim_action)
+        self._sim_action = sim_action
+        self.sim_panel.visibility_changed.connect(sim_action.setChecked)
+        sim_action.setToolTip("Open simulation panel (independent from viewport)")
         components_action = QAction("Components", self, checkable=True)
         components_action.setChecked(False)
         components_action.setToolTip(
@@ -1764,6 +1774,18 @@ class MainWindow(QMainWindow):
             return
         self.viewport.frame_default_grid()
         self.statusBar().showMessage("Framed reference grid", 3000)
+
+    @Slot(bool)
+    def _toggle_sim_panel(self, checked: bool) -> None:
+        if checked:
+            candidate_text = self.export_panel.path.text().strip()
+            if candidate_text:
+                candidate = Path(candidate_text)
+                if candidate.is_file():
+                    self.sim_panel.set_arrow_path(str(candidate))
+            self.sim_panel.show_panel(self)
+        else:
+            self.sim_panel.hide()
 
     @Slot()
     def _new_default_scene(self) -> None:
