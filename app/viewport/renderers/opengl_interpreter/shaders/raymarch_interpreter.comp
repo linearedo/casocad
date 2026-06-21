@@ -1,0 +1,87 @@
+// Compute-prepass raymarcher (cross-vendor path).
+//
+// Concatenated after the generated #defines, sdf_2d.glsl and sdf_interpreter.glsl.
+// Runs the same evalSceneSDF VM as the fragment path, but in a COMPUTE shader —
+// which links at the full value-stack capacity on Intel/AMD/NVIDIA, unlike the
+// fragment stage (Mesa hangs, NVIDIA errors C5041 there). Each invocation shades
+// one pixel and writes it to an output image; a trivial blit then puts it on
+// screen.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba8, binding = 0) writeonly uniform image2D u_out;
+
+uniform vec2 u_resolution;
+uniform vec3 u_camera_position;
+uniform vec3 u_camera_target;
+uniform vec3 u_camera_right;
+uniform vec3 u_camera_up;
+uniform float u_focal_length;
+uniform float u_surface_opacity;
+uniform vec3 u_background_color;
+
+vec3 objectPalette(uint object_id) {
+    int slot = int((max(object_id, 1u) - 1u) % 10u);
+    if (slot == 0) return vec3(0.95, 0.28, 0.16);
+    if (slot == 1) return vec3(0.20, 0.72, 1.00);
+    if (slot == 2) return vec3(0.25, 0.88, 0.38);
+    if (slot == 3) return vec3(1.00, 0.76, 0.16);
+    if (slot == 4) return vec3(0.82, 0.36, 1.00);
+    if (slot == 5) return vec3(0.12, 0.90, 0.82);
+    if (slot == 6) return vec3(1.00, 0.42, 0.68);
+    if (slot == 7) return vec3(0.58, 0.86, 0.18);
+    if (slot == 8) return vec3(1.00, 0.52, 0.12);
+    return vec3(0.46, 0.55, 1.00);
+}
+
+float sceneDist(vec3 p) { return evalSceneSDF(p).dist; }
+
+vec3 sceneNormal(vec3 p) {
+    const float e = 0.0008;
+    const vec2 k = vec2(1.0, -1.0);
+    return normalize(
+        k.xyy * sceneDist(p + k.xyy * e) +
+        k.yyx * sceneDist(p + k.yyx * e) +
+        k.yxy * sceneDist(p + k.yxy * e) +
+        k.xxx * sceneDist(p + k.xxx * e)
+    );
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= int(u_resolution.x) || pix.y >= int(u_resolution.y)) {
+        return;
+    }
+    vec2 screen_uv =
+        (vec2(pix) + 0.5 - 0.5 * u_resolution) / max(u_resolution.y, 1.0);
+
+    vec3 forward = normalize(u_camera_target - u_camera_position);
+    vec3 right = normalize(u_camera_right);
+    vec3 up = normalize(u_camera_up);
+    vec3 ray_direction = normalize(
+        2.0 * screen_uv.x * right + 2.0 * screen_uv.y * up + u_focal_length * forward
+    );
+
+    float travel = 0.0;
+    bool hit = false;
+    vec3 point = u_camera_position;
+    for (int step = 0; step < 160; ++step) {
+        point = u_camera_position + ray_direction * travel;
+        float d = sceneDist(point);
+        if (d < 0.0008) { hit = true; break; }
+        travel += max(d, 0.0002);
+        if (travel > 100.0) break;
+    }
+
+    vec3 color = u_background_color;
+    if (hit) {
+        Sample s = evalSceneSDF(point);
+        vec3 normal = sceneNormal(point);
+        vec3 light_direction = normalize(vec3(0.7, 1.0, 0.45));
+        float diffuse = max(dot(normal, light_direction), 0.0);
+        float rim = pow(1.0 - abs(dot(normal, -ray_direction)), 2.5);
+        vec3 material = objectPalette(s.owner_id);
+        vec3 surface = material * (0.24 + 0.76 * diffuse) + material * (0.25 * rim);
+        color = mix(u_background_color, pow(surface, vec3(0.86)), u_surface_opacity);
+    }
+    imageStore(u_out, pix, vec4(color, 1.0));
+}

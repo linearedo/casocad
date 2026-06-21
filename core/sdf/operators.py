@@ -8,13 +8,13 @@ from .base import BoundingBox3D, FloatArray, SDFNode
 
 
 @dataclass
-class BinaryCSG(SDFNode):
+class BinarySDFOperator(SDFNode):
     left: SDFNode | None = None
     right: SDFNode | None = None
 
     def __post_init__(self) -> None:
         if self.left is None or self.right is None:
-            raise ValueError("CSG operations require two child nodes")
+            raise ValueError("SDF operations require two child nodes")
         if self.left.dimension != self.right.dimension:
             raise ValueError("boolean operands must have the same dimension")
 
@@ -29,7 +29,7 @@ class BinaryCSG(SDFNode):
 
 
 @dataclass
-class Union(BinaryCSG):
+class Union(BinarySDFOperator):
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -44,7 +44,7 @@ class Union(BinaryCSG):
 
 
 @dataclass
-class Intersection(BinaryCSG):
+class Intersection(BinarySDFOperator):
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -64,7 +64,7 @@ class Intersection(BinaryCSG):
 
 
 @dataclass
-class Difference(BinaryCSG):
+class Difference(BinarySDFOperator):
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
     ) -> FloatArray:
@@ -79,7 +79,7 @@ class Difference(BinaryCSG):
 
 
 @dataclass
-class SmoothUnion(BinaryCSG):
+class SmoothUnion(BinarySDFOperator):
     smoothing: float = 0.1
 
     def __post_init__(self) -> None:

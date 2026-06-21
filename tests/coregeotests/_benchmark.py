@@ -46,10 +46,12 @@ class RenderUploadProbe:
     def create_optional(cls) -> RenderUploadProbe | None:
         try:
             import moderngl
-            from app.viewport.renderers.opengl.renderer import OpenGLRenderer
+            from app.viewport.renderers.opengl_interpreter.gl_renderer import (
+                InterpreterOpenGLRenderer,
+            )
 
-            context = moderngl.create_standalone_context(backend="egl")
-            renderer = OpenGLRenderer(context)
+            context = moderngl.create_standalone_context(backend="egl", require=460)
+            renderer = InterpreterOpenGLRenderer(context)
         except Exception as error:
             logger.info(
                 "coregeotest render upload probe unavailable: %s",

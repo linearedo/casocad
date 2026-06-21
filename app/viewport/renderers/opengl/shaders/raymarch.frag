@@ -21,10 +21,10 @@ uniform int u_boundary_hover_owner_id;
 uniform int u_boundary_hover_node_index;
 uniform vec3 u_boundary_hover_normal;
 uniform int u_selected_boundary_count;
-uniform int u_selected_boundary_owner_ids[128];
-uniform int u_selected_boundary_node_indices[128];
-uniform int u_selected_boundary_whole_flags[128];
-uniform vec3 u_selected_boundary_normals[128];
+uniform int u_selected_boundary_owner_ids[16];
+uniform int u_selected_boundary_node_indices[16];
+uniform int u_selected_boundary_whole_flags[16];
+uniform vec3 u_selected_boundary_normals[16];
 const vec3 PREVIEW_COLOR = vec3(0.15, 0.92, 1.0);
 const float PI = 3.14159265359;
 

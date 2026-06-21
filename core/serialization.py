@@ -47,7 +47,7 @@ from .sdf import (
     Union,
 )
 from .sdf.base import SDFNode
-from .sdf.csg import BinaryCSG
+from .sdf.operators import BinarySDFOperator
 from .sdf.primitives_1d import Profile1D
 from .sdf.primitives_2d import Profile2D
 from .sdf.transforms import UnaryTransform
@@ -330,7 +330,7 @@ def _node_to_record(node: SDFNode) -> dict[str, Any]:
             axis_v=list(node.axis_v),
             source_ids=[child.object_id for child in node.sources],
         )
-    elif isinstance(node, BinaryCSG):
+    elif isinstance(node, BinarySDFOperator):
         assert node.left is not None and node.right is not None
         data.update(left_id=node.left.object_id, right_id=node.right.object_id)
         if isinstance(node, SmoothUnion):

@@ -43,7 +43,6 @@ from core.sdf import PlacedPolyline2D, PlacedSDF2D, SDFTree
 from core.sdf.base import BoundingBox3D, SDFNode
 
 from .camera import OrbitCamera
-from .renderers.opengl.renderer import OpenGLRenderer
 from .renderers.opengl.renderer import (
     MAX_SELECTED_BOUNDARY_OWNERS,
     POINT_VERTEX_WIDTH,
@@ -57,7 +56,7 @@ from .renderers.opengl.renderer import (
 )
 
 logger = logging.getLogger(__name__)
-MAX_SELECTED_BOUNDARY_REGIONS = 128
+MAX_SELECTED_BOUNDARY_REGIONS = 16
 FPS_COUNTER_UPDATE_MS = 500
 VIEW_ANIMATION_DURATION_MS = 180
 VIEW_ANIMATION_INTERVAL_MS = 16
@@ -2969,8 +2968,12 @@ class ViewportWidget(QOpenGLWidget):
 
     def initializeGL(self) -> None:
         try:
-            self._context = moderngl.create_context(require=330)
-            self._renderer = OpenGLRenderer(self._context)
+            self._context = moderngl.create_context(require=460)
+            from app.viewport.renderers.opengl_interpreter.gl_renderer import (
+                InterpreterOpenGLRenderer,
+            )
+
+            self._renderer = InterpreterOpenGLRenderer(self._context)
             self._compiled_scene = None
             self._compiled_preview_scene = EMPTY_RENDER_SCENE_KEY
             logger.info(

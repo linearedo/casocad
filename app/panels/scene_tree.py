@@ -198,7 +198,7 @@ class SceneTreePanel(QWidget):
             clicked_item.setSelected(True)
         menu = QMenu(self)
         menu.aboutToHide.connect(
-            lambda: signals.csg_preview_requested.emit("", [])
+            lambda: signals.sdf_op_preview_requested.emit("", [])
         )
         add_menu = menu.addMenu("Add SDF")
         add_sdf_menu_actions(add_menu, signals.add_primitive_requested)
@@ -221,12 +221,12 @@ class SceneTreePanel(QWidget):
                 action = boolean_menu.addAction(label)
                 action.setEnabled(len(selected) == 2)
                 action.hovered.connect(
-                    lambda value=operation: signals.csg_preview_requested.emit(
+                    lambda value=operation: signals.sdf_op_preview_requested.emit(
                         value, self.selected_handles()
                     )
                 )
                 action.triggered.connect(
-                    lambda checked=False, value=operation: signals.csg_requested.emit(
+                    lambda checked=False, value=operation: signals.sdf_op_requested.emit(
                         value, self.selected_handles()
                     )
                 )
@@ -392,7 +392,7 @@ class SceneTreePanel(QWidget):
                 action.hovered.connect(
                     lambda op=operation,
                     first=base_handle,
-                    second=other_handle: signals.csg_preview_requested.emit(
+                    second=other_handle: signals.sdf_op_preview_requested.emit(
                         op, [first, second]
                     )
                 )
@@ -400,7 +400,7 @@ class SceneTreePanel(QWidget):
                     lambda checked=False,
                     op=operation,
                     first=base_handle,
-                    second=other_handle: signals.csg_requested.emit(
+                    second=other_handle: signals.sdf_op_requested.emit(
                         op, [first, second]
                     )
                 )
@@ -412,28 +412,28 @@ class SceneTreePanel(QWidget):
             subtract = subtract_menu.addAction(label)
             subtract.hovered.connect(
                 lambda first=base_handle,
-                second=other_handle: signals.csg_preview_requested.emit(
+                second=other_handle: signals.sdf_op_preview_requested.emit(
                     "difference", [first, second]
                 )
             )
             subtract.triggered.connect(
                 lambda checked=False,
                 first=base_handle,
-                second=other_handle: signals.csg_requested.emit(
+                second=other_handle: signals.sdf_op_requested.emit(
                     "difference", [first, second]
                 )
             )
             reverse = reverse_menu.addAction(label)
             reverse.hovered.connect(
                 lambda first=other_handle,
-                second=base_handle: signals.csg_preview_requested.emit(
+                second=base_handle: signals.sdf_op_preview_requested.emit(
                     "difference", [first, second]
                 )
             )
             reverse.triggered.connect(
                 lambda checked=False,
                 first=other_handle,
-                second=base_handle: signals.csg_requested.emit(
+                second=base_handle: signals.sdf_op_requested.emit(
                     "difference", [first, second]
                 )
             )

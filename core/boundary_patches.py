@@ -37,7 +37,7 @@ from core.sdf import (
     Union,
 )
 from core.sdf.base import SDFNode
-from core.sdf.csg import BinaryCSG
+from core.sdf.operators import BinarySDFOperator
 
 PATCH_TOLERANCE = 1.5e-3
 CURVE_PATCH_PICK_TOLERANCE = 0.05
@@ -469,7 +469,7 @@ def _surface_patches_for_node(
                 normal_sign=normal_sign,
             ),
         )
-    if isinstance(node, BinaryCSG):
+    if isinstance(node, BinarySDFOperator):
         return tuple()
     return tuple()
 

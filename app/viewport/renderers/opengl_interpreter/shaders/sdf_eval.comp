@@ -1,0 +1,51 @@
+// Off-screen compute sampler — validation harness (design §7.1).
+//
+// Concatenated after the generated #defines and sdf_interpreter.glsl. Evaluates
+// the interpreter at a batch of points and writes (dist, owner, region) so the
+// host can diff against SDFNode.to_numpy / surface_selector_values.
+//
+// u_mode selects what to evaluate:
+//   0 -> irNodeSDF(u_node_index, p)        (single leaf, Stage 2)
+//   1 -> evalSceneSDF(p)                    (full bytecode program, Stage 3+)
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 4) readonly  buffer Points    { float u_points[]; };
+layout(std430, binding = 5) writeonly buffer OutDist   { float o_dist[]; };
+layout(std430, binding = 6) writeonly buffer OutOwner  { uint  o_owner[]; };
+layout(std430, binding = 7) writeonly buffer OutRegion { uint  o_region[]; };
+
+uniform uint u_point_count;
+uniform uint u_node_index;
+uniform uint u_mode;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= u_point_count) {
+        return;
+    }
+    vec3 p = vec3(
+        u_points[gid * 3u + 0u],
+        u_points[gid * 3u + 1u],
+        u_points[gid * 3u + 2u]
+    );
+
+    Sample s;
+    if (u_mode == 0u) {
+        s = irNodeSDF(u_node_index, p);
+    } else if (u_mode == 1u) {
+        s = evalSceneSDF(p);
+    } else if (u_mode == 2u) {
+        s.dist = evalProfileSDF(u_node_index, p.xy);
+        s.owner_id = 0u;
+        s.region_id = 0u;
+    } else {
+        s.dist = evalProfile1DSDF(u_node_index, p.x);
+        s.owner_id = 0u;
+        s.region_id = 0u;
+    }
+
+    o_dist[gid] = s.dist;
+    o_owner[gid] = s.owner_id;
+    o_region[gid] = s.region_id;
+}

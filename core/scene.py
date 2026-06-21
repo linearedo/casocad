@@ -60,7 +60,7 @@ from .sdf import (
     Translate,
     Union,
 )
-from .sdf.csg import BinaryCSG
+from .sdf.operators import BinarySDFOperator
 from .sdf.solid_from_2d import Revolve
 from .sdf.transforms import UnaryTransform
 
@@ -1021,7 +1021,7 @@ class SceneDocument:
                 "smooth_union": SmoothUnion,
             }
             if operation not in constructors:
-                raise ValueError(f"unknown CSG operation: {operation}")
+                raise ValueError(f"unknown SDF operation: {operation}")
             combined = constructors[operation](
                 name=f"{label}: {first.name}, {second.name}",
                 object_id=object_id,
@@ -1620,7 +1620,7 @@ class SceneDocument:
                 current.child = replacement
                 return current if replacement is not None else None, True
             return current, False
-        if isinstance(current, BinaryCSG):
+        if isinstance(current, BinarySDFOperator):
             assert current.left is not None and current.right is not None
             if current.left is target:
                 return current.right, True
@@ -1655,7 +1655,7 @@ class SceneDocument:
                 return None, removed
             current.child = replacement
             return current, removed
-        if isinstance(current, BinaryCSG):
+        if isinstance(current, BinarySDFOperator):
             assert current.left is not None and current.right is not None
             left, left_removed = self._remove_targets_from(current.left, target_ids)
             right, right_removed = self._remove_targets_from(

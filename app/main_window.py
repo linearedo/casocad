@@ -363,8 +363,8 @@ class MainWindow(QMainWindow):
             self._on_viewport_boundary_region_requested
         )
         signals.delete_nodes_requested.connect(self._on_delete_nodes)
-        signals.csg_requested.connect(self._on_csg_requested)
-        signals.csg_preview_requested.connect(self._on_csg_preview_requested)
+        signals.sdf_op_requested.connect(self._on_sdf_op_requested)
+        signals.sdf_op_preview_requested.connect(self._on_sdf_op_preview_requested)
         signals.transform_requested.connect(self._on_transform_requested)
         signals.solid_from_2d_requested.connect(self._on_solid_from_2d)
         signals.set_fluid_root_requested.connect(self._on_set_fluid_root)
@@ -1278,7 +1278,7 @@ class MainWindow(QMainWindow):
         self._publish_document()
 
     @Slot(str, object)
-    def _on_csg_preview_requested(self, operation: str, handles: list[int]) -> None:
+    def _on_sdf_op_preview_requested(self, operation: str, handles: list[int]) -> None:
         if not operation:
             self.viewport.clear_boolean_preview()
             return
@@ -1307,7 +1307,7 @@ class MainWindow(QMainWindow):
         )
 
     @Slot(str, object)
-    def _on_csg_requested(self, operation: str, handles: list[int]) -> None:
+    def _on_sdf_op_requested(self, operation: str, handles: list[int]) -> None:
         if len(handles) != 2:
             signals.log_message.emit(
                 "warning", "Select exactly two independent SDF nodes."

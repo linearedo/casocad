@@ -6,7 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from core.sdf.base import FloatArray, SDFNode
-from core.sdf.csg import Difference, Intersection, SmoothUnion, Union
+from core.sdf.operators import Difference, Intersection, SmoothUnion, Union
 from core.sdf.transforms import Rotate, Scale, Translate
 
 NODE_INSIDE = np.uint8(0)
@@ -244,7 +244,7 @@ def sample_boundary_faces(
         )
         crossing[exact_initial] = initial_points[exact_initial]
         crossing[exact_inside] = inside_points[exact_inside]
-        # At intersections the final CSG can be zero along a finite edge
+        # At intersections the final SDF can be zero along a finite edge
         # segment. Attribute the transition from its refined OUTSIDE bracket,
         # where the branch that actually makes the neighbor outside is clear.
         outside_bracket = inside_points + high[:, None] * (

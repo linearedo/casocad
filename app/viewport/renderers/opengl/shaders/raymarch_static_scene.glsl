@@ -18,12 +18,13 @@ float renderSceneSDF(vec3 p) {
 
 vec3 sceneNormal(vec3 p) {
     const float e = 0.0008;
-    vec2 h = vec2(e, 0.0);
-    return normalize(vec3(
-        renderSceneSDF(p + h.xyy) - renderSceneSDF(p - h.xyy),
-        renderSceneSDF(p + h.yxy) - renderSceneSDF(p - h.yxy),
-        renderSceneSDF(p + h.yyx) - renderSceneSDF(p - h.yyx)
-    ));
+    const vec2 k = vec2(1.0, -1.0);
+    return normalize(
+        k.xyy * renderSceneSDF(p + k.xyy * e) +
+        k.yyx * renderSceneSDF(p + k.yyx * e) +
+        k.yxy * renderSceneSDF(p + k.yxy * e) +
+        k.xxx * renderSceneSDF(p + k.xxx * e)
+    );
 }
 
 float gridLineCoverage(float coordinate, float spacing) {
@@ -100,7 +101,7 @@ vec3 shadeSceneSurface(vec3 point, vec3 ray_direction) {
     ) {
         boundary_hovered = true;
     }
-    for (int index = 0; index < 128; ++index) {
+    for (int index = 0; index < 16; ++index) {
         if (index >= u_selected_boundary_count) break;
         int selected_node_index = u_selected_boundary_node_indices[index];
         if (selected_node_index < 0) continue;

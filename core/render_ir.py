@@ -58,6 +58,10 @@ class RenderIRNode:
     children: tuple[int, ...]
     params: tuple[float, ...] = ()
     component_indices: tuple[int, ...] = ()
+    # Bit-flag payload packed into GpuNode.flags. For Layer 2 region_selector
+    # nodes this carries the region id to assign on a match (design §5.2);
+    # for geometry leaves it stays 0 (reserved for Layer 1 intrinsic bits).
+    flags: int = 0
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,8 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     surface_format = QSurfaceFormat()
-    surface_format.setVersion(3, 3)
+    # The SDF interpreter is the only renderer; it needs OpenGL 4.6 core for SSBOs.
+    surface_format.setVersion(4, 6)
     surface_format.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
     surface_format.setDepthBufferSize(24)
     QSurfaceFormat.setDefaultFormat(surface_format)
