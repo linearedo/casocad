@@ -39,7 +39,6 @@ from .sdf import (
     Rotate,
     Scale,
     SegmentProfile,
-    SmoothUnion,
     Sphere,
     Torus,
     Translate,
@@ -273,7 +272,6 @@ def _build_profile_1d_ir_node(
                 "union": "profile_union_1d",
                 "intersection": "profile_intersection_1d",
                 "difference": "profile_difference_1d",
-                "smooth_union": "profile_smooth_union_1d",
             }[profile.operation],
             object_id=0,
             dimension=1,
@@ -295,9 +293,7 @@ def _build_profile_1d_ir_node(
                     offset,
                 ),
             ),
-            params=(float(scale) * float(profile.smoothing),)
-            if profile.operation == "smooth_union"
-            else (),
+            params=(),
         )
     else:
         unsupported.append(type(profile).__name__)
@@ -485,7 +481,6 @@ def _build_profile_ir_node(
                 "union": "profile_union_2d",
                 "intersection": "profile_intersection_2d",
                 "difference": "profile_difference_2d",
-                "smooth_union": "profile_smooth_union_2d",
             }[profile.operation],
             object_id=0,
             dimension=2,
@@ -507,9 +502,7 @@ def _build_profile_ir_node(
                     offset,
                 ),
             ),
-            params=(float(scale) * float(profile.smoothing),)
-            if profile.operation == "smooth_union"
-            else (),
+            params=(),
         )
     else:
         unsupported.append(type(profile).__name__)
@@ -702,23 +695,6 @@ def _build_render_ir_node(
                     aliases,
                 ) for child in node.children()
             ),
-        )
-    elif isinstance(node, SmoothUnion):
-        payload = RenderIRNode(
-            kind="smooth_union",
-            object_id=max(node.object_id, 0),
-            dimension=node.dimension,
-            children=tuple(
-                _build_render_ir_node(
-                    child,
-                    nodes,
-                    ir_nodes,
-                    unsupported,
-                    transform,
-                    aliases,
-                ) for child in node.children()
-            ),
-            params=(transform.apply_length(float(node.smoothing)),),
         )
     elif isinstance(node, PlacedSDF2D):
         payload = _build_placed_sdf_2d_ir_node(

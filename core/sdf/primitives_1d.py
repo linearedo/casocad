@@ -71,13 +71,10 @@ class BinaryProfile1D(Profile1D):
             "union",
             "intersection",
             "difference",
-            "smooth_union",
         }:
             raise ValueError(
                 f"unsupported 1D boolean operation: {self.operation}"
             )
-        if self.operation == "smooth_union" and self.smoothing <= 0.0:
-            raise ValueError("smooth union radius must be positive")
 
     def to_numpy(self, T: FloatArray) -> FloatArray:
         left = self.left.to_numpy(T)
@@ -86,19 +83,7 @@ class BinaryProfile1D(Profile1D):
             return np.minimum(left, right)
         if self.operation == "intersection":
             return np.maximum(left, right)
-        if self.operation == "difference":
-            return np.maximum(left, -right)
-        blend = np.clip(
-            0.5 + 0.5 * (right - left) / self.smoothing,
-            0.0,
-            1.0,
-        )
-        return np.asarray(
-            right * (1.0 - blend)
-            + left * blend
-            - self.smoothing * blend * (1.0 - blend),
-            dtype=np.float64,
-        )
+        return np.maximum(left, -right)
 
     def bounds(self) -> tuple[float, float]:
         left = self.left.bounds()

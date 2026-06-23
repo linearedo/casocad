@@ -691,10 +691,8 @@ class BinaryProfile(Profile2D):
     smoothing: float = 0.1
 
     def __post_init__(self) -> None:
-        if self.operation not in {"union", "intersection", "difference", "smooth_union"}:
+        if self.operation not in {"union", "intersection", "difference"}:
             raise ValueError(f"unsupported 2D boolean operation: {self.operation}")
-        if self.operation == "smooth_union" and self.smoothing <= 0.0:
-            raise ValueError("smooth union radius must be positive")
 
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         left = self.left.to_numpy(U, V)
@@ -703,15 +701,7 @@ class BinaryProfile(Profile2D):
             return np.minimum(left, right)
         if self.operation == "intersection":
             return np.maximum(left, right)
-        if self.operation == "difference":
-            return np.maximum(left, -right)
-        h = np.clip(0.5 + 0.5 * (right - left) / self.smoothing, 0.0, 1.0)
-        return np.asarray(
-            right * (1.0 - h)
-            + left * h
-            - self.smoothing * h * (1.0 - h),
-            dtype=np.float64,
-        )
+        return np.maximum(left, -right)
 
     def bounds(self) -> tuple[float, float, float, float]:
         left = self.left.bounds()

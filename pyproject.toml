@@ -11,8 +11,6 @@ authors = [
 
 dependencies = [
     "PySide6==6.11.1",
-    "moderngl==5.12.0",
-    "glcontext==3.0.0",
     "pyarrow==24.0.0",
     "numpy>=2.0.0",
 ]

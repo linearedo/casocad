@@ -35,7 +35,6 @@ from core.sdf import (
     RoundedRectangleProfile,
     SDFTree,
     SegmentProfile,
-    SmoothUnion,
     Sphere,
     SquareProfile,
     Torus,
@@ -250,7 +249,6 @@ def test_3d_boolean_variant_timing() -> None:
         ("union", Union),
         ("intersection", Intersection),
         ("difference", object),
-        ("smooth_union", SmoothUnion),
     ):
         document = SceneDocument()
         first = document.add_primitive("sphere")
@@ -273,7 +271,7 @@ def test_3d_boolean_variant_timing() -> None:
 
 
 def test_2d_and_1d_boolean_variant_timing() -> None:
-    for operation in ("union", "intersection", "difference", "smooth_union"):
+    for operation in ("union", "intersection", "difference"):
         document = SceneDocument()
         first = document.add_primitive("rectangle")
         second = document.add_primitive("circle")

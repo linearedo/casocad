@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from core.mesher import FluidDomain
 from core.scene import SceneDocument
-from core.sdf import Box, SmoothUnion, Sphere
+from core.sdf import Box, Sphere, Union
 
 
 def build_scene() -> SceneDocument:
@@ -18,11 +18,10 @@ def build_scene() -> SceneDocument:
         center=(0.4, 0.0, 0.0),
         half_size=(0.55, 0.45, 0.45),
     )
-    root = SmoothUnion(
-        name="smooth_benchmark",
+    root = Union(
+        name="union_benchmark",
         object_id=3,
         left=sphere,
         right=box,
-        smoothing=0.18,
     )
     return SceneDocument([root], FluidDomain(root))

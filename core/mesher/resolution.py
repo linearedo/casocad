@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from core.sdf.base import SDFNode
-from core.sdf.operators import BinarySDFOperator, SmoothUnion
+from core.sdf.operators import BinarySDFOperator
 from core.sdf.placed_1d import PlacedSDF1D
 from core.sdf.placed_2d import PlacedSDF2D
 from core.sdf.primitives_3d import Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Sphere, Torus
@@ -54,8 +54,6 @@ def minimum_feature_size(node: SDFNode) -> float:
             minimum_feature_size(node.left),
             minimum_feature_size(node.right),
         )
-        if isinstance(node, SmoothUnion):
-            feature = min(feature, 2.0 * node.smoothing)
         return feature
     if isinstance(node, Extrude):
         assert node.section is not None

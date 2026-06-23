@@ -39,7 +39,6 @@ from .sdf import (
     RoundedRectangleProfile,
     Scale,
     SegmentProfile,
-    SmoothUnion,
     Sphere,
     SquareProfile,
     Torus,
@@ -333,8 +332,6 @@ def _node_to_record(node: SDFNode) -> dict[str, Any]:
     elif isinstance(node, BinarySDFOperator):
         assert node.left is not None and node.right is not None
         data.update(left_id=node.left.object_id, right_id=node.right.object_id)
-        if isinstance(node, SmoothUnion):
-            data["smoothing"] = node.smoothing
     elif isinstance(node, UnaryTransform):
         assert node.child is not None
         data["child_id"] = node.child.object_id
@@ -492,15 +489,12 @@ def _node_from_record(
         "Union": Union,
         "Intersection": Intersection,
         "Difference": Difference,
-        "SmoothUnion": SmoothUnion,
     }
     if node_type in binary_types:
-        extra = {"smoothing": float(data["smoothing"])} if node_type == "SmoothUnion" else {}
         return binary_types[node_type](
             **common,
             left=build(int(data["left_id"])),
             right=build(int(data["right_id"])),
-            **extra,
         )
     if node_type == "Translate":
         return Translate(**common, child=build(int(data["child_id"])), offset=tuple(data["offset"]))

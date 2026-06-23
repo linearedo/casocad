@@ -29,17 +29,21 @@ from app.artifacts import (
     RenderSceneSnapshot,
     build_render_artifact,
 )
-from app.flow_sim_panel import FlowSimPanel
 from app.panels.export_panel import ExportPanel
 from app.panels.log_panel import LogPanel
 from app.panels.mesher_panel import MesherPanel
 from app.panels.properties import CadDimensionSpinBox, PropertiesPanel
 from app.panels.scene_tree import SceneTreePanel
 from app.signals import signals
-from app.viewport.viewport_widget import ViewportWidget
+from app.viewport.renderers.qrhi.viewport import QRhiViewportWidget as ViewportWidget
 from core.boundary import BoundaryRegion
 from core.boundary_direction import owner_outside_direction_vector
 from core.boundary_patches import BoundaryPatchHit
+from core.model import (
+    disjointness_violations,
+    grammar_violations,
+    model_from_document,
+)
 from core.sdf import PlacedSDF2D
 from core.sdf.base import BoundingBox3D, SDFNode
 from core.serialization import load_scene, save_scene
@@ -137,7 +141,6 @@ class MainWindow(QMainWindow):
         self.mesher_panel = MesherPanel()
         self.export_panel = ExportPanel()
         self.log_panel = LogPanel()
-        self.sim_panel = FlowSimPanel(parent=self)
         self._thread: QProcess | None = None
         self._meshing_mode: str | None = None
         self._meshing_version: int | None = None
@@ -232,14 +235,6 @@ class MainWindow(QMainWindow):
         auto_snap_action.setObjectName("autoGridSpacingAction")
         auto_snap_action.setToolTip("Return snap spacing to the scene-based grid")
         auto_snap_action.triggered.connect(self._reset_grid_spacing)
-        sim_action = QAction("Sim", self)
-        sim_action.setObjectName("openSimPanelAction")
-        sim_action.setCheckable(True)
-        sim_action.toggled.connect(self._toggle_sim_panel)
-        toolbar.addAction(sim_action)
-        self._sim_action = sim_action
-        self.sim_panel.visibility_changed.connect(sim_action.setChecked)
-        sim_action.setToolTip("Open simulation panel (independent from viewport)")
         components_action = QAction("Components", self, checkable=True)
         components_action.setChecked(False)
         components_action.setToolTip(
@@ -333,16 +328,99 @@ class MainWindow(QMainWindow):
         self._redo_action.triggered.connect(self._redo_document_edit)
         self._update_history_actions()
 
+        domains_menu = self.menuBar().addMenu("&Domains")
+        validate_action = domains_menu.addAction("Validate Domains (disjointness)")
+        validate_action.triggered.connect(self._validate_domains_disjoint)
+
+    def _model_or_none(self):
+        """Adapt the live document to a Model, or None if it cannot form one
+        (e.g. duplicate top-level names mid-edit). See core.model.model_from_document."""
+        try:
+            return model_from_document(self.document)
+        except ValueError:
+            return None
+
+    def _update_grammar_diagnostics(self) -> None:
+        """Live, non-blocking role-grammar check (exact-SDF spec §4).
+
+        Quiet by design: it only fires when operators are wired in an
+        exactness-breaking way (e.g. intersecting a union result), which makes
+        the interior distance field non-exact. Disjointness (§7) is deferred to
+        the Validate Domains action / future mesh-time gate, not run live.
+        """
+        model = self._model_or_none()
+        issues = grammar_violations(model) if model is not None else []
+        last = getattr(self, "_last_grammar_issues", [])
+        if issues == last:
+            return
+        self._last_grammar_issues = issues
+        if issues:
+            signals.log_message.emit(
+                "warning",
+                "Exact-SDF grammar violated (interior distance no longer exact): "
+                + issues[0],
+            )
+            self.statusBar().showMessage("⚠ Exact-SDF grammar violated", 5000)
+        elif last:
+            signals.log_message.emit("info", "Exact-SDF grammar OK")
+
+    @Slot()
+    def _validate_domains_disjoint(self) -> None:
+        """On-demand exactness + disjointness check (spec §4 + §7).
+
+        Runs the full compile gate (role grammar + the sampled disjointness
+        probe). The hard gate will also run automatically at mesh time once a
+        mesher exists; for now it is user-triggered from the Domains menu.
+        """
+        model = self._model_or_none()
+        if model is None:
+            QMessageBox.warning(
+                self,
+                "Validate Domains",
+                "Top-level object names must be unique to form Domains.",
+            )
+            return
+        problems = grammar_violations(model) + disjointness_violations(model)
+        if not problems:
+            QMessageBox.information(
+                self,
+                "Validate Domains",
+                f"All {len(model.domains)} domain(s) are exact and mutually "
+                "disjoint.",
+            )
+            return
+        QMessageBox.warning(
+            self,
+            "Validate Domains",
+            "Model is not compilable:\n\n- " + "\n- ".join(problems),
+        )
+
     def _connect_signals(self) -> None:
         signals.add_primitive_requested.connect(self._on_add_primitive)
         signals.viewport_shape_drawn.connect(self._on_viewport_shape_drawn)
+        signals.viewport_shape_preview_requested.connect(
+            self._on_viewport_shape_preview
+        )
         signals.viewport_point_shape_drawn.connect(self._on_viewport_point_shape_drawn)
         signals.viewport_move_tool_requested.connect(self._start_viewport_move)
         signals.viewport_boundary_tool_requested.connect(
             self._start_boundary_region_tool
         )
         signals.viewport_move_requested.connect(self._on_viewport_move_requested)
+        signals.viewport_move_preview_requested.connect(
+            self._on_viewport_move_preview
+        )
+        signals.viewport_rotate_tool_requested.connect(self._start_viewport_rotate)
         signals.viewport_rotate_requested.connect(self._on_viewport_rotate_requested)
+        signals.viewport_rotate_preview_requested.connect(
+            self._on_viewport_rotate_preview
+        )
+        signals.viewport_extrude_preview_requested.connect(
+            self._on_viewport_extrude_preview
+        )
+        signals.viewport_revolve_preview_requested.connect(
+            self._on_viewport_revolve_preview
+        )
         signals.viewport_transform_requested.connect(
             self._on_viewport_transform_requested
         )
@@ -393,6 +471,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         if notify_document:
             signals.document_changed.emit(self.document)
+        self._update_grammar_diagnostics()
         if clear_selection:
             signals.node_selected.emit(None)
         if not self.document.objects:
@@ -570,6 +649,22 @@ class MainWindow(QMainWindow):
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
         self.scene_tree.select_handle(handle)
+
+    def _on_viewport_shape_preview(self, kind, start, end, parameters) -> None:
+        """Live ghost of a shape being drawn (non-committing). Boundary cutters
+        are skipped — they need a selected region and special handling."""
+        if self.viewport.active_boundary_cutter_tool() is not None:
+            return
+        try:
+            preview = self.document.snapshot()
+            preview.add_primitive_from_drag(kind, start, end, parameters=parameters)
+            version, tree = preview.visual_snapshot()
+            artifact = build_render_artifact(
+                RenderSceneSnapshot(version=version, tree=tree)
+            )
+        except (KeyError, ValueError):
+            return
+        self.viewport.show_scene_preview(artifact.render_ir)
 
     @Slot(str, object, object, object)
     def _on_viewport_shape_drawn(
@@ -801,6 +896,15 @@ class MainWindow(QMainWindow):
             return
         self.viewport.begin_move_tool(handles[0])
 
+    def _start_viewport_rotate(self) -> None:
+        handles = self.scene_tree.selected_handles()
+        if len(handles) != 1:
+            signals.log_message.emit(
+                "warning", "Select exactly one Scene object before using Rotate."
+            )
+            return
+        self.viewport.begin_rotate_tool(handles[0])
+
     @Slot()
     def _copy_selection(self) -> None:
         handles = self.scene_tree.selected_handles()
@@ -915,6 +1019,26 @@ class MainWindow(QMainWindow):
         return True
 
     @Slot(int, object)
+    def _on_viewport_move_preview(
+        self,
+        handle: int,
+        delta: tuple[float, float, float],
+    ) -> None:
+        """Render a non-committing ghost of the move during the drag. Builds a
+        throwaway document so the live tree/undo history stay untouched; the
+        viewport restores the committed scene on cancel or after commit."""
+        try:
+            preview = self.document.snapshot()
+            preview.move_object(handle, delta)
+            version, tree = preview.visual_snapshot()
+            artifact = build_render_artifact(
+                RenderSceneSnapshot(version=version, tree=tree)
+            )
+        except (KeyError, ValueError) as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        self.viewport.show_scene_preview(artifact.render_ir)
+
     def _on_viewport_move_requested(
         self,
         handle: int,
@@ -947,6 +1071,26 @@ class MainWindow(QMainWindow):
             5000,
         )
 
+    def _on_viewport_rotate_preview(
+        self,
+        handle: int,
+        axis: str,
+        angle_degrees: float,
+        pivot: tuple[float, float, float],
+    ) -> None:
+        """Non-committing ghost of a rotation drag (see _on_viewport_move_preview)."""
+        try:
+            preview = self.document.snapshot()
+            preview.rotate_object(handle, axis, angle_degrees, pivot)
+            version, tree = preview.visual_snapshot()
+            artifact = build_render_artifact(
+                RenderSceneSnapshot(version=version, tree=tree)
+            )
+        except (KeyError, ValueError, NotImplementedError) as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        self.viewport.show_scene_preview(artifact.render_ir)
+
     @Slot(int, str, float, object)
     def _on_viewport_rotate_requested(
         self,
@@ -977,6 +1121,42 @@ class MainWindow(QMainWindow):
             f"Object rotated {angle_degrees:.1f} deg around {axis.upper()}",
             5000,
         )
+
+    def _on_viewport_extrude_preview(self, handle: int, signed_height: float) -> None:
+        try:
+            preview = self.document.snapshot()
+            new_handle = preview.solid_from_2d(
+                [handle], "extrude", signed_height=signed_height)
+            version, tree = preview.visual_snapshot()
+            artifact = build_render_artifact(
+                RenderSceneSnapshot(version=version, tree=tree)
+            )
+        except (KeyError, ValueError) as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        del new_handle
+        self.viewport.show_scene_preview(artifact.render_ir)
+
+    def _on_viewport_revolve_preview(
+        self, handle, axis_origin, axis_direction, radial_direction, angle_degrees
+    ) -> None:
+        try:
+            preview = self.document.snapshot()
+            preview.solid_from_2d(
+                [handle], "revolve",
+                revolve_axis_origin=axis_origin,
+                revolve_axis_direction=axis_direction,
+                revolve_radial_direction=radial_direction,
+                revolve_angle_degrees=angle_degrees,
+            )
+            version, tree = preview.visual_snapshot()
+            artifact = build_render_artifact(
+                RenderSceneSnapshot(version=version, tree=tree)
+            )
+        except (KeyError, ValueError) as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        self.viewport.show_scene_preview(artifact.render_ir)
 
     @Slot(int, object, object)
     def _on_viewport_transform_requested(
@@ -1300,11 +1480,17 @@ class MainWindow(QMainWindow):
         ):
             self.viewport.clear_boolean_preview()
             return
-        self.viewport.set_boolean_preview(
-            operation,
-            first.object_id,
-            second.object_id,
-        )
+        try:
+            preview = self.document.snapshot()
+            preview.combine(handles[0], handles[1], operation)
+            version, tree = preview.visual_snapshot()
+            artifact = build_render_artifact(
+                RenderSceneSnapshot(version=version, tree=tree)
+            )
+        except (KeyError, ValueError):
+            self.viewport.clear_boolean_preview()
+            return
+        self.viewport.show_scene_preview(artifact.render_ir)
 
     @Slot(str, object)
     def _on_sdf_op_requested(self, operation: str, handles: list[int]) -> None:
@@ -1774,18 +1960,6 @@ class MainWindow(QMainWindow):
             return
         self.viewport.frame_default_grid()
         self.statusBar().showMessage("Framed reference grid", 3000)
-
-    @Slot(bool)
-    def _toggle_sim_panel(self, checked: bool) -> None:
-        if checked:
-            candidate_text = self.export_panel.path.text().strip()
-            if candidate_text:
-                candidate = Path(candidate_text)
-                if candidate.is_file():
-                    self.sim_panel.set_arrow_path(str(candidate))
-            self.sim_panel.show_panel(self)
-        else:
-            self.sim_panel.hide()
 
     @Slot()
     def _new_default_scene(self) -> None:

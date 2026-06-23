@@ -53,7 +53,6 @@ from .sdf import (
     SDFTree,
     Scale,
     SegmentProfile,
-    SmoothUnion,
     Sphere,
     SquareProfile,
     Torus,
@@ -1018,7 +1017,6 @@ class SceneDocument:
                 "union": Union,
                 "intersection": Intersection,
                 "difference": Difference,
-                "smooth_union": SmoothUnion,
             }
             if operation not in constructors:
                 raise ValueError(f"unknown SDF operation: {operation}")

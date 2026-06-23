@@ -284,7 +284,7 @@ Notes:
 ## 7. Integration with existing code
 
 The seam already exists: the ViewportRenderer Protocol.
-* Add renderers/opengl_interpreter/.
+* Add renderers/interpreter_glsl/.
 * upload_render_ir serializes the IR into the 4 buffers (Nodes, Params, Children,
   Bytecode).
 * If program_compile_ms drops to ~0 on topology changes, the architecture works.
@@ -312,7 +312,7 @@ app/viewport/
   renderer_base.py        # ViewportRenderer Protocol (the seam; unchanged)
   renderers/
     opengl/               # existing codegen backend, kept as fallback during migration
-    opengl_interpreter/   # the new backend (this design)
+    interpreter_glsl/   # the new backend (this design)
       __init__.py
       renderer.py         # implements ViewportRenderer Protocol; paintGL-facing,
                           #   - no per-topology GLSL codegen

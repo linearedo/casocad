@@ -1,5 +1,5 @@
 from .base import BoundingBox3D, SDFNode
-from .operators import Difference, Intersection, SmoothUnion, Union
+from .operators import Difference, Intersection, Union
 from .placed_1d import PlacedSDF1D
 from .placed_2d import PlacedPolyline2D, PlacedSDF2D
 from .primitives_1d import (
@@ -68,7 +68,6 @@ __all__ = [
     "SDFTree",
     "Scale",
     "SegmentProfile",
-    "SmoothUnion",
     "Sphere",
     "SquareProfile",
     "Torus",

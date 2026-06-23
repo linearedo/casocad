@@ -64,7 +64,6 @@ _OPERATOR_KINDS = (
     "union",
     "intersection",
     "difference",
-    "smooth_union",
 )
 
 _LEAF_3D_KINDS = (
@@ -109,7 +108,6 @@ _PROFILE_2D_KINDS = (
     "profile_union_2d",
     "profile_intersection_2d",
     "profile_difference_2d",
-    "profile_smooth_union_2d",
 )
 
 _PROFILE_1D_KINDS = (
@@ -117,7 +115,6 @@ _PROFILE_1D_KINDS = (
     "profile_union_1d",
     "profile_intersection_1d",
     "profile_difference_1d",
-    "profile_smooth_union_1d",
 )
 
 _SELECTOR_KINDS = (

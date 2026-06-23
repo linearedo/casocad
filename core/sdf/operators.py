@@ -76,38 +76,3 @@ class Difference(BinarySDFOperator):
     def bounding_box(self) -> BoundingBox3D:
         assert self.left is not None
         return self.left.bounding_box()
-
-
-@dataclass
-class SmoothUnion(BinarySDFOperator):
-    smoothing: float = 0.1
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.smoothing <= 0.0:
-            raise ValueError("smooth union radius must be positive")
-
-    def to_numpy(
-        self, X: FloatArray, Y: FloatArray, Z: FloatArray
-    ) -> FloatArray:
-        assert self.left is not None and self.right is not None
-        a = self.left.to_numpy(X, Y, Z)
-        b = self.right.to_numpy(X, Y, Z)
-        h = np.clip(0.5 + 0.5 * (b - a) / self.smoothing, 0.0, 1.0)
-        return np.asarray(
-            b * (1.0 - h) + a * h - self.smoothing * h * (1.0 - h),
-            dtype=np.float64,
-        )
-
-    def bounding_box(self) -> BoundingBox3D:
-        assert self.left is not None and self.right is not None
-        box = self.left.bounding_box().union(self.right.bounding_box())
-        k = self.smoothing
-        return BoundingBox3D(
-            box.x_min - k,
-            box.x_max + k,
-            box.y_min - k,
-            box.y_max + k,
-            box.z_min - k,
-            box.z_max + k,
-        )

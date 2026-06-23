@@ -28,7 +28,6 @@ from core.sdf import (
     RectangleProfile,
     Rotate,
     Scale,
-    SmoothUnion,
     Sphere,
     SquareProfile,
     SegmentProfile,
@@ -437,7 +436,7 @@ def _surface_patches_for_node(
                 normal_sign=-normal_sign,
             ),
         )
-    if isinstance(node, (Union, Intersection, SmoothUnion)):
+    if isinstance(node, (Union, Intersection)):
         assert node.left is not None and node.right is not None
         return (
             *_surface_patches_for_node(

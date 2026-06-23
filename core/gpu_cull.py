@@ -11,7 +11,7 @@ difference) — so the field is
 
 That flat form lets a per-tile broadphase keep only the few leaves whose bounding
 sphere reaches a tile, instead of evaluating every node at every pixel. Scenes
-whose operators don't flatten (intersection, smooth_union, differences nested
+whose operators don't flatten (intersection, differences nested
 under a subtraction) are reported non-cullable and the renderer keeps the exact
 full VM. This module is backend-agnostic: pure data + a CPU reference evaluator
 used to prove the flattened field equals the tree.
@@ -39,7 +39,7 @@ def flatten_scene(render_ir: RenderIR | None) -> CullPlan | None:
     """Flatten a union/difference scene into ADD/SUB leaf sets, or None.
 
     Returns None when the operator graph cannot be expressed as
-    ``max(min(ADD), max(-SUB))`` (intersection, smooth_union, or a difference
+    ``max(min(ADD), max(-SUB))`` (intersection, or a difference
     appearing under an already-subtractive branch).
     """
 
@@ -72,7 +72,7 @@ def flatten_scene(render_ir: RenderIR | None) -> CullPlan | None:
                 stack.append((int(children[0]), sign))
                 for child in children[1:]:
                     stack.append((int(child), -sign))
-        else:  # intersection, smooth_union, anything else
+        else:  # intersection, anything else
             ok = False
             break
 

@@ -216,7 +216,6 @@ class SceneTreePanel(QWidget):
                 ("Union selected pair", "union"),
                 ("Intersect selected pair", "intersection"),
                 ("Difference: first - second", "difference"),
-                ("Smooth Union selected pair", "smooth_union"),
             ):
                 action = boolean_menu.addAction(label)
                 action.setEnabled(len(selected) == 2)
@@ -381,7 +380,6 @@ class SceneTreePanel(QWidget):
         for label, operation in (
             ("Union with", "union"),
             ("Intersect with", "intersection"),
-            ("Smooth Union with", "smooth_union"),
         ):
             operation_menu = menu.addMenu(label)
             self._context_submenus.append(operation_menu)

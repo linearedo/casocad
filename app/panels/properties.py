@@ -45,7 +45,6 @@ from core.sdf import (
     RoundedRectangleProfile,
     Scale,
     SegmentProfile,
-    SmoothUnion,
     Sphere,
     SquareProfile,
     Torus,
@@ -516,13 +515,6 @@ class PropertiesPanel(QWidget):
                     "minor_radius",
                     half_length_from_full_length(value),
                 ),
-                0.001,
-            )
-        elif isinstance(node, SmoothUnion):
-            self._add_float(
-                "Smoothing",
-                node.smoothing,
-                lambda value: self._set_value("smoothing", value),
                 0.001,
             )
         elif isinstance(node, Translate):

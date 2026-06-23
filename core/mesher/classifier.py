@@ -6,7 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from core.sdf.base import FloatArray, SDFNode
-from core.sdf.operators import Difference, Intersection, SmoothUnion, Union
+from core.sdf.operators import Difference, Intersection, Union
 from core.sdf.transforms import Rotate, Scale, Translate
 
 NODE_INSIDE = np.uint8(0)
@@ -40,7 +40,7 @@ def boundary_owner_ids(node: SDFNode) -> set[int]:
     if isinstance(node, (Translate, Rotate, Scale)):
         assert node.child is not None
         return boundary_owner_ids(node.child)
-    if isinstance(node, (Union, Intersection, Difference, SmoothUnion)):
+    if isinstance(node, (Union, Intersection, Difference)):
         assert node.left is not None and node.right is not None
         return boundary_owner_ids(node.left) | boundary_owner_ids(node.right)
     children = node.children()
@@ -364,37 +364,34 @@ def nearest_tag_mask(
 
 def _profile_boolean_sources(
     node: SDFNode,
-) -> tuple[SDFNode, SDFNode, str, float] | None:
+) -> tuple[SDFNode, SDFNode, str] | None:
     profile = getattr(node, "profile", None)
     operation = getattr(profile, "operation", None)
     sources = node.children()
-    if operation not in {"union", "intersection", "difference", "smooth_union"}:
+    if operation not in {"union", "intersection", "difference"}:
         return None
     if len(sources) != 2:
         return None
     left, right = sources
-    smoothing = float(getattr(profile, "smoothing", 0.0))
-    return left, right, operation, smoothing
+    return left, right, operation
 
 
 def _boolean_sources(
     node: SDFNode,
-) -> tuple[SDFNode, SDFNode, str, float] | None:
+) -> tuple[SDFNode, SDFNode, str] | None:
     profile_sources = _profile_boolean_sources(node)
     if profile_sources is not None:
         return profile_sources
-    if not isinstance(node, (Union, Intersection, Difference, SmoothUnion)):
+    if not isinstance(node, (Union, Intersection, Difference)):
         return None
     assert node.left is not None and node.right is not None
     if isinstance(node, Union):
         operation = "union"
     elif isinstance(node, Intersection):
         operation = "intersection"
-    elif isinstance(node, Difference):
-        operation = "difference"
     else:
-        operation = "smooth_union"
-    return node.left, node.right, operation, getattr(node, "smoothing", 0.0)
+        operation = "difference"
+    return node.left, node.right, operation
 
 
 def evaluate_with_attribution(
@@ -430,7 +427,7 @@ def evaluate_with_attribution(
         return evaluate_with_attribution(node.child, *local)
     boolean_sources = _boolean_sources(node)
     if boolean_sources is not None:
-        left, right, operation, smoothing = boolean_sources
+        left, right, operation = boolean_sources
         left_distance, left_ids = evaluate_with_attribution(left, X, Y, Z)
         right_distance, right_ids = evaluate_with_attribution(right, X, Y, Z)
         if operation == "union":
@@ -439,21 +436,9 @@ def evaluate_with_attribution(
         elif operation == "intersection":
             choose_left = left_distance >= right_distance
             distance = np.maximum(left_distance, right_distance)
-        elif operation == "difference":
+        else:
             choose_left = left_distance >= -right_distance
             distance = np.maximum(left_distance, -right_distance)
-        else:
-            h = np.clip(
-                0.5 + 0.5 * (right_distance - left_distance) / smoothing,
-                0.0,
-                1.0,
-            )
-            distance = (
-                right_distance * (1.0 - h)
-                + left_distance * h
-                - smoothing * h * (1.0 - h)
-            )
-            choose_left = h >= 0.5
         return (
             np.asarray(distance, dtype=np.float64),
             np.where(choose_left, left_ids, right_ids).astype(
@@ -497,7 +482,7 @@ def evaluate_volume_attribution(
         return evaluate_volume_attribution(node.child, *local)
     boolean_sources = _boolean_sources(node)
     if boolean_sources is not None:
-        left, right, operation, _smoothing = boolean_sources
+        left, right, operation = boolean_sources
         if operation == "difference":
             return evaluate_volume_attribution(left, X, Y, Z)
         left_distance = left.to_numpy(X, Y, Z)

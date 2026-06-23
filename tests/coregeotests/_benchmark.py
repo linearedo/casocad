@@ -44,21 +44,9 @@ class RenderUploadProbe:
 
     @classmethod
     def create_optional(cls) -> RenderUploadProbe | None:
-        try:
-            import moderngl
-            from app.viewport.renderers.opengl_interpreter.gl_renderer import (
-                InterpreterOpenGLRenderer,
-            )
-
-            context = moderngl.create_standalone_context(backend="egl", require=460)
-            renderer = InterpreterOpenGLRenderer(context)
-        except Exception as error:
-            logger.info(
-                "coregeotest render upload probe unavailable: %s",
-                error,
-            )
-            return None
-        return cls(context, renderer)
+        # The moderngl GPU upload probe was removed in the QRhi migration; the
+        # timing tests run their CPU path with the probe unavailable (None).
+        return None
 
     def upload(self, render_ir: object) -> UploadTiming:
         total_start = perf_counter()
