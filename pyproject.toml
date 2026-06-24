@@ -1,7 +1,7 @@
 [project]
 name = "casoCAD"
 version = "0.1.0"
-description = "Programmable SDF-based lattice-grid CAD engine with PySide6, ModernGL and Apache Arrow export."
+description = "Programmable SDF-based lattice-grid CAD engine with PySide6."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }

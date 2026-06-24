@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-"""QRhi viewport widget — a QRhiWidget that renders a scene via the QRhi
-interpreter renderer, with mouse orbit / zoom.
+"""QRhi viewport widget — a QRhiWidget that renders a scene via the QRhi codegen
+renderer, with mouse orbit / zoom.
 
-ONE renderer + ONE shader source drive every backend. The only platform-specific
-line is the backend *hint*: Qt's default on Linux is the slow OpenGL, so we steer
-Linux to Vulkan; macOS/Windows keep their native default (Metal/D3D). Override
-with the ``QRHI_BACKEND`` env var (vulkan|opengl|metal|d3d11) for testing.
+ONE renderer + ONE shader source drive every backend. Backend-aware: the renderer
+adapts to each backend's coordinate conventions (fb_y_up / clip_y_sign) at
+initialize, and the backend is a clean, overridable choice — no backend is pinned
+(the bytecode VM that used to force OpenGL has been removed). Set ``QRHI_BACKEND``
+(vulkan|opengl|metal|d3d11) to choose one; otherwise QRhi picks the platform
+default.
 """
 
 import math
 import os
 import random
-import sys
 import time
 
 import numpy as np
@@ -41,12 +42,12 @@ _BACKENDS = {
 
 
 def _choose_api() -> "QRhiWidget.Api | None":
+    """Backend-aware: honour an explicit QRHI_BACKEND, else let QRhi choose the
+    platform-native default (None). The renderer is backend-agnostic, so no backend
+    is pinned here — the OpenGL hard-pin that the bytecode VM required is gone."""
     want = os.environ.get("QRHI_BACKEND", "").lower()
     if want in _BACKENDS and _BACKENDS[want] is not None:
         return _BACKENDS[want]
-    # Linux default is the slow OpenGL -> prefer Vulkan; elsewhere keep native default.
-    if sys.platform.startswith("linux"):
-        return QRhiWidget.Api.Vulkan
     return None
 
 
@@ -129,6 +130,20 @@ class QRhiViewportWidget(QRhiWidget):
         self._last_frame_t = None
         self._fps_label_t = 0.0
         self._fps_label = None
+        # Render throttle: input marks dirty; a 60fps timer renders only when
+        # something changed (decouples render rate from the touchpad's flood).
+        # Created ONCE here — not per resizeEvent, which leaked a timer each call.
+        self._dirty = True
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(16)
+        # Interactive-quality state: while the camera/tool is actively moving the
+        # renderer uses a cheaper per-pixel budget (see u_interacting); a short
+        # idle delay then triggers one full-quality frame once motion stops.
+        self._interacting = False
+        self._interaction_idle = QTimer(self)
+        self._interaction_idle.setSingleShot(True)
+        self._interaction_idle.timeout.connect(self._end_interaction)
         self.setMouseTracking(True)  # deliver hover moves for the coord readout
         self._readout_label = None
         self._build_command_panel()
@@ -412,10 +427,12 @@ class QRhiViewportWidget(QRhiWidget):
         y0, p0, dy, dp = self._view_anim
         self._yaw = y0 + dy * eased
         self._pitch = p0 + dp * eased
-        self._dirty = True
         if t >= 1.0:
             self._view_anim = None
             self._view_anim_timer.stop()
+            self._end_interaction()  # settle to a full-quality frame
+        else:
+            self._begin_interaction()
 
     def _position_command_panel(self) -> None:
         p = self._command_panel
@@ -431,18 +448,26 @@ class QRhiViewportWidget(QRhiWidget):
         self._position_command_panel()
         self._position_view_panel()
         self._position_readout_label()
-        # Render throttle: input only marks dirty; a 60fps timer renders when
-        # (and only when) something changed — decouples render rate from the
-        # touchpad's event flood.
-        self._dirty = True
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(16)
+        self._dirty = True  # the throttle timer (built in __init__) repaints
 
     def _tick(self) -> None:
         if self._dirty:
             self._dirty = False
             self.update()
+
+    def _begin_interaction(self) -> None:
+        """Mark the viewport as actively moving (cheap interactive frames) and
+        (re)arm the idle timer that snaps back to a full-quality frame shortly
+        after motion stops."""
+        self._interacting = True
+        self._dirty = True
+        self._interaction_idle.start(140)
+
+    def _end_interaction(self) -> None:
+        """Motion stopped: render one full-quality frame."""
+        if self._interacting:
+            self._interacting = False
+            self._dirty = True
 
     # -- public API ----------------------------------------------------------
 
@@ -933,6 +958,7 @@ class QRhiViewportWidget(QRhiWidget):
         try:
             if not self._renderer_ready:
                 self._renderer.initialize(self.rhi(), self.renderTarget())
+                self._renderer.set_update_callback(self.update)
                 self._renderer_ready = True
         except BaseException:
             import traceback
@@ -944,6 +970,15 @@ class QRhiViewportWidget(QRhiWidget):
             cb, self.renderTarget(), self._camera_values(),
             self._overlay_geometry())
         self._update_fps()
+
+    def closeEvent(self, event) -> None:
+        # Best-effort: persist the driver pipeline cache for next launch (no-op if
+        # the backend doesn't collect it).
+        try:
+            self._renderer.save_pipeline_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        super().closeEvent(event)
 
     # -- gizmo overlay -------------------------------------------------------
 
@@ -1152,6 +1187,7 @@ class QRhiViewportWidget(QRhiWidget):
             "u_grid_spacing": self._grid_spacing,
             "u_grid_plane": self._grid_plane,
             "u_selected_object_id": self._selected_id,
+            "u_interacting": 1 if self._interacting else 0,
         }
 
     # -- interaction ---------------------------------------------------------
@@ -1205,6 +1241,9 @@ class QRhiViewportWidget(QRhiWidget):
             self._dirty = True
         if self._last_pos is None or not (e.buttons() & Qt.MouseButton.LeftButton):
             return
+        # A left-drag is in progress (orbit or any tool): use cheap interactive
+        # frames until motion stops.
+        self._begin_interaction()
         # While a create tool is armed, a left-drag sketches the shape — don't
         # orbit; show a live ghost + rubber-band from the drag start.
         if self._create_kind is not None:
@@ -1409,6 +1448,7 @@ class QRhiViewportWidget(QRhiWidget):
             super().keyPressEvent(e)
 
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
+        self._end_interaction()  # drag finished -> render the settled frame sharp
         if self._extrude_active and e.button() == Qt.MouseButton.LeftButton:
             handle, height = self._extrude_handle, self._extrude_height
             self._end_extrude_tool()
@@ -1549,7 +1589,7 @@ class QRhiViewportWidget(QRhiWidget):
         if dy == 0:
             return
         self._distance = max(0.5, min(200.0, self._distance * math.exp(-dy * 0.0012)))
-        self._dirty = True
+        self._begin_interaction()
 
 
 __all__ = ["QRhiViewportWidget"]

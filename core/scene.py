@@ -1993,17 +1993,21 @@ class SceneDocument:
         list[BoundaryRegion],
         int,
         int,
+        dict[int, object],
     ]:
         self.refresh_derived_geometry()
-        return deepcopy(
+        memo: dict[int, object] = {}
+        objects, fluid_domain, boundary_regions, version, next_object_id = deepcopy(
             (
                 self.objects,
                 self.fluid_domain,
                 self.boundary_regions,
                 self.version,
                 self._next_object_id,
-            )
+            ),
+            memo,
         )
+        return objects, fluid_domain, boundary_regions, version, next_object_id, memo
 
     def snapshot(self) -> SceneDocument:
         (
@@ -2012,6 +2016,7 @@ class SceneDocument:
             boundary_regions,
             version,
             next_object_id,
+            memo,
         ) = self._snapshot_bundle()
         snapshot = SceneDocument(
             objects=objects,
@@ -2020,6 +2025,23 @@ class SceneDocument:
             version=version,
         )
         snapshot._next_object_id = next_object_id
+        # Preserve handle identity: re-map THIS document's handles onto the copied
+        # nodes (deepcopy's memo links id(original) -> copy). Preview tools snapshot
+        # the document and then address it with LIVE handles (move/rotate/extrude/
+        # revolve); without this a live handle could resolve to a *different* node in
+        # the snapshot — e.g. a BoundaryRegion, raising "only SDF objects can be
+        # rotated" — even though the commit on the live document is correct.
+        handles: dict[int, SceneItem] = {}
+        node_handles: dict[int, int] = {}
+        for handle, original in self._handles.items():
+            copied = memo.get(id(original))
+            if copied is None:
+                continue
+            handles[handle] = copied
+            node_handles[id(copied)] = handle
+        snapshot._handles = handles
+        snapshot._node_handles = node_handles
+        snapshot._next_handle = self._next_handle
         return snapshot
 
     def visual_snapshot(self) -> tuple[int, SDFTree | None]:

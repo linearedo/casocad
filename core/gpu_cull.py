@@ -1,23 +1,14 @@
 from __future__ import annotations
 
-"""Scene flattening + per-leaf bounds for GPU spatial culling (design §13.5).
+"""Per-leaf bounds + uniform-grid binning for the codegen spatial cull.
 
-Original culling design (not derived from any external SDF library): when the
-scene's operator graph is a union/difference composition it flattens to two flat
-leaf sets — *additive* (contributes by union/min) and *subtractive* (carves by
-difference) — so the field is
-
-    dist(p) = max( min_{a in ADD} sdf_a(p),  max_{s in SUB} -sdf_s(p) )
-
-That flat form lets a per-tile broadphase keep only the few leaves whose bounding
-sphere reaches a tile, instead of evaluating every node at every pixel. Scenes
-whose operators don't flatten (intersection, differences nested
-under a subtraction) are reported non-cullable and the renderer keeps the exact
-full VM. This module is backend-agnostic: pure data + a CPU reference evaluator
-used to prove the flattened field equals the tree.
+Backend-agnostic, pure data. ``leaf_bounds`` gives each IR leaf a conservative
+world-space bounding sphere (from the SDF node's authoritative ``bounding_box()``,
+or a cheap closed-form fallback for hand-built IRs); ``build_term_grid`` bins the
+codegen term list into a world-space uniform grid so the shader's DDA march only
+evaluates the few terms whose bound reaches each cell. (The old bytecode-VM
+flatten/cull machinery was removed with the VM.)
 """
-
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -25,60 +16,6 @@ from .gpu_node_types import is_operator
 from .render_ir import RenderIR, RenderIRNode
 
 _INF_RADIUS = 1.0e9  # sentinel "unbounded" leaf: never culled
-
-
-@dataclass(frozen=True)
-class CullPlan:
-    """Flat additive/subtractive leaf index sets for a cullable scene."""
-
-    add: tuple[int, ...]
-    sub: tuple[int, ...]
-
-
-def flatten_scene(render_ir: RenderIR | None) -> CullPlan | None:
-    """Flatten a union/difference scene into ADD/SUB leaf sets, or None.
-
-    Returns None when the operator graph cannot be expressed as
-    ``max(min(ADD), max(-SUB))`` (intersection, or a difference
-    appearing under an already-subtractive branch).
-    """
-
-    if render_ir is None or not render_ir.nodes or len(render_ir.root_indices) != 1:
-        return None
-
-    nodes = render_ir.nodes
-    add: list[int] = []
-    sub: list[int] = []
-    ok = True
-
-    # Iterative walk carrying a sign: +1 additive, -1 subtractive.
-    stack: list[tuple[int, int]] = [(render_ir.root_indices[0], 1)]
-    while stack:
-        index, sign = stack.pop()
-        node = nodes[index]
-        if not is_operator(node.kind):
-            (add if sign > 0 else sub).append(index)
-            continue
-        if node.kind == "union":
-            for child in node.children:
-                stack.append((int(child), sign))
-        elif node.kind == "difference":
-            if sign < 0:
-                # difference under a subtraction does not flatten — bail out.
-                ok = False
-                break
-            children = node.children
-            if children:
-                stack.append((int(children[0]), sign))
-                for child in children[1:]:
-                    stack.append((int(child), -sign))
-        else:  # intersection, anything else
-            ok = False
-            break
-
-    if not ok:
-        return None
-    return CullPlan(add=tuple(add), sub=tuple(sub))
 
 
 def _leaf_bounding_sphere(node: RenderIRNode) -> tuple[float, float, float, float]:
@@ -107,7 +44,27 @@ def _leaf_bounding_sphere(node: RenderIRNode) -> tuple[float, float, float, floa
         return (p[0], p[1], p[2], float(np.hypot(abs(p[12]), abs(p[13]))))
     if k == "torus":
         return (p[0], p[1], p[2], float(abs(p[12]) + abs(p[13])))
-    # profiles / sweeps / placed: unbounded (never culled).
+    # Placed 2D sections (closed-form): thin discs/quads on a world plane. World
+    # centre = origin + cu*axis_u + cv*axis_v (orthonormal basis); radius = the
+    # profile extent + the section's small half-thickness. Giving these a bound lets
+    # the cull grid include them, so adding a 2D section doesn't disable culling for
+    # the whole scene. (Params are already world-space; see build_render_ir.)
+    if k in ("placed_circle_2d", "placed_rectangle_2d", "placed_square_2d",
+             "placed_rounded_rectangle_2d", "placed_ellipse_2d"):
+        origin = np.asarray(p[0:3], dtype=np.float64)
+        center = origin + p[12] * np.asarray(p[3:6], dtype=np.float64) \
+            + p[13] * np.asarray(p[6:9], dtype=np.float64)
+        if k == "placed_circle_2d":
+            r = abs(p[14])
+        elif k == "placed_square_2d":
+            r = abs(p[14]) * 1.4142135623730951
+        elif k == "placed_ellipse_2d":
+            r = max(abs(p[14]), abs(p[15]))
+        else:  # rectangle / rounded_rectangle: half-extents at indices 14, 15
+            r = float(np.hypot(p[14], p[15]))
+        return (float(center[0]), float(center[1]), float(center[2]), r + 0.01)
+    # polyline/bezier sections, extrude/revolve/profile sub-graphs, sweeps, placed
+    # 1D: no cheap closed-form bound -> unbounded sentinel (never culled).
     return (0.0, 0.0, 0.0, _INF_RADIUS)
 
 
@@ -119,123 +76,69 @@ def leaf_bounds(render_ir: RenderIR | None) -> np.ndarray:
     for i, node in enumerate(nodes):
         if is_operator(node.kind):
             out[i] = (0.0, 0.0, 0.0, _INF_RADIUS)
+        elif getattr(node, "bound", None) is not None:
+            # Authoritative world bound captured from the SDF node's bounding_box()
+            # (build_render_ir) — covers every geometry kind, incl. sections, tubes,
+            # extrude/revolve. Falls back to the param formula for hand-built IRs.
+            out[i] = node.bound
         else:
             out[i] = _leaf_bounding_sphere(node)
     return out
 
 
-@dataclass(frozen=True)
-class GridPlan:
-    """A world-space uniform grid binning leaves into cells (design §13.5).
-
-    ``origin`` + ``cell`` + ``dim`` define a regular GxGxG grid. For each cell,
-    ``add_offsets``/``add_counts`` index into ``add_items`` (leaf node indices);
-    likewise for sub. A leaf is binned into every cell its bounding sphere
-    overlaps, so a DDA sphere-trace that re-fetches the cell each step and clamps
-    steps to cell boundaries evaluates only nearby leaves yet stays exact.
-    """
-
-    origin: tuple[float, float, float]
-    cell: tuple[float, float, float]
-    dim: int
-    add_offsets: np.ndarray  # int32 (dim^3,)
-    add_counts: np.ndarray   # int32 (dim^3,)
-    add_items: np.ndarray    # uint32 (total,)
-    sub_offsets: np.ndarray
-    sub_counts: np.ndarray
-    sub_items: np.ndarray
-
-
-def _bin_leaves(
-    leaves: tuple[int, ...],
-    bounds: np.ndarray,
-    origin: np.ndarray,
-    cell: np.ndarray,
-    dim: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Bin leaves into the GxGxG grid by sphere-vs-cell-AABB overlap."""
-
-    cells: list[list[int]] = [[] for _ in range(dim * dim * dim)]
-    inv = 1.0 / cell
-    for leaf in leaves:
-        cx, cy, cz, r = bounds[leaf]
-        center = np.array([cx, cy, cz])
-        lo = np.floor((center - r - origin) * inv).astype(int)
-        hi = np.floor((center + r - origin) * inv).astype(int)
-        lo = np.clip(lo, 0, dim - 1)
-        hi = np.clip(hi, 0, dim - 1)
-        for iz in range(lo[2], hi[2] + 1):
-            for iy in range(lo[1], hi[1] + 1):
-                for ix in range(lo[0], hi[0] + 1):
-                    cells[(iz * dim + iy) * dim + ix].append(int(leaf))
-    counts = np.array([len(c) for c in cells], dtype=np.int32)
-    offsets = np.zeros(dim * dim * dim, dtype=np.int32)
-    if counts.size:
-        offsets[1:] = np.cumsum(counts)[:-1]
-    items = np.array([i for c in cells for i in c], dtype=np.uint32)
-    if items.size == 0:
-        items = np.zeros(1, dtype=np.uint32)
-    return offsets, counts, items
-
-
-def build_grid(
-    plan: CullPlan,
+def build_term_grid(
+    positive_leaves: np.ndarray,
     bounds: np.ndarray,
     dim: int = 16,
-) -> GridPlan | None:
-    """Build a uniform grid over the additive leaves' extent, or None.
+):
+    """Uniform grid for the codegen term model: bin each term by its positive
+    leaf's bound; items are TERM indices.
 
-    Returns None when any additive leaf is unbounded (sentinel radius) — such a
-    scene can't be reliably gridded, so the renderer keeps the full VM.
+    A codegen term is one positive solid with local carves; carves only shrink the
+    solid, so the solid's bound conservatively contains the term's surface → bin by
+    it. The shader looks up a cell, then for each term index evaluates the carved
+    term and accumulates the DNF groups. Returns
+    ``(origin, cell, dim, offsets, counts, items)`` or None when any term's positive
+    leaf is unbounded (sentinel radius) — that scene keeps the brute-force map().
     """
-
-    if not plan.add:
+    pl = np.asarray(positive_leaves, dtype=np.int64)
+    if pl.size == 0:
         return None
-    add = np.asarray(plan.add, dtype=np.int64)
-    add_b = bounds[add]
-    if np.any(add_b[:, 3] >= _INF_RADIUS):
-        return None  # unbounded additive leaf -> not griddable
-    lo = np.min(add_b[:, :3] - add_b[:, 3:4], axis=0)
-    hi = np.max(add_b[:, :3] + add_b[:, 3:4], axis=0)
-    span = np.maximum(hi - lo, 1e-4)
+    b = bounds[pl].astype(np.float64)
+    if np.any(b[:, 3] >= _INF_RADIUS):
+        return None
+    lo_all = np.min(b[:, :3] - b[:, 3:4], axis=0)
+    hi_all = np.max(b[:, :3] + b[:, 3:4], axis=0)
+    span = np.maximum(hi_all - lo_all, 1e-4)
     pad = span * 0.01
-    origin = lo - pad
+    origin = lo_all - pad
     cell = (span + 2 * pad) / dim
-
-    ao, ac, ai = _bin_leaves(plan.add, bounds, origin, cell, dim)
-    so, sc, si = _bin_leaves(plan.sub, bounds, origin, cell, dim)
-    return GridPlan(
-        origin=tuple(float(v) for v in origin),
-        cell=tuple(float(v) for v in cell),
-        dim=dim,
-        add_offsets=ao, add_counts=ac, add_items=ai,
-        sub_offsets=so, sub_counts=sc, sub_items=si,
-    )
-
-
-def combine_flat(
-    plan: CullPlan,
-    leaf_distance: dict[int, np.ndarray],
-) -> np.ndarray:
-    """Evaluate ``max(min(ADD), max(-SUB))`` given each leaf's distances.
-
-    ``leaf_distance`` maps node index -> per-point distances. Used by parity
-    tests to compare the flattened field against the full VM.
-    """
-
-    first = next(iter(leaf_distance.values()))
-    if plan.add:
-        dist = leaf_distance[plan.add[0]].copy()
-        for idx in plan.add[1:]:
-            dist = np.minimum(dist, leaf_distance[idx])
-    else:
-        dist = np.full_like(first, 1.0e6)
-    for idx in plan.sub:
-        dist = np.maximum(dist, -leaf_distance[idx])
-    return dist
+    ncells = dim * dim * dim
+    inv = 1.0 / cell
+    center, radius = b[:, :3], b[:, 3:4]
+    lo = np.clip(np.floor((center - radius - origin) * inv).astype(np.int64), 0, dim - 1)
+    hi = np.clip(np.floor((center + radius - origin) * inv).astype(np.int64), 0, dim - 1)
+    sp = hi - lo + 1
+    per = sp[:, 0] * sp[:, 1] * sp[:, 2]
+    total = int(per.sum())
+    if total == 0:
+        return None
+    starts = np.zeros(len(pl) + 1, np.int64)
+    starts[1:] = np.cumsum(per)
+    local = np.arange(total, dtype=np.int64) - np.repeat(starts[:-1], per)
+    nx = np.repeat(sp[:, 0], per)
+    ny = np.repeat(sp[:, 1], per)
+    ix = np.repeat(lo[:, 0], per) + (local % nx)
+    iy = np.repeat(lo[:, 1], per) + ((local // nx) % ny)
+    iz = np.repeat(lo[:, 2], per) + (local // (nx * ny))
+    ci = (iz * dim + iy) * dim + ix
+    counts = np.bincount(ci, minlength=ncells).astype(np.int32)
+    offsets = np.zeros(ncells, np.int32)
+    offsets[1:] = np.cumsum(counts)[:-1]
+    order = np.argsort(ci, kind="stable")
+    items = np.repeat(np.arange(len(pl)), per)[order].astype(np.uint32)
+    return (tuple(float(v) for v in origin), tuple(float(v) for v in cell),
+            int(dim), offsets, counts, items)
 
 
-__all__ = [
-    "CullPlan", "GridPlan", "flatten_scene", "leaf_bounds", "build_grid",
-    "combine_flat", "_INF_RADIUS",
-]
+__all__ = ["leaf_bounds", "build_term_grid", "_INF_RADIUS"]

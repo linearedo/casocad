@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Backend-agnostic render intermediate representation for SDF scenes."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import cos, radians, sin
 
 import numpy as np
@@ -61,6 +61,10 @@ class RenderIRNode:
     # nodes this carries the region id to assign on a match (design §5.2);
     # for geometry leaves it stays 0 (reserved for Layer 1 intrinsic bits).
     flags: int = 0
+    # World-space (cx, cy, cz, radius) enclosing sphere for geometry leaves, from
+    # the SDF node's authoritative bounding_box() (None for operators/unsupported).
+    # Used by the GPU spatial cull (core/gpu_cull) to bin leaves into grid cells.
+    bound: tuple[float, float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -519,6 +523,30 @@ def _build_profile_ir_node(
     return index
 
 
+def _world_bound_sphere(node, transform: _AffineTransform):
+    """World-space ``(cx, cy, cz, radius)`` enclosing ``node`` under ``transform``,
+    derived from the node's authoritative ``bounding_box()`` (transform applied to
+    the box corners). Returns None if the node has no usable box. This is what lets
+    the GPU cull bin *every* geometry kind, not just the closed-form primitives."""
+    try:
+        bb = node.bounding_box()
+        corners = np.array(
+            [(x, y, z)
+             for x in (bb.x_min, bb.x_max)
+             for y in (bb.y_min, bb.y_max)
+             for z in (bb.z_min, bb.z_max)],
+            dtype=np.float64,
+        )
+        world = np.array([transform.apply_point(tuple(c)) for c in corners])
+    except Exception:
+        return None
+    lo = world.min(axis=0)
+    hi = world.max(axis=0)
+    center = (lo + hi) * 0.5
+    radius = float(np.linalg.norm(hi - center)) + 1.0e-4
+    return (float(center[0]), float(center[1]), float(center[2]), radius)
+
+
 def _build_render_ir_node(
     node,
     nodes: dict[tuple[object, ...], int],
@@ -917,6 +945,9 @@ def _build_render_ir_node(
             params=(),
         )
     index = len(ir_nodes)
+    if payload.kind != "unsupported" and not isinstance(
+            node, (Union, Intersection, Difference)):
+        payload = replace(payload, bound=_world_bound_sphere(node, transform))
     ir_nodes.append(payload)
     nodes[node_key] = index
     return index
@@ -1049,6 +1080,19 @@ def _build_placed_sdf_2d_ir_node(
     )
 
 
+def _reachable_node_indices(nodes: list[RenderIRNode], start: int) -> set[int]:
+    """Node indices reachable from ``start`` by walking children (inclusive)."""
+    seen: set[int] = set()
+    stack = [start]
+    while stack:
+        index = stack.pop()
+        if index in seen:
+            continue
+        seen.add(index)
+        stack.extend(int(child) for child in nodes[index].children)
+    return seen
+
+
 def build_render_ir(tree: SDFTree | None) -> RenderIR:
     if tree is None:
         return RenderIR((), (), (), (), (), (), ())
@@ -1080,8 +1124,26 @@ def build_render_ir(tree: SDFTree | None) -> RenderIR:
         transform,
         aliases,
     )
-    root_indices = (root_index,)
     component_indices = tuple(ref.node_index for ref in component_refs)
+    # tree.root is the solid boolean. Standalone components — placed 2D/1D
+    # sections — are NOT part of it, so the renderer (which walks only the root)
+    # would never reach them and they would never render. Union those non-root
+    # components onto the root so the viewport shows them. Components already
+    # inside the root are reachable and skipped, so boolean scenes are unchanged.
+    reachable = _reachable_node_indices(ir_nodes, root_index)
+    extra_roots = tuple(idx for idx in component_indices if idx not in reachable)
+    if extra_roots:
+        root_indices = (len(ir_nodes),)
+        ir_nodes.append(
+            RenderIRNode(
+                kind="union",
+                object_id=0,
+                dimension=3,
+                children=(root_index, *extra_roots),
+            )
+        )
+    else:
+        root_indices = (root_index,)
     material_refs = component_refs or (
         RenderIRObjectRef(
             object_id=max(tree.root.object_id, 0),
