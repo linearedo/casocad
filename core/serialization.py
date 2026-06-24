@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .boundary import BoundaryRegion
-from .mesher import FluidDomain
+from .domain import FluidDomain
 from .scene import SceneDocument
 from .sdf import (
     BezierCurveProfile,

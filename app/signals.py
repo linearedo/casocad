@@ -6,8 +6,6 @@ from PySide6.QtCore import QObject, Signal
 class AppSignals(QObject):
     document_changed = Signal(object)
     scene_changed = Signal(object)
-    mesh_ready = Signal(object)
-    preview_ready = Signal(object)
     node_selected = Signal(object)
     selection_changed = Signal(object)
     add_primitive_requested = Signal(str)
@@ -42,9 +40,6 @@ class AppSignals(QObject):
     create_polygon_from_polyline_requested = Signal(object)
     undo_snapshot_ready = Signal(object)
     node_edited = Signal()
-    export_requested = Signal(str)
-    mesh_requested = Signal()
-    mesh_progress = Signal(int)
     log_message = Signal(str, str)
 
 

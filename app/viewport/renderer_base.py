@@ -61,40 +61,6 @@ class ViewportRenderer(Protocol):
         rotation_gizmo_radius: float,
     ) -> None: ...
 
-    def append_lattice_preview_chunk(
-        self,
-        positions,
-        node_types,
-        boundary_faces,
-        source_object_ids,
-        primary_tag_ids,
-        cell_size: float,
-        dimension: int,
-        axis_i: tuple[float, float, float],
-        axis_j: tuple[float, float, float],
-    ) -> None: ...
-
-    def clear_lattice(self) -> None: ...
-
-    def begin_lattice_upload(
-        self,
-        point_count: int,
-        square_count: int,
-        cell_size: float,
-    ) -> None: ...
-
-    def write_lattice_points(
-        self,
-        start: int,
-        point_vertices,
-    ) -> None: ...
-
-    def write_lattice_squares(
-        self,
-        start: int,
-        square_instances,
-    ) -> None: ...
-
     def release(self) -> None: ...
 
 

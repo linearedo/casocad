@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 from pathlib import Path
-import pickle
 import sys
-import tempfile
 
 import numpy as np
-from PySide6.QtCore import QProcess, Qt, QTimer, Slot
-from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
+from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QColorDialog,
     QDockWidget,
@@ -29,9 +26,8 @@ from app.artifacts import (
     RenderSceneSnapshot,
     build_render_artifact,
 )
-from app.panels.export_panel import ExportPanel
+from app.meshing import MeshingWorkspace
 from app.panels.log_panel import LogPanel
-from app.panels.mesher_panel import MesherPanel
 from app.panels.properties import CadDimensionSpinBox, PropertiesPanel
 from app.panels.scene_tree import SceneTreePanel
 from app.signals import signals
@@ -138,18 +134,8 @@ class MainWindow(QMainWindow):
         self.artifacts = ArtifactManager(self)
         self.scene_tree = SceneTreePanel()
         self.properties = PropertiesPanel()
-        self.mesher_panel = MesherPanel()
-        self.export_panel = ExportPanel()
         self.log_panel = LogPanel()
-        self._thread: QProcess | None = None
-        self._meshing_mode: str | None = None
-        self._meshing_version: int | None = None
-        self._temporary_mesh_path: Path | None = None
-        self._mesh_input_path: Path | None = None
-        self._mesh_result_path: Path | None = None
-        self._mesh_preview_chunk_paths: list[Path] = []
-        self._mesh_stdout_buffer = ""
-        self._mesh_error_message: str | None = None
+        self._meshing_workspace: MeshingWorkspace | None = None
         self._render_request_timer = QTimer(self)
         self._render_request_timer.setSingleShot(True)
         self._render_request_timer.timeout.connect(self._flush_render_request)
@@ -163,16 +149,10 @@ class MainWindow(QMainWindow):
     def _build_docks(self) -> None:
         scene_dock = self._dock("Scene", self.scene_tree)
         properties_dock = self._dock("Properties", self.properties)
-        mesher_dock = self._dock("Mesher", self.mesher_panel)
-        export_dock = self._dock("Export", self.export_panel)
         log_dock = self._dock("Log", self.log_panel)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, scene_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, properties_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, mesher_dock)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, export_dock)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, log_dock)
-        self.tabifyDockWidget(export_dock, log_dock)
-        self.tabifyDockWidget(properties_dock, mesher_dock)
         properties_dock.raise_()
 
     def _dock(self, title: str, widget: object) -> QDockWidget:
@@ -190,20 +170,6 @@ class MainWindow(QMainWindow):
             tuple(QKeySequence(shortcut) for shortcut in FRAME_SHORTCUTS)
         )
         fit_action.triggered.connect(self._frame_scene)
-        toolbar.addSeparator()
-        mode_group = QActionGroup(self)
-        mode_group.setExclusive(True)
-        self._sdf_action = QAction("SDF", self, checkable=True)
-        self._sdf_action.setChecked(True)
-        self._lattice_action = QAction("Lattice", self, checkable=True)
-        mode_group.addAction(self._sdf_action)
-        mode_group.addAction(self._lattice_action)
-        toolbar.addAction(self._sdf_action)
-        toolbar.addAction(self._lattice_action)
-        self._sdf_action.triggered.connect(lambda: self.viewport.set_mode("sdf"))
-        self._lattice_action.triggered.connect(
-            lambda: self.viewport.set_mode("lattice")
-        )
         grid_action = QAction("Grid", self, checkable=True)
         grid_action.setChecked(True)
         grid_action.toggled.connect(self.viewport.set_grid_visible)
@@ -332,6 +298,17 @@ class MainWindow(QMainWindow):
         validate_action = domains_menu.addAction("Validate Domains (disjointness)")
         validate_action.triggered.connect(self._validate_domains_disjoint)
 
+        meshing_menu = self.menuBar().addMenu("&Meshing")
+        workspace_action = meshing_menu.addAction("Open Meshing Workspace...")
+        workspace_action.triggered.connect(self._open_meshing_workspace)
+
+    def _open_meshing_workspace(self) -> None:
+        if self._meshing_workspace is None:
+            self._meshing_workspace = MeshingWorkspace(self)
+        self._meshing_workspace.show()
+        self._meshing_workspace.raise_()
+        self._meshing_workspace.activateWindow()
+
     def _model_or_none(self):
         """Adapt the live document to a Model, or None if it cannot form one
         (e.g. duplicate top-level names mid-edit). See core.model.model_from_document."""
@@ -456,8 +433,6 @@ class MainWindow(QMainWindow):
         signals.undo_snapshot_ready.connect(self._record_undo_snapshot)
         signals.node_edited.connect(self._on_node_edited)
         signals.selection_changed.connect(self._on_selection_changed)
-        signals.export_requested.connect(self._on_export_requested)
-        signals.mesh_requested.connect(self._on_mesh_requested)
         signals.log_message.connect(self._on_log_message)
         self.artifacts.render_ready.connect(self._on_render_artifact_ready)
         self.artifacts.render_failed.connect(self._on_render_artifact_failed)
@@ -479,8 +454,6 @@ class MainWindow(QMainWindow):
             if render_timer is not None:
                 render_timer.stop()
             self.viewport.set_scene_artifact(None, None)
-            self._sdf_action.setChecked(True)
-            self.viewport.set_mode("sdf")
             self.viewport.configure_default_grid()
             self.viewport.frame_default_grid()
             self._sync_grid_spacing_control()
@@ -491,7 +464,7 @@ class MainWindow(QMainWindow):
             domain = self.document.fluid_domain
             assert domain is not None
             box = domain.bounding_box()
-            self.viewport.configure_grid(box, self.mesher_panel.config().dx)
+            self.viewport.configure_grid(box)
             self._sync_grid_spacing_control()
             if frame:
                 self.viewport.frame_box(box)
@@ -1531,9 +1504,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_selection_changed(self, handles: list[int]) -> None:
         self.viewport.clear_boolean_preview()
-        object_ids: set[int] = set()
         selected_names: list[str] = []
-        geometry_filter = None
         scene_selection = None
         boundary_regions: list[BoundaryRegion] = []
         for handle in handles:
@@ -1544,16 +1515,9 @@ class MainWindow(QMainWindow):
             selected_names.append(node.name)
             if isinstance(node, BoundaryRegion):
                 boundary_regions.append(node)
-                object_ids.add(node.object_id)
                 continue
             if not isinstance(node, SDFNode):
                 continue
-            if node.children():
-                object_ids.update(self._attribution_ids(node))
-                if len(handles) == 1:
-                    geometry_filter = node
-            else:
-                object_ids.add(node.object_id)
             if len(handles) == 1:
                 scene_selection = node
         boundary_selectors, boundary_normals = (
@@ -1565,25 +1529,12 @@ class MainWindow(QMainWindow):
             tuple(boundary_regions),
         )
         self.viewport.set_scene_selection(scene_selection)
-        self.viewport.set_lattice_filter(
-            object_ids or None,
-            geometry=geometry_filter,
-        )
         if selected_names:
             self.statusBar().showMessage(
-                f"Lattice selection: {', '.join(selected_names)}"
+                f"Selection: {', '.join(selected_names)}"
             )
         else:
             self.statusBar().clearMessage()
-
-    def _attribution_ids(self, node: SDFNode) -> set[int]:
-        children = node.children()
-        if not children:
-            return {node.object_id}
-        result: set[int] = set()
-        for child in children:
-            result.update(self._attribution_ids(child))
-        return result or {node.object_id}
 
     @Slot(str, object)
     def _on_transform_requested(
@@ -1675,275 +1626,6 @@ class MainWindow(QMainWindow):
         self.document.mark_changed()
         self._publish_document(clear_selection=False)
 
-    @Slot(str)
-    def _on_export_requested(self, path: str) -> None:
-        if not path.strip():
-            signals.log_message.emit("warning", "Choose an Arrow output path.")
-            return
-        output = Path(path)
-        if output.suffix.lower() != ".arrow":
-            output = output.with_suffix(".arrow")
-            self.export_panel.path.setText(str(output))
-        self._start_meshing(output, "export")
-
-    @Slot()
-    def _on_mesh_requested(self) -> None:
-        if self._thread is not None:
-            return
-        descriptor, path = tempfile.mkstemp(
-            prefix="casocad-preview-", suffix=".arrow"
-        )
-        os.close(descriptor)
-        self._temporary_mesh_path = Path(path)
-        self._start_meshing(self._temporary_mesh_path, "preview")
-
-    def _start_meshing(self, output: Path, mode: str) -> None:
-        if self._thread is not None:
-            if mode == "preview":
-                self._remove_temporary_mesh()
-            return
-        if self.document.fluid_domain is None:
-            signals.log_message.emit(
-                "warning",
-                "Select one 2D or 3D SDF as the Fluid Domain before meshing.",
-            )
-            self._remove_temporary_mesh()
-            return
-        snapshot = self.document.snapshot()
-        config = self.mesher_panel.config()
-        assert snapshot.fluid_domain is not None
-        self.scene_tree.tree.clearSelection()
-        self.viewport.set_lattice_filter(None)
-        self.viewport.configure_grid(snapshot.fluid_domain.bounding_box(), config.dx)
-        self._meshing_mode = mode
-        self.mesher_panel.set_busy(True)
-        self.export_panel.set_actions_enabled(False)
-        if mode == "export":
-            self.export_panel.set_busy(True)
-        self._meshing_version = snapshot.version
-        input_descriptor, input_path = tempfile.mkstemp(
-            prefix="casocad-mesh-input-", suffix=".pickle"
-        )
-        os.close(input_descriptor)
-        result_descriptor, result_path = tempfile.mkstemp(
-            prefix="casocad-mesh-result-", suffix=".pickle"
-        )
-        os.close(result_descriptor)
-        self._mesh_input_path = Path(input_path)
-        self._mesh_result_path = Path(result_path)
-        self._mesh_preview_chunk_paths = []
-        self._mesh_stdout_buffer = ""
-        self._mesh_error_message = None
-        with self._mesh_input_path.open("wb") as stream:
-            pickle.dump(
-                (snapshot.version, snapshot.fluid_domain, config),
-                stream,
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
-        process = QProcess(self)
-        process.setProgram(sys.executable)
-        process.setArguments(
-            [
-                "-m",
-                "app.mesher_process",
-                str(self._mesh_input_path),
-                str(output),
-                str(self._mesh_result_path),
-            ]
-        )
-        process.readyReadStandardOutput.connect(self._on_mesh_process_stdout)
-        process.readyReadStandardError.connect(self._on_mesh_process_stderr)
-        process.errorOccurred.connect(self._on_mesh_process_error)
-        process.finished.connect(self._on_mesh_process_finished)
-        self._thread = process
-        process.start()
-
-    @Slot()
-    def _on_mesh_process_stdout(self) -> None:
-        process = self._thread
-        if process is None:
-            return
-        data = bytes(process.readAllStandardOutput()).decode(
-            "utf-8",
-            errors="replace",
-        )
-        self._mesh_stdout_buffer += data
-        while "\n" in self._mesh_stdout_buffer:
-            line, self._mesh_stdout_buffer = self._mesh_stdout_buffer.split(
-                "\n",
-                1,
-            )
-            self._handle_mesh_process_message(line)
-
-    @Slot()
-    def _on_mesh_process_stderr(self) -> None:
-        process = self._thread
-        if process is None:
-            return
-        message = bytes(process.readAllStandardError()).decode(
-            "utf-8",
-            errors="replace",
-        ).strip()
-        if message:
-            logger.warning("mesher process stderr: %s", message)
-
-    def _handle_mesh_process_message(self, line: str) -> None:
-        if not line.strip():
-            return
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            logger.warning("invalid mesher process message: %s", line)
-            return
-        version = int(message.get("version", -1))
-        if version != self._meshing_version or version != self.document.version:
-            if message.get("type") == "preview_chunk":
-                path_text = str(message.get("path", ""))
-                if path_text:
-                    Path(path_text).unlink(missing_ok=True)
-            return
-        message_type = message.get("type")
-        if message_type == "progress":
-            signals.mesh_progress.emit(int(message.get("value", 0)))
-        elif message_type == "preview_chunk":
-            self._load_mesh_preview_chunk(Path(str(message.get("path", ""))))
-        elif message_type == "failed":
-            self._mesh_error_message = str(message.get("message", "meshing failed"))
-
-    def _load_mesh_preview_chunk(self, path: Path) -> None:
-        if not path.exists():
-            return
-        self._mesh_preview_chunk_paths.append(path)
-        try:
-            with path.open("rb") as stream:
-                chunk = pickle.load(stream)
-        except (OSError, pickle.PickleError, EOFError) as error:
-            logger.warning("could not read mesh preview chunk %s: %s", path, error)
-            return
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            logger.warning("could not remove mesh preview chunk %s", path)
-        self.viewport.append_lattice_preview_chunk(chunk)
-
-    @Slot(QProcess.ProcessError)
-    def _on_mesh_process_error(self, error: QProcess.ProcessError) -> None:
-        self._mesh_error_message = f"mesher process error: {error.name}"
-
-    @Slot(int, QProcess.ExitStatus)
-    def _on_mesh_process_finished(
-        self,
-        exit_code: int,
-        exit_status: QProcess.ExitStatus,
-    ) -> None:
-        if self._mesh_stdout_buffer.strip():
-            remaining = self._mesh_stdout_buffer
-            self._mesh_stdout_buffer = ""
-            self._handle_mesh_process_message(remaining)
-        version = self._meshing_version
-        result_path = self._mesh_result_path
-        if version is None:
-            self._clear_worker()
-            return
-        if (
-            exit_status != QProcess.ExitStatus.NormalExit
-            or exit_code != 0
-            or result_path is None
-            or not result_path.exists()
-            or result_path.stat().st_size == 0
-        ):
-            self._on_mesh_failed(
-                version,
-                self._mesh_error_message
-                or f"mesher process exited with code {exit_code}",
-            )
-            self._cleanup_mesh_process_files()
-            self._clear_worker()
-            return
-        try:
-            with result_path.open("rb") as stream:
-                result = pickle.load(stream)
-        except (OSError, pickle.PickleError, EOFError) as error:
-            self._on_mesh_failed(version, f"could not read mesh result: {error}")
-            self._cleanup_mesh_process_files()
-            self._clear_worker()
-            return
-        self._on_mesh_completed(version, result)
-        self._cleanup_mesh_process_files()
-        self._clear_worker()
-
-    @Slot(int, object)
-    def _on_mesh_completed(self, version: int, result: object) -> None:
-        if version != self.document.version:
-            self._remove_temporary_mesh()
-            self.mesher_panel.set_busy(False)
-            self.export_panel.set_actions_enabled(True)
-            signals.log_message.emit(
-                "warning",
-                "Discarded stale mesh result because the scene changed.",
-            )
-            return
-        if self._meshing_mode == "preview":
-            signals.preview_ready.emit(result)
-            self._remove_temporary_mesh()
-        else:
-            signals.mesh_ready.emit(result)
-        self.mesher_panel.set_busy(False)
-        self.export_panel.set_actions_enabled(True)
-
-    @Slot(int, str)
-    def _on_mesh_failed(self, version: int, message: str) -> None:
-        if version != self.document.version:
-            self._remove_temporary_mesh()
-            self.mesher_panel.set_busy(False)
-            self.export_panel.set_actions_enabled(True)
-            signals.log_message.emit(
-                "warning",
-                "Ignored stale mesh failure because the scene changed.",
-            )
-            return
-        self._remove_temporary_mesh()
-        self.mesher_panel.set_busy(False)
-        self.export_panel.set_actions_enabled(True)
-        action = "Preview" if self._meshing_mode == "preview" else "Export"
-        signals.log_message.emit("error", f"{action} failed: {message}")
-        QMessageBox.critical(self, f"{action} failed", message)
-
-    @Slot()
-    def _clear_worker(self) -> None:
-        self._thread = None
-        self._meshing_mode = None
-        self._meshing_version = None
-        self._mesh_stdout_buffer = ""
-        self._mesh_error_message = None
-
-    def _cleanup_mesh_process_files(self) -> None:
-        for path in (
-            self._mesh_input_path,
-            self._mesh_result_path,
-            *self._mesh_preview_chunk_paths,
-        ):
-            if path is None:
-                continue
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("could not remove mesh worker file %s", path)
-        self._mesh_input_path = None
-        self._mesh_result_path = None
-        self._mesh_preview_chunk_paths = []
-
-    def _remove_temporary_mesh(self) -> None:
-        if self._temporary_mesh_path is None:
-            return
-        try:
-            self._temporary_mesh_path.unlink(missing_ok=True)
-        except OSError:
-            logger.warning(
-                "could not remove preview lattice %s", self._temporary_mesh_path
-            )
-        self._temporary_mesh_path = None
-
     @Slot()
     def _frame_scene(self) -> None:
         selected_box = selected_sdf_bounding_box(
@@ -2023,17 +1705,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 8000)
 
     def closeEvent(self, event: object) -> None:
-        if (
-            self._thread is not None
-            and self._thread.state() != QProcess.ProcessState.NotRunning
-        ):
-            QMessageBox.information(
-                self,
-                "Meshing in progress",
-                "Wait for the current Arrow export to finish before closing.",
-            )
-            event.ignore()
-            return
         self._render_request_timer.stop()
         self.artifacts.shutdown()
         super().closeEvent(event)

@@ -18,7 +18,7 @@ from .boundary_patches import (
     boundary_patches,
     boundary_selector_from_node,
 )
-from .mesher import FluidDomain
+from .domain import FluidDomain
 from .sdf import (
     BezierCurveProfile,
     BezierSurfaceProfile,
@@ -1222,7 +1222,7 @@ class SceneDocument:
         ):
             raise ValueError(
                 "only dimension-compatible placed SDFs and BoundaryRegion "
-                "objects can tag lattice nodes"
+                "objects can tag FluidDomain boundaries"
             )
         if self.fluid_domain is None:
             raise ValueError("select a FluidDomain root first")

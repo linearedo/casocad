@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from core.boundary import BoundaryRegion
-from core.mesher import FluidDomain
+from core.domain import FluidDomain
 from core.scene import SceneDocument
 from core.sdf import Cylinder
 

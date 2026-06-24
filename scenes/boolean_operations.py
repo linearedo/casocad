@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from core.mesher import FluidDomain
+from core.domain import FluidDomain
 from core.scene import SceneDocument
 from core.sdf import Box, Difference, Intersection, Sphere, Union
 

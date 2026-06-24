@@ -74,7 +74,6 @@ class QRhiViewportWidget(QRhiWidget):
         self._sdf_opacity = 1.0
         self._gizmo_visible = True
         self._components_visible = True
-        self._mode = "sdf"
         self._grid_plane = 0  # 0=XY, 1=XZ, 2=YZ
         self._view_anim = None  # (start_yaw, start_pitch, dyaw, dpitch)
         self._view_anim_clock = QElapsedTimer()
@@ -904,12 +903,10 @@ class QRhiViewportWidget(QRhiWidget):
     def _noop(self, *a, **k) -> None:
         return None
 
-    set_lattice_filter = _noop
     set_boundary_hover = _noop
     begin_boundary_region_tool = _noop
     apply_committed_move_preview = _noop
     apply_committed_boolean_preview = _noop
-    append_lattice_preview_chunk = _noop
 
     # --- boolean preview (real; main_window builds the combined render) ---
     def set_boolean_preview(self, *a, **k) -> None:
@@ -919,10 +916,6 @@ class QRhiViewportWidget(QRhiWidget):
 
     def clear_boolean_preview(self) -> None:
         self._restore_committed_scene()
-
-    # --- display toggles (real) ---
-    def set_mode(self, mode: str) -> None:
-        self._mode = str(mode)
 
     def set_sdf_opacity(self, opacity: float) -> None:
         self._sdf_opacity = max(0.0, min(1.0, float(opacity)))
@@ -1563,7 +1556,7 @@ class QRhiViewportWidget(QRhiWidget):
         tree = self._tree
         if tree is None or getattr(tree, "root", None) is None:
             return
-        from core.mesher.classifier import evaluate_with_attribution
+        from core.sdf_attribution import evaluate_with_attribution
         cp, rd = self._screen_ray(pos)
         travel, hit_id = 0.0, 0
         for _ in range(200):

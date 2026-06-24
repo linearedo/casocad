@@ -40,10 +40,6 @@ Current and planned execution paths are:
 - future surface and volume meshing for OpenFOAM and SU2
 - solver-specific case generators
 
-Viewport Baseline:
-
-- Viewport rendering uses `RenderIR` with cached backend programs; do not replace the current cached-topology design with a larger renderer rewrite unless timing evidence or backend requirements justify it.
-
 Core product invariants:
 
 - SDF geometry is the authoritative geometry kernel

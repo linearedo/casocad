@@ -12,8 +12,11 @@ from core.boundary_patches import (
     boundary_selector_from_node,
     pick_boundary_patch,
 )
-from core.mesher import FluidDomain
-from core.mesher.mesher import _boundary_interval_mask, _surface_split_selector_mask
+from core.domain import FluidDomain
+from core.boundary_selection import (
+    boundary_interval_mask,
+    surface_split_selector_mask,
+)
 from core.render_ir import build_render_ir
 from core.scene import SceneDocument
 from core.serialization import load_scene, save_scene
@@ -337,7 +340,7 @@ def test_scene_planar_cutter_split_creates_inside_and_outside_regions() -> None:
     assert selector in document.fluid_domain.selector_objects
 
 
-def test_2d_boundary_interval_mask_restricts_mesher_samples() -> None:
+def test_2dboundary_interval_mask_restricts_mesher_samples() -> None:
     rectangle = PlacedSDF2D(
         name="section",
         object_id=4,
@@ -364,7 +367,7 @@ def test_2d_boundary_interval_mask_restricts_mesher_samples() -> None:
         dtype=np.float64,
     )
 
-    mask = _boundary_interval_mask(region, rectangle, positions)
+    mask = boundary_interval_mask(region, rectangle, positions)
 
     assert mask.tolist() == [False, True, False]
 
@@ -459,7 +462,7 @@ def test_2d_circle_interval_mask_restricts_mesher_samples() -> None:
         dtype=np.float64,
     )
 
-    mask = _boundary_interval_mask(region, circle, positions)
+    mask = boundary_interval_mask(region, circle, positions)
 
     assert mask.tolist() == [True, True, False]
 
@@ -490,7 +493,7 @@ def test_2d_ellipse_interval_mask_restricts_mesher_samples() -> None:
         dtype=np.float64,
     )
 
-    mask = _boundary_interval_mask(region, ellipse, positions)
+    mask = boundary_interval_mask(region, ellipse, positions)
 
     assert mask.tolist() == [True, True, False]
 
@@ -1027,7 +1030,7 @@ def test_outside_selector_boundary_region_serializes_selector_side(
     assert selector_regions[0].selector_side == "outside"
 
 
-def test_surface_split_selector_mask_restricts_3d_boundary_samples() -> None:
+def testsurface_split_selector_mask_restricts_3d_boundary_samples() -> None:
     selector = PlacedSDF1D(
         name="split",
         object_id=7,
@@ -1044,7 +1047,7 @@ def test_surface_split_selector_mask_restricts_3d_boundary_samples() -> None:
         dtype=np.float64,
     )
 
-    mask = _surface_split_selector_mask(
+    mask = surface_split_selector_mask(
         f"selector:{selector.object_id}",
         {selector.object_id: selector},
         Box(name="volume", object_id=1),
@@ -1081,7 +1084,7 @@ def test_planar_profile_selector_mask_splits_surface_area_not_curve() -> None:
         dtype=np.float64,
     )
 
-    mask = _surface_split_selector_mask(
+    mask = surface_split_selector_mask(
         f"selector:{selector.object_id}",
         {selector.object_id: selector},
         Box(name="volume", object_id=1),
@@ -1160,7 +1163,7 @@ def test_planar_selector_mask_is_limited_to_selected_boundary_region() -> None:
     )
 
     for selector in selectors:
-        mask = _surface_split_selector_mask(
+        mask = surface_split_selector_mask(
             f"selector:{selector.object_id}",
             {selector.object_id: selector},
             root,
@@ -1188,7 +1191,7 @@ def test_surface_sdf_selector_mask_uses_universal_cutter_formula() -> None:
         dtype=np.float64,
     )
 
-    mask = _surface_split_selector_mask(
+    mask = surface_split_selector_mask(
         f"selector:{cutter.object_id}",
         {cutter.object_id: cutter},
         Box(name="volume", object_id=1),
@@ -1215,7 +1218,7 @@ def test_surface_sdf_selector_mask_supports_outside_subregion() -> None:
         dtype=np.float64,
     )
 
-    mask = _surface_split_selector_mask(
+    mask = surface_split_selector_mask(
         f"selector:{cutter.object_id}",
         {cutter.object_id: cutter},
         Box(name="volume", object_id=1),
@@ -1261,7 +1264,7 @@ def test_surface_sdf_selector_mask_is_limited_to_selected_boundary_region() -> N
         dtype=np.float64,
     )
 
-    inside_mask = _surface_split_selector_mask(
+    inside_mask = surface_split_selector_mask(
         f"selector:{cutter.object_id}",
         {cutter.object_id: cutter},
         root,
@@ -1269,7 +1272,7 @@ def test_surface_sdf_selector_mask_is_limited_to_selected_boundary_region() -> N
         region=region,
         tolerance=0.0,
     )
-    outside_mask = _surface_split_selector_mask(
+    outside_mask = surface_split_selector_mask(
         f"selector:{cutter.object_id}",
         {cutter.object_id: cutter},
         root,

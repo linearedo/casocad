@@ -51,8 +51,8 @@ def selector_volume_ir(
 
 
 def _signed_tol(side: str, tolerance: float) -> float:
-    # >= 0 => inside (sel_d <= tol); < 0 => outside (sel_d > -tol). See §5.2 and
-    # the CPU mask logic in mesher (_surface_split_selector_mask).
+    # >= 0 => inside (sel_d <= tol); < 0 => outside (sel_d > -tol). Keep this
+    # in parity with core.boundary_selection.surface_split_selector_mask().
     if side == "outside":
         return -abs(tolerance)
     return abs(tolerance)
