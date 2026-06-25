@@ -11,6 +11,7 @@ bytecode opcodes are all defined here once. ``emit_glsl_defines()`` renders them
 into a header chunk that the interpreter shader ``#include``s.
 """
 
+from collections.abc import Iterable
 from enum import IntEnum
 
 
@@ -76,7 +77,7 @@ _LEAF_3D_KINDS = (
     "pyramid",
     "torus",
     "polyline_tube",
-    "bezier_tube",
+    "quadratic_bezier_tube",
     "extrude_profile_2d",
     "revolve_profile_2d",
 )
@@ -88,9 +89,15 @@ _LEAF_PLACED_KINDS = (
     "placed_rounded_rectangle_2d",
     "placed_ellipse_2d",
     "placed_profile_2d",
-    "placed_polyline_2d",
-    "placed_bezier_curve_2d",
+    "placed_polyline_1d",
+    "placed_quadratic_bezier_curve_1d",
     "placed_profile_1d",
+)
+
+_LEAF_SPECIALIZED_2D_KINDS = (
+    "placed_polygon_2d",
+    "placed_quadratic_bezier_surface_2d",
+    "placed_quadratic_bezier_polycurve_1d",
 )
 
 _PROFILE_2D_KINDS = (
@@ -101,8 +108,8 @@ _PROFILE_2D_KINDS = (
     "profile_ellipse_2d",
     "profile_polygon_2d",
     "profile_polyline_2d",
-    "profile_bezier_curve_2d",
-    "profile_bezier_surface_2d",
+    "profile_quadratic_bezier_curve_1d",
+    "profile_quadratic_bezier_surface_2d",
     "profile_offset_2d",
     "profile_distance_offset_2d",
     "profile_union_2d",
@@ -130,6 +137,7 @@ _CATEGORY_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("profile2d", _PROFILE_2D_KINDS),
     ("profile1d", _PROFILE_1D_KINDS),
     ("selector", _SELECTOR_KINDS),
+    ("leaf", _LEAF_SPECIALIZED_2D_KINDS),
 )
 
 
@@ -177,27 +185,45 @@ def is_profile(kind: str) -> bool:
     return kind in PROFILE_KINDS
 
 
-def emit_glsl_defines() -> str:
+def emit_glsl_defines(
+    used_kinds: Iterable[str] | None = None,
+    *,
+    include_stack_defs: bool = True,
+    include_opcode_defs: bool = True,
+) -> str:
     """Render the GLSL ``#define`` header generated from the Python tables.
 
     The interpreter shaders ``#include`` this so the kind codes, opcodes, and
     stack capacities are guaranteed identical to the host serializer.
+
+    ``used_kinds`` is an optional source-size trim for specialized codegen
+    shaders. The default emits every node kind and support constant for
+    interpreter-style callers.
     """
 
     lines: list[str] = [
         "// AUTO-GENERATED from core/gpu_node_types.py — do not edit by hand.",
         "",
-        f"#define IR_STACK_CAPACITY {IR_STACK_CAPACITY}",
-        f"#define IR_PROFILE_STACK_CAPACITY {IR_PROFILE_STACK_CAPACITY}",
-        "",
-        f"#define OP_PUSH_LEAF {int(Opcode.PUSH_LEAF)}u",
-        f"#define OP_EVAL_NODE {int(Opcode.EVAL_OP)}u",
-        f"#define OP_REGION_ASSIGN {int(Opcode.REGION_ASSIGN)}u",
-        f"#define OPCODE_SHIFT {OPCODE_SHIFT}u",
-        f"#define PAYLOAD_MASK {PAYLOAD_MASK}u",
-        "",
     ]
+    if include_stack_defs:
+        lines.extend([
+            f"#define IR_STACK_CAPACITY {IR_STACK_CAPACITY}",
+            f"#define IR_PROFILE_STACK_CAPACITY {IR_PROFILE_STACK_CAPACITY}",
+            "",
+        ])
+    if include_opcode_defs:
+        lines.extend([
+            f"#define OP_PUSH_LEAF {int(Opcode.PUSH_LEAF)}u",
+            f"#define OP_EVAL_NODE {int(Opcode.EVAL_OP)}u",
+            f"#define OP_REGION_ASSIGN {int(Opcode.REGION_ASSIGN)}u",
+            f"#define OPCODE_SHIFT {OPCODE_SHIFT}u",
+            f"#define PAYLOAD_MASK {PAYLOAD_MASK}u",
+            "",
+        ])
+    used = None if used_kinds is None else set(used_kinds)
     for code, kind in sorted(NODE_TYPE_KINDS.items()):
+        if used is not None and kind not in used:
+            continue
         lines.append(f"#define NODE_{kind.upper()} {code}u")
     lines.append("")
     return "\n".join(lines)

@@ -213,7 +213,7 @@ float irProfileLeafValue(uint node_index, vec2 q) {
         }
         return d;
     }
-    if (t == NODE_PROFILE_BEZIER_CURVE_2D) {
+    if (t == NODE_PROFILE_QUADRATIC_BEZIER_CURVE_1D) {
         uint pc = n.param_count / 2u;
         if (pc < 3u) return IR_FAR;
         float d = IR_FAR;
@@ -225,7 +225,7 @@ float irProfileLeafValue(uint node_index, vec2 q) {
         }
         return d;
     }
-    if (t == NODE_PROFILE_BEZIER_SURFACE_2D) {
+    if (t == NODE_PROFILE_QUADRATIC_BEZIER_SURFACE_2D) {
         uint pc = n.param_count / 2u;
         if (pc < 3u) return IR_FAR;
         vec2 first = vec2(irP(b, 0u), irP(b, 1u));
@@ -394,7 +394,8 @@ bool irProfileLeaf(GpuNode node, vec3 p, out float dist) {
         t == NODE_PLACED_CIRCLE_2D || t == NODE_PLACED_RECTANGLE_2D ||
         t == NODE_PLACED_SQUARE_2D || t == NODE_PLACED_ROUNDED_RECTANGLE_2D ||
         t == NODE_PLACED_ELLIPSE_2D || t == NODE_PLACED_PROFILE_2D ||
-        t == NODE_PLACED_POLYLINE_2D || t == NODE_PLACED_BEZIER_CURVE_2D ||
+        t == NODE_PLACED_POLYLINE_1D || t == NODE_PLACED_QUADRATIC_BEZIER_CURVE_1D ||
+        t == NODE_PLACED_QUADRATIC_BEZIER_POLYCURVE_1D ||
         t == NODE_EXTRUDE_PROFILE_2D;
     if (isPlaced2D) {
         vec3 local3 = p - irP3(b, 0u);
@@ -433,7 +434,7 @@ bool irProfileLeaf(GpuNode node, vec3 p, out float dist) {
             float profile = evalProfileSDF(u_children[node.child_offset], q);
             dist = max(profile, abs(plane) - 0.002); return true;
         }
-        if (t == NODE_PLACED_POLYLINE_2D) {
+        if (t == NODE_PLACED_POLYLINE_1D) {
             uint pc = (node.param_count - 12u) / 2u;
             float d = IR_FAR;
             for (uint i = 0u; i + 1u < pc; i++) {
@@ -443,7 +444,8 @@ bool irProfileLeaf(GpuNode node, vec3 p, out float dist) {
             }
             dist = max(d - 0.004, abs(plane) - 0.002); return true;
         }
-        if (t == NODE_PLACED_BEZIER_CURVE_2D) {
+        if (t == NODE_PLACED_QUADRATIC_BEZIER_CURVE_1D ||
+            t == NODE_PLACED_QUADRATIC_BEZIER_POLYCURVE_1D) {
             uint pc = (node.param_count - 12u) / 2u;
             float d = IR_FAR;
             for (uint i = 0u; i + 2u < pc; i += 2u) {

@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from core.boundary import BoundaryRegion
 from core.sdf.base import BoundingBox3D, FloatArray, SDFNode
 from core.sdf.placed_1d import PlacedSDF1D
-from core.sdf.placed_2d import PlacedPolyline2D, PlacedSDF2D
+from core.sdf.placed_2d import PlacedPolyline1D, PlacedSDF2D
 from core.sdf_attribution import boundary_owner_ids
 
-DomainTag = PlacedSDF1D | PlacedPolyline2D | PlacedSDF2D | BoundaryRegion
+DomainTag = PlacedSDF1D | PlacedPolyline1D | PlacedSDF2D | BoundaryRegion
 
 
 @dataclass(frozen=True)
@@ -58,15 +58,15 @@ class FluidDomain:
                 )
             if (
                 self.root.dimension == 2
-                and not isinstance(tag, (PlacedSDF1D, PlacedPolyline2D, BoundaryRegion))
+                and not isinstance(tag, (PlacedSDF1D, PlacedPolyline1D, BoundaryRegion))
             ):
                 raise ValueError(
-                    "2D FluidDomain tags must be PlacedSDF1D, PlacedPolyline2D, "
+                    "2D FluidDomain tags must be PlacedSDF1D, PlacedPolyline1D, "
                     "or BoundaryRegion objects"
                 )
             if (
                 self.root.dimension == 2
-                and isinstance(tag, (PlacedSDF1D, PlacedPolyline2D))
+                and isinstance(tag, (PlacedSDF1D, PlacedPolyline1D))
                 and not tag.lies_in_plane_of(self.root)
             ):
                 raise ValueError("1D FluidDomain tags must lie in the 2D root workplane")
@@ -85,7 +85,7 @@ class FluidDomain:
             if self.root.dimension == 3:
                 valid_selector = isinstance(selector, SDFNode)
             else:
-                valid_selector = isinstance(selector, (PlacedSDF1D, PlacedPolyline2D))
+                valid_selector = isinstance(selector, (PlacedSDF1D, PlacedPolyline1D))
             if not valid_selector:
                 raise ValueError("FluidDomain boundary selectors must be SDF cutter objects")
             if (

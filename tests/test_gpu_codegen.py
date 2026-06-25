@@ -10,8 +10,13 @@ is the same size regardless of instance count or operator mix.
 from core.gpu_codegen import (
     emit_fragment_shader,
     emit_map_glsl,
+    group_capacity,
+    has_carves,
     scene_structure_signature,
     supported,
+    term_count,
+    uses_spatial_cull,
+    viewport_leaf_signature,
 )
 from core.render_ir import RenderIR, RenderIRNode
 
@@ -55,6 +60,17 @@ def test_leaf_dispatch_only_present_types() -> None:
         assert f"t == {absent}" not in glsl, f"sphere scene must not branch {absent}"
 
 
+def test_viewport_leaf_signature_emits_all_direct_leaf_branches() -> None:
+    ir = _ir([_sphere(1)], 0)
+    glsl = emit_map_glsl(ir, leaf_kinds=viewport_leaf_signature(ir))
+
+    assert "t == NODE_SPHERE" in glsl
+    assert "t == NODE_BOX" in glsl
+    assert "t == NODE_PLACED_QUADRATIC_BEZIER_CURVE_1D" in glsl
+    assert "t == NODE_PLACED_QUADRATIC_BEZIER_SURFACE_2D" in glsl
+    assert "evalProfileSDF" not in glsl
+
+
 def test_intersection_adds_no_shader_code() -> None:
     # The whole point: intersection is a data-driven DNF loop, not extra source.
     union = emit_map_glsl(
@@ -62,20 +78,27 @@ def test_intersection_adds_no_shader_code() -> None:
     inter = _ir([_sphere(1, -1), _sphere(2, -0.5), _sphere(3, 1), _sphere(4, 0.5),
                  _op("union", [0, 1]), _op("union", [2, 3]),
                  _op("intersection", [4, 5])], 6)
-    assert emit_map_glsl(inter).count("\n") == union.count("\n")
+    inter_glsl = emit_map_glsl(inter)
+    assert "u_group_count" not in union
+    assert "u_group_count" in inter_glsl
+    assert group_capacity(inter) == 2
+    for op in ("NODE_UNION", "NODE_INTERSECTION", "NODE_DIFFERENCE"):
+        assert f"t == {op}" not in inter_glsl
 
 
 def test_emits_dnf_loops_and_map_signature() -> None:
     glsl = emit_map_glsl(_ir([_sphere(1), _sphere(2, 2), _op("union", [0, 1])], 2))
     assert "float map(vec3 p, out uint owner_out)" in glsl
     assert "u_term_count" in glsl
-    assert "u_group_count" in glsl          # intersection breadth, data-driven
+    assert "u_group_count" not in glsl      # single-group union fast path
+    assert "float g[" not in glsl
     assert "leafDist" in glsl
 
 
 def test_helpers_emitted_only_when_needed() -> None:
     sphere_only = emit_map_glsl(_ir([_sphere(1), _sphere(2, 2), _op("union", [0, 1])], 2))
     assert "irOrientedLocal" not in sphere_only  # spheres don't need it
+    assert "irP2(" not in sphere_only
     with_box = emit_map_glsl(_ir([_box(1), _sphere(2), _op("difference", [0, 1])], 2))
     assert "irOrientedLocal" in with_box
 
@@ -83,12 +106,18 @@ def test_helpers_emitted_only_when_needed() -> None:
 def test_full_fragment_shader_is_complete() -> None:
     # emit_fragment_shader = preamble + leafDist + map + raymarch main. Validated
     # to render correctly on real GPU (intersection blob); here just structural.
-    glsl = emit_fragment_shader(
-        _ir([_sphere(1, -1), _sphere(2, 1), _op("union", [0, 1])], 2))
+    ir = _ir([_sphere(1, -1), _sphere(2, 1), _op("union", [0, 1])], 2)
+    glsl = emit_fragment_shader(ir)
     assert glsl.startswith("#version")
     assert "float map(vec3 p, out uint owner_out)" in glsl
     assert "void main()" in glsl
     assert "u_camera_position" in glsl and "frag_color" in glsl
+    assert "uniform float u_max_ray_distance" in glsl
+    assert "t > u_max_ray_distance" in glsl
+    assert "//" not in glsl
+    assert not any(line[:1].isspace() for line in glsl.splitlines())
+    assert not any("  " in line for line in glsl.splitlines())
+    assert "// Single-group DNF" in emit_fragment_shader(ir, strip_comments=False)
 
 
 def _placed(kind, o, extra):
@@ -114,13 +143,169 @@ def test_placed_2d_sections_supported_and_emitted() -> None:
     assert "irExactEllipseDistance" not in sph
 
 
+def test_placed_polygon_and_quadratic_bezier_surface_are_direct_leaves() -> None:
+    polygon = _placed(
+        "placed_polygon_2d",
+        1,
+        (-0.5, -0.4, 0.5, -0.4, 0.3, 0.4, -0.3, 0.4),
+    )
+    quadratic_bezier_surface = _placed(
+        "placed_quadratic_bezier_surface_2d",
+        2,
+        (-0.5, -0.3, 0.0, 0.5, 0.5, -0.3),
+    )
+    ir = _ir([polygon, quadratic_bezier_surface, _op("union", [0, 1])], 2)
+    assert supported(ir)
+    assert scene_structure_signature(ir) == {
+        "placed_polygon_2d",
+        "placed_quadratic_bezier_surface_2d",
+    }
+    glsl = emit_map_glsl(ir)
+    assert "t == NODE_PLACED_POLYGON_2D" in glsl
+    assert "t == NODE_PLACED_QUADRATIC_BEZIER_SURFACE_2D" in glsl
+    assert "evalProfileSDF" not in glsl
+    assert "irSegmentRayCrosses" in glsl
+    assert "irQuadraticBezierRayCrossValue" in glsl
+
+
+def test_quadratic_bezier_polycurve_is_direct_loop_leaf() -> None:
+    polycurve = _placed(
+        "placed_quadratic_bezier_polycurve_1d",
+        1,
+        (-0.5, -0.3, -0.25, 0.5, 0.0, -0.2, 0.25, 0.5, 0.5, -0.3),
+    )
+    ir = _ir([polycurve], 0)
+
+    assert supported(ir)
+    assert scene_structure_signature(ir) == {"placed_quadratic_bezier_polycurve_1d"}
+    glsl = emit_map_glsl(ir)
+
+    assert "t == NODE_PLACED_QUADRATIC_BEZIER_POLYCURVE_1D" in glsl
+    assert "evalProfileSDF" not in glsl
+    assert "irQuadraticBezierDistance" in glsl
+    assert "irQuadraticBezierRayCross" not in glsl
+
+
+def test_three_point_quadratic_bezier_surface_keeps_one_leaf_kind() -> None:
+    quadratic_bezier_curve = _placed(
+        "placed_quadratic_bezier_curve_1d",
+        3,
+        (-0.5, 0.0, 0.0, 0.5, 0.5, 0.0),
+    )
+    quadratic_bezier_surface = _placed(
+        "placed_quadratic_bezier_surface_2d",
+        2,
+        (-0.5, -0.3, 0.0, 0.5, 0.5, -0.3),
+    )
+    ir = _ir([_box(1), quadratic_bezier_curve, quadratic_bezier_surface, _op("union", [0, 1, 2])], 3)
+
+    assert term_count(ir) == 3
+    assert group_capacity(ir) == 1
+    assert not has_carves(ir)
+    assert not uses_spatial_cull(ir)
+    glsl = emit_fragment_shader(ir)
+    forced_cull = emit_fragment_shader(ir, spatial_cull=True)
+
+    assert "placed_quadratic_bezier_curve_1d" in scene_structure_signature(ir)
+    assert "placed_quadratic_bezier_surface_2d" in scene_structure_signature(ir)
+    assert "placed_quadratic_bezier_polycurve_1d" not in scene_structure_signature(ir)
+    assert "t == NODE_PLACED_QUADRATIC_BEZIER_CURVE_1D" in glsl
+    assert "t == NODE_PLACED_QUADRATIC_BEZIER_SURFACE_2D" in glsl
+    assert "NODE_PLACED_QUADRATIC_BEZIER_POLYCURVE_1D" not in glsl.replace(
+        "#define NODE_PLACED_QUADRATIC_BEZIER_POLYCURVE_1D", ""
+    )
+    assert "uint pc = (node.param_count - 12u) / 2u" in glsl
+    assert "if (pc == 3u)" in glsl
+    assert "irQuadraticBezierRayCrossValue" in glsl
+    assert "irSegmentRayCrossValue" in glsl
+    assert "bool irQuadraticBezierRayCrosses" in glsl
+    assert "bool irSegmentRayCrosses" in glsl
+    assert "float irSegmentDistance2D" in glsl
+    assert "if (bb <= 1.0e-12) return irSegmentDistance2D(pos, A, C);" in glsl
+    curve_only = emit_fragment_shader(_ir([quadratic_bezier_curve], 0))
+    assert "float irSegmentDistance2D" not in curve_only
+    assert "vec2 pa = pos - A" in curve_only
+    assert "cellDist(" not in glsl
+    assert "cgRayGrid" not in glsl
+    assert "u_cull_enabled" not in glsl
+    assert "u_group_count" not in glsl
+    assert "u_sel_count" not in glsl
+    assert "regionAt" not in glsl
+    assert "u_carves" not in glsl
+    assert "layout(std430, binding = 5)" not in glsl
+    assert "u_children" not in glsl
+    assert "layout(std430, binding = 2)" not in glsl
+    assert "float termDist" not in glsl
+    assert "termDist(" not in glsl
+    assert "float g[" not in glsl
+    assert "layout(std430, binding = 6)" not in glsl
+    assert len(glsl.encode("utf-8")) < len(forced_cull.encode("utf-8"))
+
+
+def test_representative_quadratic_bezier_2d_variant_stays_under_source_budget() -> None:
+    quadratic_bezier_curve = _placed(
+        "placed_quadratic_bezier_curve_1d",
+        3,
+        (-0.5, 0.0, 0.0, 0.5, 0.5, 0.0),
+    )
+    quadratic_bezier_surface = _placed(
+        "placed_quadratic_bezier_surface_2d",
+        4,
+        (-0.5, -0.3, 0.0, 0.5, 0.5, -0.3),
+    )
+    ir = _ir(
+        [_box(1), _placed("placed_circle_2d", 2, (0.0, 0.0, 0.4)),
+         quadratic_bezier_curve, quadratic_bezier_surface, _op("union", [0, 1, 2, 3])],
+        4,
+    )
+
+    assert scene_structure_signature(ir) == {
+        "box",
+        "placed_circle_2d",
+        "placed_quadratic_bezier_curve_1d",
+        "placed_quadratic_bezier_surface_2d",
+    }
+    assert group_capacity(ir) == 1
+    assert not uses_spatial_cull(ir)
+    assert not has_carves(ir)
+    glsl = emit_fragment_shader(ir)
+
+    assert "#define NODE_SPHERE" not in glsl
+    assert "#define NODE_PROFILE_CIRCLE_2D" not in glsl
+    assert "#define NODE_REGION_SELECTOR" not in glsl
+    assert "#define NODE_BOX" in glsl
+    assert "#define NODE_PLACED_CIRCLE_2D" in glsl
+    assert "#define NODE_PLACED_QUADRATIC_BEZIER_CURVE_1D" in glsl
+    assert "#define NODE_PLACED_QUADRATIC_BEZIER_SURFACE_2D" in glsl
+    assert "#define IR_STACK_CAPACITY" not in glsl
+    assert "#define IR_PROFILE_STACK_CAPACITY" not in glsl
+    assert "#define OP_PUSH_LEAF" not in glsl
+    assert "#define PAYLOAD_MASK" not in glsl
+    assert len(glsl.encode("utf-8")) < 8_500
+
+
+def test_large_scene_variant_keeps_spatial_cull_path() -> None:
+    nodes = [_sphere(i + 1, x=float(i) * 0.2) for i in range(16)]
+    nodes.append(_op("union", range(16)))
+    ir = _ir(nodes, 16)
+
+    assert term_count(ir) == 16
+    assert uses_spatial_cull(ir)
+    glsl = emit_fragment_shader(ir)
+
+    assert "cellDist(" in glsl
+    assert "cgRayGrid" in glsl
+    assert "u_cull_enabled" in glsl
+    assert "layout(std430, binding = 6)" in glsl
+
+
 def _tube(kind, o, pts, r=0.3):
     params = tuple(c for pt in pts for c in pt) + (r, 0.0, 0.0)  # +radius,inner,flat
     return RenderIRNode(kind=kind, object_id=o, dimension=1, children=(), params=params)
 
 
 def test_tubes_supported_and_emitted() -> None:
-    # Step 2: polyline/bezier tubes render via codegen (points inline in params).
+    # Step 2: polyline/quadratic Bezier tubes render via codegen (points inline in params).
     ir = _ir([_tube("polyline_tube", 1, [(-1, 0, 0), (0, 1, 0), (1, 0, 0)]),
               _sphere(2, 0, 0, 0, 0.6), _op("union", [0, 1])], 2)
     assert supported(ir)
@@ -129,7 +314,7 @@ def test_tubes_supported_and_emitted() -> None:
     assert "t == NODE_POLYLINE_TUBE" in glsl
     assert "irSegmentDistance3D" in glsl and "irTubeSDF" in glsl
     bez = emit_map_glsl(
-        _ir([_tube("bezier_tube", 1, [(-1, 0, 0), (0, 1, 0), (1, 0, 0)]),
+        _ir([_tube("quadratic_bezier_tube", 1, [(-1, 0, 0), (0, 1, 0), (1, 0, 0)]),
              _sphere(2), _op("union", [0, 1])], 2))
     assert "irQuadraticBezierDistance3D" in bez
     # sphere-only scene stays free of tube helpers
@@ -173,9 +358,11 @@ def test_region_selectors_emit_subtree_vm() -> None:
     glsl = emit_fragment_shader(ir)
     assert "evalSubtreeDist" in glsl and "regionAt" in glsl
     assert "u_sel" in glsl
-    # a scene with no selector gets the no-op regionAt stub (no subtree VM)
+    # a scene with no selector omits the selector VM and no-op regionAt stub.
     plain = emit_fragment_shader(_ir([_sphere(1), _sphere(2, 2), _op("union", [0, 1])], 2))
-    assert "evalSubtreeDist" not in plain and "regionAt" in plain
+    assert "evalSubtreeDist" not in plain
+    assert "regionAt" not in plain
+    assert "u_sel_count" not in plain
 
 
 def test_supported_scope() -> None:
@@ -191,12 +378,26 @@ def test_carve_under_union_now_supported() -> None:
     carve = _ir([_sphere(1), _sphere(2), _sphere(3, 4),
                  _op("difference", [0, 1]), _op("union", [3, 2])], 4)
     assert supported(carve)
+    assert has_carves(carve)
     groups = flatten_terms(carve)
     assert len(groups) == 1                       # union -> single group
     terms = groups[0]
     assert {leaf for leaf, _carves in terms} == {0, 2}    # solids A and C
     assert dict(terms)[0] == (1,)                 # A carries the local hole B
     assert dict(terms)[2] == ()                   # C is uncarved
+
+
+def test_carved_scene_keeps_carve_buffer_and_loop() -> None:
+    ir = _ir([_box(1), _sphere(2), _op("difference", [0, 1])], 2)
+
+    assert supported(ir)
+    assert has_carves(ir)
+    glsl = emit_fragment_shader(ir)
+
+    assert "layout(std430, binding = 5)" in glsl
+    assert "u_carves" in glsl
+    assert "float termDist" in glsl
+    assert "for (uint j = 0u; j < cc; j++)" in glsl
 
 
 def test_union_of_many_carved_solids_is_linear() -> None:

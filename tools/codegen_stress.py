@@ -27,10 +27,13 @@ Scenes:
   polytope N    intersection of N planes/solids (N groups -> adaptive g[] bucket).
   union N       union of N*2 solids (1 group, N leaves).
   mixed N       N instances cycling through every leaf kind, unioned (heavy data).
+  quadratic_bezier_2d N    startup-like box+cylinder scene plus N placed Quadratic Bezier curves and
+                one placed Quadratic Bezier surface; useful for cold 2D compile probes.
 """
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import statistics
@@ -96,12 +99,12 @@ def _every_leaf(nodes, pos):
     pts = (x, y, z, x + 0.4, y + 1.0, z, x, y + 2.0, z + 0.4)
     tube_b = (x + 0.1, y + 1.0, z + 0.1, 1.9)
     out.append(_add(nodes, "polyline_tube", pts + (0.25, 0.0, 0.0), dim=1, bound=tube_b))
-    out.append(_add(nodes, "bezier_tube", pts + (0.25, 0.0, 0.0), dim=1, bound=tube_b))
+    out.append(_add(nodes, "quadratic_bezier_tube", pts + (0.25, 0.0, 0.0), dim=1, bound=tube_b))
     # placed open curves (points @12+ as 2D pairs)
     crv_b = (x, y, z, 1.6)
-    out.append(_add(nodes, "placed_polyline_2d",
+    out.append(_add(nodes, "placed_polyline_1d",
                     b + (0.0, 0.0, 0.5, 0.4, 1.0, -0.2), dim=2, bound=crv_b))
-    out.append(_add(nodes, "placed_bezier_curve_2d",
+    out.append(_add(nodes, "placed_quadratic_bezier_curve_1d",
                     b + (0.0, 0.0, 0.5, 0.6, 1.0, 0.0), dim=2, bound=crv_b))
     # profile-VM leaves (need a child profile sub-graph)
     prof_b = (x, y, z, 1.8)
@@ -180,6 +183,27 @@ def build_scene(scene: str, n: int) -> RenderIR:
             gy = (i // side) * 4.0 - side * 2.0
             leaves += _every_leaf(nodes, (gx, gy, 0.0))
         root = chain("union", leaves)
+    elif scene == "quadratic_bezier_2d":
+        b = _basis((0.0, 0.0, 0.0))
+        leaves = [
+            _add(nodes, "box", b + (0.5, 0.5, 0.5), oid=1),
+            _add(nodes, "cylinder", b + (0.3, 0.8), oid=2),
+        ]
+        for i in range(max(1, n)):
+            off = float(i) * 0.15
+            leaves.append(_add(
+                nodes,
+                "placed_quadratic_bezier_curve_1d",
+                b + (-0.5 + off, 0.0, 0.0 + off, 0.5, 0.5 + off, 0.0),
+                dim=2,
+            ))
+        leaves.append(_add(
+            nodes,
+            "placed_quadratic_bezier_triangle_2d",
+            b + (-0.5, -0.3, 0.0, 0.5, 0.5, -0.3),
+            dim=2,
+        ))
+        root = chain("union", leaves)
     else:
         raise SystemExit(f"unknown scene: {scene}")
     return RenderIR(nodes=tuple(nodes), root_indices=(root,), component_indices=comps)
@@ -196,9 +220,19 @@ def _time(fn, repeat):
     return best * 1e3, out          # ms, result
 
 
+def _samples(fn, repeat):
+    out = []
+    for _ in range(repeat):
+        t = time.perf_counter()
+        fn()
+        out.append((time.perf_counter() - t) * 1e3)
+    return out
+
+
 def cmd_create(args) -> None:
     from core.gpu_codegen import (flatten_terms, scene_structure_signature,
-                                  group_capacity, emit_fragment_shader, supported)
+                                  group_capacity, emit_fragment_shader, supported,
+                                  has_carves, term_count, uses_spatial_cull)
     from core.gpu_scene import serialize_scene
     from app.viewport.renderers.qrhi.vulkanize import vulkanize, uniform_block_members
     from app.viewport.renderers.qrhi.renderer import _bake
@@ -210,29 +244,41 @@ def cmd_create(args) -> None:
     groups = flatten_terms(ir)
     ng = len(groups) if groups else 0
     nterms = sum(len(g) for g in groups) if groups else 0
+    if args.spatial_cull == "auto":
+        spatial_cull = uses_spatial_cull(ir)
+    else:
+        spatial_cull = args.spatial_cull == "on"
     print(f"  flattened: groups={ng}  terms={nterms}  "
-          f"capacity=g[{group_capacity(ir)}]  kinds={len(scene_structure_signature(ir))}")
+          f"capacity=g[{group_capacity(ir)}]  kinds={len(scene_structure_signature(ir))}  "
+          f"auto_cull={uses_spatial_cull(ir)}  shader_cull={spatial_cull}  "
+          f"term_count={term_count(ir)}  has_carves={has_carves(ir)}")
 
     rows = [("build render_ir", tb)]
     rows.append(("flatten_terms", _time(lambda: flatten_terms(ir), r)[0]))
     rows.append(("scene_signature", _time(lambda: scene_structure_signature(ir), r)[0]))
     rows.append(("group_capacity", _time(lambda: group_capacity(ir), r)[0]))
     rows.append(("serialize_scene", _time(lambda: serialize_scene(ir), r)[0]))
-    t_emit, gl_src = _time(lambda: emit_fragment_shader(ir), r)
+    t_emit, gl_src = _time(lambda: emit_fragment_shader(ir, spatial_cull=spatial_cull), r)
     rows.append(("emit_fragment_shader", t_emit))
     t_vk, vsrc = _time(lambda: vulkanize(gl_src), r)
     rows.append(("vulkanize", t_vk))
     rows.append(("uniform_block_members", _time(lambda: uniform_block_members(gl_src), r)[0]))
-    t_bake, _ = _time(lambda: _bake("frag", vsrc), 1)     # qsb subprocess: once
+    qsb_repeat = max(1, args.qsb_repeat)
+    qsb_samples = _samples(lambda: _bake("frag", vsrc), qsb_repeat)
+    t_bake = min(qsb_samples)
     rows.append(("qsb compile (offline)", t_bake))
 
     total = sum(ms for _, ms in rows)
     print(f"  shader source: {len(gl_src):,} chars  ({gl_src.count(chr(10))} lines)")
     print("  ---- stage timings (min of "
-          f"{r}, qsb once) -------------------------")
+          f"{r}, qsb min of {qsb_repeat}) -------------------------")
     for name, ms in rows:
         bar = "#" * min(40, int(ms / max(total, 1e-9) * 40))
         print(f"    {name:24s} {ms:8.2f} ms  {bar}")
+    if qsb_repeat > 1:
+        print(f"    {'qsb samples':24s} min={min(qsb_samples):.2f} ms  "
+              f"median={statistics.median(qsb_samples):.2f} ms  "
+              f"max={max(qsb_samples):.2f} ms")
     print(f"    {'TOTAL':24s} {total:8.2f} ms")
 
 
@@ -242,6 +288,10 @@ def cmd_fps(args) -> None:
     from PySide6.QtWidgets import QApplication
     from app.viewport.renderers.qrhi.viewport import QRhiViewportWidget
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     app = QApplication(sys.argv[:1])
     w = QRhiViewportWidget()
     w.resize(args.width, args.height)
@@ -249,11 +299,13 @@ def cmd_fps(args) -> None:
     # Report whether codegen will cull or brute-force this scene (and warn if a
     # large brute-force scene risks an OOM/watchdog kill). Codegen is the only
     # renderer now, so this always applies.
-    from core.gpu_codegen import flatten_terms
+    from core.gpu_codegen import flatten_terms, term_count, uses_spatial_cull
     from core.gpu_cull import build_term_grid, leaf_bounds
     import numpy as np
-    groups = flatten_terms(ir)
-    if groups:
+    if not uses_spatial_cull(ir):
+        print(f"[stress-fps] cull OFF by shader policy: {term_count(ir)} terms "
+              "use the flat shader variant", flush=True)
+    elif groups := flatten_terms(ir):
         pos = np.array([leaf for g in groups for leaf, _c in g], dtype=np.uint32)
         grid = build_term_grid(pos, leaf_bounds(ir), dim=16)
         if grid is None:
@@ -289,12 +341,19 @@ def cmd_fps(args) -> None:
 
     w._renderer.render = _wrapped
 
+    def abort_if_qrhi_unavailable():
+        if getattr(w._renderer, "_rhi", None) is None:
+            print("[stress-fps] QRhi unavailable; cannot measure real pipeline compile",
+                  flush=True)
+            app.quit()
+
     def drive():
         w._yaw += 0.012
         w._begin_interaction()
         w.update()
 
     driver = QTimer(); driver.timeout.connect(drive); driver.start(5)
+    QTimer.singleShot(1500, abort_if_qrhi_unavailable)
     QTimer.singleShot(int(args.warmup * 1000), lambda: state.update(measure=True))
 
     def done():
@@ -323,6 +382,93 @@ def cmd_fps(args) -> None:
     app.exec()
 
 
+def _workflow_points(tool: str):
+    if tool == "quadratic_bezier_polycurve":
+        return (
+            (-0.55, -0.20, 0.0),
+            (-0.25, 0.35, 0.0),
+            (0.05, -0.10, 0.0),
+            (0.30, 0.30, 0.0),
+            (0.55, -0.15, 0.0),
+        )
+    return (
+        (-0.50, -0.25, 0.0),
+        (0.00, 0.45, 0.0),
+        (0.50, -0.25, 0.0),
+    )
+
+
+def cmd_workflow(args) -> None:
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.main_window import MainWindow
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    app = QApplication(sys.argv[:1])
+    w = MainWindow()
+    w.resize(args.width, args.height)
+    state = {"armed": None, "commit": None, "first": None, "frames": 0}
+    _orig = w.viewport._renderer.render
+
+    def _wrapped(*a, **k):
+        now = time.perf_counter()
+        if state["commit"] is not None:
+            state["frames"] += 1
+            if state["first"] is None:
+                state["first"] = now
+                print(f"[stress-workflow] time-to-first-frame-after-commit "
+                      f"= {(now - state['commit']) * 1e3:.0f} ms", flush=True)
+        return _orig(*a, **k)
+
+    w.viewport._renderer.render = _wrapped
+    w.show(); w.raise_(); w.activateWindow()
+
+    def abort_if_qrhi_unavailable():
+        if getattr(w.viewport._renderer, "_rhi", None) is None:
+            print("[stress-workflow] QRhi unavailable; cannot measure workflow",
+                  flush=True)
+            app.quit()
+
+    def commit_tool():
+        points = _workflow_points(args.tool)
+        w.viewport._point_pts = list(points)
+        state["commit"] = time.perf_counter()
+        print(f"[stress-workflow] commit tool={args.tool} points={len(points)}",
+              flush=True)
+        w.viewport._commit_point_shape()
+        w.viewport.update()
+
+    def arm_tool():
+        state["armed"] = time.perf_counter()
+        print(f"[stress-workflow] arm tool={args.tool} "
+              f"prewarm_delay={args.prewarm_delay:.2f}s", flush=True)
+        w.viewport.begin_create_tool(args.tool)
+        QTimer.singleShot(int(args.prewarm_delay * 1000), commit_tool)
+
+    def done():
+        if state["first"] is None:
+            print("[stress-workflow] no frame after commit", flush=True)
+        else:
+            print(f"[stress-workflow] frames_after_commit={state['frames']}",
+                  flush=True)
+        app.quit()
+
+    QTimer.singleShot(1500, abort_if_qrhi_unavailable)
+    QTimer.singleShot(int(args.start_delay * 1000), arm_tool)
+    QTimer.singleShot(
+        int((args.start_delay + args.prewarm_delay + args.measure) * 1000),
+        done,
+    )
+    QTimer.singleShot(
+        int((args.start_delay + args.prewarm_delay + args.measure + 4) * 1000),
+        app.quit,
+    )
+    app.exec()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -331,6 +477,8 @@ def main() -> None:
     sc.add_argument("--scene", default="alltypes")
     sc.add_argument("--n", type=int, default=1)
     sc.add_argument("--repeat", type=int, default=20)
+    sc.add_argument("--qsb-repeat", type=int, default=1)
+    sc.add_argument("--spatial-cull", choices=("auto", "on", "off"), default="auto")
     sc.set_defaults(func=cmd_create)
     sf = sub.add_parser("fps", help="orbit the real viewport and time frames")
     sf.add_argument("--scene", default="alltypes")
@@ -341,6 +489,15 @@ def main() -> None:
     sf.add_argument("--measure", type=float, default=6.0)
     sf.add_argument("--screenshot", default=None)
     sf.set_defaults(func=cmd_fps)
+    sw = sub.add_parser("workflow", help="time a real MainWindow draw-tool commit")
+    sw.add_argument("--tool", choices=("quadratic_bezier_curve", "quadratic_bezier_polycurve",
+                                      "quadratic_bezier_surface"), default="quadratic_bezier_surface")
+    sw.add_argument("--width", type=int, default=960)
+    sw.add_argument("--height", type=int, default=720)
+    sw.add_argument("--start-delay", type=float, default=1.5)
+    sw.add_argument("--prewarm-delay", type=float, default=2.0)
+    sw.add_argument("--measure", type=float, default=3.0)
+    sw.set_defaults(func=cmd_workflow)
     args = ap.parse_args()
     args.func(args)
 

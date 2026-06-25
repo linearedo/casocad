@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 from core.boundary import BoundaryRegion
-from core.sdf import PlacedPolyline2D, PlacedSDF1D, PlacedSDF2D
+from core.sdf import PlacedPolyline1D, PlacedSDF1D, PlacedSDF2D
 
 
 def _camel_to_snake(value: str) -> str:
@@ -24,7 +24,7 @@ def display_kind(node: object) -> str:
     Placed 1D/2D nodes are implementation containers: users care about the
     profile they drew, not the placement wrapper.
     """
-    if isinstance(node, (PlacedSDF1D, PlacedSDF2D, PlacedPolyline2D)):
+    if isinstance(node, (PlacedSDF1D, PlacedSDF2D, PlacedPolyline1D)):
         profile = getattr(node, "profile", None)
         if profile is not None:
             return _profile_display_kind(profile)

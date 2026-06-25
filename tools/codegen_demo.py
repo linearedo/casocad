@@ -125,7 +125,7 @@ def build_scene(kind: str, per: int) -> RenderIR:
             cx, cy, cz = (rng2.uniform(-2, 2) for _ in range(3))
             pts = [(cx, cy, cz), (cx + rng2.uniform(-1, 1), cy + 1.2, cz),
                    (cx + rng2.uniform(-1, 1), cy + 2.2, cz + rng2.uniform(-1, 1))]
-            k = rng2.choice(["polyline_tube", "bezier_tube"])
+            k = rng2.choice(["polyline_tube", "quadratic_bezier_tube"])
             params = tuple(c for pt in pts for c in pt) + (0.3, 0.0, 0.0)
             nodes.append(RenderIRNode(kind=k, object_id=len(nodes) + 1, dimension=1,
                                       children=(), params=params))

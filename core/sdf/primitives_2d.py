@@ -213,7 +213,7 @@ def _segment_ray_crossings_numpy(
     return np.asarray(active & (U < intersection), dtype=np.bool_)
 
 
-def _bezier_surface_closed(
+def _quadratic_bezier_surface_closed(
     points: tuple[tuple[float, float], ...],
     tolerance: float = 1.0e-12,
 ) -> bool:
@@ -342,7 +342,7 @@ class PolylineProfile(Profile2D):
 
 
 @dataclass(frozen=True)
-class BezierCurveProfile(Profile2D):
+class QuadraticBezierCurveProfile(Profile2D):
     points: tuple[tuple[float, float], ...] = (
         (-0.6, -0.35),
         (0.0, 0.55),
@@ -352,22 +352,22 @@ class BezierCurveProfile(Profile2D):
     def __post_init__(self) -> None:
         normalized = _as_points(self.points)
         if len(normalized) < 3:
-            raise ValueError("bezier curve requires at least three points")
+            raise ValueError("quadratic Bezier curve requires at least three points")
         if len(normalized) % 2 == 0:
             raise ValueError(
-                "bezier curve requires an odd point count: anchor, control, anchor"
+                "quadratic Bezier curve requires an odd point count: anchor, control, anchor"
             )
         if all(
             np.linalg.norm(np.asarray(control) - np.asarray(start)) <= 1e-12
             and np.linalg.norm(np.asarray(end) - np.asarray(start)) <= 1e-12
             for start, control, end in _quadratic_bezier_spans(normalized)
         ):
-            raise ValueError("bezier curve requires at least one nonzero span")
+            raise ValueError("quadratic Bezier curve requires at least one nonzero span")
         object.__setattr__(self, "points", normalized)
 
     @property
     def kind(self) -> str:
-        return "bezier_polycurve" if len(self.points) > 3 else "bezier_curve"
+        return "quadratic_bezier_polycurve" if len(self.points) > 3 else "quadratic_bezier_curve"
 
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         distances = [
@@ -387,7 +387,7 @@ class BezierCurveProfile(Profile2D):
 
 
 @dataclass(frozen=True)
-class BezierSurfaceProfile(Profile2D):
+class QuadraticBezierSurfaceProfile(Profile2D):
     points: tuple[tuple[float, float], ...] = (
         (-0.65, -0.35),
         (-0.25, 0.55),
@@ -399,22 +399,22 @@ class BezierSurfaceProfile(Profile2D):
     def __post_init__(self) -> None:
         normalized = _as_points(self.points)
         if len(normalized) < 3:
-            raise ValueError("bezier surface requires at least three points")
+            raise ValueError("quadratic Bezier surface requires at least three points")
         if len(normalized) % 2 == 0:
             raise ValueError(
-                "bezier surface requires an odd point count: anchor, control, anchor"
+                "quadratic Bezier surface requires an odd point count: anchor, control, anchor"
             )
         if all(
             np.linalg.norm(np.asarray(control) - np.asarray(start)) <= 1e-12
             and np.linalg.norm(np.asarray(end) - np.asarray(start)) <= 1e-12
             for start, control, end in _quadratic_bezier_spans(normalized)
         ):
-            raise ValueError("bezier surface requires at least one nonzero span")
+            raise ValueError("quadratic Bezier surface requires at least one nonzero span")
         object.__setattr__(self, "points", normalized)
 
     @property
     def kind(self) -> str:
-        return "bezier_surface"
+        return "quadratic_bezier_surface"
 
     def to_numpy(self, U: FloatArray, V: FloatArray) -> FloatArray:
         spans = _quadratic_bezier_spans(self.points)
@@ -422,14 +422,14 @@ class BezierSurfaceProfile(Profile2D):
             _quadratic_bezier_distance_numpy(U, V, start, control, end)
             for start, control, end in spans
         ]
-        if not _bezier_surface_closed(self.points):
+        if not _quadratic_bezier_surface_closed(self.points):
             distances.append(_segment_distance_numpy(U, V, self.points[-1], self.points[0]))
         distance = np.asarray(np.minimum.reduce(distances), dtype=np.float64)
 
         inside = np.full(np.shape(distance), False, dtype=np.bool_)
         for start, control, end in spans:
             inside ^= _quadratic_bezier_ray_crossings_numpy(U, V, start, control, end)
-        if not _bezier_surface_closed(self.points):
+        if not _quadratic_bezier_surface_closed(self.points):
             inside ^= _segment_ray_crossings_numpy(U, V, self.points[-1], self.points[0])
         return np.asarray(np.where(inside, -distance, distance), dtype=np.float64)
 

@@ -21,15 +21,15 @@ from core.render_ir import build_render_ir
 from core.scene import SceneDocument
 from core.serialization import load_scene, save_scene
 from core.sdf import (
-    BezierCurveProfile,
-    BezierSurfaceProfile,
+    QuadraticBezierCurveProfile,
+    QuadraticBezierSurfaceProfile,
     Box,
     CircleProfile,
     Cylinder,
     Difference,
     EllipseProfile,
     Intersection,
-    PlacedPolyline2D,
+    PlacedPolyline1D,
     PlacedSDF1D,
     PlacedSDF2D,
     PolygonProfile,
@@ -429,7 +429,7 @@ def test_2d_circle_interval_preview_is_render_ir_supported() -> None:
     )
 
     preview = boundary_region_preview_node(circle, region)
-    assert isinstance(preview, PlacedPolyline2D)
+    assert isinstance(preview, PlacedPolyline1D)
     render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
 
     assert render_ir.supported
@@ -504,22 +504,22 @@ def test_1d_objects_create_boundary_selectors_without_cutting_geometry() -> None
         object_id=5,
         profile=SegmentProfile(),
     )
-    polyline = PlacedPolyline2D(
+    polyline = PlacedPolyline1D(
         name="curve_selector",
         object_id=6,
         profile=PolylineProfile(),
     )
-    bezier_curve = PlacedPolyline2D(
-        name="bezier_selector",
+    quadratic_bezier_curve = PlacedPolyline1D(
+        name="quadratic_bezier_selector",
         object_id=7,
-        profile=BezierCurveProfile(
+        profile=QuadraticBezierCurveProfile(
             points=((-0.5, 0.0), (0.0, 0.4), (0.5, 0.0)),
         ),
     )
-    bezier_polycurve = PlacedPolyline2D(
-        name="bezier_polycurve_selector",
+    quadratic_bezier_polycurve = PlacedPolyline1D(
+        name="quadratic_bezier_polycurve_selector",
         object_id=8,
-        profile=BezierCurveProfile(
+        profile=QuadraticBezierCurveProfile(
             points=(
                 (-0.5, 0.0),
                 (-0.25, 0.4),
@@ -532,8 +532,8 @@ def test_1d_objects_create_boundary_selectors_without_cutting_geometry() -> None
 
     surface_selector = boundary_selector_from_node(segment, domain_dimension=3)
     curve_selector = boundary_selector_from_node(polyline, domain_dimension=2)
-    bezier_selector = boundary_selector_from_node(bezier_curve, domain_dimension=2)
-    polycurve_selector = boundary_selector_from_node(bezier_polycurve, domain_dimension=3)
+    quadratic_bezier_selector = boundary_selector_from_node(quadratic_bezier_curve, domain_dimension=2)
+    polycurve_selector = boundary_selector_from_node(quadratic_bezier_polycurve, domain_dimension=3)
 
     assert surface_selector is not None
     assert surface_selector.selector_type == "surface_split_curve"
@@ -541,12 +541,12 @@ def test_1d_objects_create_boundary_selectors_without_cutting_geometry() -> None
     assert curve_selector is not None
     assert curve_selector.selector_type == "boundary_curve_selector"
     assert curve_selector.object_id == polyline.object_id
-    assert bezier_selector is not None
-    assert bezier_selector.selector_type == "boundary_curve_selector"
-    assert bezier_selector.object_id == bezier_curve.object_id
+    assert quadratic_bezier_selector is not None
+    assert quadratic_bezier_selector.selector_type == "boundary_curve_selector"
+    assert quadratic_bezier_selector.object_id == quadratic_bezier_curve.object_id
     assert polycurve_selector is not None
     assert polycurve_selector.selector_type == "surface_split_curve"
-    assert polycurve_selector.object_id == bezier_polycurve.object_id
+    assert polycurve_selector.object_id == quadratic_bezier_polycurve.object_id
 
 
 def test_scene_boundary_region_from_hit_stores_patch_identity() -> None:
@@ -854,7 +854,7 @@ def test_boundary_patch_preview_node_for_1d_selector_hit_is_render_ir_supported(
 
 def test_boundary_patch_preview_node_for_polyline_selector_hit_is_render_ir_supported() -> None:
     volume = Box(name="volume", object_id=1)
-    selector = PlacedPolyline2D(
+    selector = PlacedPolyline1D(
         name="split_curve",
         object_id=2,
         profile=PolylineProfile(points=((0.5, -0.3), (0.5, 0.3))),
@@ -885,12 +885,12 @@ def test_boundary_patch_preview_node_for_polyline_selector_hit_is_render_ir_supp
     assert render_ir.root_indices
 
 
-def test_boundary_patch_preview_node_for_bezier_selector_hit_is_render_ir_supported() -> None:
+def test_boundary_patch_preview_node_for_quadratic_bezier_selector_hit_is_render_ir_supported() -> None:
     volume = Box(name="volume", object_id=1)
-    selector = PlacedPolyline2D(
+    selector = PlacedPolyline1D(
         name="split_bezier",
         object_id=2,
-        profile=BezierCurveProfile(points=((0.5, -0.3), (0.5, 0.0), (0.5, 0.3))),
+        profile=QuadraticBezierCurveProfile(points=((0.5, -0.3), (0.5, 0.0), (0.5, 0.3))),
         origin=(0.0, 0.0, 0.0),
         axis_u=(1.0, 0.0, 0.0),
         axis_v=(0.0, 1.0, 0.0),
@@ -1149,7 +1149,7 @@ def test_planar_selector_mask_is_limited_to_selected_boundary_region() -> None:
         PlacedSDF2D(
             name="planar_bezier_cut",
             object_id=7,
-            profile=BezierSurfaceProfile(
+            profile=QuadraticBezierSurfaceProfile(
                 points=(
                     (-0.25, -0.25),
                     (0.0, 0.35),

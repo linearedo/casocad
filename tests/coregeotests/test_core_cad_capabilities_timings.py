@@ -13,8 +13,8 @@ from core.render_ir import build_render_ir
 from core.scene import SceneDocument
 from core.serialization import load_scene, save_scene
 from core.sdf import (
-    BezierCurveProfile,
-    BezierSurfaceProfile,
+    QuadraticBezierCurveProfile,
+    QuadraticBezierSurfaceProfile,
     Box,
     BoxFrame,
     CappedCone,
@@ -23,7 +23,7 @@ from core.sdf import (
     Cylinder,
     EllipseProfile,
     Intersection,
-    PlacedPolyline2D,
+    PlacedPolyline1D,
     PlacedSDF1D,
     PlacedSDF2D,
     PolygonProfile,
@@ -107,8 +107,8 @@ def test_all_2d_and_1d_primitive_creation_timing() -> None:
     expected_profiles = {
         "segment": SegmentProfile,
         "polyline": PolylineProfile,
-        "bezier_curve": BezierCurveProfile,
-        "bezier_polycurve": BezierCurveProfile,
+        "quadratic_bezier_curve": QuadraticBezierCurveProfile,
+        "quadratic_bezier_polycurve": QuadraticBezierCurveProfile,
         "circle": CircleProfile,
         "rectangle": RectangleProfile,
         "square": SquareProfile,
@@ -116,7 +116,7 @@ def test_all_2d_and_1d_primitive_creation_timing() -> None:
         "ellipse": EllipseProfile,
         "regular_polygon": RegularPolygonProfile,
         "polygon": PolygonProfile,
-        "bezier_surface": BezierSurfaceProfile,
+        "quadratic_bezier_surface": QuadraticBezierSurfaceProfile,
     }
 
     for kind, profile_type in expected_profiles.items():
@@ -128,7 +128,7 @@ def test_all_2d_and_1d_primitive_creation_timing() -> None:
         )
         node = document.node(handle)
         assert timing.tree_node_count >= 1
-        assert isinstance(node, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D))
+        assert isinstance(node, (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D))
         assert isinstance(node.profile, profile_type)
         _, _ = benchmark_scene_step(
             document,
@@ -156,13 +156,13 @@ def test_lower_dimensional_render_ir_upload_timing(
     lower_dimensional_kinds = (
         "segment",
         "polyline",
-        "bezier_curve",
-        "bezier_polycurve",
+        "quadratic_bezier_curve",
+        "quadratic_bezier_polycurve",
         "rounded_rectangle",
         "ellipse",
         "regular_polygon",
         "polygon",
-        "bezier_surface",
+        "quadratic_bezier_surface",
     )
     for kind in lower_dimensional_kinds:
         document = SceneDocument()
@@ -196,10 +196,10 @@ def test_drag_creation_timing_for_supported_tools() -> None:
     drag_kinds = (
         "segment",
         "polyline",
-        "bezier_curve",
-        "bezier_polycurve",
+        "quadratic_bezier_curve",
+        "quadratic_bezier_polycurve",
         "polyline_tube",
-        "bezier_tube",
+        "quadratic_bezier_tube",
         "circle",
         "rectangle",
         "square",
@@ -336,8 +336,8 @@ def test_curve_polygon_and_point_shape_workflow_timing() -> None:
     )
     _, _ = benchmark_scene_step(
         document,
-        "add_bezier_curve_custom_points",
-        lambda scene: scene.add_bezier_curve(
+        "add_quadratic_bezier_curve_custom_points",
+        lambda scene: scene.add_quadratic_bezier_curve(
             ((-0.4, 0.0), (0.0, 0.6), (0.5, -0.1))
         ),
         None,
@@ -345,12 +345,12 @@ def test_curve_polygon_and_point_shape_workflow_timing() -> None:
 
     for kind in (
         "polyline",
-        "bezier_curve",
-        "bezier_polycurve",
+        "quadratic_bezier_curve",
+        "quadratic_bezier_polycurve",
         "polygon",
-        "bezier_surface",
+        "quadratic_bezier_surface",
         "polyline_tube",
-        "bezier_tube",
+        "quadratic_bezier_tube",
     ):
         handle, timing = benchmark_scene_step(
             document,
@@ -640,13 +640,13 @@ def _world_points_for_shape(
             (0.0, 0.0, 0.4),
             (0.55, 0.0, -0.1),
         )
-    if kind in {"bezier_curve", "bezier_tube"}:
+    if kind in {"quadratic_bezier_curve", "quadratic_bezier_tube"}:
         return (
             (-0.5, 0.0, -0.2),
             (0.0, 0.0, 0.55),
             (0.55, 0.0, -0.1),
         )
-    if kind in {"bezier_polycurve", "bezier_surface"}:
+    if kind in {"quadratic_bezier_polycurve", "quadratic_bezier_surface"}:
         return (
             (-0.5, 0.0, -0.2),
             (-0.2, 0.0, 0.55),

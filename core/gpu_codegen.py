@@ -31,7 +31,11 @@ layout as ``core.gpu_scene.serialize_scene``):
 
 import os
 
-from core.gpu_node_types import emit_glsl_defines
+from core.gpu_node_types import (
+    OPERATOR_KINDS,
+    PROFILE_KINDS,
+    emit_glsl_defines,
+)
 from core.render_ir import RenderIR
 
 # ADAPTIVE group capacity. The shader holds a `float g[N]` accumulator array whose
@@ -45,8 +49,9 @@ from core.render_ir import RenderIR
 # BUCKETED so edits that nudge the group count (20 -> 21) stay in one variant (no
 # re-bake); a bucket change re-bakes (~30ms) and the capacity is part of the bake
 # key. See progress/codegen_full_migration.md.
-_CG_GROUP_BUCKETS = (8, 16, 32, 64, 128, 256)
+_CG_GROUP_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 CG_GROUP_CEILING = _CG_GROUP_BUCKETS[-1]   # > this many groups -> scene bails
+_SPATIAL_CULL_MIN_TERMS = 16
 
 
 def group_capacity(render_ir: RenderIR | None) -> int | None:
@@ -96,34 +101,33 @@ _LEAF_GLSL: dict[str, str] = {
     "placed_circle_2d": """vec3 l3 = p - irP3(base,0u);
         vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
         float plane = dot(l3, irP3(base,9u));
-        float prof = length(q - vec2(irP(base,12u), irP(base,13u))) - irP(base,14u);
+        float prof = length(q - irP2(base,12u)) - irP(base,14u);
         return max(prof, abs(plane) - 0.002);""",
     "placed_rectangle_2d": """vec3 l3 = p - irP3(base,0u);
         vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
         float plane = dot(l3, irP3(base,9u));
-        vec2 d = abs(q - vec2(irP(base,12u), irP(base,13u))) - vec2(irP(base,14u), irP(base,15u));
+        vec2 d = abs(q - irP2(base,12u)) - irP2(base,14u);
         float prof = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0);
         return max(prof, abs(plane) - 0.002);""",
     "placed_square_2d": """vec3 l3 = p - irP3(base,0u);
         vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
         float plane = dot(l3, irP3(base,9u));
-        vec2 d = abs(q - vec2(irP(base,12u), irP(base,13u))) - vec2(irP(base,14u));
+        vec2 d = abs(q - irP2(base,12u)) - vec2(irP(base,14u));
         float prof = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0);
         return max(prof, abs(plane) - 0.002);""",
     "placed_rounded_rectangle_2d": """vec3 l3 = p - irP3(base,0u);
         vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
         float plane = dot(l3, irP3(base,9u));
-        float cr = irP(base,16u); vec2 inner = vec2(irP(base,14u), irP(base,15u)) - vec2(cr);
-        vec2 d = abs(q - vec2(irP(base,12u), irP(base,13u))) - inner;
+        float cr = irP(base,16u); vec2 inner = irP2(base,14u) - vec2(cr);
+        vec2 d = abs(q - irP2(base,12u)) - inner;
         float prof = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - cr;
         return max(prof, abs(plane) - 0.002);""",
     "placed_ellipse_2d": """vec3 l3 = p - irP3(base,0u);
         vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
         float plane = dot(l3, irP3(base,9u));
-        float prof = irExactEllipseDistance(q - vec2(irP(base,12u), irP(base,13u)),
-                                            vec2(irP(base,14u), irP(base,15u)));
+        float prof = irExactEllipseDistance(q - irP2(base,12u), irP2(base,14u));
         return max(prof, abs(plane) - 0.002);""",
-    # Tubes (sweeps): radius around a polyline / bezier centerline. Points live
+    # Tubes (sweeps): radius around a polyline / quadratic Bezier centerline. Points live
     # inline in params; pc = (param_count-3)/3, then radius/inner/flat_caps.
     "polyline_tube": """uint pc = (node.param_count - 3u) / 3u;
         float radius = irP(base, node.param_count - 3u);
@@ -137,7 +141,7 @@ _LEAF_GLSL: dict[str, str] = {
         for (uint i = 0u; i + 1u < pc; i++)
             outer = min(outer, irFlatCappedSegmentTubeSDF3D(p, irP3(base, i*3u), irP3(base, (i+1u)*3u), radius));
         return irFlatTubeSDF(outer, cl, inner);""",
-    "bezier_tube": """uint pc = (node.param_count - 3u) / 3u;
+    "quadratic_bezier_tube": """uint pc = (node.param_count - 3u) / 3u;
         float radius = irP(base, node.param_count - 3u);
         float inner = irP(base, node.param_count - 2u);
         bool flat_caps = irP(base, node.param_count - 1u) > 0.5;
@@ -151,24 +155,82 @@ _LEAF_GLSL: dict[str, str] = {
         vec3 et = irSafeDirection(ep - lc, ep - ls);
         float outer = max(max(cl - radius, dot(sp0 - p, st)), dot(p - ep, et));
         return irFlatTubeSDF(outer, cl, inner);""",
-    # Placed 2D open curves (polyline / bezier) — points inline in params @12+.
-    "placed_polyline_2d": """vec3 l3 = p - irP3(base,0u);
+    # Placed 2D open curves (polyline / quadratic Bezier) — points inline in params @12+.
+    "placed_polyline_1d": """vec3 l3 = p - irP3(base,0u);
         vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
         float plane = dot(l3, irP3(base,9u));
         uint pc = (node.param_count - 12u) / 2u; float d = IR_FAR;
         for (uint i = 0u; i + 1u < pc; i++)
-            d = min(d, irSegmentDistance2D(q, vec2(irP(base,12u+i*2u), irP(base,12u+i*2u+1u)),
-                                              vec2(irP(base,12u+(i+1u)*2u), irP(base,12u+(i+1u)*2u+1u))));
+            d = min(d, irSegmentDistance2D(q, irP2(base,12u+i*2u),
+                                              irP2(base,12u+(i+1u)*2u)));
         return max(d - 0.004, abs(plane) - 0.002);""",
-    "placed_bezier_curve_2d": """vec3 l3 = p - irP3(base,0u);
+    "placed_quadratic_bezier_polycurve_1d": """vec3 l3 = p - irP3(base,0u);
         vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
         float plane = dot(l3, irP3(base,9u));
         uint pc = (node.param_count - 12u) / 2u; float d = IR_FAR;
         for (uint i = 0u; i + 2u < pc; i += 2u)
-            d = min(d, irQuadraticBezierDistance(q, vec2(irP(base,12u+i*2u), irP(base,12u+i*2u+1u)),
-                                                    vec2(irP(base,12u+(i+1u)*2u), irP(base,12u+(i+1u)*2u+1u)),
-                                                    vec2(irP(base,12u+(i+2u)*2u), irP(base,12u+(i+2u)*2u+1u))));
+            d = min(d, irQuadraticBezierDistance(q, irP2(base,12u+i*2u),
+                                                    irP2(base,12u+(i+1u)*2u),
+                                                    irP2(base,12u+(i+2u)*2u)));
         return max(d - 0.004, abs(plane) - 0.002);""",
+    "placed_quadratic_bezier_curve_1d": """vec3 l3 = p - irP3(base,0u);
+        vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
+        float plane = dot(l3, irP3(base,9u));
+        float d = irQuadraticBezierDistance(q,
+            irP2(base,12u), irP2(base,14u), irP2(base,16u));
+        return max(d - 0.004, abs(plane) - 0.002);""",
+    "placed_polygon_2d": """vec3 l3 = p - irP3(base,0u);
+        vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
+        float plane = dot(l3, irP3(base,9u));
+        uint pc = (node.param_count - 12u) / 2u;
+        if (pc < 3u) return IR_FAR;
+        float d = IR_FAR; bool inside = false;
+        for (uint i = 0u; i < pc; i++) {
+            uint j = (i + 1u) % pc;
+            vec2 a = irP2(base,12u+i*2u);
+            vec2 bb = irP2(base,12u+j*2u);
+            d = min(d, irSegmentDistance2D(q, a, bb));
+            inside = inside != irSegmentRayCrosses(q, a, bb);
+        }
+        float prof = inside ? -d : d;
+        return max(prof, abs(plane) - 0.002);""",
+    "placed_quadratic_bezier_surface_2d": """vec3 l3 = p - irP3(base,0u);
+        vec2 q = vec2(dot(l3, irP3(base,3u)), dot(l3, irP3(base,6u)));
+        float plane = dot(l3, irP3(base,9u));
+        uint pc = (node.param_count - 12u) / 2u;
+        if (pc < 3u) return IR_FAR;
+        if (pc == 3u) {
+            vec2 a = irP2(base,12u);
+            vec2 bb = irP2(base,14u);
+            vec2 c = irP2(base,16u);
+            float d = min(irQuadraticBezierDistance(q, a, bb, c),
+                          irSegmentDistance2D(q, c, a));
+            float crossings = irQuadraticBezierRayCrossValue(q, a, bb, c)
+                            + irSegmentRayCrossValue(q, c, a);
+            float prof = (1.0 - 2.0 * mod(crossings, 2.0)) * d;
+            return max(prof, abs(plane) - 0.002);
+        }
+        vec2 first = irP2(base,12u);
+        vec2 last = irP2(base,12u+(pc-1u)*2u);
+        bool closed = distance(first, last) <= 1.0e-6;
+        float d = IR_FAR;
+        for (uint i = 0u; i + 2u < pc; i += 2u) {
+            vec2 a = irP2(base,12u+i*2u);
+            vec2 bb = irP2(base,12u+(i+1u)*2u);
+            vec2 c = irP2(base,12u+(i+2u)*2u);
+            d = min(d, irQuadraticBezierDistance(q, a, bb, c));
+        }
+        if (!closed) d = min(d, irSegmentDistance2D(q, last, first));
+        float crossings = 0.0;
+        for (uint i = 0u; i + 2u < pc; i += 2u) {
+            vec2 a = irP2(base,12u+i*2u);
+            vec2 bb = irP2(base,12u+(i+1u)*2u);
+            vec2 c = irP2(base,12u+(i+2u)*2u);
+            crossings += irQuadraticBezierRayCrossValue(q, a, bb, c);
+        }
+        if (!closed) crossings += irSegmentRayCrossValue(q, last, first);
+        float prof = (1.0 - 2.0 * mod(crossings, 2.0)) * d;
+        return max(prof, abs(plane) - 0.002);""",
     # Profile sub-graph leaves — call the embedded 2D/1D profile stack-VM
     # (evalProfileSDF / evalProfile1DSDF) over the node's children sub-graph.
     "placed_profile_2d": """vec3 l3 = p - irP3(base,0u);
@@ -209,7 +271,9 @@ _PROFILE_KINDS = frozenset((
 ))
 # Helpers the embedded profile-VM block already defines — don't double-emit them.
 _PROFILE_VM_PROVIDES = frozenset((
-    "irExactEllipseDistance", "irSegmentDistance2D", "irQuadraticBezierDistance",
+    "irExactEllipseDistance", "irSegmentDistance2D", "irSegmentRayCrosses",
+    "irSegmentRayCrossValue", "irQuadraticBezierDistance",
+    "irQuadraticBezierRayCrosses", "irQuadraticBezierRayCrossValue",
 ))
 # 2D/1D profile COMBINATOR kinds (boolean/offset of profiles). These are the only
 # profile nodes that need the stack machine; a single analytic leaf does not.
@@ -279,15 +343,26 @@ _HELPERS = {
     "irCappedConeSDF": ("capped_cone",),
     "irBoxFrameSDF": ("box_frame",),
     "irExactEllipseDistance": ("placed_ellipse_2d",),
-    # Tube helpers (order matters: bezier-distance uses segment-distance).
-    "irSegmentDistance3D": ("polyline_tube", "bezier_tube"),
-    "irQuadraticBezierDistance3D": ("bezier_tube",),
+    # Tube helpers (order matters: quadratic-Bezier-distance uses segment-distance).
+    "irSegmentDistance3D": ("polyline_tube", "quadratic_bezier_tube"),
+    "irQuadraticBezierDistance3D": ("quadratic_bezier_tube",),
     "irFlatCappedSegmentTubeSDF3D": ("polyline_tube",),
-    "irSafeDirection": ("bezier_tube",),
-    "irTubeSDF": ("polyline_tube", "bezier_tube"),
-    "irFlatTubeSDF": ("polyline_tube", "bezier_tube"),
-    "irSegmentDistance2D": ("placed_polyline_2d",),
-    "irQuadraticBezierDistance": ("placed_bezier_curve_2d",),
+    "irSafeDirection": ("quadratic_bezier_tube",),
+    "irTubeSDF": ("polyline_tube", "quadratic_bezier_tube"),
+    "irFlatTubeSDF": ("polyline_tube", "quadratic_bezier_tube"),
+    "irSegmentDistance2D": (
+        "placed_polyline_1d", "placed_polygon_2d", "placed_quadratic_bezier_surface_2d",
+    ),
+    "irQuadraticBezierDistance": (
+        "placed_quadratic_bezier_curve_1d", "placed_quadratic_bezier_polycurve_1d",
+        "placed_quadratic_bezier_surface_2d",
+    ),
+    "irSegmentRayCrosses": (
+        "placed_polygon_2d", "placed_quadratic_bezier_surface_2d",
+    ),
+    "irSegmentRayCrossValue": ("placed_quadratic_bezier_surface_2d",),
+    "irQuadraticBezierRayCrosses": ("placed_quadratic_bezier_surface_2d",),
+    "irQuadraticBezierRayCrossValue": ("placed_quadratic_bezier_surface_2d",),
 }
 
 _HELPER_GLSL = {
@@ -428,7 +503,73 @@ _HELPER_GLSL = {
     }
     return sqrt(max(res, 0.0));
 }""",
+    "irSegmentRayCrosses": """bool irSegmentRayCrosses(vec2 pos, vec2 A, vec2 B) {
+    float den = B.y - A.y;
+    den = abs(den) < 1.0e-8 ? (den < 0.0 ? -1.0e-8 : 1.0e-8) : den;
+    return ((A.y > pos.y) != (B.y > pos.y)) &&
+           (pos.x < (B.x - A.x) * (pos.y - A.y) / den + A.x);
+}""",
+    "irSegmentRayCrossValue": """float irSegmentRayCrossValue(vec2 pos, vec2 A, vec2 B) {
+    return irSegmentRayCrosses(pos, A, B) ? 1.0 : 0.0;
+}""",
+    "irQuadraticBezierRayCrosses": """bool irQuadraticBezierRayCrosses(vec2 pos, vec2 A, vec2 B, vec2 C) {
+    float qa = A.y - 2.0*B.y + C.y;
+    float qb = 2.0*(B.y - A.y);
+    float qc = A.y - pos.y;
+    bool crosses = false;
+    if (abs(qa) <= 1.0e-8) {
+        if (abs(qb) <= 1.0e-8) return false;
+        float t = -qc / qb;
+        if (t >= 0.0 && t < 1.0) {
+            vec2 q = mix(mix(A, B, t), mix(B, C, t), t);
+            crosses = q.x > pos.x;
+        }
+        return crosses;
+    }
+    float h = qb*qb - 4.0*qa*qc;
+    if (h <= 1.0e-8) return false;
+    float root = sqrt(h);
+    float t0 = (-qb - root) / (2.0*qa);
+    float t1 = (-qb + root) / (2.0*qa);
+    if (t0 >= 0.0 && t0 < 1.0) {
+        vec2 q0 = mix(mix(A, B, t0), mix(B, C, t0), t0);
+        crosses = crosses != (q0.x > pos.x);
+    }
+    if (t1 >= 0.0 && t1 < 1.0) {
+        vec2 q1 = mix(mix(A, B, t1), mix(B, C, t1), t1);
+        crosses = crosses != (q1.x > pos.x);
+    }
+    return crosses;
+}""",
+    "irQuadraticBezierRayCrossValue": """float irQuadraticBezierRayCrossValue(vec2 pos, vec2 A, vec2 B, vec2 C) {
+    return irQuadraticBezierRayCrosses(pos, A, B, C) ? 1.0 : 0.0;
+}""",
 }
+
+_QUADRATIC_BEZIER_DISTANCE_WITH_SEGMENT_FALLBACK = """float irQuadraticBezierDistance(vec2 pos, vec2 A, vec2 B, vec2 C) {
+    vec2 a = B - A; vec2 b = A - 2.0*B + C; vec2 c = a*2.0; vec2 d = A - pos;
+    float bb = dot(b, b);
+    if (bb <= 1.0e-12) return irSegmentDistance2D(pos, A, C);
+    float kk = 1.0/bb; float kx = kk*dot(a, b);
+    float ky = (kk*(2.0*dot(a, a) + dot(d, b)))/3.0; float kz = kk*dot(d, a);
+    float pp = ky - kx*kx; float qq = kx*(2.0*kx*kx - 3.0*ky) + kz;
+    float hh = qq*qq + 4.0*pp*pp*pp; float res = 0.0;
+    if (hh >= 0.0) {
+        hh = sqrt(hh); vec2 x = (vec2(hh, -hh) - qq)*0.5;
+        vec2 uv = sign(x)*pow(abs(x), vec2(1.0/3.0));
+        float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+        vec2 w = d + (c + b*t)*t; res = dot(w, w);
+    } else {
+        float z = sqrt(max(-pp, 0.0)); float den = 2.0*pp*z;
+        float ang = den == 0.0 ? 0.0 : qq/den;
+        float v = acos(clamp(ang, -1.0, 1.0))/3.0;
+        float m = cos(v); float n = sin(v)*1.732050808;
+        vec3 t = clamp(vec3(m + m, -n - m, n - m)*z - kx, 0.0, 1.0);
+        vec2 qx = d + (c + b*t.x)*t.x; vec2 qy = d + (c + b*t.y)*t.y;
+        res = min(dot(qx, qx), dot(qy, qy));
+    }
+    return sqrt(max(res, 0.0));
+}"""
 
 
 # Region selectors (Layer 2): tag region_id on a target object's surface where a
@@ -436,7 +577,6 @@ _HELPER_GLSL = {
 # distance, so they run as a post-process over the geometry. Embedded only when a
 # region_selector is present; a no-op stub otherwise. Uses a float-only 3D subtree
 # stack-VM (only .dist is needed) over leafDist.
-_SELECTOR_STUB = "uint regionAt(vec3 p, uint owner) { return 0u; }\n"
 _SELECTOR_GLSL = """bool irSelIsOp(uint t) {
     return t == NODE_UNION || t == NODE_INTERSECTION || t == NODE_DIFFERENCE;
 }
@@ -595,6 +735,31 @@ def _dnf_leaf_indices(groups) -> set[int]:
     return leaves
 
 
+def term_count(render_ir: RenderIR | None) -> int:
+    groups = flatten_terms(render_ir)
+    if groups is None:
+        return 0
+    return sum(len(group) for group in groups)
+
+
+def has_carves(render_ir: RenderIR | None) -> bool:
+    groups = flatten_terms(render_ir)
+    if groups is None:
+        return False
+    return any(bool(carves) for group in groups for _leaf, carves in group)
+
+
+def uses_spatial_cull(render_ir: RenderIR | None) -> bool:
+    """Whether this scene should emit the spatial-cull shader path.
+
+    The cull grid is valuable for larger scenes, but for tiny interactive scenes
+    it adds DDA/grid code that can cost more driver compile time than it saves at
+    runtime. This is backend-neutral shader specialization; the renderer may still
+    disable culling at runtime if bounds are unavailable.
+    """
+    return term_count(render_ir) >= _SPATIAL_CULL_MIN_TERMS
+
+
 def scene_structure_signature(render_ir: RenderIR | None) -> frozenset[str]:
     """The recompile key: the set of 3D-scene leaf KINDS. Instance data changes
     (and profile sub-graph contents) never re-bake; only a new leaf kind does."""
@@ -606,6 +771,23 @@ def scene_structure_signature(render_ir: RenderIR | None) -> frozenset[str]:
     return frozenset(
         render_ir.nodes[i].kind for i in _dnf_leaf_indices(groups)
         if render_ir.nodes[i].kind in _LEAF_GLSL)
+
+
+_DIRECT_LEAF_KINDS = frozenset(_LEAF_GLSL) - _PROFILE_KINDS
+
+
+def viewport_leaf_signature(render_ir: RenderIR | None) -> frozenset[str]:
+    """Stable QRhi viewport leaf family.
+
+    The core emitter can still generate tiny scene-specialized shaders, but the
+    interactive viewport wants one cross-backend shader for all direct SDF leaf
+    primitives so adding a curve/surface kind does not force a new native pipeline.
+    Profile VM leaves stay opt-in because they pull in a different evaluator.
+    """
+    kinds = scene_structure_signature(render_ir)
+    if not kinds:
+        return frozenset()
+    return _DIRECT_LEAF_KINDS | (kinds & _PROFILE_KINDS)
 
 
 def supported(render_ir: RenderIR | None) -> bool:
@@ -637,15 +819,45 @@ def _leaf_dist_fn(kinds: frozenset[str]) -> str:
 
 def _helpers_for(kinds: frozenset[str], skip: frozenset[str] = frozenset()) -> str:
     out = []
+    has_segment_distance_2d = any(k in kinds for k in _HELPERS["irSegmentDistance2D"])
     for name, users in _HELPERS.items():
         if name in skip:
             continue
         if any(k in kinds for k in users):
-            out.append(_HELPER_GLSL[name])
+            if name == "irQuadraticBezierDistance" and has_segment_distance_2d:
+                out.append(_QUADRATIC_BEZIER_DISTANCE_WITH_SEGMENT_FALLBACK)
+            else:
+                out.append(_HELPER_GLSL[name])
     return "\n".join(out)
 
 
-def emit_map_glsl(render_ir: RenderIR) -> str:
+def _uses_irp2(kinds: frozenset[str]) -> bool:
+    return any("irP2(" in _LEAF_GLSL[kind] for kind in kinds)
+
+
+def _codegen_define_kinds(
+    render_ir: RenderIR,
+    kinds: frozenset[str],
+    *,
+    use_profile_vm: bool,
+    use_selectors: bool,
+) -> frozenset[str]:
+    """Node constants the specialized shader source can actually reference."""
+    used = set(kinds)
+    if use_profile_vm:
+        used.update(PROFILE_KINDS)
+    if use_selectors:
+        used.update(OPERATOR_KINDS)
+        used.update(node.kind for node in render_ir.nodes)
+    return frozenset(used)
+
+
+def emit_map_glsl(
+    render_ir: RenderIR,
+    *,
+    spatial_cull: bool | None = None,
+    leaf_kinds: frozenset[str] | None = None,
+) -> str:
     """Emit the GLSL preamble + leafDist + the term-DNF ``map()`` for a scene.
 
     ``map(p, owner)`` returns the scene SDF and the owning object id of the
@@ -654,58 +866,70 @@ def emit_map_glsl(render_ir: RenderIR) -> str:
     accumulator by ``min``, then ``max``es the groups (intersection). See
     flatten_terms for the algebra.
     """
-    kinds = scene_structure_signature(render_ir)
+    kinds = scene_structure_signature(render_ir) if leaf_kinds is None else leaf_kinds
+    unknown = kinds - frozenset(_LEAF_GLSL)
+    if unknown:
+        raise ValueError(f"unknown codegen leaf kinds: {sorted(unknown)}")
     use_profile_vm = bool(kinds & _PROFILE_KINDS)
     simple_profiles = use_profile_vm and profiles_are_simple(render_ir)
     profile_block = _profile_vm_glsl(simple_profiles) if use_profile_vm else ""
     skip = _PROFILE_VM_PROVIDES if use_profile_vm else frozenset()
-    selector_block = _SELECTOR_GLSL if selector_indices(render_ir) else _SELECTOR_STUB
+    use_selectors = bool(selector_indices(render_ir))
+    use_children = use_profile_vm or use_selectors
+    use_carves = has_carves(render_ir)
+    children_buffer = (
+        "layout(std430, binding = 2) readonly buffer Children { uint  u_children[]; };\n"
+        if use_children else ""
+    )
+    selector_buffer = (
+        "layout(std430, binding = 3) readonly buffer Selectors { uint  u_sel[]; };\n"
+        if use_selectors else ""
+    )
+    carves_buffer = (
+        "layout(std430, binding = 5) readonly buffer Carves { uint  u_carves[]; };\n"
+        if use_carves else ""
+    )
+    selector_uniform = "uniform uint u_sel_count;\n" if use_selectors else ""
+    selector_block = _SELECTOR_GLSL if use_selectors else ""
+    if spatial_cull is None:
+        spatial_cull = uses_spatial_cull(render_ir)
     # Adaptive-capacity group accumulators (NOT unrolled per group): the term loop
     # scatters into g[gid] by dynamic index, then the combine loop maxes over the
     # runtime u_group_count. cap = the scene's bucketed group capacity, baked into
     # the array size (part of the bake-cache key); the shader is fixed-size for any
     # group count <= cap.
     cap = group_capacity(render_ir) or _CG_GROUP_BUCKETS[-1]
-    return f"""{emit_glsl_defines()}
-struct GpuNode {{ uint type; uint dim; uint base_owner_id; uint flags;
-                 uint param_offset; uint param_count; uint child_offset; uint child_count; }};
-layout(std430, binding = 0) readonly buffer Nodes  {{ GpuNode u_nodes[]; }};
-layout(std430, binding = 1) readonly buffer Params {{ float   u_params[]; }};
-layout(std430, binding = 2) readonly buffer Children  {{ uint  u_children[]; }};
-layout(std430, binding = 3) readonly buffer Selectors {{ uint  u_sel[]; }};
-layout(std430, binding = 4) readonly buffer Terms  {{ uvec4 u_terms[]; }};
-layout(std430, binding = 5) readonly buffer Carves {{ uint  u_carves[]; }};
-// Spatial cull grid (binned terms; DDA-marched). Items are term indices; built
-// host-side by core.gpu_cull.build_term_grid. Gated by u_cull_enabled.
-layout(std430, binding = 6) readonly buffer GridOff  {{ uint u_goff[]; }};
-layout(std430, binding = 7) readonly buffer GridCnt  {{ uint u_gcnt[]; }};
-layout(std430, binding = 8) readonly buffer GridItem {{ uint u_gitem[]; }};
-const float IR_FAR = 1.0e6;
-uniform uint u_term_count;
-uniform uint u_sel_count;
-uniform int  u_group_count;
-uniform vec3 u_grid_origin;
-uniform vec3 u_grid_cell;
-uniform int  u_grid_dim;
-uniform int  u_cull_enabled;
-float irP(uint base, uint i) {{ return u_params[base + i]; }}
-vec3 irP3(uint base, uint i) {{ return vec3(u_params[base+i], u_params[base+i+1u], u_params[base+i+2u]); }}
-{_helpers_for(kinds, skip)}
-{profile_block}
-{_leaf_dist_fn(kinds)}
-{selector_block}
-// One carved term: the positive leaf raised by -leafDist of each local carve.
-float termDist(uint ti, vec3 p, out uint owner) {{
-    uvec4 t = u_terms[ti]; uint leaf = t.x; uint co = t.z; uint cc = t.w;
-    float d = leafDist(leaf, p);
-    for (uint j = 0u; j < cc; j++) {{
-        float h = -leafDist(u_carves[co + j], p);
-        if (h > d) d = h;
-    }}
-    owner = u_nodes[leaf].base_owner_id;
-    return d;
-}}
-// term DNF: max over groups of (min over carved terms within the group). Brute
+    single_group = cap == 1
+    inline_simple_terms = single_group and not use_carves
+    group_uniform = "" if single_group else "uniform int  u_group_count;\n"
+    if single_group:
+        if inline_simple_terms:
+            map_glsl = """// Single-group DNF: simple union of uncarved terms.
+float map(vec3 p, out uint owner_out) {
+    float res = IR_FAR; uint owner = 0u;
+    for (uint i = 0u; i < u_term_count; i++) {
+        uint leaf = u_terms[i].x;
+        float d = leafDist(leaf, p);
+        if (d < res) { res = d; owner = u_nodes[leaf].base_owner_id; }
+    }
+    owner_out = owner;
+    return res;
+}
+"""
+        else:
+            map_glsl = """// Single-group DNF: simple union of carved terms.
+float map(vec3 p, out uint owner_out) {
+    float res = IR_FAR; uint owner = 0u;
+    for (uint i = 0u; i < u_term_count; i++) {
+        uint own; float d = termDist(i, p, own);
+        if (d < res) { res = d; owner = own; }
+    }
+    owner_out = owner;
+    return res;
+}
+"""
+    else:
+        map_glsl = f"""// term DNF: max over groups of (min over carved terms within the group). Brute
 // force over ALL terms (used for normals and the no-cull path).
 float map(vec3 p, out uint owner_out) {{
     float g[{cap}]; uint o[{cap}];
@@ -720,7 +944,75 @@ float map(vec3 p, out uint owner_out) {{
     owner_out = owner;
     return res;
 }}
-// Same DNF but over ONLY the terms binned into grid cell `ci` (the cull path).
+"""
+    if inline_simple_terms:
+        term_dist_glsl = ""
+    elif use_carves:
+        term_dist_glsl = """// One carved term: the positive leaf raised by -leafDist of each local carve.
+float termDist(uint ti, vec3 p, out uint owner) {
+    uvec4 t = u_terms[ti]; uint leaf = t.x; uint co = t.z; uint cc = t.w;
+    float d = leafDist(leaf, p);
+    for (uint j = 0u; j < cc; j++) {
+        float h = -leafDist(u_carves[co + j], p);
+        if (h > d) d = h;
+    }
+    owner = u_nodes[leaf].base_owner_id;
+    return d;
+}
+"""
+    else:
+        term_dist_glsl = """// One uncarved term.
+float termDist(uint ti, vec3 p, out uint owner) {
+    uint leaf = u_terms[ti].x;
+    float d = leafDist(leaf, p);
+    owner = u_nodes[leaf].base_owner_id;
+    return d;
+}
+"""
+    grid_buffers = ""
+    grid_uniforms = ""
+    grid_helpers = ""
+    if spatial_cull:
+        grid_buffers = """// Spatial cull grid (binned terms; DDA-marched). Items are term indices; built
+// host-side by core.gpu_cull.build_term_grid. Gated by u_cull_enabled.
+layout(std430, binding = 6) readonly buffer GridOff  { uint u_goff[]; };
+layout(std430, binding = 7) readonly buffer GridCnt  { uint u_gcnt[]; };
+layout(std430, binding = 8) readonly buffer GridItem { uint u_gitem[]; };
+"""
+        grid_uniforms = """uniform vec3 u_grid_origin;
+uniform vec3 u_grid_cell;
+uniform int  u_grid_dim;
+"""
+        if single_group:
+            if inline_simple_terms:
+                cell_dist = """// Single-group DNF over ONLY the uncarved terms binned into grid cell `ci`.
+float cellDist(int ci, vec3 p, out uint owner_out) {
+    uint off = u_goff[ci]; uint cnt = u_gcnt[ci];
+    float res = IR_FAR; uint owner = 0u;
+    for (uint i = 0u; i < cnt; i++) {
+        uint leaf = u_terms[u_gitem[off + i]].x;
+        float d = leafDist(leaf, p);
+        if (d < res) { res = d; owner = u_nodes[leaf].base_owner_id; }
+    }
+    owner_out = owner;
+    return res;
+}
+"""
+            else:
+                cell_dist = """// Single-group DNF over ONLY the terms binned into grid cell `ci`.
+float cellDist(int ci, vec3 p, out uint owner_out) {
+    uint off = u_goff[ci]; uint cnt = u_gcnt[ci];
+    float res = IR_FAR; uint owner = 0u;
+    for (uint i = 0u; i < cnt; i++) {
+        uint own; float d = termDist(u_gitem[off + i], p, own);
+        if (d < res) { res = d; owner = own; }
+    }
+    owner_out = owner;
+    return res;
+}
+"""
+        else:
+            cell_dist = f"""// Same DNF but over ONLY the terms binned into grid cell `ci` (the cull path).
 float cellDist(int ci, vec3 p, out uint owner_out) {{
     float g[{cap}]; uint o[{cap}];
     for (uint k = 0u; k < {cap}u; k++) {{ g[k] = IR_FAR; o[k] = 0u; }}
@@ -736,6 +1028,8 @@ float cellDist(int ci, vec3 p, out uint owner_out) {{
     owner_out = owner;
     return res;
 }}
+"""
+        grid_helpers = f"""{cell_dist}\
 bool cgRayGrid(vec3 ro, vec3 rd, out float t0, out float t1) {{
     vec3 lo = u_grid_origin; vec3 hi = u_grid_origin + u_grid_cell * float(u_grid_dim);
     vec3 inv = 1.0 / rd; vec3 a = (lo - ro) * inv; vec3 b = (hi - ro) * inv;
@@ -753,12 +1047,52 @@ float cgCellExit(vec3 p, vec3 rd, ivec3 c) {{
     return min(min(tb.x, tb.y), tb.z);
 }}
 """
+    define_kinds = _codegen_define_kinds(
+        render_ir,
+        kinds,
+        use_profile_vm=use_profile_vm,
+        use_selectors=use_selectors,
+    )
+    irp2_accessor = (
+        "vec2 irP2(uint base, uint i) { return vec2(u_params[base+i], u_params[base+i+1u]); }\n"
+        if _uses_irp2(kinds) else ""
+    )
+    return f"""{emit_glsl_defines(
+        define_kinds,
+        include_stack_defs=use_profile_vm or use_selectors,
+        include_opcode_defs=False,
+    )}
+struct GpuNode {{ uint type; uint dim; uint base_owner_id; uint flags;
+                 uint param_offset; uint param_count; uint child_offset; uint child_count; }};
+layout(std430, binding = 0) readonly buffer Nodes  {{ GpuNode u_nodes[]; }};
+layout(std430, binding = 1) readonly buffer Params {{ float   u_params[]; }};
+{children_buffer}\
+{selector_buffer}\
+layout(std430, binding = 4) readonly buffer Terms  {{ uvec4 u_terms[]; }};
+{carves_buffer}\
+{grid_buffers}\
+const float IR_FAR = 1.0e6;
+uniform uint u_term_count;
+{selector_uniform}\
+{group_uniform}\
+{grid_uniforms}\
+float irP(uint base, uint i) {{ return u_params[base + i]; }}
+{irp2_accessor}\
+vec3 irP3(uint base, uint i) {{ return vec3(u_params[base+i], u_params[base+i+1u], u_params[base+i+2u]); }}
+{_helpers_for(kinds, skip)}
+{profile_block}
+{_leaf_dist_fn(kinds)}
+{selector_block}
+{term_dist_glsl}\
+{map_glsl}\
+{grid_helpers}\
+"""
 
 
 # Raymarch main: camera ray -> cull-grid DDA (or brute-force map()) -> Lambert +
 # owner palette, grid plane behind. Camera/grid uniforms are loose (the host
 # collects them into one std140 block).
-_RAYMARCH_MAIN = """
+_RAYMARCH_MAIN_PREFIX = """
 layout(location = 0) out vec4 frag_color;
 uniform vec2 u_resolution;
 uniform vec3 u_camera_position;
@@ -766,10 +1100,13 @@ uniform vec3 u_camera_target;
 uniform vec3 u_camera_right;
 uniform vec3 u_camera_up;
 uniform float u_focal_length;
+uniform float u_max_ray_distance;
 uniform vec3 u_background_color;
 uniform int u_show_grid;
 uniform float u_grid_spacing;
 uniform int u_fb_y_up;
+"""
+_RAYMARCH_MAIN_BODY = """
 vec3 palette(uint id) {
     uint s = (max(id, 1u) - 1u) % 6u;
     if (s == 0u) return vec3(0.95, 0.28, 0.16);
@@ -804,7 +1141,25 @@ void main() {
                       + 2.0*uv.y*normalize(u_camera_up) + u_focal_length*fwd);
     vec3 ro = u_camera_position;
     float t = 0.0; bool hit = false; uint owner = 0u; vec3 hp = ro;
-    if (u_cull_enabled == 1) {
+{march_loop}
+    vec3 col = gridBg(ro, rd, u_background_color);
+    if (hit) {
+        vec3 n = mapNormal(hp);
+        float diff = max(dot(n, normalize(vec3(0.7, 1.0, 0.45))), 0.0);
+        col = palette(owner) * (0.25 + 0.75*diff);
+{selector_shading}
+    }
+    frag_color = vec4(col, 1.0);
+}
+"""
+
+_BRUTE_FORCE_MARCH_LOOP = """    for (int i = 0; i < 160; i++) {
+        hp = ro + rd*t; float d = map(hp, owner);
+        if (d < 0.0008) { hit = true; break; }
+        t += max(d, 0.0002); if (t > u_max_ray_distance) break;
+    }"""
+
+_CULL_MARCH_LOOP = """    if (u_cull_enabled == 1) {
         // DDA the cull grid: evaluate only the current cell's terms, never step
         // past the cell boundary (the next cell may hold nearer geometry); empty
         // cells jump straight to their exit face.
@@ -826,31 +1181,61 @@ void main() {
         for (int i = 0; i < 160; i++) {
             hp = ro + rd*t; float d = map(hp, owner);
             if (d < 0.0008) { hit = true; break; }
-            t += max(d, 0.0002); if (t > 100.0) break;
+            t += max(d, 0.0002); if (t > u_max_ray_distance) break;
         }
-    }
-    vec3 col = gridBg(ro, rd, u_background_color);
-    if (hit) {
-        vec3 n = mapNormal(hp);
-        float diff = max(dot(n, normalize(vec3(0.7, 1.0, 0.45))), 0.0);
-        col = palette(owner) * (0.25 + 0.75*diff);
-        uint region = regionAt(hp, owner);   // Layer 2 region tag (no-op if none)
-        if (region != 0u) col = mix(col, vec3(1.0, 0.30, 0.28), 0.45);
-    }
-    frag_color = vec4(col, 1.0);
-}
-"""
+    }"""
 
 
-def emit_fragment_shader(render_ir: RenderIR, *, version: str = "#version 460") -> str:
+_SELECTOR_SHADING = """        uint region = regionAt(hp, owner);
+        if (region != 0u) col = mix(col, vec3(1.0, 0.30, 0.28), 0.45);"""
+
+
+def _raymarch_main(spatial_cull: bool, use_selectors: bool) -> str:
+    uniforms = "uniform int u_cull_enabled;\n" if spatial_cull else ""
+    loop = _CULL_MARCH_LOOP if spatial_cull else _BRUTE_FORCE_MARCH_LOOP
+    selector_shading = _SELECTOR_SHADING if use_selectors else ""
+    return (_RAYMARCH_MAIN_PREFIX + uniforms
+            + _RAYMARCH_MAIN_BODY
+            .replace("{march_loop}", loop)
+            .replace("{selector_shading}", selector_shading))
+
+
+def _strip_line_comments(src: str) -> str:
+    lines = []
+    for line in src.splitlines():
+        code = line.split("//", 1)[0].strip()
+        if code:
+            if not code.startswith("#"):
+                code = " ".join(code.split())
+            lines.append(code)
+    return "\n".join(lines) + "\n"
+
+
+def emit_fragment_shader(
+    render_ir: RenderIR,
+    *,
+    version: str = "#version 460",
+    spatial_cull: bool | None = None,
+    leaf_kinds: frozenset[str] | None = None,
+    strip_comments: bool = True,
+) -> str:
     """Complete codegen fragment shader (preamble + leafDist + map + raymarch
     main) for a supported scene. Loose uniforms still need ``vulkanize`` before
     ``qsb`` (host convention)."""
-    return f"{version}\n{emit_map_glsl(render_ir)}{_RAYMARCH_MAIN}"
+    if spatial_cull is None:
+        spatial_cull = uses_spatial_cull(render_ir)
+    use_selectors = bool(selector_indices(render_ir))
+    src = (
+        f"{version}\n"
+        f"{emit_map_glsl(render_ir, spatial_cull=spatial_cull, leaf_kinds=leaf_kinds)}"
+        f"{_raymarch_main(spatial_cull, use_selectors)}"
+    )
+    return _strip_line_comments(src) if strip_comments else src
 
 
 __all__ = [
     "emit_map_glsl", "emit_fragment_shader", "scene_structure_signature",
+    "viewport_leaf_signature",
     "supported", "flatten_terms", "group_capacity", "profiles_are_simple",
-    "selector_indices",
+    "selector_indices", "term_count", "has_carves", "uses_spatial_cull",
 ]

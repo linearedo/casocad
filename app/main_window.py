@@ -150,10 +150,16 @@ class MainWindow(QMainWindow):
         scene_dock = self._dock("Scene", self.scene_tree)
         properties_dock = self._dock("Properties", self.properties)
         log_dock = self._dock("Log", self.log_panel)
+        self._scene_dock = scene_dock
+        self._properties_dock = properties_dock
+        self._log_dock = log_dock
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, properties_dock)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, scene_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, properties_dock)
+        self.tabifyDockWidget(scene_dock, properties_dock)
+        scene_dock.raise_()
+        self.resizeDocks([scene_dock], [320], Qt.Orientation.Horizontal)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, log_dock)
-        properties_dock.raise_()
+        log_dock.hide()
 
     def _dock(self, title: str, widget: object) -> QDockWidget:
         dock = QDockWidget(title, self)
@@ -293,6 +299,10 @@ class MainWindow(QMainWindow):
         )
         self._redo_action.triggered.connect(self._redo_document_edit)
         self._update_history_actions()
+
+        view_menu = self.menuBar().addMenu("&View")
+        for dock in (self._scene_dock, self._properties_dock, self._log_dock):
+            view_menu.addAction(dock.toggleViewAction())
 
         domains_menu = self.menuBar().addMenu("&Domains")
         validate_action = domains_menu.addAction("Validate Domains (disjointness)")
@@ -777,8 +787,8 @@ class MainWindow(QMainWindow):
         active = self._active_planar_cutter_kind(kind)
         if active == "polyline":
             return "polygon"
-        if active == "bezier_polycurve":
-            return "bezier_surface"
+        if active == "quadratic_bezier_polycurve":
+            return "quadratic_bezier_surface"
         return kind
 
     def _mark_internal_boundary_selector(
@@ -1467,7 +1477,7 @@ class MainWindow(QMainWindow):
         except (KeyError, ValueError):
             self.viewport.clear_boolean_preview()
             return
-        self.viewport.show_scene_preview(artifact.render_ir)
+        self.viewport.show_scene_preview(artifact.render_ir, preview_kind="boolean")
 
     @Slot(str, object)
     def _on_sdf_op_requested(self, operation: str, handles: list[int]) -> None:

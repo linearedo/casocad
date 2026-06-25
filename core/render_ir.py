@@ -8,9 +8,9 @@ from math import cos, radians, sin
 import numpy as np
 
 from .sdf import (
-    BezierTube,
-    BezierCurveProfile,
-    BezierSurfaceProfile,
+    QuadraticBezierTube,
+    QuadraticBezierCurveProfile,
+    QuadraticBezierSurfaceProfile,
     CircleProfile,
     Box,
     BoxFrame,
@@ -26,7 +26,7 @@ from .sdf import (
     OffsetProfile1D,
     PolygonProfile,
     PolylineTube,
-    PlacedPolyline2D,
+    PlacedPolyline1D,
     PlacedSDF1D,
     PlacedSDF2D,
     PolylineProfile,
@@ -208,7 +208,7 @@ class _AffineTransform:
 
 def _node_topology_signature(node: RenderIRNode) -> tuple[object, ...]:
     semantic_flags: tuple[object, ...] = ()
-    if node.kind in {"polyline_tube", "bezier_tube"} and node.params:
+    if node.kind in {"polyline_tube", "quadratic_bezier_tube"} and node.params:
         semantic_flags = ("flat_caps" if node.params[-1] > 0.5 else "round_caps",)
     return (
         node.kind,
@@ -420,9 +420,9 @@ def _build_profile_ir_node(
                 )
             ),
         )
-    elif isinstance(profile, BezierCurveProfile):
+    elif isinstance(profile, QuadraticBezierCurveProfile):
         payload = RenderIRNode(
-            kind="profile_bezier_curve_2d",
+            kind="profile_quadratic_bezier_curve_1d",
             object_id=0,
             dimension=2,
             children=(),
@@ -435,9 +435,9 @@ def _build_profile_ir_node(
                 )
             ),
         )
-    elif isinstance(profile, BezierSurfaceProfile):
+    elif isinstance(profile, QuadraticBezierSurfaceProfile):
         payload = RenderIRNode(
-            kind="profile_bezier_surface_2d",
+            kind="profile_quadratic_bezier_surface_2d",
             object_id=0,
             dimension=2,
             children=(),
@@ -752,14 +752,17 @@ def _build_render_ir_node(
                 *transform.apply_direction(node.axis_u),
             ),
         )
-    elif isinstance(node, PlacedPolyline2D):
+    elif isinstance(node, PlacedPolyline1D):
         assert node.profile is not None
+        kind = "placed_polyline_1d"
+        if isinstance(node.profile, QuadraticBezierCurveProfile):
+            kind = (
+                "placed_quadratic_bezier_curve_1d"
+                if len(node.profile.points) == 3
+                else "placed_quadratic_bezier_polycurve_1d"
+            )
         payload = RenderIRNode(
-            kind=(
-                "placed_bezier_curve_2d"
-                if isinstance(node.profile, BezierCurveProfile)
-                else "placed_polyline_2d"
-            ),
+            kind=kind,
             object_id=node.object_id,
             dimension=1,
             children=(),
@@ -903,9 +906,9 @@ def _build_render_ir_node(
                 1.0 if node.caps == "flat" else 0.0,
             ),
         )
-    elif isinstance(node, BezierTube):
+    elif isinstance(node, QuadraticBezierTube):
         payload = RenderIRNode(
-            kind="bezier_tube",
+            kind="quadratic_bezier_tube",
             object_id=node.object_id,
             dimension=3,
             children=(),
@@ -923,7 +926,7 @@ def _build_render_ir_node(
         (
             PlacedSDF2D,
             PolygonProfile,
-            BezierCurveProfile,
+            QuadraticBezierCurveProfile,
             PolylineProfile,
         ),
     ):
@@ -1040,14 +1043,62 @@ def _build_placed_sdf_2d_ir_node(
                 *(transform.scale * value for value in profile.semi_axes),
             ),
         )
+    if isinstance(profile, (PolygonProfile, RegularPolygonProfile)):
+        points = (
+            tuple(tuple(float(value) for value in point) for point in profile._vertices())
+            if isinstance(profile, RegularPolygonProfile)
+            else profile.points
+        )
+        return RenderIRNode(
+            kind="placed_polygon_2d",
+            object_id=node.object_id,
+            dimension=2,
+            children=(),
+            params=tuple(
+                [
+                    *transform.apply_point(node.origin),
+                    *transform.apply_direction(node.axis_u),
+                    *transform.apply_direction(node.axis_v),
+                    *transform.apply_direction(node.normal),
+                    *(
+                        float(value)
+                        for point in points
+                        for value in (
+                            transform.scale * float(point[0]),
+                            transform.scale * float(point[1]),
+                        )
+                    ),
+                ]
+            ),
+        )
+    if isinstance(profile, QuadraticBezierSurfaceProfile):
+        return RenderIRNode(
+            kind="placed_quadratic_bezier_surface_2d",
+            object_id=node.object_id,
+            dimension=2,
+            children=(),
+            params=tuple(
+                [
+                    *transform.apply_point(node.origin),
+                    *transform.apply_direction(node.axis_u),
+                    *transform.apply_direction(node.axis_v),
+                    *transform.apply_direction(node.normal),
+                    *(
+                        float(value)
+                        for point in profile.points
+                        for value in (
+                            transform.scale * float(point[0]),
+                            transform.scale * float(point[1]),
+                        )
+                    ),
+                ]
+            ),
+        )
     if isinstance(
         profile,
         (
             OffsetProfile,
             BinaryProfile,
-            PolygonProfile,
-            RegularPolygonProfile,
-            BezierSurfaceProfile,
         ),
     ):
         return RenderIRNode(

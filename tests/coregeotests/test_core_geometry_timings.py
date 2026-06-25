@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from core.scene import SceneDocument
-from core.sdf import BezierTube, Extrude, PolylineTube, Revolve, Scale, Translate
+from core.sdf import QuadraticBezierTube, Extrude, PolylineTube, Revolve, Scale, Translate
 
 from ._benchmark import RenderUploadProbe, benchmark_scene_step
 
@@ -249,10 +249,10 @@ def test_path_based_solids_timing(
         lambda scene: scene.rotate_object(polyline_handle, "y", 35.0),
         render_upload_probe,
     )
-    bezier_handle, _ = benchmark_scene_step(
+    quadratic_bezier_handle, _ = benchmark_scene_step(
         document,
-        "create_bezier_tube",
-        lambda scene: scene.add_bezier_tube(
+        "create_quadratic_bezier_tube",
+        lambda scene: scene.add_quadratic_bezier_tube(
             (
                 (-0.6, 0.0, -0.1),
                 (0.0, 0.7, 0.35),
@@ -264,20 +264,20 @@ def test_path_based_solids_timing(
     )
     _, _ = benchmark_scene_step(
         document,
-        "move_bezier_tube",
-        lambda scene: scene.move_object(bezier_handle, (-0.10, 0.05, 0.0)),
+        "move_quadratic_bezier_tube",
+        lambda scene: scene.move_object(quadratic_bezier_handle, (-0.10, 0.05, 0.0)),
         render_upload_probe,
     )
     _, _ = benchmark_scene_step(
         document,
-        "rotate_bezier_tube",
-        lambda scene: scene.rotate_object(bezier_handle, "x", -20.0),
+        "rotate_quadratic_bezier_tube",
+        lambda scene: scene.rotate_object(quadratic_bezier_handle, "x", -20.0),
         render_upload_probe,
     )
 
     assert polyline_timing.render_ir_supported
     assert isinstance(document.node(polyline_handle), PolylineTube)
-    assert isinstance(document.node(bezier_handle), BezierTube)
+    assert isinstance(document.node(quadratic_bezier_handle), QuadraticBezierTube)
 
 
 def test_delete_reuses_previous_render_topology_timing(

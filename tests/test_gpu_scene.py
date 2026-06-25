@@ -106,3 +106,16 @@ def test_glsl_defines_match_python_codes() -> None:
     assert f"#define IR_STACK_CAPACITY {IR_STACK_CAPACITY}" in glsl
     for kind, code in NODE_TYPE_CODES.items():
         assert f"#define NODE_{kind.upper()} {code}u" in glsl
+
+
+def test_glsl_defines_can_filter_node_kinds() -> None:
+    glsl = emit_glsl_defines(
+        {"sphere", "box"},
+        include_stack_defs=False,
+        include_opcode_defs=False,
+    )
+    assert "#define IR_STACK_CAPACITY" not in glsl
+    assert "#define OP_PUSH_LEAF" not in glsl
+    assert f"#define NODE_SPHERE {NODE_TYPE_CODES['sphere']}u" in glsl
+    assert f"#define NODE_BOX {NODE_TYPE_CODES['box']}u" in glsl
+    assert "#define NODE_CYLINDER" not in glsl

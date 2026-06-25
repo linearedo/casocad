@@ -3,10 +3,10 @@ from __future__ import annotations
 from app.panels.display import display_kind
 from core.boundary import BoundaryRegion
 from core.sdf import (
-    BezierCurveProfile,
+    QuadraticBezierCurveProfile,
     Box,
     CircleProfile,
-    PlacedPolyline2D,
+    PlacedPolyline1D,
     PlacedSDF1D,
     PlacedSDF2D,
     RectangleProfile,
@@ -27,9 +27,9 @@ def test_display_kind_uses_profile_for_placed_sdf_nodes() -> None:
 
 
 def test_display_kind_uses_profile_for_placed_curves() -> None:
-    curve = PlacedPolyline2D(name="curve", profile=BezierCurveProfile())
-    assert curve.kind == "placed_bezier_curve_2d"
-    assert display_kind(curve) == "bezier_curve"
+    curve = PlacedPolyline1D(name="curve", profile=QuadraticBezierCurveProfile())
+    assert curve.kind == "placed_quadratic_bezier_curve_1d"
+    assert display_kind(curve) == "quadratic_bezier_curve"
 
 
 def test_display_kind_keeps_normal_sdf_and_boundary_kinds() -> None:

@@ -11,6 +11,7 @@ from PySide6.QtCore import QProcess, Qt, Slot
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDockWidget,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -198,7 +199,6 @@ class MeshingWorkspace(QMainWindow):
         center_layout.addWidget(self.filled_toggle)
         center_layout.addWidget(self.wireframe_toggle)
         center_layout.addWidget(self.viewer, 1)
-        center_layout.addWidget(self.preview)
 
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(left)
@@ -226,6 +226,17 @@ class MeshingWorkspace(QMainWindow):
         self.pages.addWidget(viewer_page)
         self.pages.addWidget(script_page)
         self.setCentralWidget(self.pages)
+
+        # The created-element preview is a hidden, toggleable dock (mirrors the
+        # main window's Log panel) so it no longer permanently occupies space.
+        self.preview_dock = QDockWidget("Elements", self)
+        self.preview_dock.setObjectName("meshingElementsDock")
+        self.preview_dock.setWidget(self.preview)
+        self.addDockWidget(
+            Qt.DockWidgetArea.BottomDockWidgetArea, self.preview_dock)
+        self.preview_dock.hide()
+        view_menu = self.menuBar().addMenu("&View")
+        view_menu.addAction(self.preview_dock.toggleViewAction())
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Meshing", self)

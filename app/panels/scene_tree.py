@@ -18,15 +18,15 @@ from app.panels.display import display_kind
 from app.signals import signals
 from core.boundary import BoundaryRegion
 from core.scene import SceneDocument
-from core.sdf import PlacedPolyline2D, PlacedSDF1D, PlacedSDF2D, PolylineProfile
+from core.sdf import PlacedPolyline1D, PlacedSDF1D, PlacedSDF2D, PolylineProfile
 from core.sdf.base import SDFNode
 HANDLE_ROLE = Qt.ItemDataRole.UserRole
 SDF_ICON_DIR = Path(__file__).resolve().parents[2] / "assets" / "icons"
 SDF_MENU_ITEMS: tuple[tuple[str, str], ...] = (
     ("Segment 1D", "segment"),
     ("Polyline 1D", "polyline"),
-    ("Bezier Curve 1D", "bezier_curve"),
-    ("Bezier Polycurve 1D", "bezier_polycurve"),
+    ("Quadratic Bezier Curve 1D", "quadratic_bezier_curve"),
+    ("Quadratic Bezier Polycurve 1D", "quadratic_bezier_polycurve"),
     ("Circle 2D", "circle"),
     ("Rectangle 2D", "rectangle"),
     ("Square 2D", "square"),
@@ -34,7 +34,7 @@ SDF_MENU_ITEMS: tuple[tuple[str, str], ...] = (
     ("Ellipse 2D", "ellipse"),
     ("Regular Polygon 2D", "regular_polygon"),
     ("Polygon 2D", "polygon"),
-    ("Bezier Surface 2D", "bezier_surface"),
+    ("Quadratic Bezier Surface 2D", "quadratic_bezier_surface"),
     ("Sphere", "sphere"),
     ("Box", "box"),
     ("Box Frame", "box_frame"),
@@ -44,7 +44,7 @@ SDF_MENU_ITEMS: tuple[tuple[str, str], ...] = (
     ("Pyramid", "pyramid"),
     ("Torus", "torus"),
     ("Polyline Tube", "polyline_tube"),
-    ("Bezier Tube", "bezier_tube"),
+    ("Quadratic Bezier Tube", "quadratic_bezier_tube"),
 )
 SDF_MENU_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("1D", SDF_MENU_ITEMS[:4]),
@@ -127,7 +127,7 @@ class SceneTreePanel(QWidget):
                         "Boundary tag"
                         if isinstance(
                             node,
-                            (PlacedSDF1D, PlacedPolyline2D, BoundaryRegion),
+                            (PlacedSDF1D, PlacedPolyline1D, BoundaryRegion),
                         )
                         else "Section tag"
                     )
@@ -315,7 +315,7 @@ class SceneTreePanel(QWidget):
         polygon_from_polyline = menu.addAction("Create Polygon from Polyline")
         polygon_from_polyline.setEnabled(
             len(selected) == 1
-            and isinstance(selected_node, PlacedPolyline2D)
+            and isinstance(selected_node, PlacedPolyline1D)
             and isinstance(selected_node.profile, PolylineProfile)
         )
         polygon_from_polyline.triggered.connect(
@@ -353,10 +353,10 @@ class SceneTreePanel(QWidget):
         if region.patch_id is None or fluid_root is None:
             return False
         if fluid_root.dimension == 2:
-            return isinstance(selector, (PlacedSDF1D, PlacedPolyline2D))
+            return isinstance(selector, (PlacedSDF1D, PlacedPolyline1D))
         return isinstance(selector, SDFNode) and (
             selector.dimension == 3
-            or isinstance(selector, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D))
+            or isinstance(selector, (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D))
         )
 
     def _populate_object_boolean_menu(

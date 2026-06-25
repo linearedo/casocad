@@ -10,11 +10,11 @@ The suite benchmarks:
 - all 3D primitive creation, move, rotate, boolean, translate, scale
 - all 2D and 1D primitive/profile creation, move, rotate, boolean
 - drag-based primitive creation for supported tools
-- custom polyline, bezier, polygon, and world-point shape workflows
+- custom polyline, quadratic Bezier, polygon, and world-point shape workflows
 - copy, paste, delete, and transform wrapper workflows
 - fluid-domain root, tag, and boundary-region workflows
 - extrude and revolve from 2D profiles
-- path-based solids via `polyline_tube` and `bezier_tube`
+- path-based solids via `polyline_tube` and `quadratic_bezier_tube`
 
 Each step logs:
 

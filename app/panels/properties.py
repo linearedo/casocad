@@ -22,9 +22,9 @@ from app.signals import signals
 from core.boundary import BoundaryRegion
 from core.scene import SceneDocument
 from core.sdf import (
-    BezierCurveProfile,
-    BezierSurfaceProfile,
-    BezierTube,
+    QuadraticBezierCurveProfile,
+    QuadraticBezierSurfaceProfile,
+    QuadraticBezierTube,
     Box,
     BoxFrame,
     CappedCone,
@@ -50,7 +50,7 @@ from core.sdf import (
     SquareProfile,
     Torus,
     Translate,
-    PlacedPolyline2D,
+    PlacedPolyline1D,
 )
 from core.sdf.base import BoundingBox3D, SDFNode
 
@@ -593,8 +593,8 @@ class PropertiesPanel(QWidget):
                 )
             )
             self._layout.addRow("Angle", angle)
-        elif isinstance(node, (PolylineTube, BezierTube)):
-            minimum = 3 if isinstance(node, BezierTube) else 2
+        elif isinstance(node, (PolylineTube, QuadraticBezierTube)):
+            minimum = 3 if isinstance(node, QuadraticBezierTube) else 2
             self._add_tube_point_fields(node, minimum)
             caps = QComboBox()
             caps.addItems(("round", "flat"))
@@ -629,13 +629,13 @@ class PropertiesPanel(QWidget):
                 lambda value: self._set_placed_axes("axis_u", value),
             )
             self._add_profile_1d_fields(node)
-        elif isinstance(node, PlacedPolyline2D):
+        elif isinstance(node, PlacedPolyline1D):
             if node.profile is not None:
                 self._layout.addRow("Profile", QLabel(node.profile.kind))
-                minimum = 3 if isinstance(node.profile, BezierCurveProfile) else 2
+                minimum = 3 if isinstance(node.profile, QuadraticBezierCurveProfile) else 2
                 self._add_point_profile_fields(node, node.profile, minimum)
         elif isinstance(node, PlacedSDF2D):
-            if not isinstance(node.profile, (BezierSurfaceProfile, PolygonProfile)):
+            if not isinstance(node.profile, (QuadraticBezierSurfaceProfile, PolygonProfile)):
                 self._layout.addRow(
                     "Workplane",
                     QLabel(standard_workplane_label(node.axis_u, node.axis_v)),
@@ -756,13 +756,13 @@ class PropertiesPanel(QWidget):
                 )
             )
             self._layout.addRow("Sides", sides)
-        if isinstance(profile, (PolygonProfile, BezierSurfaceProfile)):
+        if isinstance(profile, (PolygonProfile, QuadraticBezierSurfaceProfile)):
             self._add_point_profile_fields(node, profile, 3)
 
     def _add_point_profile_fields(
         self,
-        node: PlacedPolyline2D | PlacedSDF2D,
-        profile: BezierCurveProfile | BezierSurfaceProfile | PolylineProfile | PolygonProfile,
+        node: PlacedPolyline1D | PlacedSDF2D,
+        profile: QuadraticBezierCurveProfile | QuadraticBezierSurfaceProfile | PolylineProfile | PolygonProfile,
         minimum_points: int,
     ) -> None:
         editor = QLineEdit(
@@ -777,7 +777,7 @@ class PropertiesPanel(QWidget):
         )
         editor.setToolTip(
             "Ordered world points as {x;y;z} entries. "
-            "Bezier points alternate anchor, control, anchor. "
+            "Quadratic Bezier points alternate anchor, control, anchor. "
             "Polyline closure is explicit; polygon closure is automatic."
         )
         editor.editingFinished.connect(
@@ -790,13 +790,13 @@ class PropertiesPanel(QWidget):
 
     def _add_tube_point_fields(
         self,
-        node: PolylineTube | BezierTube,
+        node: PolylineTube | QuadraticBezierTube,
         minimum_points: int,
     ) -> None:
         editor = QLineEdit(format_point_list_text(node.points))
         editor.setToolTip(
             "Ordered world points as {x;y;z} entries. "
-            "Bezier tube points alternate anchor, control, anchor."
+            "Quadratic Bezier tube points alternate anchor, control, anchor."
         )
         editor.editingFinished.connect(
             lambda control=editor, minimum=minimum_points: self._set_tube_points(
@@ -807,7 +807,7 @@ class PropertiesPanel(QWidget):
         self._layout.addRow("Points", editor)
 
     def _set_tube_points(self, text: str, minimum_points: int) -> None:
-        if not isinstance(self._node, (PolylineTube, BezierTube)):
+        if not isinstance(self._node, (PolylineTube, QuadraticBezierTube)):
             return
         undo_snapshot = self._undo_snapshot()
         previous = self._node.points
@@ -823,7 +823,7 @@ class PropertiesPanel(QWidget):
         signals.node_edited.emit()
 
     def _set_point_profile(self, text: str, minimum_points: int) -> None:
-        if not isinstance(self._node, (PlacedPolyline2D, PlacedSDF2D)):
+        if not isinstance(self._node, (PlacedPolyline1D, PlacedSDF2D)):
             return
         if self._node.profile is None:
             return
@@ -972,7 +972,7 @@ class PropertiesPanel(QWidget):
         signals.node_edited.emit()
 
     def _set_placed_axes(self, attribute: str, value: tuple[float, ...]) -> None:
-        if not isinstance(self._node, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D)):
+        if not isinstance(self._node, (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D)):
             return
         previous = getattr(self._node, attribute)
         if values_equal(previous, value):

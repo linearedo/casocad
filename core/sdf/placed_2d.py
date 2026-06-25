@@ -6,9 +6,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .base import BoundingBox3D, FloatArray, SDFNode
-from .primitives_2d import BezierCurveProfile, PolylineProfile, Profile2D
+from .primitives_2d import QuadraticBezierCurveProfile, PolylineProfile, Profile2D
 
-CurveProfile2D = BezierCurveProfile | PolylineProfile
+CurveProfile1D = QuadraticBezierCurveProfile | PolylineProfile
 
 
 def _normalized(vector: tuple[float, float, float]) -> NDArray[np.float64]:
@@ -188,15 +188,15 @@ class PlacedSDF2D(SDFNode):
 
 
 @dataclass
-class PlacedPolyline2D(SDFNode):
-    profile: CurveProfile2D | None = None
+class PlacedPolyline1D(SDFNode):
+    profile: CurveProfile1D | None = None
     origin: tuple[float, float, float] = (0.0, 0.0, 0.0)
     axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0)
     axis_v: tuple[float, float, float] = (0.0, 1.0, 0.0)
 
     def __post_init__(self) -> None:
         if self.profile is None:
-            raise ValueError("PlacedPolyline2D requires a curve profile")
+            raise ValueError("PlacedPolyline1D requires a curve profile")
         u = _normalized(self.axis_u)
         v = _normalized(self.axis_v)
         if abs(float(np.dot(u, v))) > 1e-6:
@@ -210,11 +210,11 @@ class PlacedPolyline2D(SDFNode):
 
     @property
     def kind(self) -> str:
-        if isinstance(self.profile, BezierCurveProfile):
+        if isinstance(self.profile, QuadraticBezierCurveProfile):
             if len(self.profile.points) > 3:
-                return "placed_bezier_polycurve_2d"
-            return "placed_bezier_curve_2d"
-        return "placed_polyline_2d"
+                return "placed_quadratic_bezier_polycurve_1d"
+            return "placed_quadratic_bezier_curve_1d"
+        return "placed_polyline_1d"
 
     @property
     def normal(self) -> tuple[float, float, float]:

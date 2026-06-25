@@ -21,7 +21,7 @@ from core.sdf import (
     EllipseProfile,
     Extrude,
     Intersection,
-    PlacedPolyline2D,
+    PlacedPolyline1D,
     PlacedSDF1D,
     PlacedSDF2D,
     PolylineProfile,
@@ -160,7 +160,7 @@ def boundary_selector_from_node(
     *,
     domain_dimension: int,
 ) -> BoundarySelector | None:
-    if domain_dimension == 3 and isinstance(node, (PlacedSDF1D, PlacedPolyline2D)):
+    if domain_dimension == 3 and isinstance(node, (PlacedSDF1D, PlacedPolyline1D)):
         return BoundaryObjectSelector(
             selector_id=f"selector:{node.object_id}",
             selector_type="surface_split_curve",
@@ -181,7 +181,7 @@ def boundary_selector_from_node(
             object_id=node.object_id,
             name=node.name,
         )
-    if domain_dimension == 2 and isinstance(node, (PlacedSDF1D, PlacedPolyline2D)):
+    if domain_dimension == 2 and isinstance(node, (PlacedSDF1D, PlacedPolyline1D)):
         return BoundaryObjectSelector(
             selector_id=f"selector:{node.object_id}",
             selector_type="boundary_curve_selector",
@@ -681,7 +681,7 @@ def surface_selector_volume(
         volume: SDFNode | None = deepcopy(selector)
     elif isinstance(selector, PlacedSDF2D):
         volume = _placed_2d_selector_volume(root, selector)
-    elif isinstance(selector, PlacedPolyline2D):
+    elif isinstance(selector, PlacedPolyline1D):
         volume = _polyline_selector_volume(root, selector)
     elif isinstance(selector, PlacedSDF1D) and isinstance(
         selector.profile,
@@ -798,7 +798,7 @@ def _placed_2d_selector_volume(
 
 def _polyline_selector_volume(
     root: SDFNode,
-    selector: PlacedPolyline2D,
+    selector: PlacedPolyline1D,
 ) -> SDFNode | None:
     if selector.profile is None:
         return None
@@ -834,7 +834,7 @@ def _selector_has_surface_preview_volume(selector: SDFNode) -> bool:
         isinstance(selector, PlacedSDF1D)
         and isinstance(selector.profile, SegmentProfile)
     ) or (
-        isinstance(selector, PlacedPolyline2D)
+        isinstance(selector, PlacedPolyline1D)
         and selector.profile is not None
     )
 
@@ -1043,7 +1043,7 @@ def _closed_curve_interval_preview_node(
         )
         for angle in angles
     )
-    return PlacedPolyline2D(
+    return PlacedPolyline1D(
         name=f"{owner.name}_{patch.patch_id}_interval_highlight",
         object_id=0,
         profile=PolylineProfile(points=points),
@@ -1109,7 +1109,7 @@ def _selector_world_endpoints(
         origin = np.asarray(selector.origin, dtype=np.float64)
         axis = np.asarray(selector.axis_u, dtype=np.float64)
         return origin + t_min * axis, origin + t_max * axis
-    if isinstance(selector, PlacedPolyline2D):
+    if isinstance(selector, PlacedPolyline1D):
         profile = selector.profile
         if profile is None or not hasattr(profile, "points"):
             return None

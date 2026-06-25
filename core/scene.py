@@ -20,9 +20,9 @@ from .boundary_patches import (
 )
 from .domain import FluidDomain
 from .sdf import (
-    BezierCurveProfile,
-    BezierSurfaceProfile,
-    BezierTube,
+    QuadraticBezierCurveProfile,
+    QuadraticBezierSurfaceProfile,
+    QuadraticBezierTube,
     BinaryProfile1D,
     BinaryProfile,
     BoundingBox3D,
@@ -39,7 +39,7 @@ from .sdf import (
     OffsetProfile,
     OffsetProfile1D,
     PlacedSDF1D,
-    PlacedPolyline2D,
+    PlacedPolyline1D,
     PlacedSDF2D,
     PolygonProfile,
     PolylineTube,
@@ -73,11 +73,11 @@ Primitive3D = (
     | Pyramid
     | Torus
     | PolylineTube
-    | BezierTube
+    | QuadraticBezierTube
 )
 SceneItem = SDFNode | BoundaryRegion
 INTERNAL_BOUNDARY_SELECTOR_PREFIX = "__boundary_selector_"
-DEFAULT_BEZIER_POLYCURVE_POINTS = (
+DEFAULT_QUADRATIC_BEZIER_POLYCURVE_POINTS = (
     (-0.65, -0.35),
     (-0.3, 0.55),
     (0.0, -0.05),
@@ -199,7 +199,7 @@ class SceneDocument:
             ),
             "torus": lambda: Torus(**common, major_radius=0.5, minor_radius=0.15),
             "polyline_tube": lambda: PolylineTube(**common),
-            "bezier_tube": lambda: BezierTube(**common),
+            "quadratic_bezier_tube": lambda: QuadraticBezierTube(**common),
         }
         if kind not in factories:
             raise ValueError(f"unknown 3D primitive type: {kind}")
@@ -217,7 +217,7 @@ class SceneDocument:
             "ellipse": EllipseProfile,
             "regular_polygon": RegularPolygonProfile,
             "polygon": PolygonProfile,
-            "bezier_surface": BezierSurfaceProfile,
+            "quadratic_bezier_surface": QuadraticBezierSurfaceProfile,
         }
         if kind not in factories:
             raise ValueError(f"unknown 2D profile type: {kind}")
@@ -245,9 +245,9 @@ class SceneDocument:
         origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
         axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0),
         axis_v: tuple[float, float, float] = (0.0, 1.0, 0.0),
-    ) -> PlacedPolyline2D:
+    ) -> PlacedPolyline1D:
         object_id = self._allocate_object_id()
-        return PlacedPolyline2D(
+        return PlacedPolyline1D(
             name=name or f"polyline_{object_id}",
             object_id=object_id,
             profile=PolylineProfile(points=tuple(points)),
@@ -256,19 +256,19 @@ class SceneDocument:
             axis_v=axis_v,
         )
 
-    def create_bezier_curve(
+    def create_quadratic_bezier_curve(
         self,
         points: tuple[tuple[float, float], ...] | list[tuple[float, float]],
         name: str | None = None,
         origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
         axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0),
         axis_v: tuple[float, float, float] = (0.0, 1.0, 0.0),
-    ) -> PlacedPolyline2D:
+    ) -> PlacedPolyline1D:
         object_id = self._allocate_object_id()
-        return PlacedPolyline2D(
-            name=name or f"bezier_curve_{object_id}",
+        return PlacedPolyline1D(
+            name=name or f"quadratic_bezier_curve_{object_id}",
             object_id=object_id,
-            profile=BezierCurveProfile(points=tuple(points)),
+            profile=QuadraticBezierCurveProfile(points=tuple(points)),
             origin=origin,
             axis_u=axis_u,
             axis_v=axis_v,
@@ -294,7 +294,7 @@ class SceneDocument:
 
     def add_placed_2d_profile(
         self,
-        profile: PolygonProfile | BezierSurfaceProfile,
+        profile: PolygonProfile | QuadraticBezierSurfaceProfile,
         name: str | None = None,
         origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
         axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0),
@@ -328,7 +328,7 @@ class SceneDocument:
         self.mark_changed()
         return self.handle_for(node)
 
-    def add_bezier_curve(
+    def add_quadratic_bezier_curve(
         self,
         points: tuple[tuple[float, float], ...] | list[tuple[float, float]],
         name: str | None = None,
@@ -336,7 +336,7 @@ class SceneDocument:
         axis_u: tuple[float, float, float] = (1.0, 0.0, 0.0),
         axis_v: tuple[float, float, float] = (0.0, 1.0, 0.0),
     ) -> int:
-        node = self.create_bezier_curve(points, name, origin, axis_u, axis_v)
+        node = self.create_quadratic_bezier_curve(points, name, origin, axis_u, axis_v)
         self.objects.append(node)
         self._reindex()
         self.mark_changed()
@@ -362,7 +362,7 @@ class SceneDocument:
         self.mark_changed()
         return self.handle_for(node)
 
-    def add_bezier_tube(
+    def add_quadratic_bezier_tube(
         self,
         points: tuple[tuple[float, float, float], ...] | list[tuple[float, float, float]],
         name: str | None = None,
@@ -370,8 +370,8 @@ class SceneDocument:
         inner_radius: float = 0.0,
     ) -> int:
         object_id = self._allocate_object_id()
-        node = BezierTube(
-            name=name or f"bezier_tube_{object_id}",
+        node = QuadraticBezierTube(
+            name=name or f"quadratic_bezier_tube_{object_id}",
             object_id=object_id,
             points=tuple(points),
             radius=radius,
@@ -406,11 +406,11 @@ class SceneDocument:
             raise ValueError(f"unknown reference plane: {reference_plane}")
         if kind not in {
             "polyline",
-            "bezier_curve",
-            "bezier_polycurve",
+            "quadratic_bezier_curve",
+            "quadratic_bezier_polycurve",
             "polyline_tube",
-            "bezier_tube",
-            "bezier_surface",
+            "quadratic_bezier_tube",
+            "quadratic_bezier_surface",
             "polygon",
         }:
             raise ValueError(f"unsupported point shape: {kind}")
@@ -422,21 +422,21 @@ class SceneDocument:
                 if kind in {"polyline", "polyline_tube"}
                 else f"{kind} requires at least three points"
             )
-        if kind == "bezier_curve" and len(points) != 3:
-            raise ValueError("bezier curve requires exactly three points")
-        if kind == "bezier_polycurve" and len(points) % 2 == 0:
+        if kind == "quadratic_bezier_curve" and len(points) != 3:
+            raise ValueError("quadratic Bezier curve requires exactly three points")
+        if kind == "quadratic_bezier_polycurve" and len(points) % 2 == 0:
             raise ValueError(
-                "bezier polycurve requires an odd point count: "
+                "quadratic Bezier polycurve requires an odd point count: "
                 "anchor, control, anchor"
             )
-        if kind == "bezier_tube" and len(points) % 2 == 0:
+        if kind == "quadratic_bezier_tube" and len(points) % 2 == 0:
             raise ValueError(
-                "bezier tube requires an odd point count: "
+                "quadratic Bezier tube requires an odd point count: "
                 "anchor, control, anchor"
             )
-        if kind == "bezier_surface" and len(points) % 2 == 0:
+        if kind == "quadratic_bezier_surface" and len(points) % 2 == 0:
             raise ValueError(
-                "bezier surface requires an odd point count: "
+                "quadratic Bezier surface requires an odd point count: "
                 "anchor, control, anchor"
             )
         axis_u, axis_v = REFERENCE_PLANE_AXES_3D[reference_plane]
@@ -460,18 +460,18 @@ class SceneDocument:
             )
         if kind == "polyline_tube":
             return self.add_polyline_tube(points)
-        if kind == "bezier_tube":
-            return self.add_bezier_tube(points)
-        if kind in {"bezier_curve", "bezier_polycurve"}:
-            return self.add_bezier_curve(
+        if kind == "quadratic_bezier_tube":
+            return self.add_quadratic_bezier_tube(points)
+        if kind in {"quadratic_bezier_curve", "quadratic_bezier_polycurve"}:
+            return self.add_quadratic_bezier_curve(
                 local_points,
                 origin=origin,
                 axis_u=axis_u,
                 axis_v=axis_v,
             )
-        if kind == "bezier_surface":
+        if kind == "quadratic_bezier_surface":
             return self.add_placed_2d_profile(
-                BezierSurfaceProfile(points=local_points),
+                QuadraticBezierSurfaceProfile(points=local_points),
                 name=None,
                 origin=origin,
                 axis_u=axis_u,
@@ -489,15 +489,15 @@ class SceneDocument:
             node: SDFNode = self.create_placed_1d()
         elif kind == "polyline":
             node = self.create_polyline(PolylineProfile().points)
-        elif kind == "bezier_curve":
-            node = self.create_bezier_curve(BezierCurveProfile().points)
-        elif kind == "bezier_polycurve":
-            node = self.create_bezier_curve(DEFAULT_BEZIER_POLYCURVE_POINTS)
+        elif kind == "quadratic_bezier_curve":
+            node = self.create_quadratic_bezier_curve(QuadraticBezierCurveProfile().points)
+        elif kind == "quadratic_bezier_polycurve":
+            node = self.create_quadratic_bezier_curve(DEFAULT_QUADRATIC_BEZIER_POLYCURVE_POINTS)
         elif kind == "polyline_tube":
             node = self.create_primitive(kind)
-        elif kind == "bezier_tube":
+        elif kind == "quadratic_bezier_tube":
             node = self.create_primitive(kind)
-        elif kind == "bezier_surface":
+        elif kind == "quadratic_bezier_surface":
             node = self.create_placed_2d(kind)
         elif kind in {
             "circle",
@@ -560,15 +560,15 @@ class SceneDocument:
                 axis_u=axis_u,
                 axis_v=axis_v,
             )
-        elif kind == "bezier_curve":
-            node = self.create_bezier_curve(
+        elif kind == "quadratic_bezier_curve":
+            node = self.create_quadratic_bezier_curve(
                 ((-extent_a, 0.0), (0.0, extent_b), (extent_a, 0.0)),
                 origin=tuple(float(value) for value in center),
                 axis_u=axis_u,
                 axis_v=axis_v,
             )
-        elif kind == "bezier_polycurve":
-            node = self.create_bezier_curve(
+        elif kind == "quadratic_bezier_polycurve":
+            node = self.create_quadratic_bezier_curve(
                 (
                     (-extent_a, 0.0),
                     (-0.5 * extent_a, extent_b),
@@ -590,12 +590,12 @@ class SceneDocument:
                 ),
                 radius=float(parameters.get("radius", 0.12)),
             )
-        elif kind == "bezier_tube":
+        elif kind == "quadratic_bezier_tube":
             control = 0.5 * (start_array + end_array)
             axis_offset = np.zeros(3, dtype=np.float64)
             axis_offset[axis_b] = extent_b
-            node = BezierTube(
-                name=f"bezier_tube_{self._next_object_id}",
+            node = QuadraticBezierTube(
+                name=f"quadratic_bezier_tube_{self._next_object_id}",
                 object_id=self._allocate_object_id(),
                 points=(
                     tuple(float(value) for value in start_array),
@@ -641,8 +641,8 @@ class SceneDocument:
                         (-extent_a, extent_b),
                     )
                 )
-            elif kind == "bezier_surface":
-                node.profile = BezierSurfaceProfile(
+            elif kind == "quadratic_bezier_surface":
+                node.profile = QuadraticBezierSurfaceProfile(
                     points=(
                         (-extent_a, -extent_b),
                         (-0.35 * extent_a, extent_b),
@@ -751,7 +751,7 @@ class SceneDocument:
     def create_polygon_from_polyline(self, handle: int) -> int:
         node = self.node(handle)
         if (
-            not isinstance(node, PlacedPolyline2D)
+            not isinstance(node, PlacedPolyline1D)
             or not isinstance(node.profile, PolylineProfile)
         ):
             raise ValueError("select one polyline to create a polygon")
@@ -834,7 +834,7 @@ class SceneDocument:
         delta: tuple[float, float, float],
     ) -> int:
         node = self.node(handle)
-        if isinstance(node, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D)):
+        if isinstance(node, (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D)):
             node.origin = tuple(
                 node.origin[index] + delta[index] for index in range(3)
             )
@@ -847,7 +847,7 @@ class SceneDocument:
             )
             self.mark_changed()
             return handle
-        if isinstance(node, (PolylineTube, BezierTube)):
+        if isinstance(node, (PolylineTube, QuadraticBezierTube)):
             node.points = tuple(
                 tuple(point[index] + delta[index] for index in range(3))
                 for point in node.points
@@ -1163,8 +1163,8 @@ class SceneDocument:
     @staticmethod
     def _compatible_domain_tags(
         root: SDFNode,
-        tags: tuple[PlacedSDF1D | PlacedPolyline2D | PlacedSDF2D | BoundaryRegion, ...],
-    ) -> tuple[PlacedSDF1D | PlacedPolyline2D | PlacedSDF2D | BoundaryRegion, ...]:
+        tags: tuple[PlacedSDF1D | PlacedPolyline1D | PlacedSDF2D | BoundaryRegion, ...],
+    ) -> tuple[PlacedSDF1D | PlacedPolyline1D | PlacedSDF2D | BoundaryRegion, ...]:
         valid_owner_ids = boundary_owner_ids(root)
         return tuple(
             tag
@@ -1174,7 +1174,7 @@ class SceneDocument:
                 and isinstance(root, PlacedSDF2D)
                 and (
                     (
-                        isinstance(tag, (PlacedSDF1D, PlacedPolyline2D))
+                        isinstance(tag, (PlacedSDF1D, PlacedPolyline1D))
                         and tag.lies_in_plane_of(root)
                     )
                     or (
@@ -1209,7 +1209,7 @@ class SceneDocument:
             or (
                 root.dimension == 2
                 and isinstance(root, PlacedSDF2D)
-                and isinstance(selector, (PlacedSDF1D, PlacedPolyline2D))
+                and isinstance(selector, (PlacedSDF1D, PlacedPolyline1D))
                 and selector.lies_in_plane_of(root)
             )
         )
@@ -1218,7 +1218,7 @@ class SceneDocument:
         node = self.node(handle)
         if not isinstance(
             node,
-            (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D, BoundaryRegion),
+            (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D, BoundaryRegion),
         ):
             raise ValueError(
                 "only dimension-compatible placed SDFs and BoundaryRegion "
@@ -1791,7 +1791,7 @@ class SceneDocument:
                 node.offset[index] + delta[index] for index in range(3)
             )
             return True
-        if isinstance(node, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D)):
+        if isinstance(node, (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D)):
             node.origin = tuple(
                 node.origin[index] + delta[index] for index in range(3)
             )
@@ -1805,7 +1805,7 @@ class SceneDocument:
                 node.center[index] + delta[index] for index in range(3)
             )
             return True
-        if isinstance(node, (PolylineTube, BezierTube)):
+        if isinstance(node, (PolylineTube, QuadraticBezierTube)):
             node.points = tuple(
                 tuple(point[index] + delta[index] for index in range(3))
                 for point in node.points
@@ -1873,10 +1873,10 @@ class SceneDocument:
                 ):
                     return False
             return True
-        if isinstance(node, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D)):
+        if isinstance(node, (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D)):
             node.origin = self._rotate_point(node.origin, axis, angle_degrees, pivot)
             node.axis_u = self._rotate_vector(node.axis_u, axis, angle_degrees)
-            if isinstance(node, (PlacedPolyline2D, PlacedSDF2D)):
+            if isinstance(node, (PlacedPolyline1D, PlacedSDF2D)):
                 node.axis_v = self._rotate_vector(node.axis_v, axis, angle_degrees)
             for child in node.children():
                 if not self._rotate_node_in_place(
@@ -1899,7 +1899,7 @@ class SceneDocument:
             node.axis_w = self._rotate_vector(node.axis_w, axis, angle_degrees)
             node.__post_init__()
             return True
-        if isinstance(node, (PolylineTube, BezierTube)):
+        if isinstance(node, (PolylineTube, QuadraticBezierTube)):
             node.points = tuple(
                 self._rotate_point(point, axis, angle_degrees, pivot)
                 for point in node.points

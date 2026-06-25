@@ -39,6 +39,8 @@ _BACKENDS = {
     "metal": getattr(QRhiWidget.Api, "Metal", None),
     "d3d11": getattr(QRhiWidget.Api, "Direct3D11", None),
 }
+_MAX_VIEWPORT_FPS = 60
+_FRAME_INTERVAL_MS = max(1, round(1000 / _MAX_VIEWPORT_FPS))
 
 
 def _choose_api() -> "QRhiWidget.Api | None":
@@ -83,11 +85,14 @@ class QRhiViewportWidget(QRhiWidget):
         self._last_pos = None
         self._press_pos = None
         self._tree = None        # SDFTree, for CPU click-picking
+        self._scene_center = None
+        self._scene_radius = 0.0
         self._selected_id = 0
         self._move_active = False
         self._move_handle = None
         self._move_start_grid = None       # grid point under cursor at drag start
         self._move_preview_delta = (0.0, 0.0, 0.0)
+        self._move_commit_delta = (0.0, 0.0, 0.0)
         # rotate tool state (grid-plane rotation around the object pivot)
         self._rotate_active = False
         self._rotate_handle = None
@@ -114,6 +119,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._boundary_cutter_tool = None
         self._boundary_region_selected = False
         self._committed_render_ir = None   # last committed scene (restore target)
+        self._preview_kind = None
         # drag-to-create tool state (Draw button -> viewport_create_requested)
         self._create_kind = None
         self._create_start_world = None
@@ -127,6 +133,7 @@ class QRhiViewportWidget(QRhiWidget):
         # render FPS overlay (measures real frame cadence in render())
         self._fps_ema = 0.0
         self._last_frame_t = None
+        self._last_render_submit_t = None
         self._fps_label_t = 0.0
         self._fps_label = None
         # Render throttle: input marks dirty; a 60fps timer renders only when
@@ -135,7 +142,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._dirty = True
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(16)
+        self._timer.start(_FRAME_INTERVAL_MS)
         # Interactive-quality state: while the camera/tool is actively moving the
         # renderer uses a cheaper per-pixel budget (see u_interacting); a short
         # idle delay then triggers one full-quality frame once motion stops.
@@ -360,7 +367,7 @@ class QRhiViewportWidget(QRhiWidget):
     }
 
     def _build_view_panel(self) -> None:
-        """Bottom-left overlay: 3D / {x,y} / {x,z} / {y,z} reference-view buttons.
+        """Bottom-right overlay: 3D / {x,y} / {x,z} / {y,z} reference-view buttons.
         Each sets the active grid (draw) plane and flies the camera to it."""
         panel = QFrame(self)
         panel.setObjectName("viewportViewPanel")
@@ -395,8 +402,9 @@ class QRhiViewportWidget(QRhiWidget):
         p = self._view_panel
         if p is None:
             return
-        # bottom-left, raised above the corner orientation-axis gizmo (~130px).
-        p.move(8, max(8, self.height() - p.height() - 132))
+        # bottom-right, raised above the corner orientation-axis gizmo (~130px).
+        p.move(max(8, self.width() - p.width() - 8),
+               max(8, self.height() - p.height() - 132))
         p.raise_()
 
     def set_reference_view(self, view: str) -> None:
@@ -454,6 +462,9 @@ class QRhiViewportWidget(QRhiWidget):
             self._dirty = False
             self.update()
 
+    def _request_render(self) -> None:
+        self._dirty = True
+
     def _begin_interaction(self) -> None:
         """Mark the viewport as actively moving (cheap interactive frames) and
         (re)arm the idle timer that snaps back to a full-quality frame shortly
@@ -490,15 +501,50 @@ class QRhiViewportWidget(QRhiWidget):
         """The app's render hook: show the freshly built scene."""
         self._tree = tree  # kept for CPU click-picking
         self._committed_render_ir = render_ir  # restore target after a preview
+        self._update_scene_bounds(tree)
+        self._preview_kind = None
+        self._move_commit_delta = (0.0, 0.0, 0.0)
         self.set_scene(render_ir)
 
-    def show_scene_preview(self, render_ir) -> None:
+    def _update_scene_bounds(self, tree) -> None:
+        root = getattr(tree, "root", None)
+        if root is None:
+            self._scene_center = None
+            self._scene_radius = 0.0
+            return
+        try:
+            box = root.bounding_box()
+        except Exception:
+            self._scene_center = None
+            self._scene_radius = 0.0
+            return
+        self._scene_center = np.array(
+            [
+                (box.x_min + box.x_max) * 0.5,
+                (box.y_min + box.y_max) * 0.5,
+                (box.z_min + box.z_max) * 0.5,
+            ],
+            dtype=np.float64,
+        )
+        half = np.array(
+            [
+                (box.x_max - box.x_min) * 0.5,
+                (box.y_max - box.y_min) * 0.5,
+                (box.z_max - box.z_min) * 0.5,
+            ],
+            dtype=np.float64,
+        )
+        self._scene_radius = max(float(np.linalg.norm(half)), 1.0)
+
+    def show_scene_preview(self, render_ir, *, preview_kind: str = "tool") -> None:
         """Render a non-committing ghost during a move/rotate drag (main_window
         builds it). The committed scene is restored on cancel/commit."""
+        self._preview_kind = preview_kind
         self._renderer.set_scene(render_ir)
         self._dirty = True
 
     def _restore_committed_scene(self) -> None:
+        self._preview_kind = None
         self._renderer.set_scene(self._committed_render_ir)
         self._dirty = True
 
@@ -526,6 +572,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._move_active = True
         self._move_start_grid = None
         self._move_preview_delta = (0.0, 0.0, 0.0)
+        self._move_commit_delta = (0.0, 0.0, 0.0)
         self.setCursor(Qt.CursorShape.SizeAllCursor)
         self.setFocus()
         signals.log_message.emit(
@@ -534,11 +581,15 @@ class QRhiViewportWidget(QRhiWidget):
             f"{self.reference_plane_label} grid. Release to apply, Esc cancels.",
         )
 
-    def end_move_tool(self, *a, **k) -> None:
+    def end_move_tool(self, *a, preserve_preview: bool = False, **k) -> None:
         self._move_active = False
         self._move_handle = None
         self._move_start_grid = None
-        self._move_preview_delta = (0.0, 0.0, 0.0)
+        if preserve_preview:
+            self._move_commit_delta = self._move_preview_delta
+        else:
+            self._move_preview_delta = (0.0, 0.0, 0.0)
+            self._move_commit_delta = (0.0, 0.0, 0.0)
         self.unsetCursor()
 
     # --- rotate tool (real, deferred preview) ---
@@ -721,8 +772,8 @@ class QRhiViewportWidget(QRhiWidget):
     # --- draw / create tool (real) ---
     # kinds built from a click sequence rather than a single drag
     _POINT_CREATE_KINDS = {
-        "polyline", "bezier_curve", "bezier_polycurve",
-        "polyline_tube", "bezier_tube", "bezier_surface", "polygon",
+        "polyline", "quadratic_bezier_curve", "quadratic_bezier_polycurve",
+        "polyline_tube", "quadratic_bezier_tube", "quadratic_bezier_surface", "polygon",
     }
 
     def _plane_id(self) -> str:
@@ -743,6 +794,13 @@ class QRhiViewportWidget(QRhiWidget):
         point_mode = kind in self._POINT_CREATE_KINDS
         self._point_pts = [] if point_mode else None
         self._point_hover = None
+        self._renderer.prewarm_for_tool(
+            self._committed_render_ir,
+            kind,
+            compile_pipeline=(
+                not point_mode or self._renderer.should_prewarm_tool_pipeline()
+            ),
+        )
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setFocus()
         if point_mode:
@@ -875,7 +933,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._update_cutter_buttons_enabled()
 
     _PLANAR_CUTTER_KINDS = (("Segment", "segment"), ("Polyline", "polyline"),
-                            ("Bezier Polycurve", "bezier_polycurve"))
+                            ("Quadratic Bezier Polycurve", "quadratic_bezier_polycurve"))
     _SURFACE_CUTTER_KINDS = (("Sphere", "sphere"), ("Box", "box"),
                              ("Cylinder", "cylinder"), ("Cone", "cone"))
 
@@ -915,7 +973,8 @@ class QRhiViewportWidget(QRhiWidget):
         return None
 
     def clear_boolean_preview(self) -> None:
-        self._restore_committed_scene()
+        if self._preview_kind == "boolean":
+            self._restore_committed_scene()
 
     def set_sdf_opacity(self, opacity: float) -> None:
         self._sdf_opacity = max(0.0, min(1.0, float(opacity)))
@@ -951,7 +1010,7 @@ class QRhiViewportWidget(QRhiWidget):
         try:
             if not self._renderer_ready:
                 self._renderer.initialize(self.rhi(), self.renderTarget())
-                self._renderer.set_update_callback(self.update)
+                self._renderer.set_update_callback(self._request_render)
                 self._renderer_ready = True
         except BaseException:
             import traceback
@@ -959,10 +1018,17 @@ class QRhiViewportWidget(QRhiWidget):
             raise
 
     def render(self, cb) -> None:
+        now = time.perf_counter()
+        if self._last_render_submit_t is not None:
+            elapsed_ms = (now - self._last_render_submit_t) * 1000.0
+            if elapsed_ms < _FRAME_INTERVAL_MS:
+                self._dirty = True
+                return
+        self._last_render_submit_t = now
         self._renderer.render(
             cb, self.renderTarget(), self._camera_values(),
             self._overlay_geometry())
-        self._update_fps()
+        self._update_fps(now)
 
     def closeEvent(self, event) -> None:
         # Best-effort: persist the driver pipeline cache for next launch (no-op if
@@ -992,7 +1058,12 @@ class QRhiViewportWidget(QRhiWidget):
         center = np.array([(bb.x_min + bb.x_max) * 0.5,
                            (bb.y_min + bb.y_max) * 0.5,
                            (bb.z_min + bb.z_max) * 0.5])
-        return center + np.array(self._move_preview_delta)
+        delta = (
+            self._move_preview_delta
+            if self._move_active
+            else self._move_commit_delta
+        )
+        return center + np.array(delta)
 
     # quad-segment triangulation: (endpoint_select, side) per vertex
     _SEG_CORNERS = ((0.0, 1.0), (0.0, -1.0), (1.0, 1.0),
@@ -1136,8 +1207,9 @@ class QRhiViewportWidget(QRhiWidget):
                 tip = pivot + radius * (math.cos(spoke) * u + math.sin(spoke) * v)
                 self._seg(pivot, tip, (1.0, 1.0, 0.7), out)
 
-    def _update_fps(self) -> None:
-        now = time.perf_counter()
+    def _update_fps(self, now: float | None = None) -> None:
+        if now is None:
+            now = time.perf_counter()
         last, self._last_frame_t = self._last_frame_t, now
         if last is None:
             return
@@ -1174,6 +1246,7 @@ class QRhiViewportWidget(QRhiWidget):
             "u_camera_right": tuple(right),
             "u_camera_up": tuple(up),
             "u_focal_length": self._focal,
+            "u_max_ray_distance": self._max_ray_distance(pos),
             "u_surface_opacity": self._sdf_opacity,
             "u_background_color": self._bg,
             "u_show_grid": 1 if self._show_grid else 0,
@@ -1481,12 +1554,13 @@ class QRhiViewportWidget(QRhiWidget):
             handle = self._move_handle
             delta = self._move_preview_delta
             moved = max(abs(c) for c in delta) > 1e-9
-            self.end_move_tool()
             if moved and handle is not None:
                 # Single commit (one undo step); main_window re-publishes,
                 # which restores the real scene over the preview.
+                self.end_move_tool(preserve_preview=True)
                 signals.viewport_move_requested.emit(int(handle), delta)
             else:
+                self.end_move_tool()
                 self._restore_committed_scene()  # no displacement -> drop preview
             self._last_pos = None
             self._press_pos = None
@@ -1559,6 +1633,7 @@ class QRhiViewportWidget(QRhiWidget):
         from core.sdf_attribution import evaluate_with_attribution
         cp, rd = self._screen_ray(pos)
         travel, hit_id = 0.0, 0
+        maximum_travel = self._max_ray_distance(cp)
         for _ in range(200):
             p = cp + rd * travel
             d, owner = evaluate_with_attribution(
@@ -1568,11 +1643,18 @@ class QRhiViewportWidget(QRhiWidget):
                 hit_id = int(owner[0])
                 break
             travel += max(dist, 0.002)
-            if travel > 100.0:
+            if travel > maximum_travel:
                 break
         self._selected_id = hit_id
         signals.viewport_scene_object_selected.emit(hit_id)
         self._dirty = True
+
+    def _max_ray_distance(self, camera_position) -> float:
+        if self._scene_center is None:
+            return 100.0
+        camera = np.asarray(camera_position, dtype=np.float64)
+        to_scene = float(np.linalg.norm(camera - self._scene_center))
+        return max(100.0, to_scene + self._scene_radius * 4.0)
 
     def wheelEvent(self, e: QWheelEvent) -> None:
         # angleDelta (mouse wheel, ~120/notch) or pixelDelta (touchpad, small).

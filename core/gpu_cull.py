@@ -63,7 +63,7 @@ def _leaf_bounding_sphere(node: RenderIRNode) -> tuple[float, float, float, floa
         else:  # rectangle / rounded_rectangle: half-extents at indices 14, 15
             r = float(np.hypot(p[14], p[15]))
         return (float(center[0]), float(center[1]), float(center[2]), r + 0.01)
-    # polyline/bezier sections, extrude/revolve/profile sub-graphs, sweeps, placed
+    # polyline/quadratic Bezier sections, extrude/revolve/profile sub-graphs, sweeps, placed
     # 1D: no cheap closed-form bound -> unbounded sentinel (never culled).
     return (0.0, 0.0, 0.0, _INF_RADIUS)
 

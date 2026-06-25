@@ -8,9 +8,9 @@ from .boundary import BoundaryRegion
 from .domain import FluidDomain
 from .scene import SceneDocument
 from .sdf import (
-    BezierCurveProfile,
-    BezierSurfaceProfile,
-    BezierTube,
+    QuadraticBezierCurveProfile,
+    QuadraticBezierSurfaceProfile,
+    QuadraticBezierTube,
     BinaryProfile1D,
     BinaryProfile,
     Box,
@@ -26,7 +26,7 @@ from .sdf import (
     OffsetProfile,
     OffsetProfile1D,
     PlacedSDF1D,
-    PlacedPolyline2D,
+    PlacedPolyline1D,
     PlacedSDF2D,
     PolygonProfile,
     PolylineTube,
@@ -179,14 +179,14 @@ def load_scene(path: str | Path) -> SceneDocument:
         regions_by_id = {
             region.object_id: region for region in document.boundary_regions
         }
-        tag_items: list[PlacedSDF1D | PlacedPolyline2D | PlacedSDF2D | BoundaryRegion] = []
+        tag_items: list[PlacedSDF1D | PlacedPolyline1D | PlacedSDF2D | BoundaryRegion] = []
         for object_id in (int(item) for item in fluid.get("tag_object_ids", [])):
             region = regions_by_id.get(object_id)
             if region is not None:
                 tag_items.append(region)
             elif object_id in records:
                 tag = build(object_id)
-                if isinstance(tag, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D)):
+                if isinstance(tag, (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D)):
                     tag_items.append(tag)
         tags = tuple(tag_items)
         selector_items: list[SDFNode] = []
@@ -196,18 +196,18 @@ def load_scene(path: str | Path) -> SceneDocument:
             if object_id in records:
                 selector_items.append(build(object_id))
         if root.dimension == 2:
-            migrated: list[PlacedSDF1D | PlacedPolyline2D | BoundaryRegion] = []
+            migrated: list[PlacedSDF1D | PlacedPolyline1D | BoundaryRegion] = []
             for tag in tags:
-                if isinstance(tag, (PlacedSDF1D, PlacedPolyline2D, BoundaryRegion)):
+                if isinstance(tag, (PlacedSDF1D, PlacedPolyline1D, BoundaryRegion)):
                     migrated.append(tag)
                 else:
                     raise ValueError(
                         "2D fluid tag objects must be PlacedSDF1D, "
-                        "PlacedPolyline2D, or BoundaryRegion"
+                        "PlacedPolyline1D, or BoundaryRegion"
                     )
             tags = tuple(migrated)
         if not all(
-            isinstance(tag, (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D, BoundaryRegion))
+            isinstance(tag, (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D, BoundaryRegion))
             for tag in tags
         ):
             raise ValueError(
@@ -220,7 +220,7 @@ def load_scene(path: str | Path) -> SceneDocument:
                 for tag in tags
                 if isinstance(
                     tag,
-                    (PlacedSDF1D, PlacedPolyline2D, PlacedSDF2D, BoundaryRegion),
+                    (PlacedSDF1D, PlacedPolyline1D, PlacedSDF2D, BoundaryRegion),
                 )
             ),
             tuple(selector_items),
@@ -312,7 +312,7 @@ def _node_to_record(node: SDFNode) -> dict[str, Any]:
             axis_u=list(node.axis_u),
             source_ids=[child.object_id for child in node.sources],
         )
-    elif isinstance(node, PlacedPolyline2D):
+    elif isinstance(node, PlacedPolyline1D):
         assert node.profile is not None
         data.update(
             profile=_profile_to_dict(node.profile),
@@ -366,7 +366,7 @@ def _node_to_record(node: SDFNode) -> dict[str, Any]:
             inner_radius=node.inner_radius,
             caps=node.caps,
         )
-    elif isinstance(node, BezierTube):
+    elif isinstance(node, QuadraticBezierTube):
         data.update(
             points=[list(point) for point in node.points],
             radius=node.radius,
@@ -467,8 +467,8 @@ def _node_from_record(
             axis_v=tuple(data["axis_v"]),
             sources=tuple(build(int(item)) for item in data.get("source_ids", [])),
         )
-    if node_type == "PlacedPolyline2D":
-        return PlacedPolyline2D(
+    if node_type == "PlacedPolyline1D":
+        return PlacedPolyline1D(
             **common,
             profile=_profile_from_dict(data["profile"]),
             origin=tuple(data["origin"]),
@@ -551,8 +551,8 @@ def _node_from_record(
             inner_radius=float(data.get("inner_radius", 0.0)),
             caps=str(data.get("caps", "round")),
         )
-    if node_type == "BezierTube":
-        return BezierTube(
+    if node_type == "QuadraticBezierTube":
+        return QuadraticBezierTube(
             **common,
             points=tuple(tuple(point) for point in data["points"]),
             radius=float(data["radius"]),
@@ -582,8 +582,8 @@ def _profile_from_dict(data: dict[str, Any]) -> Profile2D:
         "RoundedRectangleProfile": RoundedRectangleProfile,
         "EllipseProfile": EllipseProfile,
         "RegularPolygonProfile": RegularPolygonProfile,
-        "BezierCurveProfile": BezierCurveProfile,
-        "BezierSurfaceProfile": BezierSurfaceProfile,
+        "QuadraticBezierCurveProfile": QuadraticBezierCurveProfile,
+        "QuadraticBezierSurfaceProfile": QuadraticBezierSurfaceProfile,
         "PolylineProfile": PolylineProfile,
         "PolygonProfile": PolygonProfile,
         "OffsetProfile": OffsetProfile,

@@ -220,7 +220,7 @@ def _unit_vector(first: Point3D, second: Point3D) -> np.ndarray:
     return vector / length
 
 
-def _bezier_endpoint_tangents(points: tuple[Point3D, ...]) -> tuple[np.ndarray, np.ndarray]:
+def _quadratic_bezier_endpoint_tangents(points: tuple[Point3D, ...]) -> tuple[np.ndarray, np.ndarray]:
     start = points[0]
     first_control = points[1]
     first_end = points[2]
@@ -327,7 +327,7 @@ class PolylineTube(SDFNode):
 
 
 @dataclass
-class BezierTube(SDFNode):
+class QuadraticBezierTube(SDFNode):
     points: tuple[Point3D, ...] = (
         (-0.75, 0.0, 0.0),
         (0.0, 0.55, 0.0),
@@ -340,21 +340,21 @@ class BezierTube(SDFNode):
     def __post_init__(self) -> None:
         points = _as_points(self.points)
         if len(points) < 3:
-            raise ValueError("bezier tube requires at least three points")
+            raise ValueError("quadratic Bezier tube requires at least three points")
         if len(points) % 2 == 0:
             raise ValueError(
-                "bezier tube requires an odd point count: anchor, control, anchor"
+                "quadratic Bezier tube requires an odd point count: anchor, control, anchor"
             )
         if all(
             np.linalg.norm(np.asarray(control) - np.asarray(start)) <= 1.0e-12
             and np.linalg.norm(np.asarray(end) - np.asarray(start)) <= 1.0e-12
             for start, control, end in _quadratic_bezier_spans(points)
         ):
-            raise ValueError("bezier tube requires at least one nonzero span")
+            raise ValueError("quadratic Bezier tube requires at least one nonzero span")
         _validate_tube_radius(self.radius, self.inner_radius)
         _validate_caps(self.caps)
         if self.caps == "flat":
-            _bezier_endpoint_tangents(points)
+            _quadratic_bezier_endpoint_tangents(points)
         self.points = points
 
     @property
@@ -363,7 +363,7 @@ class BezierTube(SDFNode):
 
     @property
     def kind(self) -> str:
-        return "bezier_polycurve_tube" if len(self.points) > 3 else "bezier_tube"
+        return "quadratic_bezier_polycurve_tube" if len(self.points) > 3 else "quadratic_bezier_tube"
 
     def to_numpy(
         self, X: FloatArray, Y: FloatArray, Z: FloatArray
@@ -375,7 +375,7 @@ class BezierTube(SDFNode):
         centerline = np.asarray(np.minimum.reduce(distances), dtype=np.float64)
         outer = centerline - self.radius
         if self.caps == "flat":
-            start_tangent, end_tangent = _bezier_endpoint_tangents(self.points)
+            start_tangent, end_tangent = _quadratic_bezier_endpoint_tangents(self.points)
             start_plane, end_plane = _flat_cap_planes_numpy(
                 X,
                 Y,

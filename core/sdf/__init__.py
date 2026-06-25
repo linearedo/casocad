@@ -1,7 +1,7 @@
 from .base import BoundingBox3D, SDFNode
 from .operators import Difference, Intersection, Union
 from .placed_1d import PlacedSDF1D
-from .placed_2d import PlacedPolyline2D, PlacedSDF2D
+from .placed_2d import PlacedPolyline1D, PlacedSDF2D
 from .primitives_1d import (
     BinaryProfile1D,
     OffsetProfile1D,
@@ -9,8 +9,8 @@ from .primitives_1d import (
     SegmentProfile,
 )
 from .primitives_2d import (
-    BezierCurveProfile,
-    BezierSurfaceProfile,
+    QuadraticBezierCurveProfile,
+    QuadraticBezierSurfaceProfile,
     BinaryProfile,
     CircleProfile,
     DistanceOffsetProfile,
@@ -28,15 +28,15 @@ from .primitives_3d import Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, S
 from .solid_from_2d import Extrude, Revolve
 from .transforms import Rotate, Scale, Translate
 from .tree import SDFTree
-from .tubes import BezierTube, PolylineTube
+from .tubes import QuadraticBezierTube, PolylineTube
 
 __all__ = [
     "BoundingBox3D",
     "Box",
     "BoxFrame",
-    "BezierCurveProfile",
-    "BezierSurfaceProfile",
-    "BezierTube",
+    "QuadraticBezierCurveProfile",
+    "QuadraticBezierSurfaceProfile",
+    "QuadraticBezierTube",
     "BinaryProfile1D",
     "BinaryProfile",
     "CappedCone",
@@ -50,7 +50,7 @@ __all__ = [
     "Extrude",
     "Intersection",
     "OffsetProfile1D",
-    "PlacedPolyline2D",
+    "PlacedPolyline1D",
     "PlacedSDF2D",
     "PlacedSDF1D",
     "PolygonProfile",

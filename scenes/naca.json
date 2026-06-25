@@ -50,7 +50,7 @@
         1.0,
         0.0
       ],
-      "name": "bezier_surface_8",
+      "name": "quadratic_bezier_surface_8",
       "object_id": 8,
       "origin": [
         -12.0,
@@ -80,7 +80,7 @@
             0.0
           ]
         ],
-        "type": "BezierSurfaceProfile"
+        "type": "QuadraticBezierSurfaceProfile"
       },
       "source_ids": [],
       "type": "PlacedSDF2D"
@@ -96,7 +96,7 @@
         1.0,
         0.0
       ],
-      "name": "difference: rectangle_7, bezier_surface_8",
+      "name": "difference: rectangle_7, quadratic_bezier_surface_8",
       "object_id": 9,
       "origin": [
         3.5,
@@ -140,7 +140,7 @@
                 0.0
               ]
             ],
-            "type": "BezierSurfaceProfile"
+            "type": "QuadraticBezierSurfaceProfile"
           },
           "offset": [
             -15.5,
