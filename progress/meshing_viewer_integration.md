@@ -664,9 +664,12 @@ Implemented:
   - `QRhiMeshViewerWidget` records `driverInfo()` after QRhi initialization.
   - The metadata includes backend name, vendor id, device id, device name, and
     device type.
-  - `nvidia-smi` is trusted only when the current QRhi render device is NVIDIA.
-  - If QRhi is rendering on another GPU, NVIDIA telemetry is ignored so Auto
-    does not budget for the wrong device.
+  - `nvidia-smi` is trusted when the current QRhi render device is NVIDIA or
+    the process was launched with the NVIDIA offload environment used by
+    `outbin/casocad-nvidia`.
+  - If QRhi is rendering on another GPU and no NVIDIA offload launch state is
+    present, NVIDIA telemetry is ignored so Auto does not budget for the wrong
+    device.
 - Added `tests/test_gpu_memory_budget.py`.
   - Verifies free-VRAM based budgeting.
   - Verifies wireframe reduces the budget.
@@ -682,3 +685,57 @@ Current policy:
 - Wireframe previews are more conservative because triangle wireframe can add
   about twice the vertex storage of filled triangles.
 - No speculative allocation is used.
+
+Follow-up fix:
+
+- The `Max render triangles` spinbox still had the old cap of `6,666,666`.
+- That value came from the previous `20,000,000` vertex cap divided by three.
+- The spinbox now shares the same `50,000,000` render-triangle maximum used by
+  the Auto budget clamp.
+
+Follow-up fix:
+
+- Plain `./outbin/casocad` could still report `nvidia-smi` in Auto logs.
+- Root cause:
+  - QRhi render-device metadata is only available after QRhi initialization.
+  - When Auto ran with unknown render-device metadata, the probe still allowed
+    `nvidia-smi`.
+- Fix:
+  - `nvidia-smi` is now used only when QRhi has reported a known NVIDIA render
+    device or when the process carries the NVIDIA offload launch environment.
+  - If the QRhi render device is unknown and there is no NVIDIA offload launch
+    state, Auto falls back instead of assuming that visible NVIDIA telemetry
+    belongs to the active renderer.
+- Verification:
+  - full test suite passed: `159 passed, 3 skipped`
+
+## Repeated Auto Worker Restart Fix
+
+Observed issue:
+
+- Repeatedly pressing `Auto` could log cache worker crashes with exit code `9`.
+- This was not necessarily an OOM condition.
+- The loader killed the old cache worker when starting a new load, but stale
+  Qt process callbacks could still fire.
+- Because the loader stored only one `_cache_process`, an old worker callback
+  could interact with the new worker state.
+
+Fix:
+
+- Cache worker callbacks now capture their owning `QProcess`.
+- Stale callbacks are ignored unless they belong to the current process.
+- Stopping a worker clears the current process before killing it, so later
+  stale crash/finished signals are ignored.
+- Pressing `Auto` with the same computed limit no longer reloads the current
+  artifact.
+
+Verification:
+
+- Focused tests passed:
+  - `tests/test_mesh_viewer_loader.py`
+  - `tests/test_mesh_render_cache.py`
+  - `tests/test_gpu_memory_budget.py`
+  - `tests/test_meshing_workspace_script.py`
+  - result: `12 passed`
+- Full test suite passed:
+  - result: `158 passed, 3 skipped`

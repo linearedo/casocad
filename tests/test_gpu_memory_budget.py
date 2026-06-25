@@ -77,6 +77,38 @@ def test_nvidia_probe_is_ignored_for_non_nvidia_render_device(monkeypatch) -> No
     assert info is None
 
 
+def test_nvidia_probe_is_ignored_when_render_device_is_unknown(monkeypatch) -> None:
+    def fake_check_output(*args, **kwargs) -> str:
+        return "4096, 6144, 0x25A2, NVIDIA GeForce RTX 3050 Laptop GPU\n"
+
+    monkeypatch.setattr(gpu_memory.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(gpu_memory.sys, "platform", "linux")
+    monkeypatch.delenv("__NV_PRIME_RENDER_OFFLOAD", raising=False)
+    monkeypatch.delenv("__VK_LAYER_NV_optimus", raising=False)
+    monkeypatch.delenv("__GLX_VENDOR_LIBRARY_NAME", raising=False)
+
+    info = gpu_memory.query_gpu_memory_info(render_device=None)
+
+    assert info is None
+
+
+def test_nvidia_probe_uses_nvidia_launcher_environment(monkeypatch) -> None:
+    def fake_check_output(*args, **kwargs) -> str:
+        return "4096, 6144, 0x25A2, NVIDIA GeForce RTX 3050 Laptop GPU\n"
+
+    monkeypatch.setattr(gpu_memory.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(gpu_memory.sys, "platform", "linux")
+    monkeypatch.setenv("__NV_PRIME_RENDER_OFFLOAD", "1")
+
+    info = gpu_memory.query_gpu_memory_info(render_device=None)
+
+    assert info == GpuMemoryInfo(
+        source="nvidia-smi",
+        free_bytes=4096 * 1024 * 1024,
+        total_bytes=6144 * 1024 * 1024,
+    )
+
+
 def test_nvidia_probe_matches_nvidia_render_device(monkeypatch) -> None:
     def fake_check_output(*args, **kwargs) -> str:
         return "4096, 6144, 0x25A2, NVIDIA GeForce RTX 3050 Laptop GPU\n"

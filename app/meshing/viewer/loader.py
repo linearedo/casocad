@@ -144,13 +144,26 @@ class MeshArtifactLoader(QObject):
                 str(self._max_preview_vertices),
             ]
         )
-        process.readyReadStandardOutput.connect(self._on_cache_stdout)
-        process.readyReadStandardError.connect(self._on_cache_stderr)
+        process.readyReadStandardOutput.connect(
+            lambda process=process: self._on_cache_stdout(process)
+        )
+        process.readyReadStandardError.connect(
+            lambda process=process: self._on_cache_stderr(process)
+        )
         process.finished.connect(
-            lambda code, status: self._on_cache_finished(generation, code, status)
+            lambda code, status, process=process: self._on_cache_finished(
+                generation,
+                process,
+                code,
+                status,
+            )
         )
         process.errorOccurred.connect(
-            lambda error: self._on_cache_process_error(generation, error)
+            lambda error, process=process: self._on_cache_process_error(
+                generation,
+                process,
+                error,
+            )
         )
         self._cache_process = process
         self.status_changed.emit("Preparing render preview cache in worker process.")
@@ -199,9 +212,8 @@ class MeshArtifactLoader(QObject):
             daemon=True,
         ).start()
 
-    def _on_cache_stdout(self) -> None:
-        process = self._cache_process
-        if process is None:
+    def _on_cache_stdout(self, process: QProcess) -> None:
+        if process is not self._cache_process:
             return
         self._cache_stdout_buffer += bytes(process.readAllStandardOutput()).decode(
             "utf-8",
@@ -212,9 +224,8 @@ class MeshArtifactLoader(QObject):
             if line:
                 self._handle_cache_message(line)
 
-    def _on_cache_stderr(self) -> None:
-        process = self._cache_process
-        if process is None:
+    def _on_cache_stderr(self, process: QProcess) -> None:
+        if process is not self._cache_process:
             return
         self._cache_stderr_buffer += bytes(process.readAllStandardError()).decode(
             "utf-8",
@@ -242,12 +253,14 @@ class MeshArtifactLoader(QObject):
     def _on_cache_finished(
         self,
         generation: int,
+        process: QProcess,
         exit_code: int,
         exit_status: QProcess.ExitStatus,
     ) -> None:
-        process = self._cache_process
-        if process is not None:
+        if process is not self._cache_process:
             process.deleteLater()
+            return
+        process.deleteLater()
         self._cache_process = None
         if generation != self._generation:
             return
@@ -276,9 +289,10 @@ class MeshArtifactLoader(QObject):
     def _on_cache_process_error(
         self,
         generation: int,
+        process: QProcess,
         error: QProcess.ProcessError,
     ) -> None:
-        if generation != self._generation:
+        if generation != self._generation or process is not self._cache_process:
             return
         self.failed.emit(f"cache worker process error: {error.name}")
 
@@ -286,9 +300,9 @@ class MeshArtifactLoader(QObject):
         process = self._cache_process
         if process is None:
             return
+        self._cache_process = None
         process.kill()
         process.deleteLater()
-        self._cache_process = None
 
 
 __all__ = [

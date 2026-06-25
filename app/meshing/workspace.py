@@ -39,6 +39,7 @@ from .viewer.gpu_memory import (
 from .viewer import MeshPreviewSummary, QRhiMeshViewerWidget
 
 _DEFAULT_PREVIEW_RENDER_TRIANGLE_LIMIT = 100_000
+_MAX_PREVIEW_RENDER_TRIANGLE_LIMIT = 50_000_000
 
 
 _DEFAULT_SCRIPT = """\
@@ -144,7 +145,7 @@ class MeshingWorkspace(QMainWindow):
         self.open_artifact_button = QPushButton("Open mesh artifact...")
         self.open_artifact_button.clicked.connect(self.open_artifact)
         self.preview_limit = QSpinBox()
-        self.preview_limit.setRange(1_000, 6_666_666)
+        self.preview_limit.setRange(1_000, _MAX_PREVIEW_RENDER_TRIANGLE_LIMIT)
         self.preview_limit.setSingleStep(25_000)
         self.preview_limit.setValue(_DEFAULT_PREVIEW_RENDER_TRIANGLE_LIMIT)
         self.preview_limit.setToolTip("Maximum render triangles loaded into the preview")
@@ -291,13 +292,14 @@ class MeshingWorkspace(QMainWindow):
         self.viewer.set_wireframe_visible(visible)
 
     def auto_preview_limit(self) -> None:
+        previous_limit = self.preview_limit.value()
         limit, source = _auto_preview_render_triangle_limit(
             render_device=self.viewer.render_device_info(),
             wireframe_enabled=self.wireframe_toggle.isChecked(),
         )
         self.preview_limit.setValue(limit)
         self._log(f"Auto max render triangles set to {limit:,} ({source})")
-        if self._last_artifact_path is not None:
+        if self._last_artifact_path is not None and limit != previous_limit:
             self._load_artifact_preview(self._last_artifact_path)
 
     def load_scene_file(self, path: str | Path) -> None:
@@ -522,7 +524,7 @@ def _auto_preview_render_triangle_limit(
     )
     bytes_per_vertex = 3 * 4 * 2
     bytes_per_triangle = bytes_per_vertex * 3
-    limit = max(1_000, min(50_000_000, budget // bytes_per_triangle))
+    limit = max(1_000, min(_MAX_PREVIEW_RENDER_TRIANGLE_LIMIT, budget // bytes_per_triangle))
     if available is None and source == "fallback":
         limit = _DEFAULT_PREVIEW_RENDER_TRIANGLE_LIMIT
     return limit, source

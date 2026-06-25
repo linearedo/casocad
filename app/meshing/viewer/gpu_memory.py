@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import subprocess
 import sys
 
@@ -59,7 +60,7 @@ def _query_nvidia_smi(
 ) -> GpuMemoryInfo | None:
     if sys.platform not in ("linux", "win32"):
         return None
-    if render_device is not None and render_device.vendor_id != 0x10DE:
+    if not _nvidia_probe_matches_render_context(render_device):
         return None
     try:
         output = subprocess.check_output(
@@ -118,6 +119,18 @@ def _parse_hex_device_id(value: str) -> int | None:
     except ValueError:
         return None
     return parsed & 0xFFFF
+
+
+def _nvidia_probe_matches_render_context(
+    render_device: GpuRenderDeviceInfo | None,
+) -> bool:
+    if render_device is not None and render_device.vendor_id == 0x10DE:
+        return True
+    return (
+        os.environ.get("__NV_PRIME_RENDER_OFFLOAD") == "1"
+        or os.environ.get("__VK_LAYER_NV_optimus") == "NVIDIA_only"
+        or os.environ.get("__GLX_VENDOR_LIBRARY_NAME") == "nvidia"
+    )
 
 
 def _query_macos_unified_memory() -> GpuMemoryInfo | None:
