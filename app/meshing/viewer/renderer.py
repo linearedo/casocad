@@ -118,6 +118,16 @@ def _perspective(
     return matrix
 
 
+def _destroy_resource(resource: object) -> None:
+    destroy = getattr(resource, "destroy", None)
+    if destroy is None:
+        return
+    try:
+        destroy()
+    except RuntimeError:
+        pass
+
+
 class QRhiMeshRenderer:
     def __init__(self) -> None:
         self._rhi = None
@@ -211,9 +221,40 @@ class QRhiMeshRenderer:
                     self._build_chunk_buffer(wire_chunk)
 
     def clear(self) -> None:
-        self._chunks.clear()
-        self._wire_chunks.clear()
+        self._destroy_chunks(self._chunks)
+        self._destroy_chunks(self._wire_chunks)
         self._pending_uploads = False
+
+    def shutdown(self) -> None:
+        self.clear()
+        for resource_name in (
+            "_pipeline",
+            "_wire_pipeline",
+            "_shader_resources",
+            "_uniform_buffer",
+        ):
+            resource = getattr(self, resource_name)
+            if resource is not None:
+                _destroy_resource(resource)
+                setattr(self, resource_name, None)
+        if self._rhi is not None and hasattr(self._rhi, "releaseCachedResources"):
+            try:
+                self._rhi.releaseCachedResources()
+            except RuntimeError:
+                pass
+        self._render_pass_descriptor = None
+        self._vertex_shader = None
+        self._fragment_shader = None
+        self._rhi = None
+
+    def _destroy_chunks(self, chunks: list["_RenderChunk"]) -> None:
+        for chunk in chunks:
+            if chunk.buffer is not None:
+                _destroy_resource(chunk.buffer)
+                chunk.buffer = None
+            chunk.vertex_bytes = b""
+            chunk.uploaded = False
+        chunks.clear()
 
     def _build_chunk_buffer(self, chunk: "_RenderChunk") -> None:
         assert self._rhi is not None

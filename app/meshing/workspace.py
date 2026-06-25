@@ -130,6 +130,7 @@ class MeshingWorkspace(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("casoCAD - Meshing Workspace")
         self.resize(1200, 760)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self._scene_path: Path | None = None
         self._domains = MeshableDomains(())
         self._last_artifact_path: Path | None = None
@@ -371,6 +372,11 @@ class MeshingWorkspace(QMainWindow):
             return
         self._log("Cancelling meshing worker process.")
         process.kill()
+
+    def closeEvent(self, event) -> None:
+        self.cancel_script()
+        self.viewer.release_resources()
+        super().closeEvent(event)
 
     @Slot()
     def _on_script_stdout(self) -> None:

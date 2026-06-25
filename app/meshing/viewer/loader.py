@@ -180,6 +180,14 @@ class MeshArtifactLoader(QObject):
         if max_preview_vertices is not None:
             self._max_preview_vertices = max(3, int(max_preview_vertices))
 
+    def cancel(self) -> None:
+        self._generation += 1
+        self._stop_cache_process()
+        self._cache_stdout_buffer = ""
+        self._cache_stderr_buffer = ""
+        self._cache_done = None
+        self._cache_artifact_path = None
+
     def _load_worker(
         self,
         generation: int,

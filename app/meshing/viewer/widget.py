@@ -107,6 +107,13 @@ class QRhiMeshViewerWidget(QRhiWidget):
         self._renderer.clear()
         self.update()
 
+    def release_resources(self) -> None:
+        self._loader.cancel()
+        self._renderer.shutdown()
+        self._renderer_ready = False
+        self._render_device_info = None
+        self.update()
+
     def initialize(self, cb) -> None:
         if self._renderer_ready:
             return
@@ -141,6 +148,10 @@ class QRhiMeshViewerWidget(QRhiWidget):
             return
         self._distance = max(0.01, min(1.0e6, self._distance * math.exp(-delta * 0.0012)))
         self.update()
+
+    def closeEvent(self, event) -> None:
+        self.release_resources()
+        super().closeEvent(event)
 
     def _on_chunk_loaded(self, chunk: MeshPreviewChunk) -> None:
         self._renderer.add_mesh_chunk(

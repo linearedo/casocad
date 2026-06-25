@@ -739,3 +739,47 @@ Verification:
   - result: `12 passed`
 - Full test suite passed:
   - result: `158 passed, 3 skipped`
+
+## Meshing Workspace Close Cleanup
+
+Observed issue:
+
+- After closing the Meshing Workspace, CAD interaction could remain laggy.
+- The main window kept a reference to the Meshing Workspace.
+- The meshing viewer had no explicit release path for QRhi chunk buffers.
+- Closing the window could therefore leave large preview buffers/resources alive
+  longer than expected.
+
+Fix:
+
+- `QRhiMeshRenderer.shutdown()` now destroys chunk buffers, pipelines, shader
+  resource bindings, and the uniform buffer.
+- The renderer asks QRhi to `releaseCachedResources()` after clearing its own
+  resources.
+- `QRhiMeshViewerWidget.release_resources()` cancels cache loading and shuts
+  down the renderer.
+- `MeshingWorkspace.closeEvent(...)` cancels any running script worker and
+  releases viewer resources.
+- `MeshingWorkspace` now uses `WA_DeleteOnClose`.
+- `MainWindow` clears its `_meshing_workspace` reference when the workspace is
+  destroyed, so reopening creates a fresh workspace.
+
+Verification:
+
+- Compile check passed:
+  - `app/meshing/viewer/renderer.py`
+  - `app/meshing/viewer/widget.py`
+  - `app/meshing/viewer/loader.py`
+  - `app/meshing/workspace.py`
+  - `app/main_window.py`
+- Focused tests passed:
+  - `tests/test_mesh_viewer_loader.py`
+  - `tests/test_mesh_render_cache.py`
+  - `tests/test_meshing_workspace_script.py`
+  - `tests/test_gpu_memory_budget.py`
+  - result: `13 passed`
+- Offscreen Meshing Workspace close smoke passed.
+  - Qt reported `QRhiWidget: QRhi is not supported on this platform`, expected
+    with `QT_QPA_PLATFORM=offscreen`.
+- Full test suite passed:
+  - result: `159 passed, 3 skipped`

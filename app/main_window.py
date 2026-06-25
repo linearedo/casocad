@@ -305,9 +305,13 @@ class MainWindow(QMainWindow):
     def _open_meshing_workspace(self) -> None:
         if self._meshing_workspace is None:
             self._meshing_workspace = MeshingWorkspace(self)
+            self._meshing_workspace.destroyed.connect(self._on_meshing_workspace_destroyed)
         self._meshing_workspace.show()
         self._meshing_workspace.raise_()
         self._meshing_workspace.activateWindow()
+
+    def _on_meshing_workspace_destroyed(self) -> None:
+        self._meshing_workspace = None
 
     def _model_or_none(self):
         """Adapt the live document to a Model, or None if it cannot form one
@@ -1706,5 +1710,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: object) -> None:
         self._render_request_timer.stop()
+        if self._meshing_workspace is not None:
+            self._meshing_workspace.close()
         self.artifacts.shutdown()
         super().closeEvent(event)
