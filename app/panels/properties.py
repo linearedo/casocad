@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.dimensions import parse_measurement_entry, parse_scalar_entry
+from app.panels.display import display_kind
 from app.signals import signals
 from core.boundary import BoundaryRegion
 from core.scene import SceneDocument
@@ -379,7 +380,7 @@ class PropertiesPanel(QWidget):
         if node is None:
             return
         self._clear()
-        self._layout.addRow("Kind", QLabel(node.kind))
+        self._layout.addRow("Kind", QLabel(display_kind(node)))
         self._layout.addRow("Dimension", QLabel(f"{node.dimension}D"))
         if node.object_id:
             self._layout.addRow("Object ID", QLabel(str(node.object_id)))

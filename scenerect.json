@@ -1,0 +1,48 @@
+{
+  "boundary_regions": [],
+  "fluid_domain": {
+    "root_object_id": null,
+    "selector_object_ids": [],
+    "tag_object_ids": []
+  },
+  "format": "casocad_scene",
+  "objects": [
+    {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "name": "rectangle_6",
+      "object_id": 6,
+      "origin": [
+        -1.5,
+        2.5,
+        0.0
+      ],
+      "profile": {
+        "center": [
+          0.0,
+          0.0
+        ],
+        "half_size": [
+          1.5,
+          0.5
+        ],
+        "type": "RectangleProfile"
+      },
+      "source_ids": [],
+      "type": "PlacedSDF2D"
+    }
+  ],
+  "root_object_ids": [
+    6
+  ],
+  "unit": "m",
+  "version": 4
+}

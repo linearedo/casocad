@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.panels.display import display_kind
 from app.signals import signals
 from core.boundary import BoundaryRegion
 from core.scene import SceneDocument
@@ -131,7 +132,7 @@ class SceneTreePanel(QWidget):
                         else "Section tag"
                     )
             item = QTreeWidgetItem(
-                [node.name, node.kind, f"{node.dimension}D", role]
+                [node.name, display_kind(node), f"{node.dimension}D", role]
             )
             item.setData(0, HANDLE_ROLE, handle)
             if parent_handle is None:
