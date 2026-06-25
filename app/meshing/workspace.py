@@ -31,6 +31,11 @@ from PySide6.QtWidgets import (
 
 from core.meshing import MeshableDomains, load_meshable_domains
 
+from .viewer.gpu_memory import (
+    GpuRenderDeviceInfo,
+    choose_preview_budget_bytes,
+    query_gpu_memory_info,
+)
 from .viewer import MeshPreviewSummary, QRhiMeshViewerWidget
 
 _DEFAULT_PREVIEW_RENDER_TRIANGLE_LIMIT = 100_000
@@ -286,9 +291,12 @@ class MeshingWorkspace(QMainWindow):
         self.viewer.set_wireframe_visible(visible)
 
     def auto_preview_limit(self) -> None:
-        limit = _auto_preview_render_triangle_limit()
+        limit, source = _auto_preview_render_triangle_limit(
+            render_device=self.viewer.render_device_info(),
+            wireframe_enabled=self.wireframe_toggle.isChecked(),
+        )
         self.preview_limit.setValue(limit)
-        self._log(f"Auto max render triangles set to {limit:,}")
+        self._log(f"Auto max render triangles set to {limit:,} ({source})")
         if self._last_artifact_path is not None:
             self._load_artifact_preview(self._last_artifact_path)
 
@@ -500,14 +508,24 @@ def _available_memory_bytes() -> int | None:
     return page_size * available_pages
 
 
-def _auto_preview_render_triangle_limit() -> int:
+def _auto_preview_render_triangle_limit(
+    *,
+    render_device: GpuRenderDeviceInfo | None,
+    wireframe_enabled: bool,
+) -> tuple[int, str]:
     available = _available_memory_bytes()
-    if available is None:
-        return _DEFAULT_PREVIEW_RENDER_TRIANGLE_LIMIT
-    preview_budget = min(max(int(available * 0.05), 32 * 1024 * 1024), 512 * 1024 * 1024)
+    gpu_info = query_gpu_memory_info(render_device=render_device)
+    budget, source = choose_preview_budget_bytes(
+        gpu_info=gpu_info,
+        available_ram_bytes=available,
+        wireframe_enabled=wireframe_enabled,
+    )
     bytes_per_vertex = 3 * 4 * 2
-    vertex_limit = max(3_000, min(20_000_000, preview_budget // bytes_per_vertex))
-    return max(1_000, min(6_666_666, vertex_limit // 3))
+    bytes_per_triangle = bytes_per_vertex * 3
+    limit = max(1_000, min(50_000_000, budget // bytes_per_triangle))
+    if available is None and source == "fallback":
+        limit = _DEFAULT_PREVIEW_RENDER_TRIANGLE_LIMIT
+    return limit, source
 
 
 __all__ = ["MeshingWorkspace"]

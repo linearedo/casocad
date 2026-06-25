@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QRhiWidget
 
+from .gpu_memory import GpuRenderDeviceInfo
 from .loader import MeshArtifactLoader, MeshPreviewChunk, MeshPreviewSummary
 from .renderer import QRhiMeshRenderer
 
@@ -59,6 +60,7 @@ class QRhiMeshViewerWidget(QRhiWidget):
         self._preview_vertex_limit = 300_000
         self._filled_visible = False
         self._wireframe_visible = True
+        self._render_device_info: GpuRenderDeviceInfo | None = None
 
     def load_artifact(self, path: str | Path) -> None:
         self.clear_mesh()
@@ -80,6 +82,9 @@ class QRhiMeshViewerWidget(QRhiWidget):
 
     def preview_render_triangle_limit(self) -> int:
         return self._preview_vertex_limit // 3
+
+    def render_device_info(self) -> GpuRenderDeviceInfo | None:
+        return self._render_device_info
 
     def set_filled_visible(self, visible: bool) -> None:
         self._filled_visible = bool(visible)
@@ -106,6 +111,7 @@ class QRhiMeshViewerWidget(QRhiWidget):
         if self._renderer_ready:
             return
         self._renderer.initialize(self.rhi(), self.renderTarget())
+        self._render_device_info = _render_device_info(self.rhi())
         self._renderer_ready = True
 
     def render(self, cb) -> None:
@@ -202,6 +208,25 @@ class QRhiMeshViewerWidget(QRhiWidget):
             "filled_visible": self._filled_visible,
             "wireframe_visible": self._wireframe_visible,
         }
+
+
+def _render_device_info(rhi) -> GpuRenderDeviceInfo | None:
+    if rhi is None or not hasattr(rhi, "driverInfo"):
+        return None
+    try:
+        driver = rhi.driverInfo()
+        backend = bytes(rhi.backendName()).decode("utf-8", errors="replace")
+        name = bytes(driver.deviceName).decode("utf-8", errors="replace")
+        device_type = getattr(driver.deviceType, "name", str(driver.deviceType))
+        return GpuRenderDeviceInfo(
+            backend_name=backend,
+            vendor_id=int(driver.vendorId),
+            device_id=int(driver.deviceId),
+            device_name=name,
+            device_type=device_type,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 __all__ = ["QRhiMeshViewerWidget"]

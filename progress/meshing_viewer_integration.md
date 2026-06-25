@@ -636,3 +636,49 @@ Verification after adding chunk-owned QRhi buffers:
   - result: `7 passed`
 - Full test suite passed:
   - result: `152 passed, 3 skipped`
+
+## Optional GPU Memory Probe For Auto Budget
+
+Design decision:
+
+- VRAM querying is kept separate from QRhi rendering.
+- The renderer remains backend-aware and cross-platform.
+- GPU memory information is optional metadata used only by the Meshing
+  Workspace `Auto` preview budget.
+
+Implemented:
+
+- Added `app/meshing/viewer/gpu_memory.py`.
+  - Defines `GpuMemoryInfo`.
+  - Tries `nvidia-smi` on Linux/Windows with a timeout.
+  - Reports free and total memory separately.
+  - Treats macOS memory as unified memory metadata.
+  - Returns `None` when no safe probe is available.
+- Updated the Meshing Workspace `Auto` button.
+  - Uses GPU free memory when available.
+  - Falls back to total GPU memory, then system RAM, then a conservative
+    default.
+  - Applies a lower budget when wireframe is enabled.
+  - Logs the source used, for example `nvidia-smi` or `system-ram`.
+- Tied GPU-memory probing to the current QRhi render device.
+  - `QRhiMeshViewerWidget` records `driverInfo()` after QRhi initialization.
+  - The metadata includes backend name, vendor id, device id, device name, and
+    device type.
+  - `nvidia-smi` is trusted only when the current QRhi render device is NVIDIA.
+  - If QRhi is rendering on another GPU, NVIDIA telemetry is ignored so Auto
+    does not budget for the wrong device.
+- Added `tests/test_gpu_memory_budget.py`.
+  - Verifies free-VRAM based budgeting.
+  - Verifies wireframe reduces the budget.
+  - Verifies system-RAM fallback.
+  - Verifies NVIDIA telemetry is ignored for a non-NVIDIA QRhi render device.
+  - Verifies NVIDIA telemetry is used when the QRhi render device matches.
+- Verification:
+  - full test suite passed: `157 passed, 3 skipped`
+
+Current policy:
+
+- Filled-only previews can use a larger fraction of detected free VRAM.
+- Wireframe previews are more conservative because triangle wireframe can add
+  about twice the vertex storage of filled triangles.
+- No speculative allocation is used.
