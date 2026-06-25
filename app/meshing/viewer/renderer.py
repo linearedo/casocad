@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
@@ -28,6 +29,7 @@ from PySide6.QtGui import (
 log = logging.getLogger(__name__)
 
 _VERTEX_STRIDE = 24
+_MAX_UPLOAD_BYTES_PER_FRAME = 64 * 1024 * 1024
 _VERT = """\
 #version 450
 layout(location = 0) in vec3 in_position;
@@ -123,17 +125,12 @@ class QRhiMeshRenderer:
         self._vertex_shader = None
         self._fragment_shader = None
         self._uniform_buffer = None
-        self._vertex_buffer = None
-        self._wire_vertex_buffer = None
         self._shader_resources = None
         self._pipeline = None
         self._wire_pipeline = None
-        self._vertex_bytes = b""
-        self._wire_vertex_bytes = b""
-        self._vertex_count = 0
-        self._wire_vertex_count = 0
-        self._uploaded = False
-        self._wire_uploaded = False
+        self._chunks: list[_RenderChunk] = []
+        self._wire_chunks: list[_RenderChunk] = []
+        self._pending_uploads = False
         self._clip_y_sign = 1.0
         self._depth_zero_to_one = True
 
@@ -159,12 +156,20 @@ class QRhiMeshRenderer:
         )
         self._uniform_buffer.create()
         self._build_pipeline()
-        if self._vertex_bytes:
-            self._build_vertex_buffer()
-        if self._wire_vertex_bytes:
-            self._build_wire_vertex_buffer()
+        for chunk in [*self._chunks, *self._wire_chunks]:
+            self._build_chunk_buffer(chunk)
 
     def set_mesh(
+        self,
+        vertices: NDArray[np.float32],
+        colors: NDArray[np.float32],
+        wire_vertices: NDArray[np.float32] | None = None,
+        wire_colors: NDArray[np.float32] | None = None,
+    ) -> None:
+        self.clear()
+        self.add_mesh_chunk(vertices, colors, wire_vertices, wire_colors)
+
+    def add_mesh_chunk(
         self,
         vertices: NDArray[np.float32],
         colors: NDArray[np.float32],
@@ -175,63 +180,52 @@ class QRhiMeshRenderer:
             raise ValueError("mesh vertices and colors must have the same shape")
         if vertices.ndim != 2 or vertices.shape[1] != 3:
             raise ValueError("mesh vertices must have shape (N, 3)")
-        interleaved = np.column_stack((vertices, colors)).astype(np.float32, copy=False)
-        self._vertex_bytes = interleaved.tobytes()
-        self._vertex_count = int(vertices.shape[0])
-        self._uploaded = False
+        if vertices.shape[0] > 0:
+            interleaved = np.column_stack((vertices, colors)).astype(
+                np.float32,
+                copy=False,
+            )
+            chunk = _RenderChunk(
+                vertex_bytes=interleaved.tobytes(),
+                vertex_count=int(vertices.shape[0]),
+            )
+            self._chunks.append(chunk)
+            if self._rhi is not None:
+                self._build_chunk_buffer(chunk)
         if wire_vertices is not None and wire_colors is not None:
             if wire_vertices.shape != wire_colors.shape:
                 raise ValueError("wire vertices and colors must have the same shape")
             if wire_vertices.ndim != 2 or wire_vertices.shape[1] != 3:
                 raise ValueError("wire vertices must have shape (N, 3)")
-            wire = np.column_stack((wire_vertices, wire_colors)).astype(
-                np.float32,
-                copy=False,
-            )
-            self._wire_vertex_bytes = wire.tobytes()
-            self._wire_vertex_count = int(wire_vertices.shape[0])
-        else:
-            self._wire_vertex_bytes = b""
-            self._wire_vertex_count = 0
-        self._wire_uploaded = False
-        if self._rhi is not None:
-            self._build_vertex_buffer()
-            self._build_wire_vertex_buffer()
+            if wire_vertices.shape[0] > 0:
+                wire = np.column_stack((wire_vertices, wire_colors)).astype(
+                    np.float32,
+                    copy=False,
+                )
+                wire_chunk = _RenderChunk(
+                    vertex_bytes=wire.tobytes(),
+                    vertex_count=int(wire_vertices.shape[0]),
+                )
+                self._wire_chunks.append(wire_chunk)
+                if self._rhi is not None:
+                    self._build_chunk_buffer(wire_chunk)
 
     def clear(self) -> None:
-        self._vertex_bytes = b""
-        self._wire_vertex_bytes = b""
-        self._vertex_count = 0
-        self._wire_vertex_count = 0
-        self._uploaded = False
-        self._wire_uploaded = False
-        self._vertex_buffer = None
-        self._wire_vertex_buffer = None
+        self._chunks.clear()
+        self._wire_chunks.clear()
+        self._pending_uploads = False
 
-    def _build_vertex_buffer(self) -> None:
+    def _build_chunk_buffer(self, chunk: "_RenderChunk") -> None:
         assert self._rhi is not None
-        size = max(len(self._vertex_bytes), _VERTEX_STRIDE)
-        self._vertex_buffer = self._rhi.newBuffer(
-            QRhiBuffer.Type.Static,
-            QRhiBuffer.UsageFlag.VertexBuffer,
-            size,
-        )
-        self._vertex_buffer.create()
-        self._uploaded = False
-
-    def _build_wire_vertex_buffer(self) -> None:
-        assert self._rhi is not None
-        if not self._wire_vertex_bytes:
-            self._wire_vertex_buffer = None
+        if chunk.buffer is not None:
             return
-        size = max(len(self._wire_vertex_bytes), _VERTEX_STRIDE)
-        self._wire_vertex_buffer = self._rhi.newBuffer(
+        size = max(len(chunk.vertex_bytes), _VERTEX_STRIDE)
+        chunk.buffer = self._rhi.newBuffer(
             QRhiBuffer.Type.Static,
             QRhiBuffer.UsageFlag.VertexBuffer,
             size,
         )
-        self._wire_vertex_buffer.create()
-        self._wire_uploaded = False
+        chunk.buffer.create()
 
     def _build_pipeline(self) -> None:
         assert self._rhi is not None
@@ -292,16 +286,10 @@ class QRhiMeshRenderer:
         height = max(size.height(), 1)
         background = camera.get("background_color", (0.07, 0.08, 0.10))
         rub = self._rhi.nextResourceUpdateBatch()
-        if self._vertex_buffer is not None and self._vertex_bytes and not self._uploaded:
-            rub.uploadStaticBuffer(self._vertex_buffer, self._vertex_bytes)
-            self._uploaded = True
-        if (
-            self._wire_vertex_buffer is not None
-            and self._wire_vertex_bytes
-            and not self._wire_uploaded
-        ):
-            rub.uploadStaticBuffer(self._wire_vertex_buffer, self._wire_vertex_bytes)
-            self._wire_uploaded = True
+        upload_budget = _MAX_UPLOAD_BYTES_PER_FRAME
+        upload_budget = self._upload_pending_chunks(rub, self._chunks, upload_budget)
+        upload_budget = self._upload_pending_chunks(rub, self._wire_chunks, upload_budget)
+        self._pending_uploads = self._has_pending_uploads()
         matrix = self._camera_matrix(width, height, camera)
         rub.updateDynamicBuffer(self._uniform_buffer, 0, _pack_mat4(matrix))
         cb.beginPass(
@@ -314,27 +302,63 @@ class QRhiMeshRenderer:
             camera.get("filled_visible", True)
             and self._pipeline is not None
             and self._shader_resources is not None
-            and self._vertex_buffer is not None
-            and self._vertex_count > 0
+            and self._chunks
         ):
             cb.setGraphicsPipeline(self._pipeline)
             cb.setViewport(QRhiViewport(0, 0, width, height))
             cb.setShaderResources(self._shader_resources)
-            cb.setVertexInput(0, [(self._vertex_buffer, 0)])
-            cb.draw(self._vertex_count)
+            for chunk in self._chunks:
+                if chunk.buffer is None or chunk.vertex_count <= 0:
+                    continue
+                cb.setVertexInput(0, [(chunk.buffer, 0)])
+                cb.draw(chunk.vertex_count)
         if (
             camera.get("wireframe_visible", True)
             and self._wire_pipeline is not None
             and self._shader_resources is not None
-            and self._wire_vertex_buffer is not None
-            and self._wire_vertex_count > 0
+            and self._wire_chunks
         ):
             cb.setGraphicsPipeline(self._wire_pipeline)
             cb.setViewport(QRhiViewport(0, 0, width, height))
             cb.setShaderResources(self._shader_resources)
-            cb.setVertexInput(0, [(self._wire_vertex_buffer, 0)])
-            cb.draw(self._wire_vertex_count)
+            for chunk in self._wire_chunks:
+                if chunk.buffer is None or chunk.vertex_count <= 0:
+                    continue
+                cb.setVertexInput(0, [(chunk.buffer, 0)])
+                cb.draw(chunk.vertex_count)
         cb.endPass()
+
+    def _upload_pending_chunks(
+        self,
+        rub,
+        chunks: list["_RenderChunk"],
+        byte_budget: int,
+    ) -> int:
+        uploaded_count = 0
+        for chunk in chunks:
+            if chunk.buffer is None:
+                self._build_chunk_buffer(chunk)
+            if chunk.buffer is not None and chunk.vertex_bytes and not chunk.uploaded:
+                if byte_budget <= 0:
+                    return byte_budget
+                if len(chunk.vertex_bytes) > byte_budget and uploaded_count > 0:
+                    return byte_budget
+                rub.uploadStaticBuffer(chunk.buffer, chunk.vertex_bytes)
+                byte_budget -= len(chunk.vertex_bytes)
+                uploaded_count += 1
+                chunk.vertex_bytes = b""
+                chunk.uploaded = True
+        return byte_budget
+
+    def _has_pending_uploads(self) -> bool:
+        for chunks in (self._chunks, self._wire_chunks):
+            for chunk in chunks:
+                if chunk.vertex_bytes and not chunk.uploaded:
+                    return True
+        return False
+
+    def has_pending_uploads(self) -> bool:
+        return self._pending_uploads
 
     def _camera_matrix(
         self,
@@ -358,6 +382,14 @@ class QRhiMeshRenderer:
         )
         projection[1, :] *= self._clip_y_sign
         return np.asarray(projection @ view, dtype=np.float32)
+
+
+@dataclass
+class _RenderChunk:
+    vertex_bytes: bytes
+    vertex_count: int
+    buffer: object | None = None
+    uploaded: bool = False
 
 
 __all__ = ["QRhiMeshRenderer"]

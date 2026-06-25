@@ -5,7 +5,7 @@ import numpy as np
 from app.meshing.viewer.loader import (
     MeshPreviewChunk,
     MeshPreviewSummary,
-    iter_mesh_preview_chunks,
+    iter_mesh_preview_chunks_sync,
 )
 from core.meshing import MeshArtifactWriter
 
@@ -38,7 +38,7 @@ def test_mesh_preview_loader_triangulates_artifact_rows(tmp_path) -> None:
             tag_name=["fluid", "wall", "wall"],
         )
 
-    items = list(iter_mesh_preview_chunks(path, max_rows_per_chunk=2))
+    items = list(iter_mesh_preview_chunks_sync(path, max_rows_per_chunk=2))
     chunks = [item for item in items if isinstance(item, MeshPreviewChunk)]
     summary = items[-1]
 
@@ -74,7 +74,7 @@ def test_mesh_preview_loader_respects_vertex_budget(tmp_path) -> None:
             tag_name=["fluid"] * 10,
         )
 
-    items = list(iter_mesh_preview_chunks(path, max_preview_vertices=9))
+    items = list(iter_mesh_preview_chunks_sync(path, max_preview_vertices=9))
     chunks = [item for item in items if isinstance(item, MeshPreviewChunk)]
     summary = items[-1]
 

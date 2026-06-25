@@ -487,3 +487,152 @@ Fix:
 - The workspace now stores and logs the auto value in render triangles.
 - The viewer still converts that number to an internal fill-vertex limit before
   building/loading the render cache.
+
+## Render Cache Worker Process
+
+Observed issue:
+
+- After `Loading mesh artifact...`, the GUI could still freeze before the first
+  preview chunk appeared.
+- The reason was render-cache generation:
+  - semantic Arrow rows were converted to Python lists
+  - vertices were packed to float32 render buffers
+  - the preview cache Arrow file was written
+- This happened in a Python thread inside the GUI process. Even though it was
+  not on the Qt main thread, heavy Python/Arrow conversion could still contend
+  for the GIL and starve the GUI event loop.
+
+Fix:
+
+- Added `app/meshing/viewer/cache_worker.py`.
+  - CLI: `python -m app.meshing.viewer.cache_worker ARTIFACT MAX_PREVIEW_VERTICES`
+  - Builds or reuses the render preview cache in a child process.
+  - Emits JSON-line status messages.
+- Updated `MeshArtifactLoader`.
+  - Starts the cache worker with `QProcess`.
+  - Streams cached triangle/line chunks only after the worker exits cleanly.
+  - Emits status messages for cache preparation and cache readiness.
+- Renamed the synchronous helper to `iter_mesh_preview_chunks_sync(...)`.
+  - This makes it clear that the helper is for tests/debug/non-GUI use.
+  - The GUI path uses the cache worker process.
+- The GUI process no longer performs semantic Arrow -> render-cache conversion.
+
+Remaining limitation:
+
+- Streaming the packed cache and uploading to QRhi still happen from the GUI
+  process architecture.
+- Very large preview limits can still pause during final static-buffer upload.
+- The next scalability step remains chunk-owned GPU buffers instead of one
+  combined preview buffer.
+
+Verification after moving render-cache generation to a worker process:
+
+- Compile check passed:
+  - `app/meshing/viewer/cache_worker.py`
+  - `app/meshing/viewer/loader.py`
+  - `app/meshing/viewer/render_cache.py`
+  - `app/meshing/viewer/widget.py`
+- Focused tests passed:
+  - `tests/test_mesh_render_cache.py`
+  - `tests/test_mesh_viewer_loader.py`
+  - `tests/test_mesh_artifact.py`
+  - `tests/test_mesh_api.py`
+  - `tests/test_meshing_worker.py`
+  - `tests/test_meshing_workspace_script.py`
+  - result: `11 passed`
+- Full test suite passed:
+  - result: `151 passed, 3 skipped`
+
+## Render Cache Worker Memory Fix
+
+Observed issue:
+
+- The cache worker could crash with exit code `9`.
+- That usually means the OS killed the worker process under memory pressure.
+- Root cause:
+  - `build_render_cache(...)` called `vertices.to_pylist()` for a whole Arrow
+    record batch.
+  - It also accumulated converted triangle/line arrays for the whole input
+    batch before writing cache chunks.
+  - If the meshing script emitted one huge Arrow batch, the cache worker still
+    had an unbounded memory spike even though it was outside the GUI process.
+
+Fix:
+
+- `build_render_cache(...)` now reads Arrow rows incrementally from each record
+  batch instead of materializing whole columns with `to_pylist()`.
+- Added small `_RenderPrimitiveBuffer` buffers for triangle and line cache
+  output.
+  - Buffers flush to the preview Arrow cache at `max_rows_per_chunk`.
+  - Cache memory is bounded by render-cache chunk size, not input artifact
+    batch size.
+- Added a regression test that writes a larger single input batch and verifies
+  the render cache flushes multiple bounded chunks.
+
+Verification after bounding render-cache writer memory:
+
+- Compile check passed:
+  - `app/meshing/viewer/render_cache.py`
+  - `app/meshing/viewer/cache_worker.py`
+  - `app/meshing/viewer/loader.py`
+- Focused tests passed:
+  - `tests/test_mesh_render_cache.py`
+  - `tests/test_mesh_viewer_loader.py`
+  - `tests/test_mesh_artifact.py`
+  - `tests/test_mesh_api.py`
+  - `tests/test_meshing_worker.py`
+  - `tests/test_meshing_workspace_script.py`
+  - result: `12 passed`
+- Full test suite passed:
+  - result: `152 passed, 3 skipped`
+
+## Chunk-Owned QRhi Preview Buffers
+
+Observed issue:
+
+- The render cache was chunked on disk, but the widget still accumulated all
+  preview chunks in Python lists.
+- At load completion it combined them with `np.vstack(...)` and uploaded one
+  huge static QRhi buffer.
+- This created large temporary CPU copies and one heavy final GPU upload.
+
+Fix:
+
+- `QRhiMeshRenderer` now owns many render chunks instead of one filled buffer
+  and one wire buffer.
+- Each preview cache chunk becomes its own QRhi vertex buffer.
+- `QRhiMeshViewerWidget` streams `MeshPreviewChunk` objects directly into the
+  renderer as they arrive.
+- Removed the widget-side chunk accumulation and final `np.vstack(...)`.
+- Uploaded CPU bytes are released after `uploadStaticBuffer(...)` submits them
+  to QRhi.
+- Added a per-frame upload budget so large previews are uploaded across
+  multiple render frames instead of one large final upload.
+
+Current behavior:
+
+- The cache remains chunked on disk.
+- The GUI streams chunks to chunk-owned QRhi buffers.
+- The renderer draws all uploaded filled chunks and wire chunks each frame.
+
+Remaining limitation:
+
+- There is still no view-dependent loading or eviction.
+- All chunks within the selected preview budget are eventually kept as GPU
+  buffers.
+- Very high budgets can still consume a lot of GPU memory, especially with
+  wireframe enabled.
+
+Verification after adding chunk-owned QRhi buffers:
+
+- Compile check passed:
+  - `app/meshing/viewer/renderer.py`
+  - `app/meshing/viewer/widget.py`
+- Focused tests passed:
+  - `tests/test_mesh_render_cache.py`
+  - `tests/test_mesh_viewer_loader.py`
+  - `tests/test_meshing_workspace_script.py`
+  - `tests/test_meshing_worker.py`
+  - result: `7 passed`
+- Full test suite passed:
+  - result: `152 passed, 3 skipped`

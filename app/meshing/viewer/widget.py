@@ -46,10 +46,7 @@ class QRhiMeshViewerWidget(QRhiWidget):
         self._loader.chunk_loaded.connect(self._on_chunk_loaded)
         self._loader.finished.connect(self._on_load_finished)
         self._loader.failed.connect(self._on_load_failed)
-        self._vertices: list[np.ndarray] = []
-        self._colors: list[np.ndarray] = []
-        self._wire_vertices: list[np.ndarray] = []
-        self._wire_colors: list[np.ndarray] = []
+        self._loader.status_changed.connect(self.status_changed.emit)
         self._loaded_render_triangles = 0
         self._loaded_wire_edges = 0
         self._loaded_chunk_count = 0
@@ -99,10 +96,6 @@ class QRhiMeshViewerWidget(QRhiWidget):
         return self._wireframe_visible
 
     def clear_mesh(self) -> None:
-        self._vertices.clear()
-        self._colors.clear()
-        self._wire_vertices.clear()
-        self._wire_colors.clear()
         self._loaded_render_triangles = 0
         self._loaded_wire_edges = 0
         self._loaded_chunk_count = 0
@@ -114,11 +107,11 @@ class QRhiMeshViewerWidget(QRhiWidget):
             return
         self._renderer.initialize(self.rhi(), self.renderTarget())
         self._renderer_ready = True
-        if self._vertices:
-            self._upload_current_mesh()
 
     def render(self, cb) -> None:
         self._renderer.render(cb, self.renderTarget(), self._camera_values())
+        if self._renderer.has_pending_uploads():
+            self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -144,11 +137,12 @@ class QRhiMeshViewerWidget(QRhiWidget):
         self.update()
 
     def _on_chunk_loaded(self, chunk: MeshPreviewChunk) -> None:
-        self._vertices.append(chunk.vertices)
-        self._colors.append(chunk.colors)
-        if chunk.wire_vertices.size:
-            self._wire_vertices.append(chunk.wire_vertices)
-            self._wire_colors.append(chunk.wire_colors)
+        self._renderer.add_mesh_chunk(
+            chunk.vertices,
+            chunk.colors,
+            chunk.wire_vertices,
+            chunk.wire_colors,
+        )
         self._loaded_render_triangles += chunk.triangle_count
         self._loaded_wire_edges += chunk.edge_count
         self._loaded_chunk_count += 1
@@ -159,15 +153,9 @@ class QRhiMeshViewerWidget(QRhiWidget):
                 f"{self._loaded_render_triangles} render triangle(s), "
                 f"{self._loaded_wire_edges} wire edge(s)"
             )
+        self.update()
 
     def _on_load_finished(self, summary: MeshPreviewSummary) -> None:
-        if self._vertices:
-            self.status_changed.emit(
-                "Uploading preview to GPU: "
-                f"{summary.preview_vertex_count} fill vertex/vertices, "
-                f"{summary.preview_edge_count} wire edge(s)"
-            )
-        self._upload_current_mesh()
         self._frame_bounds(summary.bounds_min, summary.bounds_max)
         suffix = " (preview truncated)" if summary.truncated else ""
         self.status_changed.emit(
@@ -181,24 +169,6 @@ class QRhiMeshViewerWidget(QRhiWidget):
 
     def _on_load_failed(self, message: str) -> None:
         self.status_changed.emit(f"Mesh preview failed: {message}")
-
-    def _upload_current_mesh(self) -> None:
-        if not self._vertices:
-            self._renderer.clear()
-            return
-        vertices = np.vstack(self._vertices).astype(np.float32, copy=False)
-        colors = np.vstack(self._colors).astype(np.float32, copy=False)
-        wire_vertices = (
-            np.vstack(self._wire_vertices).astype(np.float32, copy=False)
-            if self._wire_vertices
-            else np.zeros((0, 3), dtype=np.float32)
-        )
-        wire_colors = (
-            np.vstack(self._wire_colors).astype(np.float32, copy=False)
-            if self._wire_colors
-            else np.zeros((0, 3), dtype=np.float32)
-        )
-        self._renderer.set_mesh(vertices, colors, wire_vertices, wire_colors)
 
     def _frame_bounds(
         self,

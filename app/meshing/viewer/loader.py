@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import sys
 import threading
 from typing import Iterator
 
 import numpy as np
 from numpy.typing import NDArray
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QProcess, Signal
 
-from .render_cache import ensure_render_cache, iter_render_cache_chunks
+from .render_cache import (
+    RenderCacheSummary,
+    ensure_render_cache,
+    iter_render_cache_chunks,
+    render_cache_summary_from_dict,
+)
 
 
 @dataclass(frozen=True)
@@ -36,7 +43,7 @@ class MeshPreviewSummary:
     truncated: bool
 
 
-def iter_mesh_preview_chunks(
+def iter_mesh_preview_chunks_sync(
     path: str | Path,
     *,
     max_rows_per_chunk: int = 4096,
@@ -48,6 +55,14 @@ def iter_mesh_preview_chunks(
         artifact_path,
         max_preview_vertices=max_preview_vertices,
     )
+    yield from _iter_cached_preview_chunks(artifact_path, cache_path, cache_summary)
+
+
+def _iter_cached_preview_chunks(
+    artifact_path: Path,
+    cache_path: Path,
+    cache_summary: RenderCacheSummary,
+) -> Iterator[MeshPreviewChunk | MeshPreviewSummary]:
     empty = np.zeros((0, 3), dtype=np.float32)
 
     for cache_chunk in iter_render_cache_chunks(cache_path):
@@ -89,6 +104,7 @@ class MeshArtifactLoader(QObject):
     chunk_loaded = Signal(object)
     finished = Signal(object)
     failed = Signal(str)
+    status_changed = Signal(str)
 
     def __init__(
         self,
@@ -100,18 +116,45 @@ class MeshArtifactLoader(QObject):
         self._max_rows_per_chunk = max_rows_per_chunk
         self._max_preview_vertices = max_preview_vertices
         self._generation = 0
+        self._cache_process: QProcess | None = None
+        self._cache_stdout_buffer = ""
+        self._cache_stderr_buffer = ""
+        self._cache_done: tuple[Path, RenderCacheSummary] | None = None
+        self._cache_artifact_path: Path | None = None
+        self._cache_max_rows_per_chunk = max_rows_per_chunk
 
     def load(self, path: str | Path) -> None:
         self._generation += 1
         generation = self._generation
         artifact_path = Path(path)
-        max_rows_per_chunk = self._max_rows_per_chunk
-        max_preview_vertices = self._max_preview_vertices
-        threading.Thread(
-            target=self._load_worker,
-            args=(generation, artifact_path, max_rows_per_chunk, max_preview_vertices),
-            daemon=True,
-        ).start()
+        self._stop_cache_process()
+        self._cache_stdout_buffer = ""
+        self._cache_stderr_buffer = ""
+        self._cache_done = None
+        self._cache_artifact_path = artifact_path
+        self._cache_max_rows_per_chunk = self._max_rows_per_chunk
+
+        process = QProcess(self)
+        process.setProgram(sys.executable)
+        process.setArguments(
+            [
+                "-m",
+                "app.meshing.viewer.cache_worker",
+                str(artifact_path),
+                str(self._max_preview_vertices),
+            ]
+        )
+        process.readyReadStandardOutput.connect(self._on_cache_stdout)
+        process.readyReadStandardError.connect(self._on_cache_stderr)
+        process.finished.connect(
+            lambda code, status: self._on_cache_finished(generation, code, status)
+        )
+        process.errorOccurred.connect(
+            lambda error: self._on_cache_process_error(generation, error)
+        )
+        self._cache_process = process
+        self.status_changed.emit("Preparing render preview cache in worker process.")
+        process.start()
 
     def set_preview_limits(
         self,
@@ -128,15 +171,11 @@ class MeshArtifactLoader(QObject):
         self,
         generation: int,
         path: Path,
-        max_rows_per_chunk: int,
-        max_preview_vertices: int,
+        cache_path: Path,
+        cache_summary: RenderCacheSummary,
     ) -> None:
         try:
-            for item in iter_mesh_preview_chunks(
-                path,
-                max_rows_per_chunk=max_rows_per_chunk,
-                max_preview_vertices=max_preview_vertices,
-            ):
+            for item in _iter_cached_preview_chunks(path, cache_path, cache_summary):
                 if generation != self._generation:
                     return
                 if isinstance(item, MeshPreviewChunk):
@@ -147,10 +186,114 @@ class MeshArtifactLoader(QObject):
             if generation == self._generation:
                 self.failed.emit(str(exc))
 
+    def _start_cache_stream(
+        self,
+        generation: int,
+        artifact_path: Path,
+        cache_path: Path,
+        cache_summary: RenderCacheSummary,
+    ) -> None:
+        threading.Thread(
+            target=self._load_worker,
+            args=(generation, artifact_path, cache_path, cache_summary),
+            daemon=True,
+        ).start()
+
+    def _on_cache_stdout(self) -> None:
+        process = self._cache_process
+        if process is None:
+            return
+        self._cache_stdout_buffer += bytes(process.readAllStandardOutput()).decode(
+            "utf-8",
+            errors="replace",
+        )
+        while "\n" in self._cache_stdout_buffer:
+            line, self._cache_stdout_buffer = self._cache_stdout_buffer.split("\n", 1)
+            if line:
+                self._handle_cache_message(line)
+
+    def _on_cache_stderr(self) -> None:
+        process = self._cache_process
+        if process is None:
+            return
+        self._cache_stderr_buffer += bytes(process.readAllStandardError()).decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    def _handle_cache_message(self, line: str) -> None:
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            self._cache_stderr_buffer += line + "\n"
+            return
+        message_type = message.get("type")
+        if message_type == "started":
+            self.status_changed.emit("Render preview cache worker started.")
+        elif message_type == "done":
+            self._cache_done = (
+                Path(str(message["cache_path"])),
+                render_cache_summary_from_dict(message["summary"]),
+            )
+        elif message_type == "error":
+            details = str(message.get("traceback") or message.get("message") or "unknown error")
+            self.failed.emit(details)
+
+    def _on_cache_finished(
+        self,
+        generation: int,
+        exit_code: int,
+        exit_status: QProcess.ExitStatus,
+    ) -> None:
+        process = self._cache_process
+        if process is not None:
+            process.deleteLater()
+        self._cache_process = None
+        if generation != self._generation:
+            return
+        if self._cache_stdout_buffer.strip():
+            for line in self._cache_stdout_buffer.splitlines():
+                if line:
+                    self._handle_cache_message(line)
+            self._cache_stdout_buffer = ""
+        if exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0:
+            if self._cache_done is None:
+                details = self._cache_stderr_buffer.strip() or f"cache worker exited with {exit_code}"
+                self.failed.emit(details)
+            return
+        if self._cache_done is None:
+            details = self._cache_stderr_buffer.strip() or "cache worker did not return a result"
+            self.failed.emit(details)
+            return
+        artifact_path = self._cache_artifact_path
+        if artifact_path is None:
+            self.failed.emit("cache worker lost artifact path")
+            return
+        cache_path, cache_summary = self._cache_done
+        self.status_changed.emit("Render preview cache ready; streaming preview chunks.")
+        self._start_cache_stream(generation, artifact_path, cache_path, cache_summary)
+
+    def _on_cache_process_error(
+        self,
+        generation: int,
+        error: QProcess.ProcessError,
+    ) -> None:
+        if generation != self._generation:
+            return
+        self.failed.emit(f"cache worker process error: {error.name}")
+
+    def _stop_cache_process(self) -> None:
+        process = self._cache_process
+        if process is None:
+            return
+        process.kill()
+        process.deleteLater()
+        self._cache_process = None
+
 
 __all__ = [
     "MeshArtifactLoader",
     "MeshPreviewChunk",
     "MeshPreviewSummary",
-    "iter_mesh_preview_chunks",
+    "iter_mesh_preview_chunks_sync",
 ]

@@ -81,6 +81,24 @@ def ensure_render_cache(
     return cache_path, summary
 
 
+def render_cache_summary_from_dict(raw: object) -> RenderCacheSummary:
+    if not isinstance(raw, dict):
+        raise TypeError("render cache summary must be a JSON object")
+    return RenderCacheSummary(
+        source_path=str(raw["source_path"]),
+        source_mtime_ns=int(raw["source_mtime_ns"]),
+        max_preview_vertices=int(raw["max_preview_vertices"]),
+        element_count=int(raw["element_count"]),
+        preview_vertex_count=int(raw["preview_vertex_count"]),
+        preview_triangle_count=int(raw["preview_triangle_count"]),
+        preview_edge_count=int(raw["preview_edge_count"]),
+        tag_names=tuple(str(item) for item in raw["tag_names"]),
+        bounds_min=tuple(float(item) for item in raw["bounds_min"]),
+        bounds_max=tuple(float(item) for item in raw["bounds_max"]),
+        truncated=bool(raw["truncated"]),
+    )
+
+
 def iter_render_cache_chunks(path: str | Path) -> Iterator[RenderCacheChunk]:
     with pa.memory_map(str(path), "r") as source:
         reader = ipc.open_file(source)
@@ -123,22 +141,25 @@ def build_render_cache(
             RENDER_CACHE_SCHEMA,
             options=ipc.IpcWriteOptions(compression="zstd"),
         )
+        tri_buffer = _RenderPrimitiveBuffer(
+            writer,
+            primitive_type="triangle",
+            max_rows_per_chunk=max_rows_per_chunk,
+        )
+        line_buffer = _RenderPrimitiveBuffer(
+            writer,
+            primitive_type="line",
+            max_rows_per_chunk=max_rows_per_chunk,
+        )
         try:
             for batch in _iter_mesh_batches(source):
-                vertex_rows = batch.column("vertices").to_pylist()
-                element_types = [
-                    str(item) for item in batch.column("element_type").to_pylist()
-                ]
-                tag_names = [str(item) for item in batch.column("tag_name").to_pylist()]
-                tri_positions: list[NDArray[np.float32]] = []
-                tri_colors: list[NDArray[np.float32]] = []
-                line_positions: list[NDArray[np.float32]] = []
-                line_colors: list[NDArray[np.float32]] = []
-                for element_type, vertices, tag_name in zip(
-                    element_types,
-                    vertex_rows,
-                    tag_names,
-                ):
+                vertex_rows = batch.column("vertices")
+                element_types = batch.column("element_type")
+                tag_names = batch.column("tag_name")
+                for row_index in range(batch.num_rows):
+                    element_type = str(element_types[row_index].as_py())
+                    vertices = vertex_rows[row_index].as_py()
+                    tag_name = str(tag_names[row_index].as_py())
                     source_vertices = np.asarray(vertices, dtype=np.float64)
                     if (
                         source_vertices.ndim != 2
@@ -164,37 +185,21 @@ def build_render_cache(
                     if triangles.size == 0:
                         break
                     color = np.asarray(_tag_color(tag_name), dtype=np.float32)
-                    tri_positions.append(triangles)
-                    tri_colors.append(np.tile(color, (triangles.shape[0], 1)))
+                    tri_buffer.add(triangles, color)
                     preview_vertices += int(triangles.shape[0])
                     preview_triangles += int(triangles.shape[0] // 3)
                     if not clipped:
                         edges = _wire_edges_vertices(element_type, source_vertices)
                         if edges.size:
-                            line_positions.append(edges)
-                            line_colors.append(np.tile(color, (edges.shape[0], 1)))
+                            line_buffer.add(edges, color)
                             preview_edges += int(edges.shape[0] // 2)
                     if preview_vertices >= int(max_preview_vertices):
                         truncated = True
                         break
-                if tri_positions:
-                    _write_cache_vertices(
-                        writer,
-                        primitive_type="triangle",
-                        positions=np.vstack(tri_positions),
-                        colors=np.vstack(tri_colors),
-                        max_rows_per_chunk=max_rows_per_chunk,
-                    )
-                if line_positions:
-                    _write_cache_vertices(
-                        writer,
-                        primitive_type="line",
-                        positions=np.vstack(line_positions),
-                        colors=np.vstack(line_colors),
-                        max_rows_per_chunk=max_rows_per_chunk,
-                    )
                 if truncated:
                     break
+            tri_buffer.flush()
+            line_buffer.flush()
         finally:
             writer.close()
 
@@ -221,19 +226,7 @@ def _read_summary(path: Path) -> RenderCacheSummary | None:
         return None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        return RenderCacheSummary(
-            source_path=str(raw["source_path"]),
-            source_mtime_ns=int(raw["source_mtime_ns"]),
-            max_preview_vertices=int(raw["max_preview_vertices"]),
-            element_count=int(raw["element_count"]),
-            preview_vertex_count=int(raw["preview_vertex_count"]),
-            preview_triangle_count=int(raw["preview_triangle_count"]),
-            preview_edge_count=int(raw["preview_edge_count"]),
-            tag_names=tuple(str(item) for item in raw["tag_names"]),
-            bounds_min=tuple(float(item) for item in raw["bounds_min"]),
-            bounds_max=tuple(float(item) for item in raw["bounds_max"]),
-            truncated=bool(raw["truncated"]),
-        )
+        return render_cache_summary_from_dict(raw)
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -277,6 +270,55 @@ def _write_cache_vertices(
             pa.array(colors[start:end].tolist(), type=POSITION_TYPE),
         ]
         writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=RENDER_CACHE_SCHEMA))
+
+
+class _RenderPrimitiveBuffer:
+    def __init__(
+        self,
+        writer: ipc.RecordBatchFileWriter,
+        *,
+        primitive_type: str,
+        max_rows_per_chunk: int,
+    ) -> None:
+        self._writer = writer
+        self._primitive_type = primitive_type
+        self._max_rows_per_chunk = max(1, int(max_rows_per_chunk))
+        self._positions: list[NDArray[np.float32]] = []
+        self._colors: list[NDArray[np.float32]] = []
+        self._row_count = 0
+
+    def add(
+        self,
+        positions: NDArray[np.float32],
+        color: NDArray[np.float32],
+    ) -> None:
+        if positions.size == 0:
+            return
+        start = 0
+        while start < positions.shape[0]:
+            remaining = self._max_rows_per_chunk - self._row_count
+            take = min(remaining, positions.shape[0] - start)
+            part = positions[start : start + take].astype(np.float32, copy=False)
+            self._positions.append(part)
+            self._colors.append(np.tile(color, (take, 1)))
+            self._row_count += take
+            start += take
+            if self._row_count >= self._max_rows_per_chunk:
+                self.flush()
+
+    def flush(self) -> None:
+        if not self._positions:
+            return
+        _write_cache_vertices(
+            self._writer,
+            primitive_type=self._primitive_type,
+            positions=np.vstack(self._positions),
+            colors=np.vstack(self._colors),
+            max_rows_per_chunk=self._max_rows_per_chunk,
+        )
+        self._positions.clear()
+        self._colors.clear()
+        self._row_count = 0
 
 
 def _triangulate_vertices(
@@ -365,5 +407,6 @@ __all__ = [
     "build_render_cache",
     "ensure_render_cache",
     "iter_render_cache_chunks",
+    "render_cache_summary_from_dict",
     "render_cache_paths",
 ]
