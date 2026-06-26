@@ -171,11 +171,18 @@ class SceneDocument:
             raise ValueError("maximum SDF object count exceeded")
         return object_id
 
+    def _default_name(self, kind: str) -> str:
+        used = {item.name for _handle, item, _parent in self.walk()}
+        index = 1
+        while f"{kind}_{index}" in used:
+            index += 1
+        return f"{kind}_{index}"
+
     def create_primitive(
         self, kind: str, name: str | None = None
     ) -> Primitive3D:
         object_id = self._allocate_object_id()
-        common = {"name": name or f"{kind}_{object_id}", "object_id": object_id}
+        common = {"name": name or self._default_name(kind), "object_id": object_id}
         factories = {
             "sphere": lambda: Sphere(**common, radius=0.5),
             "box": lambda: Box(**common, half_size=(0.5, 0.5, 0.5)),
@@ -222,7 +229,7 @@ class SceneDocument:
         if kind not in factories:
             raise ValueError(f"unknown 2D profile type: {kind}")
         return PlacedSDF2D(
-            name=name or f"{kind}_{object_id}",
+            name=name or self._default_name(kind),
             object_id=object_id,
             profile=factories[kind](),
         )
@@ -233,7 +240,7 @@ class SceneDocument:
     ) -> PlacedSDF1D:
         object_id = self._allocate_object_id()
         return PlacedSDF1D(
-            name=name or f"segment_{object_id}",
+            name=name or self._default_name("segment"),
             object_id=object_id,
             profile=SegmentProfile(),
         )
@@ -248,7 +255,7 @@ class SceneDocument:
     ) -> PlacedPolyline1D:
         object_id = self._allocate_object_id()
         return PlacedPolyline1D(
-            name=name or f"polyline_{object_id}",
+            name=name or self._default_name("polyline"),
             object_id=object_id,
             profile=PolylineProfile(points=tuple(points)),
             origin=origin,
@@ -266,7 +273,7 @@ class SceneDocument:
     ) -> PlacedPolyline1D:
         object_id = self._allocate_object_id()
         return PlacedPolyline1D(
-            name=name or f"quadratic_bezier_curve_{object_id}",
+            name=name or self._default_name("quadratic_bezier_curve"),
             object_id=object_id,
             profile=QuadraticBezierCurveProfile(points=tuple(points)),
             origin=origin,
@@ -284,7 +291,7 @@ class SceneDocument:
     ) -> PlacedSDF2D:
         object_id = self._allocate_object_id()
         return PlacedSDF2D(
-            name=name or f"polygon_{object_id}",
+            name=name or self._default_name("polygon"),
             object_id=object_id,
             profile=PolygonProfile(points=tuple(points)),
             origin=origin,
@@ -302,7 +309,7 @@ class SceneDocument:
     ) -> int:
         object_id = self._allocate_object_id()
         node = PlacedSDF2D(
-            name=name or f"{profile.kind}_{object_id}",
+            name=name or self._default_name(profile.kind),
             object_id=object_id,
             profile=profile,
             origin=origin,
@@ -351,7 +358,7 @@ class SceneDocument:
     ) -> int:
         object_id = self._allocate_object_id()
         node = PolylineTube(
-            name=name or f"polyline_tube_{object_id}",
+            name=name or self._default_name("polyline_tube"),
             object_id=object_id,
             points=tuple(points),
             radius=radius,
@@ -371,7 +378,7 @@ class SceneDocument:
     ) -> int:
         object_id = self._allocate_object_id()
         node = QuadraticBezierTube(
-            name=name or f"quadratic_bezier_tube_{object_id}",
+            name=name or self._default_name("quadratic_bezier_tube"),
             object_id=object_id,
             points=tuple(points),
             radius=radius,
@@ -582,7 +589,7 @@ class SceneDocument:
             )
         elif kind == "polyline_tube":
             node = PolylineTube(
-                name=f"polyline_tube_{self._next_object_id}",
+                name=self._default_name("polyline_tube"),
                 object_id=self._allocate_object_id(),
                 points=(
                     tuple(float(value) for value in start_array),
@@ -595,7 +602,7 @@ class SceneDocument:
             axis_offset = np.zeros(3, dtype=np.float64)
             axis_offset[axis_b] = extent_b
             node = QuadraticBezierTube(
-                name=f"quadratic_bezier_tube_{self._next_object_id}",
+                name=self._default_name("quadratic_bezier_tube"),
                 object_id=self._allocate_object_id(),
                 points=(
                     tuple(float(value) for value in start_array),
@@ -965,7 +972,7 @@ class SceneDocument:
             current_domain.selector_objects if current_domain is not None else ()
         )
 
-        label = operation.replace("_", " ")
+        default_name = self._default_name(operation)
         object_id = self._allocate_object_id()
         if isinstance(first, PlacedSDF1D) and isinstance(second, PlacedSDF1D):
             if not first.is_collinear_with(second):
@@ -976,7 +983,7 @@ class SceneDocument:
                 np.dot(displacement, np.asarray(first.axis_u))
             )
             combined: SDFNode = PlacedSDF1D(
-                name=f"{label}: {first.name}, {second.name}",
+                name=default_name,
                 object_id=object_id,
                 profile=BinaryProfile1D(
                     first.profile,
@@ -1000,7 +1007,7 @@ class SceneDocument:
                 float(np.dot(displacement, np.asarray(first.axis_v))),
             )
             combined = PlacedSDF2D(
-                name=f"{label}: {first.name}, {second.name}",
+                name=default_name,
                 object_id=object_id,
                 profile=BinaryProfile(
                     first.profile,
@@ -1021,7 +1028,7 @@ class SceneDocument:
             if operation not in constructors:
                 raise ValueError(f"unknown SDF operation: {operation}")
             combined = constructors[operation](
-                name=f"{label}: {first.name}, {second.name}",
+                name=default_name,
                 object_id=object_id,
                 left=first,
                 right=second,
@@ -1061,7 +1068,7 @@ class SceneDocument:
                 "edit the placed SDF origin and axes to transform 1D or 2D objects"
             )
         common = {
-            "name": f"{transform}: {node.name}",
+            "name": self._default_name(transform),
             "object_id": self._allocate_object_id(),
             "child": node,
         }
@@ -1106,7 +1113,7 @@ class SceneDocument:
             raise ValueError("Solid From 2D requires placed 2D objects")
         placed = tuple(node for node in sections if isinstance(node, PlacedSDF2D))
         common = {
-            "name": f"{method}: {', '.join(node.name for node in placed)}",
+            "name": self._default_name(method),
             "object_id": self._allocate_object_id(),
         }
         if method == "extrude" and len(placed) == 1:

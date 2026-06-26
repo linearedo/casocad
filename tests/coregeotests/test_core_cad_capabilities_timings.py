@@ -579,7 +579,7 @@ def test_boundary_patch_preview_render_ir_timing() -> None:
 
 def test_scene_serialization_current_format_timing(tmp_path: Path) -> None:
     document = SceneDocument.default()
-    default_path = tmp_path / "default_scene.casocad.json"
+    default_path = tmp_path / "default_scene.json"
     loaded_default, _ = benchmark_scene_step(
         document,
         "serialize_load_default_3d_scene",
@@ -599,7 +599,7 @@ def test_scene_serialization_current_format_timing(tmp_path: Path) -> None:
     assert isinstance(root_node, PlacedSDF2D)
     section_document.set_fluid_root(root_2d)
     section_document.add_boundary_region(root_node.object_id, 1)
-    section_path = tmp_path / "section_scene.casocad.json"
+    section_path = tmp_path / "section_scene.json"
     loaded_section, _ = benchmark_scene_step(
         section_document,
         "serialize_load_2d_boundary_scene",

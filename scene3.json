@@ -3,10 +3,10 @@
   "version": 1,
   "unit": "m",
   "root_objects": [
-    "fluid"
+    "difference: rectangle_6, quadratic_bezier_surface_7"
   ],
   "objects": {
-    "farfield": {
+    "rectangle_6": {
       "type": "placed_sdf_2d",
       "profile": {
         "type": "rectangle",
@@ -15,14 +15,14 @@
           0.0
         ],
         "size": [
-          53.0,
-          11.0
+          4.0,
+          3.0
         ]
       },
       "origin": [
-        3.5,
-        6.5,
-        0.0
+        -2.0,
+        -0.5,
+        2.220446049250313e-16
       ],
       "axis_u": [
         1.0,
@@ -35,7 +35,7 @@
         0.0
       ]
     },
-    "airfoil": {
+    "quadratic_bezier_surface_7": {
       "type": "placed_sdf_2d",
       "profile": {
         "type": "quadratic_bezier_surface",
@@ -45,26 +45,18 @@
             0.0
           ],
           [
-            5.0,
-            2.0
+            1.0,
+            -2.0
           ],
           [
-            17.0,
-            0.0
-          ],
-          [
-            5.0,
+            -1.0,
             -1.0
-          ],
-          [
-            0.0,
-            0.0
           ]
         ]
       },
       "origin": [
-        -12.0,
-        6.0,
+        -2.0,
+        0.0,
         0.0
       ],
       "axis_u": [
@@ -78,7 +70,7 @@
         0.0
       ]
     },
-    "fluid": {
+    "difference: rectangle_6, quadratic_bezier_surface_7": {
       "type": "placed_sdf_2d",
       "profile": {
         "type": "binary",
@@ -89,8 +81,8 @@
             0.0
           ],
           "size": [
-            53.0,
-            11.0
+            4.0,
+            3.0
           ]
         },
         "right": {
@@ -103,35 +95,27 @@
                 0.0
               ],
               [
-                5.0,
-                2.0
+                1.0,
+                -2.0
               ],
               [
-                17.0,
-                0.0
-              ],
-              [
-                5.0,
+                -1.0,
                 -1.0
-              ],
-              [
-                0.0,
-                0.0
               ]
             ]
           },
           "offset": [
-            -15.5,
-            -0.5
+            0.0,
+            0.5
           ]
         },
         "operation": "difference",
         "smoothing": 0.1
       },
       "origin": [
-        3.5,
-        6.5,
-        0.0
+        -2.0,
+        -0.5,
+        2.220446049250313e-16
       ],
       "axis_u": [
         1.0,
@@ -144,17 +128,9 @@
         0.0
       ],
       "sources": [
-        "farfield",
-        "airfoil"
+        "rectangle_6",
+        "quadratic_bezier_surface_7"
       ]
-    }
-  },
-  "domains": {
-    "fluid": {
-      "type": "fluid",
-      "root": "fluid",
-      "tags": [],
-      "selectors": []
     }
   }
 }

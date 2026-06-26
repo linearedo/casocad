@@ -1680,7 +1680,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _open_scene(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open casoCAD scene", "", "casoCAD Scene (*.casocad.json *.json)"
+            self, "Open casoCAD scene", "", "casoCAD Scene (*.json)"
         )
         if not path:
             return
@@ -1699,13 +1699,13 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save casoCAD scene",
-            "scene.casocad.json",
-            "casoCAD Scene (*.casocad.json)",
+            "scene.json",
+            "casoCAD Scene (*.json)",
         )
         if not path:
             return
         if not path.lower().endswith(".json"):
-            path = f"{path}.casocad.json"
+            path = f"{path}.json"
         try:
             save_scene(self.document, path)
         except OSError as error:

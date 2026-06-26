@@ -979,7 +979,7 @@ def test_selector_backed_boundary_region_serializes_selector_objects(
     assert hit is not None
     base_handle = document.add_boundary_region_from_hit(hit)
     document.add_boundary_selector_region(document.node(base_handle), selector)
-    path = tmp_path / "selector_region.casocad.json"
+    path = tmp_path / "selector_region.json"
 
     save_scene(document, path)
     loaded = load_scene(path)
@@ -1017,7 +1017,7 @@ def test_outside_selector_boundary_region_serializes_selector_side(
     assert hit.selector is not None
     assert hit.selector.side == "outside"
     document.add_boundary_region_from_hit(hit)
-    path = tmp_path / "outside_selector_region.casocad.json"
+    path = tmp_path / "outside_selector_region.json"
 
     save_scene(document, path)
     loaded = load_scene(path)
