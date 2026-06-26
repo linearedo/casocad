@@ -190,7 +190,7 @@ def test_codegen_signature_tracks_selector_shader_variant() -> None:
     assert renderer._codegen_sig(selected)[4] is True
 
 
-def test_codegen_signature_does_not_track_direct_leaf_kind_growth() -> None:
+def test_codegen_signature_tracks_direct_leaf_kind_growth() -> None:
     box = _box_render_ir()
     with_curve = _prewarm_render_ir(box, "quadratic_bezier_polycurve")
     with_surface = _prewarm_render_ir(box, "quadratic_bezier_surface")
@@ -199,4 +199,4 @@ def test_codegen_signature_does_not_track_direct_leaf_kind_growth() -> None:
     renderer = QRhiInterpreterRenderer()
 
     assert scene_structure_signature(with_curve) != scene_structure_signature(with_surface)
-    assert renderer._codegen_sig(with_curve) == renderer._codegen_sig(with_surface)
+    assert renderer._codegen_sig(with_curve) != renderer._codegen_sig(with_surface)

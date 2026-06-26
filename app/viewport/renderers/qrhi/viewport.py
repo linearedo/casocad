@@ -120,6 +120,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._boundary_region_selected = False
         self._committed_render_ir = None   # last committed scene (restore target)
         self._preview_kind = None
+        self._boolean_preview_commit_pending = False
         # drag-to-create tool state (Draw button -> viewport_create_requested)
         self._create_kind = None
         self._create_start_world = None
@@ -503,6 +504,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._committed_render_ir = render_ir  # restore target after a preview
         self._update_scene_bounds(tree)
         self._preview_kind = None
+        self._boolean_preview_commit_pending = False
         self._move_commit_delta = (0.0, 0.0, 0.0)
         self.set_scene(render_ir)
 
@@ -964,9 +966,11 @@ class QRhiViewportWidget(QRhiWidget):
     set_boundary_hover = _noop
     begin_boundary_region_tool = _noop
     apply_committed_move_preview = _noop
-    apply_committed_boolean_preview = _noop
-
     # --- boolean preview (real; main_window builds the combined render) ---
+    def apply_committed_boolean_preview(self, *a, **k) -> None:
+        if self._preview_kind == "boolean":
+            self._boolean_preview_commit_pending = True
+
     def set_boolean_preview(self, *a, **k) -> None:
         # main_window pushes the combined ghost via show_scene_preview; nothing
         # to do viewport-side beyond that.
@@ -974,6 +978,8 @@ class QRhiViewportWidget(QRhiWidget):
 
     def clear_boolean_preview(self) -> None:
         if self._preview_kind == "boolean":
+            if self._boolean_preview_commit_pending:
+                return
             self._restore_committed_scene()
 
     def set_sdf_opacity(self, opacity: float) -> None:

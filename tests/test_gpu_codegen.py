@@ -60,14 +60,14 @@ def test_leaf_dispatch_only_present_types() -> None:
         assert f"t == {absent}" not in glsl, f"sphere scene must not branch {absent}"
 
 
-def test_viewport_leaf_signature_emits_all_direct_leaf_branches() -> None:
+def test_viewport_leaf_signature_emits_only_scene_leaf_branches() -> None:
     ir = _ir([_sphere(1)], 0)
     glsl = emit_map_glsl(ir, leaf_kinds=viewport_leaf_signature(ir))
 
     assert "t == NODE_SPHERE" in glsl
-    assert "t == NODE_BOX" in glsl
-    assert "t == NODE_PLACED_QUADRATIC_BEZIER_CURVE_1D" in glsl
-    assert "t == NODE_PLACED_QUADRATIC_BEZIER_SURFACE_2D" in glsl
+    assert "t == NODE_BOX" not in glsl
+    assert "t == NODE_PLACED_QUADRATIC_BEZIER_CURVE_1D" not in glsl
+    assert "t == NODE_PLACED_QUADRATIC_BEZIER_SURFACE_2D" not in glsl
     assert "evalProfileSDF" not in glsl
 
 
@@ -84,6 +84,19 @@ def test_intersection_adds_no_shader_code() -> None:
     assert group_capacity(inter) == 2
     for op in ("NODE_UNION", "NODE_INTERSECTION", "NODE_DIFFERENCE"):
         assert f"t == {op}" not in inter_glsl
+
+
+def test_viewport_sphere_box_intersection_variant_stays_small() -> None:
+    ir = _ir([_sphere(1), _box(2), _op("intersection", [0, 1])], 2)
+
+    glsl = emit_fragment_shader(ir, leaf_kinds=viewport_leaf_signature(ir))
+
+    assert viewport_leaf_signature(ir) == {"box", "sphere"}
+    assert "t == NODE_SPHERE" in glsl
+    assert "t == NODE_BOX" in glsl
+    assert "t == NODE_TORUS" not in glsl
+    assert "t == NODE_POLYLINE_TUBE" not in glsl
+    assert len(glsl.encode("utf-8")) < 6_000
 
 
 def test_emits_dnf_loops_and_map_signature() -> None:

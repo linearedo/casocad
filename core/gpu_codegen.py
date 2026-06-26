@@ -773,21 +773,15 @@ def scene_structure_signature(render_ir: RenderIR | None) -> frozenset[str]:
         if render_ir.nodes[i].kind in _LEAF_GLSL)
 
 
-_DIRECT_LEAF_KINDS = frozenset(_LEAF_GLSL) - _PROFILE_KINDS
-
-
 def viewport_leaf_signature(render_ir: RenderIR | None) -> frozenset[str]:
-    """Stable QRhi viewport leaf family.
+    """Viewport shader leaf family.
 
-    The core emitter can still generate tiny scene-specialized shaders, but the
-    interactive viewport wants one cross-backend shader for all direct SDF leaf
-    primitives so adding a curve/surface kind does not force a new native pipeline.
-    Profile VM leaves stay opt-in because they pull in a different evaluator.
+    Keep this scene-specialized. A universal direct-leaf shader avoids some
+    first-use rebakes, but it makes tiny boolean edits compile every primitive
+    branch on OpenGL drivers; cap=2 intersection variants can then stall for
+    many seconds.
     """
-    kinds = scene_structure_signature(render_ir)
-    if not kinds:
-        return frozenset()
-    return _DIRECT_LEAF_KINDS | (kinds & _PROFILE_KINDS)
+    return scene_structure_signature(render_ir)
 
 
 def supported(render_ir: RenderIR | None) -> bool:

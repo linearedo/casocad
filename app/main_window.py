@@ -1447,7 +1447,7 @@ class MainWindow(QMainWindow):
     @Slot(str, object)
     def _on_sdf_op_preview_requested(self, operation: str, handles: list[int]) -> None:
         if not operation:
-            self.viewport.clear_boolean_preview()
+            QTimer.singleShot(0, self.viewport.clear_boolean_preview)
             return
         if len(handles) != 2:
             self.viewport.clear_boolean_preview()

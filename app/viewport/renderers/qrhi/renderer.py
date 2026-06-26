@@ -278,9 +278,7 @@ class QRhiInterpreterRenderer:
         self._vert_shader = None             # shared fullscreen-triangle vertex
         # --- codegen path (the ONLY render path; the bytecode VM was removed) ----
         # Every supported scene renders via a shader keyed by the viewport leaf
-        # family and the few modes that affect generated source. The leaf family
-        # is stable across direct SDF primitives to avoid first-use pipeline stalls
-        # when a draw tool introduces another curve/surface kind.
+        # family and the few modes that affect generated source.
         self._cg_active = False              # is the current scene renderable by codegen?
         self._cg_render_ir = None
         self._cg_sig = None                  # baked (kinds, cap, simple) bake key
@@ -566,10 +564,10 @@ class QRhiInterpreterRenderer:
     def _defer_codegen_finalize(self, render_ir, sig, reason: str) -> None:
         self._cg_deferred_render_ir = render_ir
         self._cg_deferred_sig = sig
-        log.info("qrhi: deferred pipeline finalize scheduled reason=%s %s",
-                 reason, self._sig_label(sig))
         if self._cg_deferred_finalize_scheduled:
             return
+        log.info("qrhi: deferred pipeline finalize scheduled reason=%s %s",
+                 reason, self._sig_label(sig))
         self._cg_deferred_finalize_scheduled = True
         QTimer.singleShot(
             _DEFERRED_PIPELINE_COMPILE_DELAY_MS,
