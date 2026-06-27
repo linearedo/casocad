@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -20,8 +21,13 @@ from PySide6.QtWidgets import (
     QToolBar,
 )
 
+from app.axis_labels import world_axis_label
 from app.artifacts import (
     ArtifactManager,
+    BOOLEAN_DRAW_RESOLUTION,
+    COARSE_VIEWPORT_SURFACE_RESOLUTION,
+    REFINED_VIEWPORT_SURFACE_RESOLUTION,
+    REVOLVE_VIEWPORT_SURFACE_RESOLUTION,
     RenderArtifact,
     RenderSceneSnapshot,
     build_render_artifact,
@@ -40,7 +46,7 @@ from core.model import (
     grammar_violations,
     model_from_document,
 )
-from core.sdf import PlacedSDF2D
+from core.sdf import Difference, Intersection, PlacedSDF2D, Revolve, SDFTree, Union
 from core.sdf.base import BoundingBox3D, SDFNode
 from core.serialization import load_scene, save_scene
 from core.scene import INTERNAL_BOUNDARY_SELECTOR_PREFIX, SceneDocument
@@ -60,14 +66,21 @@ RENAME_SHORTCUT = "F2"
 
 def _format_render_artifact_ready_message(artifact: RenderArtifact) -> str:
     timings = artifact.timings
-    ir_support = "yes" if timings.render_ir_supported else "no"
+    large_scene = "yes" if timings.large_scene_mode else "no"
     return (
         "Render artifact built: "
         f"total={timings.total_ms:.1f} ms, "
-        f"render_ir={timings.render_ir_ms:.1f} ms, "
+        f"surface={timings.surface_ms:.1f} ms, "
+        f"render_wait={timings.render_wait_ms:.1f} ms, "
         f"tree_nodes={timings.tree_node_count}, "
-        f"ir_nodes={timings.render_ir_node_count}, "
-        f"ir_supported={ir_support}"
+        f"surface_resolution={timings.surface_resolution}, "
+        f"surface_vertices={timings.surface_vertex_count}, "
+        f"surface_triangles={timings.surface_triangle_count}, "
+        f"large_scene={large_scene}, "
+        f"objects={timings.total_object_count}, "
+        f"exact={timings.exact_object_count}, "
+        f"no_blur={timings.no_blur}, "
+        f"reason={timings.large_scene_reason or 'none'}"
     )
 FRAME_SHORTCUTS = ("Home",)
 FRAME_VIEW_KEY = "F"
@@ -93,6 +106,42 @@ def rgb_tuple_to_hex(color: tuple[float, float, float]) -> str:
 
 def viewport_shape_created_message(name: str) -> str:
     return f"Created {name}. Draw tool remains active; press Esc to finish."
+
+
+def parse_solid_from_2d_method(method: str) -> tuple[str, str]:
+    parts = str(method).split(":", 1)
+    base = parts[0]
+    axis = parts[1] if len(parts) == 2 else "v"
+    if base != "revolve":
+        return base, "v"
+    if len(parts) == 1:
+        return base, "custom"
+    if axis not in {"u", "v"}:
+        raise ValueError("revolve axis must be 'u' or 'v'")
+    return base, axis
+
+
+def viewport_render_resolution_for_tree(tree: object) -> tuple[int, bool]:
+    """Pick the first-build resolution and whether to climb the refinement ladder.
+
+    Returns ``(resolution, refine_after)``. Booleans and primitives start at the
+    interactive COARSE tier and refine progressively to full precision off-thread
+    (outcomes 0 and 0.5); 2D fills are cheap and rendered at full resolution
+    immediately; revolves keep their dedicated profile resolution.
+    """
+    components = tuple(getattr(tree, "components", ()) or ())
+    root = getattr(tree, "root", None)
+    if isinstance(root, (Union, Intersection, Difference)):
+        return BOOLEAN_DRAW_RESOLUTION, True
+    nodes = tuple(getattr(tree, "nodes", ()) or ())
+    if any(isinstance(node, Revolve) for node in (*components, *nodes)):
+        return REVOLVE_VIEWPORT_SURFACE_RESOLUTION, False
+    if components and all(
+        int(getattr(component, "dimension", 3)) <= 2
+        for component in components
+    ):
+        return REFINED_VIEWPORT_SURFACE_RESOLUTION, False
+    return COARSE_VIEWPORT_SURFACE_RESOLUTION, True
 
 
 def scene_item_handles(document: SceneDocument) -> list[int]:
@@ -124,7 +173,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("casoCAD - Programmable SDF CAD")
         self.resize(1400, 860)
-        self.document = SceneDocument.default()
+        self.document = SceneDocument()
         self._undo_stack: list[SceneDocument] = []
         self._redo_stack: list[SceneDocument] = []
         self._clipboard_nodes: list[SDFNode] = []
@@ -139,6 +188,7 @@ class MainWindow(QMainWindow):
         self._render_request_timer = QTimer(self)
         self._render_request_timer.setSingleShot(True)
         self._render_request_timer.timeout.connect(self._flush_render_request)
+        self.viewport.set_refinement_callback(self._schedule_render_artifact)
         self._build_docks()
         self._build_menu()
         self._build_toolbar()
@@ -237,10 +287,8 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
-        new_default = file_menu.addAction("New von Karman Scene")
+        new_default = file_menu.addAction("New Scene")
         new_default.triggered.connect(self._new_default_scene)
-        new_empty = file_menu.addAction("New Empty Scene")
-        new_empty.triggered.connect(self._new_empty_scene)
         examples_menu = file_menu.addMenu("New Example")
         for label, factory in (
             ("Pipe with inlet/outlet", build_pipe_scene),
@@ -496,8 +544,16 @@ class MainWindow(QMainWindow):
         except ValueError as error:
             signals.log_message.emit("warning", str(error))
             return
+        budget = self.viewport.render_budget_for_tree(tree)
+        surface_resolution, refine_after = viewport_render_resolution_for_tree(tree)
         self.artifacts.request_render(
-            RenderSceneSnapshot(version=version, tree=tree)
+            RenderSceneSnapshot(
+                version=version,
+                tree=tree,
+                budget=budget,
+                surface_resolution=surface_resolution,
+                refine_after=refine_after,
+            )
         )
 
     def _seed_initial_viewport_scene(self) -> None:
@@ -506,14 +562,18 @@ class MainWindow(QMainWindow):
         try:
             version, tree = self.document.visual_snapshot()
             artifact = build_render_artifact(
-                RenderSceneSnapshot(version=version, tree=tree)
+                RenderSceneSnapshot(
+                    version=version,
+                    tree=tree,
+                )
             )
         except ValueError as error:
             signals.log_message.emit("warning", str(error))
             return
         self.viewport.set_scene_artifact(
             artifact.tree,
-            artifact.render_ir,
+            artifact.surface_scene,
+            artifact.timings,
         )
 
     def _sync_grid_spacing_control(self) -> None:
@@ -613,14 +673,14 @@ class MainWindow(QMainWindow):
     def _on_render_artifact_ready(self, artifact: RenderArtifact) -> None:
         if artifact.version != self.document.version:
             return
-        logger.info(_format_render_artifact_ready_message(artifact))
         signals.log_message.emit(
             "info",
             _format_render_artifact_ready_message(artifact),
         )
         self.viewport.set_scene_artifact(
             artifact.tree,
-            artifact.render_ir,
+            artifact.surface_scene,
+            artifact.timings,
         )
 
     @Slot(int, str)
@@ -644,14 +704,39 @@ class MainWindow(QMainWindow):
             return
         try:
             preview = self.document.snapshot()
-            preview.add_primitive_from_drag(kind, start, end, parameters=parameters)
-            version, tree = preview.visual_snapshot()
+            handle = preview.add_primitive_from_drag(
+                kind,
+                start,
+                end,
+                parameters=parameters,
+            )
+            node = preview.node(handle)
+            if not isinstance(node, SDFNode):
+                return
+            tree = SDFTree(root=node, components=(node,))
+            surface_resolution, _refine_after = viewport_render_resolution_for_tree(tree)
             artifact = build_render_artifact(
-                RenderSceneSnapshot(version=version, tree=tree)
+                RenderSceneSnapshot(
+                    version=preview.version,
+                    tree=tree,
+                    surface_resolution=surface_resolution,
+                    refine_after=False,
+                )
             )
         except (KeyError, ValueError):
             return
-        self.viewport.show_scene_preview(artifact.render_ir)
+        base_scene = self.viewport.committed_surface_scene()
+        if base_scene is None or artifact.surface_scene is None:
+            self.viewport.show_scene_preview(artifact.surface_scene)
+            return
+        self.viewport.show_scene_preview(
+            replace(
+                base_scene,
+                revision=preview.version,
+                surfaces=(*base_scene.surfaces, *artifact.surface_scene.surfaces),
+                build_ms=artifact.surface_scene.build_ms,
+            )
+        )
 
     @Slot(str, object, object, object)
     def _on_viewport_shape_drawn(
@@ -1015,16 +1100,25 @@ class MainWindow(QMainWindow):
         throwaway document so the live tree/undo history stay untouched; the
         viewport restores the committed scene on cancel or after commit."""
         try:
+            node = self.document.node(handle)
+            if (
+                isinstance(node, SDFNode)
+                and self.viewport.show_move_preview(node.object_id, delta)
+            ):
+                return
             preview = self.document.snapshot()
             preview.move_object(handle, delta)
             version, tree = preview.visual_snapshot()
             artifact = build_render_artifact(
-                RenderSceneSnapshot(version=version, tree=tree)
+                RenderSceneSnapshot(
+                    version=version,
+                    tree=tree,
+                )
             )
         except (KeyError, ValueError) as error:
             signals.log_message.emit("warning", str(error))
             return
-        self.viewport.show_scene_preview(artifact.render_ir)
+        self.viewport.show_scene_preview(artifact.surface_scene)
 
     def _on_viewport_move_requested(
         self,
@@ -1071,12 +1165,15 @@ class MainWindow(QMainWindow):
             preview.rotate_object(handle, axis, angle_degrees, pivot)
             version, tree = preview.visual_snapshot()
             artifact = build_render_artifact(
-                RenderSceneSnapshot(version=version, tree=tree)
+                RenderSceneSnapshot(
+                    version=version,
+                    tree=tree,
+                )
             )
         except (KeyError, ValueError, NotImplementedError) as error:
             signals.log_message.emit("warning", str(error))
             return
-        self.viewport.show_scene_preview(artifact.render_ir)
+        self.viewport.show_scene_preview(artifact.surface_scene)
 
     @Slot(int, str, float, object)
     def _on_viewport_rotate_requested(
@@ -1116,21 +1213,37 @@ class MainWindow(QMainWindow):
                 [handle], "extrude", signed_height=signed_height)
             version, tree = preview.visual_snapshot()
             artifact = build_render_artifact(
-                RenderSceneSnapshot(version=version, tree=tree)
+                RenderSceneSnapshot(
+                    version=version,
+                    tree=tree,
+                )
             )
         except (KeyError, ValueError) as error:
             signals.log_message.emit("warning", str(error))
             return
         del new_handle
-        self.viewport.show_scene_preview(artifact.render_ir)
+        self.viewport.show_scene_preview(artifact.surface_scene)
 
     def _on_viewport_revolve_preview(
-        self, handle, axis_origin, axis_direction, radial_direction, angle_degrees
+        self,
+        handle,
+        axis_name,
+        axis_origin,
+        axis_direction,
+        radial_direction,
+        angle_degrees,
     ) -> None:
+        if (
+            axis_name not in {"u", "v"}
+            or not np.isfinite(float(angle_degrees))
+            or abs(float(angle_degrees)) <= 1.0e-6
+        ):
+            return
         try:
             preview = self.document.snapshot()
             preview.solid_from_2d(
                 [handle], "revolve",
+                revolve_axis=axis_name,
                 revolve_axis_origin=axis_origin,
                 revolve_axis_direction=axis_direction,
                 revolve_radial_direction=radial_direction,
@@ -1138,12 +1251,17 @@ class MainWindow(QMainWindow):
             )
             version, tree = preview.visual_snapshot()
             artifact = build_render_artifact(
-                RenderSceneSnapshot(version=version, tree=tree)
+                RenderSceneSnapshot(
+                    version=version,
+                    tree=tree,
+                )
             )
         except (KeyError, ValueError) as error:
+            if "revolve angle magnitude must be finite" in str(error):
+                return
             signals.log_message.emit("warning", str(error))
             return
-        self.viewport.show_scene_preview(artifact.render_ir)
+        self.viewport.show_scene_preview(artifact.surface_scene)
 
     @Slot(int, object, object)
     def _on_viewport_transform_requested(
@@ -1204,10 +1322,11 @@ class MainWindow(QMainWindow):
             5000,
         )
 
-    @Slot(int, object, object, object, float)
+    @Slot(int, str, object, object, object, float)
     def _on_viewport_revolve_requested(
         self,
         handle: int,
+        axis_name: str,
         axis_origin: tuple[float, float, float],
         axis_direction: tuple[float, float, float],
         radial_direction: tuple[float, float, float],
@@ -1218,6 +1337,7 @@ class MainWindow(QMainWindow):
             solid_handle = self.document.solid_from_2d(
                 [handle],
                 "revolve",
+                revolve_axis=axis_name,
                 revolve_axis_origin=axis_origin,
                 revolve_axis_direction=axis_direction,
                 revolve_radial_direction=radial_direction,
@@ -1230,7 +1350,8 @@ class MainWindow(QMainWindow):
         self._publish_document(clear_selection=False)
         self.scene_tree.select_handle(solid_handle)
         self.statusBar().showMessage(
-            f"Revolved {angle_degrees:.5g} degrees",
+            f"Revolved around {world_axis_label(axis_direction)} "
+            f"{angle_degrees:.5g} degrees",
             5000,
         )
 
@@ -1472,12 +1593,15 @@ class MainWindow(QMainWindow):
             preview.combine(handles[0], handles[1], operation)
             version, tree = preview.visual_snapshot()
             artifact = build_render_artifact(
-                RenderSceneSnapshot(version=version, tree=tree)
+                RenderSceneSnapshot(
+                    version=version,
+                    tree=tree,
+                )
             )
         except (KeyError, ValueError):
             self.viewport.clear_boolean_preview()
             return
-        self.viewport.show_scene_preview(artifact.render_ir, preview_kind="boolean")
+        self.viewport.show_scene_preview(artifact.surface_scene, preview_kind="boolean")
 
     @Slot(str, object)
     def _on_sdf_op_requested(self, operation: str, handles: list[int]) -> None:
@@ -1573,11 +1697,17 @@ class MainWindow(QMainWindow):
 
     @Slot(str, object)
     def _on_solid_from_2d(self, method: str, handles: list[int]) -> None:
-        if method in {"extrude", "revolve"}:
+        try:
+            base_method, revolve_axis = parse_solid_from_2d_method(method)
+        except ValueError as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        if base_method in {"extrude", "revolve"}:
             if len(handles) != 1:
                 signals.log_message.emit(
                     "warning",
-                    f"Select exactly one placed 2D SDF before using {method.title()}.",
+                    f"Select exactly one placed 2D SDF before using "
+                    f"{base_method.title()}.",
                 )
                 return
             try:
@@ -1588,17 +1718,27 @@ class MainWindow(QMainWindow):
             if not isinstance(node, PlacedSDF2D):
                 signals.log_message.emit(
                     "warning",
-                    f"{method.title()} requires one placed 2D SDF.",
+                    f"{base_method.title()} requires one placed 2D SDF.",
                 )
                 return
-            if method == "extrude":
+            if node not in self.document.objects:
+                signals.log_message.emit(
+                    "warning",
+                    f"{base_method.title()} requires a top-level placed 2D SDF.",
+                )
+                return
+            if base_method == "extrude":
                 self.viewport.begin_extrude_tool(handles[0], node)
             else:
-                self.viewport.begin_revolve_tool(handles[0], node)
+                self.viewport.begin_revolve_tool(
+                    handles[0],
+                    node,
+                    axis_name=revolve_axis,
+                )
             return
         undo_snapshot = self._history_snapshot()
         try:
-            handle = self.document.solid_from_2d(handles, method)
+            handle = self.document.solid_from_2d(handles, base_method)
         except (ValueError, KeyError) as error:
             signals.log_message.emit("warning", str(error))
             return
@@ -1660,7 +1800,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _new_default_scene(self) -> None:
         undo_snapshot = self._history_snapshot()
-        self.document = SceneDocument.default()
+        self.document = SceneDocument()
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document(frame=True)
 

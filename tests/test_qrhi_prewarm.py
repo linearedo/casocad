@@ -1,202 +1,203 @@
 from __future__ import annotations
 
-from app.viewport.renderers.qrhi import renderer as renderer_module
-from app.viewport.renderers.qrhi.renderer import (
-    QRhiInterpreterRenderer,
-    _prewarm_render_ir,
+import numpy as np
+
+from app.viewport.renderers.qrhi.surface_renderer import (
+    _LINE_STRIDE,
+    _SURFACE_STRIDE,
+    QRhiSurfaceRenderer,
+    _SurfaceChunk,
+    _chunk_from_surface,
+    _dynamic_line_payload,
+    _safe_normal_array,
 )
-from core.gpu_codegen import (
-    group_capacity,
-    has_carves,
-    profiles_are_simple,
-    scene_structure_signature,
-    selector_indices,
-    supported,
-    uses_spatial_cull,
-    viewport_leaf_signature,
+from app.viewport.surface_cache import (
+    ViewportSurfaceCache,
+    build_viewport_surface_scene,
 )
-from core.render_ir import RenderIR, RenderIRNode
+from core.scene import SceneDocument
 
 
-def _box_render_ir() -> RenderIR:
-    return RenderIR(
-        nodes=(
-            RenderIRNode(
-                kind="box",
-                object_id=1,
-                dimension=3,
-                children=(),
-                params=(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0.5, 0.5, 0.5),
-            ),
-        ),
-        root_indices=(0,),
-        component_indices=(),
+def _surface_scene(document: SceneDocument):
+    version, tree = document.visual_snapshot()
+    return build_viewport_surface_scene(
+        tree,
+        version,
+        cache=ViewportSurfaceCache(resolution=14),
     )
 
 
-def _render_sig(render_ir: RenderIR) -> tuple[object, int | None, bool, bool, bool, bool]:
-    return (
-        viewport_leaf_signature(render_ir),
-        group_capacity(render_ir),
-        profiles_are_simple(render_ir),
-        uses_spatial_cull(render_ir),
-        bool(selector_indices(render_ir)),
-        has_carves(render_ir),
-    )
+def test_surface_renderer_has_no_tool_shader_prewarm_contract() -> None:
+    renderer = QRhiSurfaceRenderer()
 
-
-def test_prewarm_render_ir_adds_quadratic_bezier_surface_signature() -> None:
-    render_ir = _box_render_ir()
-
-    prewarm = _prewarm_render_ir(render_ir, "quadratic_bezier_surface")
-
-    assert prewarm is not None
-    assert supported(prewarm)
-    assert scene_structure_signature(prewarm) == {
-        "box",
-        "placed_quadratic_bezier_surface_2d",
-    }
-
-
-def test_prewarm_render_ir_adds_quadratic_bezier_polycurve_signature() -> None:
-    render_ir = _box_render_ir()
-
-    prewarm = _prewarm_render_ir(render_ir, "quadratic_bezier_polycurve")
-
-    assert prewarm is not None
-    assert supported(prewarm)
-    assert scene_structure_signature(prewarm) == {
-        "box",
-        "placed_quadratic_bezier_polycurve_1d",
-    }
-
-
-def test_prewarm_render_ir_ignores_unknown_tools() -> None:
-    assert _prewarm_render_ir(None, "quadratic_bezier_tube") is None
-
-
-def test_tool_prewarm_can_skip_gui_thread_pipeline_compile(monkeypatch) -> None:
-    render_ir = _box_render_ir()
-    prewarm = _prewarm_render_ir(render_ir, "quadratic_bezier_surface")
-    assert prewarm is not None
-    sig = _render_sig(prewarm)
-    shader = object()
-    calls = []
-    renderer = QRhiInterpreterRenderer()
-    renderer._baked = True
-    renderer._rpd = object()
-    renderer._cg_srb = object()
-    renderer._cg_frag_cache[sig] = shader
-
-    monkeypatch.setattr(
-        renderer,
-        "_prewarm_pipeline",
-        lambda prewarm_sig, frag: calls.append((prewarm_sig, frag)),
-    )
-
-    renderer.prewarm_for_tool(render_ir, "quadratic_bezier_surface", compile_pipeline=False)
-    assert calls == []
-
-    renderer.prewarm_for_tool(render_ir, "quadratic_bezier_surface", compile_pipeline=True)
-    assert calls == [(sig, shader)]
-
-
-def test_tool_pipeline_prewarm_policy_is_backend_agnostic() -> None:
-    class FakeRhi:
-        def __init__(self, backend: str) -> None:
-            self._backend = backend
-
-        def backendName(self) -> str:
-            return self._backend
-
-    renderer = QRhiInterpreterRenderer()
     assert not renderer.should_prewarm_tool_pipeline()
-
-    for backend in ("OpenGL", "Vulkan", "Metal", "D3D11"):
-        renderer._rhi = FakeRhi(backend)
-        assert renderer.should_prewarm_tool_pipeline()
+    assert renderer.prewarm_for_tool(None, "quadratic_bezier_surface") is None
+    assert renderer.save_pipeline_cache() is None
 
 
-def test_shader_cached_pipeline_cold_scene_finalizes_deferred(monkeypatch) -> None:
-    render_ir = _box_render_ir()
-    sig = _render_sig(render_ir)
-    shader = object()
-    renderer = QRhiInterpreterRenderer()
-    renderer._baked = True
-    renderer._rpd = object()
-    renderer._cg_frag_cache[sig] = shader
-    activated = []
-    callbacks = []
-    updates = []
+def test_indexed_surface_chunk_uses_stable_vertex_and_index_payloads() -> None:
+    document = SceneDocument()
+    document.add_primitive("sphere")
+    scene = _surface_scene(document)
 
-    monkeypatch.setattr(
-        renderer_module.QTimer,
-        "singleShot",
-        lambda _delay_ms, callback: callbacks.append(callback),
+    assert scene is not None
+    chunk = _chunk_from_surface(scene.surfaces[0])
+
+    assert chunk is not None
+    assert chunk.vertex_count == scene.surfaces[0].vertex_count
+    assert len(chunk.vertex_bytes) == chunk.vertex_count * _SURFACE_STRIDE
+    assert chunk.index_count == scene.surfaces[0].indices.size
+    assert chunk.index_count > 0
+    assert chunk.wire_index_count == scene.surfaces[0].wire_indices.size
+    assert chunk.thick_line_vertex_count == 0
+    assert chunk.thick_line_bytes == b""
+
+
+def test_outline_surface_chunk_uses_dynamic_thick_line_payload() -> None:
+    document = SceneDocument()
+    document.add_primitive("segment")
+    scene = _surface_scene(document)
+
+    assert scene is not None
+    chunk = _chunk_from_surface(scene.surfaces[0])
+    assert chunk is not None
+
+    payload, vertex_count = _dynamic_line_payload([chunk], None)
+
+    assert chunk.index_count == 0
+    assert chunk.thick_line_vertex_count >= 6
+    assert len(chunk.thick_line_bytes) == chunk.thick_line_vertex_count * _LINE_STRIDE
+    assert payload == chunk.thick_line_bytes
+    assert vertex_count == chunk.thick_line_vertex_count
+
+
+def test_surface_upload_sanitizes_invalid_normals() -> None:
+    normals = np.asarray(
+        (
+            (0.0, 0.0, 0.0),
+            (np.nan, 0.0, 0.0),
+            (np.inf, 0.0, 0.0),
+            (0.0, 3.0, 4.0),
+        ),
+        dtype=np.float32,
     )
-    monkeypatch.setattr(
-        renderer,
-        "_activate_codegen_scene",
-        lambda active_render_ir: activated.append(active_render_ir),
-    )
-    renderer.set_update_callback(lambda: updates.append(True))
 
-    renderer.set_scene(render_ir)
+    sanitized = _safe_normal_array(normals)
 
-    assert activated == []
-    assert callbacks
-    assert renderer._cg_deferred_sig == sig
-
-    callbacks[0]()
-
-    assert activated == [render_ir]
-    assert updates == [True]
-    assert renderer._cg_deferred_sig is None
+    np.testing.assert_allclose(sanitized[0], (0.0, 0.0, 1.0))
+    np.testing.assert_allclose(sanitized[1], (0.0, 0.0, 1.0))
+    np.testing.assert_allclose(sanitized[2], (0.0, 0.0, 1.0))
+    np.testing.assert_allclose(sanitized[3], (0.0, 0.6, 0.8), atol=1.0e-7)
 
 
-def test_codegen_signature_tracks_selector_shader_variant() -> None:
-    geom = RenderIRNode(
-        kind="sphere",
-        object_id=1,
-        dimension=3,
-        children=(),
-        params=(0.0, 0.0, 0.0, 1.0),
-    )
-    selector_volume = RenderIRNode(
-        kind="sphere",
-        object_id=2,
-        dimension=3,
-        children=(),
-        params=(0.0, 0.0, 0.0, 0.5),
-    )
-    selector = RenderIRNode(
-        kind="region_selector",
-        object_id=1,
-        dimension=3,
-        children=(1,),
-        params=(0.1,),
-        flags=7,
-    )
-    plain = RenderIR(nodes=(geom,), root_indices=(0,), component_indices=())
-    selected = RenderIR(
-        nodes=(geom, selector_volume, selector),
-        root_indices=(0,),
-        component_indices=(2,),
-    )
-    renderer = QRhiInterpreterRenderer()
+def test_surface_renderer_set_scene_replaces_cpu_chunks_before_qrhi_init() -> None:
+    first_document = SceneDocument()
+    first_document.add_primitive("sphere")
+    first_scene = _surface_scene(first_document)
+    second_document = SceneDocument()
+    second_document.add_primitive("segment")
+    second_scene = _surface_scene(second_document)
+    renderer = QRhiSurfaceRenderer()
 
-    assert renderer._codegen_sig(plain) != renderer._codegen_sig(selected)
-    assert renderer._codegen_sig(plain)[4] is False
-    assert renderer._codegen_sig(selected)[4] is True
+    renderer.set_surface_scene(first_scene)
+    first_chunks = list(renderer._chunks)
+    renderer.set_surface_scene(second_scene)
+
+    assert len(first_chunks) == 1
+    assert len(renderer._chunks) == 1
+    assert renderer._chunks[0] is not first_chunks[0]
+    assert renderer._chunks[0].index_count == 0
+    assert renderer._chunks[0].thick_line_vertex_count > 0
 
 
-def test_codegen_signature_tracks_direct_leaf_kind_growth() -> None:
-    box = _box_render_ir()
-    with_curve = _prewarm_render_ir(box, "quadratic_bezier_polycurve")
-    with_surface = _prewarm_render_ir(box, "quadratic_bezier_surface")
-    assert with_curve is not None
-    assert with_surface is not None
-    renderer = QRhiInterpreterRenderer()
+def test_surface_renderer_retires_qrhi_chunks_before_destroying_buffers() -> None:
+    class FakeBuffer:
+        def __init__(self) -> None:
+            self.destroy_count = 0
 
-    assert scene_structure_signature(with_curve) != scene_structure_signature(with_surface)
-    assert renderer._codegen_sig(with_curve) != renderer._codegen_sig(with_surface)
+        def destroy(self) -> None:
+            self.destroy_count += 1
+
+    renderer = QRhiSurfaceRenderer()
+    renderer._rhi = object()
+    vertex_buffer = FakeBuffer()
+    renderer._chunks = [
+        _SurfaceChunk(
+            vertex_bytes=b"",
+            vertex_count=1,
+            index_bytes=b"",
+            index_count=0,
+            wire_index_bytes=b"",
+            wire_index_count=0,
+            thick_line_bytes=b"",
+            thick_line_vertex_count=0,
+            object_id=1,
+            vertex_buffer=vertex_buffer,
+        )
+    ]
+
+    renderer._retire_current_chunks()
+
+    assert renderer._chunks == []
+    assert len(renderer._retired_chunks) == 1
+    assert vertex_buffer.destroy_count == 0
+
+    renderer._collect_retired_chunks()
+    renderer._collect_retired_chunks()
+    assert vertex_buffer.destroy_count == 0
+
+    renderer._collect_retired_chunks()
+    assert vertex_buffer.destroy_count == 1
+    assert renderer._retired_chunks == []
+
+
+def test_surface_camera_matrix_matches_viewport_focal_camera() -> None:
+    renderer = QRhiSurfaceRenderer()
+    renderer._clip_y_sign = -1.0
+    renderer._depth_zero_to_one = False
+    camera = {
+        "u_camera_position": (0.0, 0.0, 6.0),
+        "u_camera_target": (0.0, 0.0, 0.0),
+        "u_camera_right": (1.0, 0.0, 0.0),
+        "u_camera_up": (0.0, 1.0, 0.0),
+        "u_focal_length": 1.5,
+    }
+
+    matrix = renderer._camera_matrix(800, 400, camera)
+
+    center = _project(matrix, (0.0, 0.0, 0.0))
+    right = _project(matrix, (1.0, 0.0, 0.0))
+    up = _project(matrix, (0.0, 1.0, 0.0))
+
+    np.testing.assert_allclose(center[:2], (0.0, 0.0), atol=1.0e-7)
+    np.testing.assert_allclose(right[0], 1.5 * 0.5 / 6.0, atol=1.0e-7)
+    np.testing.assert_allclose(up[1], 1.5 / 6.0, atol=1.0e-7)
+
+    camera["u_focal_length"] = 3.0
+    zoomed = _project(renderer._camera_matrix(800, 400, camera), (1.0, 0.0, 0.0))
+
+    np.testing.assert_allclose(zoomed[0], 2.0 * right[0], atol=1.0e-7)
+
+
+def test_surface_camera_matrix_respects_clip_y_sign() -> None:
+    renderer = QRhiSurfaceRenderer()
+    renderer._depth_zero_to_one = False
+    camera = {
+        "u_camera_position": (0.0, 0.0, 6.0),
+        "u_camera_target": (0.0, 0.0, 0.0),
+        "u_camera_right": (1.0, 0.0, 0.0),
+        "u_camera_up": (0.0, 1.0, 0.0),
+        "u_focal_length": 1.5,
+    }
+
+    renderer._clip_y_sign = -1.0
+    y_up = _project(renderer._camera_matrix(800, 400, camera), (0.0, 1.0, 0.0))
+    renderer._clip_y_sign = 1.0
+    y_down = _project(renderer._camera_matrix(800, 400, camera), (0.0, 1.0, 0.0))
+
+    np.testing.assert_allclose(y_up[1], -y_down[1], atol=1.0e-7)
+
+
+def _project(matrix: np.ndarray, point: tuple[float, float, float]) -> np.ndarray:
+    clip = matrix @ np.asarray((*point, 1.0), dtype=np.float32)
+    return clip[:3] / clip[3]

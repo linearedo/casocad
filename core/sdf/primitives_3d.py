@@ -65,6 +65,14 @@ def _oriented_box_bounds(
     axis_w: tuple[float, float, float],
     half_size: tuple[float, float, float],
 ) -> BoundingBox3D:
+    if (
+        axis_u == (1.0, 0.0, 0.0)
+        and axis_v == (0.0, 1.0, 0.0)
+        and axis_w == (0.0, 0.0, 1.0)
+    ):
+        cx, cy, cz = center
+        hx, hy, hz = half_size
+        return BoundingBox3D(cx - hx, cx + hx, cy - hy, cy + hy, cz - hz, cz + hz)
     center_array = np.asarray(center, dtype=np.float64)
     axes = (
         np.asarray(axis_u, dtype=np.float64),

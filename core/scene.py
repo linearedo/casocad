@@ -19,6 +19,7 @@ from .boundary_patches import (
     boundary_selector_from_node,
 )
 from .domain import FluidDomain
+from .preconditions import revolve_violations
 from .sdf import (
     QuadraticBezierCurveProfile,
     QuadraticBezierSurfaceProfile,
@@ -1137,12 +1138,63 @@ class SceneDocument:
                 radial_direction=revolve_radial_direction,
                 angle_degrees=revolve_angle_degrees,
             )
+            self._validate_revolve_exactness(result)
         else:
             raise ValueError(f"invalid section count for {method}")
-        self.objects.append(result)
+        current_domain = self.fluid_domain
+        replaces_fluid_root = (
+            current_domain is not None and current_domain.root is placed[0]
+        )
+        domain_tags = current_domain.tag_objects if current_domain is not None else ()
+        domain_selectors = (
+            current_domain.selector_objects if current_domain is not None else ()
+        )
+        if placed[0] in self.objects:
+            self.objects[self.objects.index(placed[0])] = result
+        else:
+            self.objects.append(result)
         self._reindex()
+        if replaces_fluid_root:
+            self.fluid_domain = FluidDomain(
+                result,
+                self._compatible_domain_tags(result, domain_tags),
+                self._compatible_domain_selectors(result, domain_selectors),
+            )
+        else:
+            self._refresh_fluid_domain()
         self.mark_changed()
         return self.handle_for(result)
+
+    def validate_revolve_from_2d(
+        self,
+        handle: int,
+        *,
+        revolve_axis: str = "v",
+        revolve_axis_origin: tuple[float, float, float] | None = None,
+        revolve_axis_direction: tuple[float, float, float] | None = None,
+        revolve_radial_direction: tuple[float, float, float] | None = None,
+        revolve_angle_degrees: float = 360.0,
+    ) -> None:
+        section = self.node(handle)
+        if not isinstance(section, PlacedSDF2D):
+            raise ValueError("Revolve requires one placed 2D SDF.")
+        candidate = Revolve(
+            name=self._default_name("revolve"),
+            object_id=0,
+            section=section,
+            axis=revolve_axis,
+            axis_origin=revolve_axis_origin,
+            axis_direction=revolve_axis_direction,
+            radial_direction=revolve_radial_direction,
+            angle_degrees=revolve_angle_degrees,
+        )
+        self._validate_revolve_exactness(candidate)
+
+    @staticmethod
+    def _validate_revolve_exactness(revolve: Revolve) -> None:
+        issues = revolve_violations(revolve)
+        if issues:
+            raise ValueError(issues[0])
 
     def set_fluid_root(self, handle: int) -> None:
         node = self.node(handle)
@@ -1960,9 +2012,7 @@ class SceneDocument:
                 radius=0.001,
             )
         else:
-            root = three_dimensional[0]
-            for node in three_dimensional[1:]:
-                root = Union(name="visual_union", left=root, right=node)
+            root = self._balanced_union(three_dimensional, "visual_union")
         components = list(visible_objects)
         internal_selectors: list[SDFNode] = []
         if self.fluid_domain is not None:
@@ -1983,6 +2033,16 @@ class SceneDocument:
             root,
             components=tuple(components),
             selector_objects=tuple(internal_selectors),
+        )
+
+    def _balanced_union(self, nodes: list[SDFNode], name: str) -> SDFNode:
+        if len(nodes) == 1:
+            return nodes[0]
+        midpoint = len(nodes) // 2
+        return Union(
+            name=name,
+            left=self._balanced_union(nodes[:midpoint], name),
+            right=self._balanced_union(nodes[midpoint:], name),
         )
 
     def visual_tree(self) -> SDFTree:

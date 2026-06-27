@@ -36,7 +36,8 @@ def test_default_startup_scene_timing(
     )
 
     assert timing.tree_node_count >= 3
-    assert timing.render_ir_supported
+    assert timing.surface_has_geometry
+    assert timing.surface_vertex_count > 0
 
 
 def test_core_3d_operations_timing(
@@ -99,7 +100,8 @@ def test_core_3d_operations_timing(
         render_upload_probe,
     )
 
-    assert sphere_timing.render_ir_supported
+    assert sphere_timing.surface_has_geometry
+    assert sphere_timing.surface_triangle_count > 0
     assert moved_handle == sphere_handle
     assert rotated_handle == translated_handle
     assert isinstance(document.node(translated_handle), Translate)
@@ -177,7 +179,8 @@ def test_core_2d_boolean_extrude_revolve_timing(
         render_upload_probe,
     )
 
-    assert rectangle_timing.render_ir_supported
+    assert rectangle_timing.surface_has_geometry
+    assert rectangle_timing.surface_vertex_count > 0
     assert isinstance(document.node(extrude_handle), Extrude)
     assert isinstance(document.node(revolve_handle), Revolve)
 
@@ -275,17 +278,15 @@ def test_path_based_solids_timing(
         render_upload_probe,
     )
 
-    assert polyline_timing.render_ir_supported
+    assert polyline_timing.surface_has_geometry
+    assert polyline_timing.surface_triangle_count > 0
     assert isinstance(document.node(polyline_handle), PolylineTube)
     assert isinstance(document.node(quadratic_bezier_handle), QuadraticBezierTube)
 
 
-def test_delete_reuses_previous_render_topology_timing(
+def test_delete_rebuilds_surface_artifact_timing(
     render_upload_probe: RenderUploadProbe | None,
 ) -> None:
-    if render_upload_probe is None:
-        pytest.skip("render upload probe unavailable")
-
     document = SceneDocument()
 
     sphere_handle, first_timing = benchmark_scene_step(
@@ -307,19 +308,15 @@ def test_delete_reuses_previous_render_topology_timing(
         render_upload_probe,
     )
 
-    assert first_timing.upload is not None
-    assert delete_timing.upload is not None
-    assert delete_timing.upload.reused_program
-    assert delete_timing.upload.program_compile_ms == 0.0
+    assert first_timing.surface_has_geometry
+    assert delete_timing.surface_has_geometry
+    assert delete_timing.surface_triangle_count > 0
     assert document.node(sphere_handle).object_id > 0
 
 
-def test_recreated_topology_reuses_program_across_object_id_changes(
+def test_recreated_surface_topology_survives_object_id_changes(
     render_upload_probe: RenderUploadProbe | None,
 ) -> None:
-    if render_upload_probe is None:
-        pytest.skip("render upload probe unavailable")
-
     document = SceneDocument()
 
     first_handle, first_timing = benchmark_scene_step(
@@ -343,11 +340,10 @@ def test_recreated_topology_reuses_program_across_object_id_changes(
     )
     second_object_id = document.node(second_handle).object_id
 
-    assert first_timing.render_ir_supported
-    assert first_timing.upload is not None
-    assert second_timing.upload is not None
+    assert first_timing.surface_has_geometry
+    assert second_timing.surface_has_geometry
+    assert second_timing.surface_triangle_count > 0
     assert first_object_id != second_object_id
-    assert second_timing.upload.reused_program
 
 
 def _set_scale_factor(

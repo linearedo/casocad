@@ -9,6 +9,7 @@ from core.preconditions import (
     revolve_violations,
 )
 from core.sdf import CircleProfile, DistanceOffsetProfile, PlacedSDF2D, Revolve
+from core.sdf.primitives_2d import QuadraticBezierSurfaceProfile
 from core.sdf.roles import Domain, DomainKind
 
 
@@ -37,12 +38,20 @@ def test_revolve_off_axis_profile_is_exact() -> None:
     assert revolve_violations(rev) == []
 
 
-def test_revolve_profile_crossing_axis_is_flagged() -> None:
-    # Circle at u in [-0.5, 0.5] straddles the axis (u=0).
+def test_revolve_symmetric_profile_crossing_axis_is_exact() -> None:
+    # A disk revolved about a diameter is a sphere; the folded profile field is
+    # still mirror-symmetric about the axis.
     rev = _revolve(CircleProfile(center=(0.0, 0.0), radius=0.5))
+    assert revolve_violations(rev) == []
+
+
+def test_revolve_asymmetric_profile_crossing_axis_is_flagged() -> None:
+    # The default Bezier surface straddles u=0 but is not mirror-symmetric, so
+    # folding to radial>=0 would drop one side of the profile distance field.
+    rev = _revolve(QuadraticBezierSurfaceProfile())
     issues = revolve_violations(rev)
     assert issues
-    assert "crosses the revolution axis" in issues[0]
+    assert "non-symmetric profile crosses the revolution axis" in issues[0]
 
 
 # --- Erosion reach (§6) -----------------------------------------------------
@@ -77,14 +86,14 @@ def test_erosion_beyond_reach_vanishes() -> None:
 
 
 def test_precondition_violations_walks_region() -> None:
-    bad = _revolve(CircleProfile(center=(0.0, 0.0), radius=0.5))
+    bad = _revolve(QuadraticBezierSurfaceProfile())
     assert precondition_violations(bad)
     good = _revolve(CircleProfile(center=(1.2, 0.0), radius=0.35))
     assert precondition_violations(good) == []
 
 
 def test_compile_model_rejects_precondition_violation() -> None:
-    bad = _revolve(CircleProfile(center=(0.0, 0.0), radius=0.5))
+    bad = _revolve(QuadraticBezierSurfaceProfile())
     domain = Domain(name="part", kind=DomainKind.SOLID, region=bad)
     with pytest.raises(ModelCompileError):
         compile_model(Model(domains=(domain,)))

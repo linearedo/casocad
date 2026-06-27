@@ -244,20 +244,22 @@ class SceneTreePanel(QWidget):
                 )
             )
         solid_menu = menu.addMenu("Solid From 2D")
+        solid_enabled = (
+            bool(selected)
+            and self._document is not None
+            and all(
+                isinstance(self._document.node(handle), SDFNode)
+                and self._document.node(handle).dimension == 2
+                and self._document.node(handle) in self._document.objects
+                for handle in selected
+            )
+        )
         for label, method in (
             ("Extrude", "extrude"),
             ("Revolve", "revolve"),
         ):
             action = solid_menu.addAction(label)
-            action.setEnabled(
-                bool(selected)
-                and self._document is not None
-                and all(
-                    isinstance(self._document.node(handle), SDFNode)
-                    and self._document.node(handle).dimension == 2
-                    for handle in selected
-                )
-            )
+            action.setEnabled(solid_enabled)
             action.triggered.connect(
                 lambda checked=False, value=method: signals.solid_from_2d_requested.emit(
                     value, self.selected_handles()

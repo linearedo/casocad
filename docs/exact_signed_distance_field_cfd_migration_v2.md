@@ -344,12 +344,12 @@ freedom.
 | `Intersection` (`max`) | `core/sdf/operators.py:47` | inside-exact | keep — **Region** composer; type to `(Region, Region)` |
 | `Difference` (`max(a,−b)`) | `core/sdf/operators.py:67` | inside-exact (result) | keep — rename concept to **Subtract**; type to `(Region, Obstacle)`, non-commutative |
 | `SmoothUnion` | `core/sdf/operators.py:82` | **destroys both sides** | **DELETE** (no quarantine — a safe compiler has no reachable unsafe corner) |
-| `profile_smooth_union_2d/_1d` | `core/gpu_node_types.py:112,120` | destroys exactness | **DELETE** (lockstep with above + their GLSL) |
+| `profile_smooth_union_2d/_1d` | removed with the old GPU interpreter registry | destroys exactness | **DELETE** (lockstep with above) |
 | `Translate` / `Rotate` | `core/sdf/transforms.py:30,87` | isometry, exact | keep |
 | `Scale` (uniform) | `core/sdf/transforms.py:55` | exact (`·s` correction present) | keep; keep `factor>0` guard |
 | Mirror / reflect | — | absent | add (isometry, exact) |
 | `DistanceOffsetProfile` (`f−r`) | `core/sdf/primitives_2d.py:664` | exact | keep — exact **dilation**; **erosion** needs the `r < reach` precondition (§6) |
-| `owner` / `PUSH_LEAF (dist,owner,region)` | interpreter + `core/gpu_node_types.py:30` | tracks active leaf | **promote to operator semantics** — drives boundary-patch provenance (§4) and interface isolation (§8) |
+| operator provenance | CPU SDF/operator semantics | tracks active contributor | **promote to operator semantics** — drives boundary-patch provenance (§4) and interface isolation (§8) |
 | `BoundarySurfacePatch` (`owner_object_id`) | `core/boundary_patches.py:74` | per-surface patch + owner | keep — the patch tags that ride operator provenance |
 | `FluidDomain` | `core/mesher/`, wired `core/scene.py:164` | wraps the *final* root only | generalize → `Domain` = a **named** top-level Region (Fluid/Solid); Model holds N |
 | `SceneDocument` | `core/scene.py:96` | free-form node graph, no roles | becomes **Model**: a set of named Domains + the disjointness check (§7) |
@@ -366,8 +366,7 @@ task is to keep them permanently out.
 2. **Typed kernel.** Introduce `Region`, `Domain` (= named Fluid/Solid Region), and the `Obstacle`
    role; make the exact operators (§4) carry their operand types so illegal combinations cannot be
    constructed.
-3. **Delete smooth blends** across `operators.py`, `gpu_node_types.py`, the profile kinds, and their
-   GLSL — lockstep.
+3. **Delete smooth blends** across `operators.py` and the profile kinds — lockstep.
 4. **Surface provenance in operators.** Promote the existing `owner` / `PUSH_LEAF` tracking to
    first-class operator output so each cut surface inherits a boundary-patch tag (§4); wire it to
    `BoundarySurfacePatch`.

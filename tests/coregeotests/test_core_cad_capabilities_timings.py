@@ -7,9 +7,9 @@ from time import perf_counter
 import numpy as np
 import pytest
 
+from app.viewport.surface_cache import ViewportSurfaceCache, build_viewport_surface_scene
 from core.boundary import BoundaryRegion
 from core.boundary_patches import boundary_patch_preview_node, pick_boundary_patch
-from core.render_ir import build_render_ir
 from core.scene import SceneDocument
 from core.serialization import load_scene, save_scene
 from core.sdf import (
@@ -145,50 +145,6 @@ def test_all_2d_and_1d_primitive_creation_timing() -> None:
             lambda scene, target=handle: scene.rotate_object(target, "z", 7.5),
             None,
         )
-
-
-def test_lower_dimensional_render_ir_upload_timing(
-    render_upload_probe: RenderUploadProbe | None,
-) -> None:
-    if render_upload_probe is None:
-        pytest.skip("render upload probe unavailable")
-
-    lower_dimensional_kinds = (
-        "segment",
-        "polyline",
-        "quadratic_bezier_curve",
-        "quadratic_bezier_polycurve",
-        "rounded_rectangle",
-        "ellipse",
-        "regular_polygon",
-        "polygon",
-        "quadratic_bezier_surface",
-    )
-    for kind in lower_dimensional_kinds:
-        document = SceneDocument()
-        handle, create_timing = benchmark_scene_step(
-            document,
-            f"render_ir_create_{kind}",
-            lambda scene, primitive=kind: scene.add_primitive(primitive),
-            render_upload_probe,
-        )
-        _, move_timing = benchmark_scene_step(
-            document,
-            f"render_ir_move_{kind}",
-            lambda scene, target=handle: scene.move_object(
-                target,
-                (0.04, -0.02, 0.0),
-            ),
-            render_upload_probe,
-        )
-
-        assert create_timing.upload is not None
-        assert move_timing.upload is not None
-        assert create_timing.render_ir_supported
-        assert move_timing.render_ir_supported
-        assert create_timing.upload.program_compile_ms < 500.0
-        assert move_timing.upload.reused_program
-        assert move_timing.upload.program_compile_ms == 0.0
 
 
 def test_drag_creation_timing_for_supported_tools() -> None:
@@ -551,7 +507,7 @@ def test_boundary_patch_picking_timing_and_default_cut_surface_precision() -> No
     assert hits[0].patch_id == "cut_surface.side_wall"
 
 
-def test_boundary_patch_preview_render_ir_timing() -> None:
+def test_boundary_patch_preview_surface_timing() -> None:
     document = SceneDocument.default()
     assert document.fluid_domain is not None
     root = document.fluid_domain.root
@@ -562,16 +518,22 @@ def test_boundary_patch_preview_render_ir_timing() -> None:
     hit = pick_boundary_patch(root, origin, direction)
     assert hit is not None
 
+    cache = ViewportSurfaceCache()
     start = perf_counter()
     for _index in range(240):
         preview = boundary_patch_preview_node(root, hit)
         assert preview is not None
-        render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-        assert render_ir.supported
+        surface_scene = build_viewport_surface_scene(
+            SDFTree(preview, components=(preview,)),
+            revision=1,
+            cache=cache,
+        )
+        assert surface_scene is not None
+        assert surface_scene.has_geometry
     elapsed_ms = (perf_counter() - start) * 1000.0
 
     logger.info(
-        "coregeotest boundary_patch_preview_render_ir count=240 elapsed=%.3f ms",
+        "coregeotest boundary_patch_preview_surface count=240 elapsed=%.3f ms",
         elapsed_ms,
     )
     assert elapsed_ms < BOUNDARY_PREVIEW_BATCH_THRESHOLD_MS

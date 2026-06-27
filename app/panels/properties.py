@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.axis_labels import world_axis_label
 from app.dimensions import parse_measurement_entry, parse_scalar_entry
 from app.panels.display import display_kind
 from app.signals import signals
@@ -574,15 +575,30 @@ class PropertiesPanel(QWidget):
                     )
             else:
                 axis = QComboBox()
-                axis.addItems(("u", "v"))
-                axis.setCurrentText(node.axis)
-                axis.currentTextChanged.connect(
-                    lambda value: self._set_value("axis", value)
+                section = node.section
+                axis_u_label = (
+                    world_axis_label(section.axis_u)
+                    if section is not None
+                    else "first profile axis"
+                )
+                axis_v_label = (
+                    world_axis_label(section.axis_v)
+                    if section is not None
+                    else "second profile axis"
+                )
+                axis.addItem(axis_u_label, "u")
+                axis.addItem(axis_v_label, "v")
+                axis.setCurrentIndex(0 if node.axis == "u" else 1)
+                axis.currentIndexChanged.connect(
+                    lambda _index, control=axis: self._set_value(
+                        "axis",
+                        control.currentData(),
+                    )
                 )
                 self._layout.addRow("Revolve axis", axis)
             angle = CadScalarSpinBox(parse_suffixes=("deg",))
             angle.setDecimals(3)
-            angle.setRange(0.1, 360.0)
+            angle.setRange(-360.0, 360.0)
             angle.setSuffix(" deg")
             angle.setKeyboardTracking(False)
             angle.setValue(node.angle_degrees)

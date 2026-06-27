@@ -90,8 +90,11 @@ class Revolve(SDFNode):
             raise ValueError("revolve requires a placed 2D section")
         if self.axis not in {"u", "v"}:
             raise ValueError("revolve axis must be 'u' or 'v'")
-        if not np.isfinite(self.angle_degrees) or not 0.0 < self.angle_degrees <= 360.0:
-            raise ValueError("revolve angle must be finite and in (0, 360]")
+        if (
+            not np.isfinite(self.angle_degrees)
+            or not 0.0 < abs(self.angle_degrees) <= 360.0
+        ):
+            raise ValueError("revolve angle magnitude must be finite and in (0, 360]")
         self._axis_frame()
 
     @property
@@ -142,9 +145,11 @@ class Revolve(SDFNode):
         y: FloatArray,
         angle_degrees: float,
     ) -> FloatArray:
-        if angle_degrees >= 360.0 - 1.0e-9:
+        if abs(angle_degrees) >= 360.0 - 1.0e-9:
             return np.full_like(x, -1.0e6, dtype=np.float64)
-        angle = np.deg2rad(angle_degrees)
+        if angle_degrees < 0.0:
+            y = -y
+        angle = np.deg2rad(abs(angle_degrees))
         radius = np.sqrt(x * x + y * y)
         theta = np.arctan2(y, x)
         theta = np.where(theta < 0.0, theta + 2.0 * np.pi, theta)
@@ -175,7 +180,7 @@ class Revolve(SDFNode):
         sample_z = origin[2] + axial * axis[2] + radial * radial_axis[2]
         u, v, _plane = self.section.project_numpy(sample_x, sample_y, sample_z)
         profile = self.section.profile.to_numpy(u, v)
-        if self.angle_degrees >= 360.0 - 1.0e-9:
+        if abs(self.angle_degrees) >= 360.0 - 1.0e-9:
             return profile
         angular = self._angular_sector_sdf_numpy(
             radial_x,

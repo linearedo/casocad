@@ -40,6 +40,7 @@ from core.sdf.operators import BinarySDFOperator
 
 PATCH_TOLERANCE = 1.5e-3
 CURVE_PATCH_PICK_TOLERANCE = 0.05
+PREVIEW_POLYLINE_SELECTOR_OFFSET = 0.024
 SURFACE_SELECTOR_TYPES = {
     "surface_sdf_subregion",
     "surface_split_curve",
@@ -265,7 +266,7 @@ def boundary_patch_preview_node(
     selector_objects: Sequence[SDFNode] = (),
     thickness: float = 0.006,
 ) -> SDFNode | None:
-    """Build transient RenderIR-compatible geometry for patch highlighting."""
+    """Build transient viewport geometry for patch highlighting."""
     owner = _find_node_by_object_id(root, hit.owner_object_id)
     if owner is None:
         return None
@@ -652,11 +653,18 @@ def _clip_surface_selector_preview(
     selector = _find_selector_node(root, selector_id, selector_objects)
     if selector is None:
         return preview
-    selector_volume = surface_selector_volume(
-        root,
-        selector,
-        scope_region=scope_region,
-    )
+    if isinstance(selector, PlacedPolyline1D):
+        selector_volume = _polyline_selector_volume(
+            root,
+            selector,
+            offset=PREVIEW_POLYLINE_SELECTOR_OFFSET,
+        )
+    else:
+        selector_volume = surface_selector_volume(
+            root,
+            selector,
+            scope_region=scope_region,
+        )
     if selector_volume is None:
         return preview
     if selector_side == "outside":
@@ -799,6 +807,8 @@ def _placed_2d_selector_volume(
 def _polyline_selector_volume(
     root: SDFNode,
     selector: PlacedPolyline1D,
+    *,
+    offset: float = PATCH_TOLERANCE,
 ) -> SDFNode | None:
     if selector.profile is None:
         return None
@@ -811,7 +821,7 @@ def _polyline_selector_volume(
     )
     band_profile = DistanceOffsetProfile(
         deepcopy(selector.profile),
-        PATCH_TOLERANCE,
+        max(float(offset), PATCH_TOLERANCE),
     )
     section = PlacedSDF2D(
         name=f"{selector.name}_selector_section",

@@ -136,6 +136,7 @@ Design guardrails:
 - Do not treat Arrow as a mandatory layer between casoCAD and every solver
 - Do not make the renderer depend on mesher output to define geometry
 - Do not silently diverge CAD geometry, mesher geometry, and exported geometry
+- Renderer performance fixes must be backend-aware and QRhi/cross-platform by default. Do not solve FPS, shader compile, buffer, or frame pacing problems as Vulkan-only issues unless the evidence proves the bug is specific to Vulkan. Prefer fixes in shared QRhi renderer, codegen, scene-complexity, culling, and interaction policy layers, then validate across available backends.
 
 If you introduce a new geometric operation, it is incomplete until:
 

@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from app.viewport.surface_cache import build_viewport_surface_scene
 from core.boundary import BoundaryRegion
 from core.boundary_patches import (
     boundary_patch_preview_node,
@@ -17,7 +18,6 @@ from core.boundary_selection import (
     boundary_interval_mask,
     surface_split_selector_mask,
 )
-from core.render_ir import build_render_ir
 from core.scene import SceneDocument
 from core.serialization import load_scene, save_scene
 from core.sdf import (
@@ -40,6 +40,17 @@ from core.sdf import (
     Sphere,
     Torus,
 )
+
+
+def _assert_preview_surface_supported(preview) -> None:
+    scene = build_viewport_surface_scene(
+        SDFTree(preview, components=(preview,)),
+        revision=1,
+    )
+
+    assert scene is not None
+    assert scene.has_geometry
+    assert not scene.failed_messages
 
 
 def test_pick_box_face_returns_explicit_surface_patch() -> None:
@@ -410,7 +421,7 @@ def test_scene_2d_circle_selector_creates_curve_interval_region() -> None:
     assert interval.selector_end == pytest.approx(0.25)
 
 
-def test_2d_circle_interval_preview_is_render_ir_supported() -> None:
+def test_2d_circle_interval_preview_has_surface_geometry() -> None:
     circle = PlacedSDF2D(
         name="section",
         object_id=4,
@@ -430,10 +441,7 @@ def test_2d_circle_interval_preview_is_render_ir_supported() -> None:
 
     preview = boundary_region_preview_node(circle, region)
     assert isinstance(preview, PlacedPolyline1D)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
 def test_2d_circle_interval_mask_restricts_mesher_samples() -> None:
@@ -762,7 +770,7 @@ def test_scene_boundary_region_from_selector_hit_stores_selector_metadata() -> N
     assert region.selector_side == "inside"
 
 
-def test_boundary_patch_preview_node_for_selector_hit_is_render_ir_supported() -> None:
+def test_boundary_patch_preview_node_for_selector_hit_has_surface_geometry() -> None:
     volume = Box(name="volume", object_id=1)
     cutter = Sphere(
         name="inlet_half",
@@ -785,13 +793,10 @@ def test_boundary_patch_preview_node_for_selector_hit_is_render_ir_supported() -
         selector_objects=(cutter,),
     )
     assert isinstance(preview, Intersection)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
-def test_boundary_patch_preview_node_for_outside_selector_hit_is_render_ir_supported() -> None:
+def test_boundary_patch_preview_node_for_outside_selector_hit_has_surface_geometry() -> None:
     volume = Box(name="volume", object_id=1)
     cutter = Sphere(
         name="small_inlet",
@@ -815,13 +820,10 @@ def test_boundary_patch_preview_node_for_outside_selector_hit_is_render_ir_suppo
         selector_objects=(cutter,),
     )
     assert isinstance(preview, Difference)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
-def test_boundary_patch_preview_node_for_1d_selector_hit_is_render_ir_supported() -> None:
+def test_boundary_patch_preview_node_for_1d_selector_hit_has_surface_geometry() -> None:
     volume = Box(name="volume", object_id=1)
     selector = PlacedSDF1D(
         name="split",
@@ -846,13 +848,10 @@ def test_boundary_patch_preview_node_for_1d_selector_hit_is_render_ir_supported(
         selector_objects=(selector,),
     )
     assert isinstance(preview, Intersection)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
-def test_boundary_patch_preview_node_for_polyline_selector_hit_is_render_ir_supported() -> None:
+def test_boundary_patch_preview_node_for_polyline_selector_hit_has_surface_geometry() -> None:
     volume = Box(name="volume", object_id=1)
     selector = PlacedPolyline1D(
         name="split_curve",
@@ -879,13 +878,10 @@ def test_boundary_patch_preview_node_for_polyline_selector_hit_is_render_ir_supp
         selector_objects=(selector,),
     )
     assert isinstance(preview, Intersection)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
-def test_boundary_patch_preview_node_for_quadratic_bezier_selector_hit_is_render_ir_supported() -> None:
+def test_boundary_patch_preview_node_for_quadratic_bezier_selector_hit_has_surface_geometry() -> None:
     volume = Box(name="volume", object_id=1)
     selector = PlacedPolyline1D(
         name="split_bezier",
@@ -912,13 +908,10 @@ def test_boundary_patch_preview_node_for_quadratic_bezier_selector_hit_is_render
         selector_objects=(selector,),
     )
     assert isinstance(preview, Intersection)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
-def test_boundary_patch_preview_node_for_planar_profile_selector_is_render_ir_supported() -> None:
+def test_boundary_patch_preview_node_for_planar_profile_selector_has_surface_geometry() -> None:
     volume = Box(name="volume", object_id=1)
     selector = PlacedSDF2D(
         name="planar_cut",
@@ -952,10 +945,7 @@ def test_boundary_patch_preview_node_for_planar_profile_selector_is_render_ir_su
         selector_objects=(selector,),
     )
     assert isinstance(preview, Intersection)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
 def test_selector_backed_boundary_region_serializes_selector_objects(
@@ -1286,7 +1276,7 @@ def test_surface_sdf_selector_mask_is_limited_to_selected_boundary_region() -> N
     assert outside_mask.tolist() == [True, False]
 
 
-def test_boundary_patch_preview_node_for_box_face_is_render_ir_supported() -> None:
+def test_boundary_patch_preview_node_for_box_face_has_surface_geometry() -> None:
     box = Box(name="volume", object_id=1)
     hit = pick_boundary_patch(
         box,
@@ -1297,10 +1287,7 @@ def test_boundary_patch_preview_node_for_box_face_is_render_ir_supported() -> No
 
     preview = boundary_patch_preview_node(box, hit)
     assert preview is not None
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
 def test_boundary_patch_preview_node_for_cylinder_side_uses_unique_transient_ids() -> None:
@@ -1314,10 +1301,7 @@ def test_boundary_patch_preview_node_for_cylinder_side_uses_unique_transient_ids
 
     preview = boundary_patch_preview_node(cylinder, hit)
     assert isinstance(preview, Difference)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
 def test_boundary_patch_preview_node_for_2d_edge_is_visible_strip() -> None:
@@ -1337,13 +1321,10 @@ def test_boundary_patch_preview_node_for_2d_edge_is_visible_strip() -> None:
     assert isinstance(preview, PlacedSDF2D)
     assert isinstance(preview.profile, RectangleProfile)
     assert preview.profile.half_size[0] == pytest.approx(0.006)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
-def test_boundary_patch_preview_node_for_2d_circle_curve_is_render_ir_supported() -> None:
+def test_boundary_patch_preview_node_for_2d_circle_curve_has_surface_geometry() -> None:
     circle = PlacedSDF2D(
         name="section",
         object_id=4,
@@ -1358,13 +1339,10 @@ def test_boundary_patch_preview_node_for_2d_circle_curve_is_render_ir_supported(
 
     preview = boundary_patch_preview_node(circle, hit)
     assert isinstance(preview, PlacedSDF2D)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
-def test_boundary_region_preview_node_for_selected_box_face_is_render_ir_supported() -> None:
+def test_boundary_region_preview_node_for_selected_box_face_has_surface_geometry() -> None:
     box = Box(name="volume", object_id=1)
     region = BoundaryRegion(
         name="outlet",
@@ -1377,13 +1355,10 @@ def test_boundary_region_preview_node_for_selected_box_face_is_render_ir_support
 
     preview = boundary_region_preview_node(box, region)
     assert preview is not None
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
-def test_boundary_region_preview_node_for_3d_sdf_selector_is_render_ir_supported() -> None:
+def test_boundary_region_preview_node_for_3d_sdf_selector_has_surface_geometry() -> None:
     box = Box(name="volume", object_id=1)
     cutter = Sphere(
         name="face_subregion",
@@ -1408,13 +1383,10 @@ def test_boundary_region_preview_node_for_3d_sdf_selector_is_render_ir_supported
         selector_objects=(cutter,),
     )
     assert isinstance(preview, Intersection)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
-def test_boundary_region_preview_node_for_outside_3d_sdf_selector_is_render_ir_supported() -> None:
+def test_boundary_region_preview_node_for_outside_3d_sdf_selector_has_surface_geometry() -> None:
     box = Box(name="volume", object_id=1)
     cutter = Sphere(
         name="face_subregion",
@@ -1440,10 +1412,7 @@ def test_boundary_region_preview_node_for_outside_3d_sdf_selector_is_render_ir_s
         selector_objects=(cutter,),
     )
     assert isinstance(preview, Difference)
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
 def test_boundary_region_preview_node_shows_both_planar_segment_split_sides() -> None:
@@ -1498,14 +1467,14 @@ def test_boundary_region_preview_node_shows_both_planar_segment_split_sides() ->
     )
     assert inside_preview is not None
     assert outside_preview is not None
-    render_ir = build_render_ir(
-        SDFTree(
-            inside_preview,
-            components=(inside_preview, outside_preview),
-        )
+    scene = build_viewport_surface_scene(
+        SDFTree(inside_preview, components=(inside_preview, outside_preview)),
+        revision=1,
     )
 
-    assert render_ir.supported
+    assert scene is not None
+    assert scene.has_geometry
+    assert not scene.failed_messages
     assert inside_preview.to_numpy(
         np.asarray([0.512], dtype=np.float64),
         np.asarray([0.0], dtype=np.float64),
@@ -1542,10 +1511,7 @@ def test_boundary_region_preview_node_for_2d_interval_is_visible_strip() -> None
     assert isinstance(preview.profile, RectangleProfile)
     assert preview.origin == pytest.approx((0.5, 0.0, 0.0))
     assert preview.profile.half_size == pytest.approx((0.006, 0.175))
-    render_ir = build_render_ir(SDFTree(preview, components=(preview,)))
-
-    assert render_ir.supported
-    assert render_ir.root_indices
+    _assert_preview_surface_supported(preview)
 
 
 def test_deleting_selector_removes_selector_backed_boundary_region() -> None:

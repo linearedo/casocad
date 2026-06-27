@@ -21,5 +21,5 @@ Each step logs:
 - mutation time on `SceneDocument`
 - `visual_snapshot()` time
 - render artifact build time
-- RenderIR build time
-- optional EGL RenderIR upload time when available
+- viewport surface generation time
+- generated viewport vertex and triangle counts

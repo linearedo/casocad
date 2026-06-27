@@ -1,24 +1,22 @@
 from __future__ import annotations
 
-"""QRhi viewport widget — a QRhiWidget that renders a scene via the QRhi codegen
-renderer, with mouse orbit / zoom.
+"""QRhi viewport widget backed by generated viewport surfaces.
 
-ONE renderer + ONE shader source drive every backend. Backend-aware: the renderer
-adapts to each backend's coordinate conventions (fb_y_up / clip_y_sign) at
-initialize, and the backend is a clean, overridable choice — no backend is pinned
-(the bytecode VM that used to force OpenGL has been removed). Set ``QRHI_BACKEND``
-(vulkan|opengl|metal|d3d11) to choose one; otherwise QRhi picks the platform
-default.
+One QRhi renderer consumes stable vertex/index buffers for each backend. Backend
+coordinate conventions (fb_y_up / clip_y_sign) are handled at initialize, and no
+backend is pinned. Set ``QRHI_BACKEND`` (vulkan|opengl|metal|d3d11) to choose
+one; otherwise QRhi picks the platform default.
 """
 
 import math
 import os
 import random
 import time
+from dataclasses import replace
 
 import numpy as np
-from PySide6.QtCore import Qt, QElapsedTimer, QTimer
-from PySide6.QtGui import QMouseEvent, QWheelEvent
+from PySide6.QtCore import QPointF, Qt, QElapsedTimer, QTimer
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -26,12 +24,18 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QRhiWidget,
+    QWidget,
 )
 
+from app.axis_labels import world_axis_label
 from app.dimensions import parse_dimension_entry
 from app.signals import signals
+from app.viewport.performance_governor import (
+    ViewportPerformanceGovernor,
+    ViewportRenderBudget,
+)
 
-from .renderer import QRhiInterpreterRenderer
+from .surface_renderer import QRhiSurfaceRenderer
 
 _BACKENDS = {
     "vulkan": QRhiWidget.Api.Vulkan,
@@ -39,8 +43,39 @@ _BACKENDS = {
     "metal": getattr(QRhiWidget.Api, "Metal", None),
     "d3d11": getattr(QRhiWidget.Api, "Direct3D11", None),
 }
-_MAX_VIEWPORT_FPS = 60
-_FRAME_INTERVAL_MS = max(1, round(1000 / _MAX_VIEWPORT_FPS))
+_REVOLVE_PREVIEW_INTERVAL_MS = 80.0
+
+
+def _revolve_signal_frame(
+    axis: np.ndarray | tuple[float, float, float],
+    radial: np.ndarray | tuple[float, float, float],
+    signed_degrees: float,
+) -> tuple[tuple[float, float, float], float] | None:
+    degrees = float(signed_degrees)
+    if not math.isfinite(degrees):
+        return None
+    if abs(degrees) <= 1.0e-6:
+        return None
+    angle = max(-360.0, min(360.0, degrees))
+    axis_vec = np.asarray(axis, dtype=np.float64)
+    axis_len = float(np.linalg.norm(axis_vec))
+    radial_vec = np.asarray(radial, dtype=np.float64)
+    if axis_len <= 1.0e-12 or not math.isfinite(axis_len):
+        return None
+    axis_vec = axis_vec / axis_len
+    radial_vec = radial_vec - axis_vec * float(np.dot(radial_vec, axis_vec))
+    radial_len = float(np.linalg.norm(radial_vec))
+    if radial_len <= 1.0e-12 or not math.isfinite(radial_len):
+        return None
+    radial_vec = radial_vec / radial_len
+    return (
+        (
+            float(radial_vec[0]),
+            float(radial_vec[1]),
+            float(radial_vec[2]),
+        ),
+        float(angle),
+    )
 
 
 def _choose_api() -> "QRhiWidget.Api | None":
@@ -53,6 +88,109 @@ def _choose_api() -> "QRhiWidget.Api | None":
     return None
 
 
+def _translated_preview_surface(surface, delta: tuple[float, float, float]):
+    offset = np.asarray(delta, dtype=np.float32)
+    vertices = np.asarray(surface.vertices, dtype=np.float32) + offset
+    bounds_delta = tuple(float(value) for value in offset)
+    return replace(
+        surface,
+        vertices=vertices,
+        bounds_min=tuple(
+            float(surface.bounds_min[index] + bounds_delta[index])
+            for index in range(3)
+        ),
+        bounds_max=tuple(
+            float(surface.bounds_max[index] + bounds_delta[index])
+            for index in range(3)
+        ),
+    )
+
+
+def _camera_basis_from_angles(
+    yaw: float,
+    pitch: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    cp = math.cos(pitch)
+    camera_offset = np.array(
+        [cp * math.cos(yaw), cp * math.sin(yaw), math.sin(pitch)],
+        dtype=np.float64,
+    )
+    fwd = -camera_offset
+    fwd /= max(float(np.linalg.norm(fwd)), 1e-9)
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(float(np.dot(fwd, world_up))) > 0.99:
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    right = np.cross(fwd, world_up)
+    right /= max(float(np.linalg.norm(right)), 1e-9)
+    up = np.cross(right, fwd)
+    return right, up, fwd
+
+
+def _orientation_axis_projection(
+    yaw: float,
+    pitch: float,
+) -> tuple[tuple[str, float, float, float], ...]:
+    right, up, fwd = _camera_basis_from_angles(yaw, pitch)
+    axes = (
+        ("X", np.array([1.0, 0.0, 0.0], dtype=np.float64)),
+        ("Y", np.array([0.0, 1.0, 0.0], dtype=np.float64)),
+        ("Z", np.array([0.0, 0.0, 1.0], dtype=np.float64)),
+    )
+    return tuple(
+        (
+            label,
+            float(np.dot(axis, right)),
+            float(-np.dot(axis, up)),
+            float(np.dot(axis, fwd)),
+        )
+        for label, axis in axes
+    )
+
+
+class _OrientationWidget(QWidget):
+    _COLORS = {
+        "X": QColor(255, 86, 65),
+        "Y": QColor(85, 235, 105),
+        "Z": QColor(92, 145, 255),
+    }
+
+    def __init__(self, viewport: "QRhiViewportWidget") -> None:
+        super().__init__(viewport)
+        self._viewport = viewport
+        self.setFixedSize(96, 96)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAutoFillBackground(False)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(6, 10, 16, 145))
+        painter.drawRoundedRect(0, 0, self.width() - 1, self.height() - 1, 6, 6)
+        origin = QPointF(38.0, 58.0)
+        length = 30.0
+        axes = sorted(
+            _orientation_axis_projection(
+                self._viewport._yaw,
+                self._viewport._pitch,
+            ),
+            key=lambda item: item[3],
+        )
+        for label, dx, dy, depth in axes:
+            color = QColor(self._COLORS[label])
+            alpha = 115 if depth > 0.0 else 235
+            color.setAlpha(alpha)
+            end = QPointF(origin.x() + dx * length, origin.y() + dy * length)
+            painter.setPen(QPen(color, 4.0, Qt.PenStyle.SolidLine,
+                                Qt.PenCapStyle.RoundCap))
+            painter.drawLine(origin, end)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(end, 4.5, 4.5)
+            painter.setPen(color)
+            painter.drawText(end + QPointF(6.0, -5.0), label)
+
+
 class QRhiViewportWidget(QRhiWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -61,7 +199,9 @@ class QRhiViewportWidget(QRhiWidget):
             self.setApi(api)
         self.setMinimumSize(480, 360)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._renderer = QRhiInterpreterRenderer()
+        self._renderer = QRhiSurfaceRenderer()
+        self._performance_governor = ViewportPerformanceGovernor()
+        self._refinement_cb = None
         self._renderer_ready = False
         # orbit camera state
         self._target = np.array([0.0, 0.0, 0.0])
@@ -88,6 +228,9 @@ class QRhiViewportWidget(QRhiWidget):
         self._scene_center = None
         self._scene_radius = 0.0
         self._selected_id = 0
+        self._selected_anchor_cache = None
+        self._hovered_id = 0
+        self._last_hover_pick_t = 0.0
         self._move_active = False
         self._move_handle = None
         self._move_start_grid = None       # grid point under cursor at drag start
@@ -109,16 +252,27 @@ class QRhiViewportWidget(QRhiWidget):
         self._extrude_height = 0.0
         self._revolve_active = False
         self._revolve_handle = None
+        self._revolve_axis_name = "v"
+        self._revolve_axis_label = "Y axis"
+        self._revolve_phase = "axis"
+        self._revolve_section_origin = None
+        self._revolve_section_normal = None
+        self._revolve_section_center = None
+        self._revolve_axis_start = None
+        self._revolve_axis_end = None
         self._revolve_origin = None
         self._revolve_axis = None
         self._revolve_radial = None
         self._revolve_start_angle = None
+        self._revolve_last_preview_ms = 0.0
+        self._revolve_last_preview_deg = None
         self._revolve_deg = 0.0
         # boundary cutter tool state (cutter = a drawn shape routed via
         # active_boundary_cutter_tool, consumed in main_window._on_viewport_shape_drawn)
         self._boundary_cutter_tool = None
         self._boundary_region_selected = False
-        self._committed_render_ir = None   # last committed scene (restore target)
+        self._committed_surface_scene = None   # last committed scene (restore target)
+        self._committed_scene_payload = None
         self._preview_kind = None
         self._boolean_preview_commit_pending = False
         # drag-to-create tool state (Draw button -> viewport_create_requested)
@@ -131,19 +285,18 @@ class QRhiViewportWidget(QRhiWidget):
         self._dimension_input = ""   # typed dimension buffer
         self._snap_enabled = True  # snap grid-plane points to grid spacing
         self._command_panel = None
+        self._orientation_widget = None
         # render FPS overlay (measures real frame cadence in render())
         self._fps_ema = 0.0
         self._last_frame_t = None
         self._last_render_submit_t = None
         self._fps_label_t = 0.0
         self._fps_label = None
-        # Render throttle: input marks dirty; a 60fps timer renders only when
-        # something changed (decouples render rate from the touchpad's flood).
-        # Created ONCE here — not per resizeEvent, which leaked a timer each call.
+        # Event-driven rendering: state changes mark the viewport dirty and
+        # schedule a single coalesced Qt update. Idle scenes do not poll.
+        self._dirty_flag = False
+        self._update_pending = False
         self._dirty = True
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(_FRAME_INTERVAL_MS)
         # Interactive-quality state: while the camera/tool is actively moving the
         # renderer uses a cheaper per-pixel budget (see u_interacting); a short
         # idle delay then triggers one full-quality frame once motion stops.
@@ -151,10 +304,14 @@ class QRhiViewportWidget(QRhiWidget):
         self._interaction_idle = QTimer(self)
         self._interaction_idle.setSingleShot(True)
         self._interaction_idle.timeout.connect(self._end_interaction)
+        self._idle_refine_timer = QTimer(self)
+        self._idle_refine_timer.setSingleShot(True)
+        self._idle_refine_timer.timeout.connect(self._advance_idle_refinement)
         self.setMouseTracking(True)  # deliver hover moves for the coord readout
         self._readout_label = None
         self._build_command_panel()
         self._build_view_panel()
+        self._build_orientation_widget()
         self._build_readout_label()
         self._build_error_label()
         self._build_fps_label()
@@ -271,7 +428,18 @@ class QRhiViewportWidget(QRhiWidget):
         if self._extrude_active:
             text = f"Extrude   height {self._extrude_height:+.3f}"
         elif self._revolve_active:
-            text = f"Revolve   {self._revolve_deg:+.1f}°"
+            if self._revolve_phase == "axis":
+                if self._revolve_axis_start is not None and self._revolve_axis_end is not None:
+                    delta = self._revolve_axis_end - self._revolve_axis_start
+                    length = float(np.linalg.norm(delta))
+                    text = f"Revolve   axis vector length {length:.3f}"
+                else:
+                    text = "Revolve   draw axis vector"
+            else:
+                text = (
+                    f"Revolve {self._revolve_axis_label}   "
+                    f"{self._revolve_deg:+.1f}°"
+                )
         elif self._rotate_active and self._rotate_pivot is not None:
             text = (f"Rotate   {self._rotate_preview_deg:+.1f}°   "
                     f"axis {self._rotate_axis.upper()}")
@@ -403,10 +571,29 @@ class QRhiViewportWidget(QRhiWidget):
         p = self._view_panel
         if p is None:
             return
-        # bottom-right, raised above the corner orientation-axis gizmo (~130px).
-        p.move(max(8, self.width() - p.width() - 8),
-               max(8, self.height() - p.height() - 132))
+        orientation = self._orientation_widget
+        if orientation is not None:
+            x = orientation.x() + orientation.width() + 8
+            y = orientation.y() + (orientation.height() - p.height()) // 2
+        else:
+            x = 114
+            y = self.height() - p.height() - 10
+        p.move(min(max(8, x), max(8, self.width() - p.width() - 8)),
+               max(8, y))
         p.raise_()
+
+    def _build_orientation_widget(self) -> None:
+        widget = _OrientationWidget(self)
+        self._orientation_widget = widget
+        self._position_orientation_widget()
+
+    def _position_orientation_widget(self) -> None:
+        widget = self._orientation_widget
+        if widget is None:
+            return
+        widget.move(10, max(10, self.height() - widget.height() - 10))
+        widget.raise_()
+        self._position_view_panel()
 
     def set_reference_view(self, view: str) -> None:
         """Switch the active grid/draw plane and fly the camera to that view."""
@@ -451,17 +638,31 @@ class QRhiViewportWidget(QRhiWidget):
         p.move(x, y)
         p.raise_()
 
+    @property
+    def _dirty(self) -> bool:
+        return bool(getattr(self, "_dirty_flag", False))
+
+    @_dirty.setter
+    def _dirty(self, dirty: bool) -> None:
+        self._dirty_flag = bool(dirty)
+        if dirty:
+            self._schedule_update()
+
+    def _schedule_update(self) -> None:
+        if self._orientation_widget is not None:
+            self._orientation_widget.update()
+        if self._update_pending:
+            return
+        self._update_pending = True
+        self.update()
+
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
         self._position_command_panel()
         self._position_view_panel()
+        self._position_orientation_widget()
         self._position_readout_label()
-        self._dirty = True  # the throttle timer (built in __init__) repaints
-
-    def _tick(self) -> None:
-        if self._dirty:
-            self._dirty = False
-            self.update()
+        self._dirty = True
 
     def _request_render(self) -> None:
         self._dirty = True
@@ -470,7 +671,12 @@ class QRhiViewportWidget(QRhiWidget):
         """Mark the viewport as actively moving (cheap interactive frames) and
         (re)arm the idle timer that snaps back to a full-quality frame shortly
         after motion stops."""
+        self._performance_governor.begin_interaction()
+        self._idle_refine_timer.stop()
         self._interacting = True
+        mark_interaction = getattr(self._renderer, "mark_interaction", None)
+        if callable(mark_interaction):
+            mark_interaction()
         self._dirty = True
         self._interaction_idle.start(140)
 
@@ -478,12 +684,14 @@ class QRhiViewportWidget(QRhiWidget):
         """Motion stopped: render one full-quality frame."""
         if self._interacting:
             self._interacting = False
+            self._performance_governor.end_interaction()
             self._dirty = True
+            self._schedule_idle_refinement()
 
     # -- public API ----------------------------------------------------------
 
-    def set_scene(self, render_ir) -> None:
-        self._renderer.set_scene(render_ir)
+    def set_scene(self, surface_scene) -> None:
+        self._renderer.set_surface_scene(surface_scene)
         self._dirty = True
 
     def frame_target(self, target=(0.0, 0.0, 0.0), distance: float = 6.0) -> None:
@@ -498,15 +706,74 @@ class QRhiViewportWidget(QRhiWidget):
     # editable via the side panels and the viewport renders it live. Early-stage
     # feature loss by design; rebuild on the clean QRhi foundation later.
 
-    def set_scene_artifact(self, tree, render_ir=None) -> None:
+    def set_scene_artifact(self, tree, surface_scene=None, timings=None) -> None:
         """The app's render hook: show the freshly built scene."""
         self._tree = tree  # kept for CPU click-picking
-        self._committed_render_ir = render_ir  # restore target after a preview
+        self._committed_scene_payload = surface_scene
+        if timings is not None:
+            self._performance_governor.record_artifact_ms(
+                float(getattr(timings, "total_ms", 0.0)),
+                int(
+                    getattr(
+                        timings,
+                        "total_object_count",
+                        int(getattr(timings, "exact_object_count", 0)),
+                    )
+                ),
+            )
+            self._performance_governor.record_render_wait_ms(
+                float(getattr(timings, "render_wait_ms", 0.0))
+            )
         self._update_scene_bounds(tree)
+        self._refresh_selected_anchor_cache()
         self._preview_kind = None
         self._boolean_preview_commit_pending = False
         self._move_commit_delta = (0.0, 0.0, 0.0)
-        self.set_scene(render_ir)
+        if self._publish_surface_scene(surface_scene):
+            self._committed_surface_scene = surface_scene
+        self._schedule_idle_refinement()
+
+    def set_refinement_callback(self, cb) -> None:
+        self._refinement_cb = cb
+        timer = getattr(self, "_idle_refine_timer", None)
+        if cb is None and timer is not None:
+            timer.stop()
+
+    def render_budget_for_tree(self, tree) -> ViewportRenderBudget:
+        camera = self._camera_values()
+        return self._performance_governor.budget_for_tree(
+            tree,
+            selected_object_id=self._selected_id,
+            edited_object_ids=self._active_edit_object_ids(),
+            hovered_object_id=self._hovered_id,
+            camera_position=camera.get("u_camera_position"),
+        )
+
+    def _schedule_idle_refinement(self) -> None:
+        if (
+            getattr(self, "_interacting", False)
+            or getattr(self, "_refinement_cb", None) is None
+        ):
+            return
+        governor = getattr(self, "_performance_governor", None)
+        if governor is None or not governor.can_refine_idle(getattr(self, "_tree", None)):
+            return
+        timer = getattr(self, "_idle_refine_timer", None)
+        if timer is not None:
+            timer.start(int(governor.config.idle_refine_interval_ms))
+
+    def _advance_idle_refinement(self) -> None:
+        if (
+            getattr(self, "_interacting", False)
+            or getattr(self, "_refinement_cb", None) is None
+        ):
+            return
+        governor = getattr(self, "_performance_governor", None)
+        if governor is None:
+            return
+        if not governor.advance_idle_refinement(getattr(self, "_tree", None)):
+            return
+        self._refinement_cb()
 
     def _update_scene_bounds(self, tree) -> None:
         root = getattr(tree, "root", None)
@@ -538,17 +805,31 @@ class QRhiViewportWidget(QRhiWidget):
         )
         self._scene_radius = max(float(np.linalg.norm(half)), 1.0)
 
-    def show_scene_preview(self, render_ir, *, preview_kind: str = "tool") -> None:
+    def show_scene_preview(self, surface_scene, *, preview_kind: str = "tool") -> None:
         """Render a non-committing ghost during a move/rotate drag (main_window
         builds it). The committed scene is restored on cancel/commit."""
         self._preview_kind = preview_kind
-        self._renderer.set_scene(render_ir)
+        self._publish_surface_scene(surface_scene)
         self._dirty = True
 
     def _restore_committed_scene(self) -> None:
         self._preview_kind = None
-        self._renderer.set_scene(self._committed_render_ir)
+        self._publish_surface_scene(self._committed_surface_scene)
         self._dirty = True
+
+    def _publish_surface_scene(self, surface_scene) -> bool:
+        failed = tuple(getattr(surface_scene, "failed_messages", ()) or ())
+        has_geometry = bool(getattr(surface_scene, "has_geometry", False))
+        if failed:
+            signals.log_message.emit(
+                "warning",
+                "Viewport surface update incomplete; failed objects are hidden. "
+                + " | ".join(failed[:2]),
+            )
+            if not has_geometry:
+                return False
+        self.set_scene(surface_scene)
+        return True
 
     def frame_box(self, box) -> None:
         cx = (box.x_min + box.x_max) * 0.5
@@ -699,8 +980,18 @@ class QRhiViewportWidget(QRhiWidget):
     def _end_revolve_tool(self) -> None:
         self._revolve_active = False
         self._revolve_handle = None
+        self._revolve_axis_name = "v"
+        self._revolve_axis_label = "Y axis"
+        self._revolve_phase = "axis"
+        self._revolve_section_origin = None
+        self._revolve_section_normal = None
+        self._revolve_section_center = None
+        self._revolve_axis_start = None
+        self._revolve_axis_end = None
         self._revolve_origin = self._revolve_axis = self._revolve_radial = None
         self._revolve_start_angle = None
+        self._revolve_last_preview_ms = 0.0
+        self._revolve_last_preview_deg = None
         self._revolve_deg = 0.0
         self.unsetCursor()
 
@@ -720,23 +1011,67 @@ class QRhiViewportWidget(QRhiWidget):
         signals.log_message.emit(
             "info", "Drag to set extrude height. Release applies, Esc cancels.")
 
-    def begin_revolve_tool(self, handle, node) -> None:
-        """Drag to sweep the profile around its V axis; release applies."""
+    def begin_revolve_tool(self, handle, node, axis_name: str = "custom") -> None:
+        """Draw an axis vector, then drag the angle gizmo to create a revolve."""
         self.end_move_tool(); self.end_rotate_tool(); self.cancel_create_tool()
         self._end_extrude_tool()
+        axis_name = axis_name if axis_name in {"u", "v"} else "custom"
         self._revolve_active = True
         self._revolve_handle = handle
-        self._revolve_origin = np.array(node.origin, dtype=np.float64)
-        axis = np.array(node.axis_v, dtype=np.float64)
-        radial = np.array(node.axis_u, dtype=np.float64)
-        self._revolve_axis = axis / max(np.linalg.norm(axis), 1e-9)
-        self._revolve_radial = radial / max(np.linalg.norm(radial), 1e-9)
+        self._revolve_axis_name = axis_name
+        self._revolve_phase = "axis" if axis_name == "custom" else "angle"
+        self._revolve_section_origin = np.array(node.origin, dtype=np.float64)
+        normal = np.array(node.normal, dtype=np.float64)
+        self._revolve_section_normal = normal / max(np.linalg.norm(normal), 1e-9)
+        self._revolve_section_center = self._section_profile_center(node)
+        self._revolve_axis_start = None
+        self._revolve_axis_end = None
+        if axis_name == "custom":
+            self._revolve_origin = None
+            self._revolve_axis = None
+            self._revolve_radial = None
+            self._revolve_axis_label = "drawn vector"
+        else:
+            self._revolve_origin = np.array(node.origin, dtype=np.float64)
+            if axis_name == "u":
+                axis = np.array(node.axis_u, dtype=np.float64)
+                radial = np.array(node.axis_v, dtype=np.float64)
+            else:
+                axis = np.array(node.axis_v, dtype=np.float64)
+                radial = np.array(node.axis_u, dtype=np.float64)
+            self._revolve_axis = axis / max(np.linalg.norm(axis), 1e-9)
+            self._revolve_radial = radial / max(np.linalg.norm(radial), 1e-9)
+            self._revolve_axis_label = world_axis_label(tuple(self._revolve_axis))
         self._revolve_start_angle = None
+        self._revolve_last_preview_ms = 0.0
+        self._revolve_last_preview_deg = None
         self._revolve_deg = 0.0
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setFocus()
-        signals.log_message.emit(
-            "info", "Drag to revolve the profile. Release applies, Esc cancels.")
+        if self._revolve_phase == "axis":
+            signals.log_message.emit(
+                "info",
+                "Drag on the selected profile plane to draw the revolve axis vector.",
+            )
+        else:
+            signals.log_message.emit(
+                "info",
+                f"Drag to revolve around {self._revolve_axis_label}. "
+                "Release applies, Esc cancels.",
+            )
+
+    def _section_profile_center(self, node):
+        profile = getattr(node, "profile", None)
+        if profile is None:
+            return np.array(node.origin, dtype=np.float64)
+        try:
+            u_min, u_max, v_min, v_max = profile.bounds()
+        except Exception:  # noqa: BLE001 - viewport hint only.
+            return np.array(node.origin, dtype=np.float64)
+        origin = np.array(node.origin, dtype=np.float64)
+        axis_u = np.array(node.axis_u, dtype=np.float64)
+        axis_v = np.array(node.axis_v, dtype=np.float64)
+        return origin + 0.5 * (u_min + u_max) * axis_u + 0.5 * (v_min + v_max) * axis_v
 
     def _ray_plane_point(self, pos, plane_point, plane_normal):
         """Generic ray vs. plane(point, normal) intersection, or None."""
@@ -748,6 +1083,67 @@ class QRhiViewportWidget(QRhiWidget):
         if t <= 0.0:
             return None
         return origin + direction * t
+
+    def _revolve_plane_point(self, pos):
+        if self._revolve_section_origin is None or self._revolve_section_normal is None:
+            return None
+        return self._ray_plane_point(
+            pos,
+            self._revolve_section_origin,
+            self._revolve_section_normal,
+        )
+
+    def _set_revolve_axis_vector(self, start, end) -> bool:
+        if start is None or end is None or self._revolve_section_normal is None:
+            return False
+        start = np.asarray(start, dtype=np.float64)
+        end = np.asarray(end, dtype=np.float64)
+        axis = end - start
+        axis_length = float(np.linalg.norm(axis))
+        if axis_length <= max(self._grid_spacing * 0.1, 1.0e-4):
+            return False
+        axis = axis / axis_length
+        center = (
+            self._revolve_section_center
+            if self._revolve_section_center is not None
+            else start
+        )
+        radial = np.asarray(center, dtype=np.float64) - start
+        radial = radial - axis * float(np.dot(radial, axis))
+        radial_length = float(np.linalg.norm(radial))
+        if radial_length <= 1.0e-9:
+            normal = np.asarray(self._revolve_section_normal, dtype=np.float64)
+            radial = np.cross(axis, normal)
+            radial_length = float(np.linalg.norm(radial))
+        if radial_length <= 1.0e-9:
+            return False
+        radial = radial / radial_length
+        self._revolve_origin = start
+        self._revolve_axis = axis
+        self._revolve_radial = radial
+        self._revolve_axis_label = world_axis_label(tuple(axis))
+        return True
+
+    def _finish_revolve_axis_phase(self) -> bool:
+        if not self._set_revolve_axis_vector(
+            self._revolve_axis_start,
+            self._revolve_axis_end,
+        ):
+            signals.log_message.emit("warning", "Draw a longer revolve axis vector.")
+            return False
+        self._revolve_phase = "angle"
+        self._revolve_start_angle = None
+        self._revolve_last_preview_ms = 0.0
+        self._revolve_last_preview_deg = None
+        self._revolve_deg = 0.0
+        self._update_readout()
+        self._dirty = True
+        signals.log_message.emit(
+            "info",
+            f"Axis set to {self._revolve_axis_label}. Drag the angle gizmo; "
+            "release applies, Esc cancels.",
+        )
+        return True
 
     def _project_ray_to_axis(self, pos, origin, axis):
         """Signed distance along `axis` of the closest point on the axis line to
@@ -797,7 +1193,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._point_pts = [] if point_mode else None
         self._point_hover = None
         self._renderer.prewarm_for_tool(
-            self._committed_render_ir,
+            self._committed_surface_scene,
             kind,
             compile_pipeline=(
                 not point_mode or self._renderer.should_prewarm_tool_pipeline()
@@ -907,11 +1303,42 @@ class QRhiViewportWidget(QRhiWidget):
 
     # value-returning stubs (safe defaults so main_window's logic doesn't crash)
 
-    def has_scene_object_id(self, *a) -> bool:
-        return False
+    def has_scene_object_id(self, object_id: int) -> bool:
+        scene = self._committed_surface_scene
+        if scene is None:
+            return False
+        return any(
+            int(surface.key.object_id) == int(object_id)
+            for surface in scene.surfaces
+        )
 
-    def can_defer_committed_move(self, *a) -> bool:
-        return False
+    def can_defer_committed_move(self, object_id: int) -> bool:
+        return self.has_scene_object_id(object_id)
+
+    def show_move_preview(
+        self,
+        object_id: int,
+        delta: tuple[float, float, float],
+    ) -> bool:
+        scene = self._committed_surface_scene
+        if scene is None:
+            return False
+        shifted: list[object] = []
+        matched = False
+        for surface in scene.surfaces:
+            if int(surface.key.object_id) != int(object_id):
+                shifted.append(surface)
+                continue
+            matched = True
+            shifted.append(_translated_preview_surface(surface, delta))
+        if not matched:
+            return False
+        preview = replace(scene, surfaces=tuple(shifted), build_ms=0.0)
+        self.show_scene_preview(preview)
+        return True
+
+    def committed_surface_scene(self):
+        return self._committed_surface_scene
 
     def paste_offset(self, *a):
         """Offset pasted/duplicated objects on the active grid plane so they
@@ -965,7 +1392,8 @@ class QRhiViewportWidget(QRhiWidget):
 
     set_boundary_hover = _noop
     begin_boundary_region_tool = _noop
-    apply_committed_move_preview = _noop
+    def apply_committed_move_preview(self, *a, **k) -> None:
+        del a, k
     # --- boolean preview (real; main_window builds the combined render) ---
     def apply_committed_boolean_preview(self, *a, **k) -> None:
         if self._preview_kind == "boolean":
@@ -997,7 +1425,51 @@ class QRhiViewportWidget(QRhiWidget):
     def set_scene_selection(self, node) -> None:
         """Sync the viewport highlight/gizmo with the tree-panel selection."""
         self._selected_id = int(getattr(node, "object_id", 0) or 0)
+        self._selected_anchor_cache = self._anchor_from_node(node)
         self._dirty = True
+
+    def _anchor_from_node(self, node):
+        if node is None:
+            return None
+        try:
+            bb = node.bounding_box()
+        except Exception:
+            return None
+        return np.array(
+            [
+                (bb.x_min + bb.x_max) * 0.5,
+                (bb.y_min + bb.y_max) * 0.5,
+                (bb.z_min + bb.z_max) * 0.5,
+            ],
+            dtype=np.float64,
+        )
+
+    def _refresh_selected_anchor_cache(self) -> None:
+        tree = self._tree
+        if tree is None or self._selected_id <= 0:
+            self._selected_anchor_cache = None
+            return
+        node = next(
+            (
+                n
+                for n in getattr(tree, "nodes", ())
+                if int(getattr(n, "object_id", 0) or 0) == int(self._selected_id)
+            ),
+            None,
+        )
+        self._selected_anchor_cache = self._anchor_from_node(node)
+
+    def _active_edit_object_ids(self) -> tuple[int, ...]:
+        if self._selected_id <= 0:
+            return ()
+        if (
+            self._move_active
+            or self._rotate_active
+            or self._extrude_active
+            or self._revolve_active
+        ):
+            return (self._selected_id,)
+        return ()
 
     def reset_grid_spacing(self) -> None:
         self._grid_spacing = self._default_grid_spacing
@@ -1015,9 +1487,12 @@ class QRhiViewportWidget(QRhiWidget):
     def initialize(self, cb) -> None:
         try:
             if not self._renderer_ready:
+                self._renderer.set_telemetry_callback(self._record_renderer_telemetry)
                 self._renderer.initialize(self.rhi(), self.renderTarget())
                 self._renderer.set_update_callback(self._request_render)
                 self._renderer_ready = True
+                self._dirty = True
+                self.update()
         except BaseException:
             import traceback
             traceback.print_exc()
@@ -1025,16 +1500,21 @@ class QRhiViewportWidget(QRhiWidget):
 
     def render(self, cb) -> None:
         now = time.perf_counter()
-        if self._last_render_submit_t is not None:
-            elapsed_ms = (now - self._last_render_submit_t) * 1000.0
-            if elapsed_ms < _FRAME_INTERVAL_MS:
-                self._dirty = True
-                return
         self._last_render_submit_t = now
+        self._update_pending = False
+        self._dirty_flag = False
+        render_start = time.perf_counter()
         self._renderer.render(
             cb, self.renderTarget(), self._camera_values(),
             self._overlay_geometry())
+        self._performance_governor.record_render_call_ms(
+            (time.perf_counter() - render_start) * 1000.0
+        )
         self._update_fps(now)
+
+    def _record_renderer_telemetry(self, name: str, value_ms: float) -> None:
+        if name == "cull_grid_ms":
+            self._performance_governor.record_cull_grid_ms(float(value_ms))
 
     def closeEvent(self, event) -> None:
         # Best-effort: persist the driver pipeline cache for next launch (no-op if
@@ -1050,20 +1530,14 @@ class QRhiViewportWidget(QRhiWidget):
     def _selected_anchor(self):
         """World anchor (bbox center) of the selected object, shifted by any
         in-progress move preview, or None."""
-        tree = self._tree
-        if tree is None or self._selected_id <= 0:
+        if self._selected_id <= 0:
             return None
-        node = next((n for n in getattr(tree, "nodes", ())
-                     if int(n.object_id) == int(self._selected_id)), None)
-        if node is None:
+        center = self._selected_anchor_cache
+        if center is None:
+            self._refresh_selected_anchor_cache()
+            center = self._selected_anchor_cache
+        if center is None:
             return None
-        try:
-            bb = node.bounding_box()
-        except Exception:
-            return None
-        center = np.array([(bb.x_min + bb.x_max) * 0.5,
-                           (bb.y_min + bb.y_max) * 0.5,
-                           (bb.z_min + bb.z_max) * 0.5])
         delta = (
             self._move_preview_delta
             if self._move_active
@@ -1087,10 +1561,10 @@ class QRhiViewportWidget(QRhiWidget):
         """Build the move gizmo (3 colored axes at the selected object) — plus a
         rotation ring while rotating — as packed (bytes, vertex_count) thick-line
         triangles, or None when nothing's selected."""
-        if not self._gizmo_visible:
-            return None
         length = self._gizmo_length()
         verts: list[float] = []
+        if not self._gizmo_visible:
+            return None
         if self._point_pts is not None:
             self._append_point_shape_preview(verts)
             if not verts:
@@ -1106,7 +1580,13 @@ class QRhiViewportWidget(QRhiWidget):
             return (arr.tobytes(), arr.size // 11)
         if self._extrude_active and self._extrude_origin is not None:
             self._append_extrude_gizmo(verts)
-        elif self._revolve_active and self._revolve_origin is not None:
+        elif (
+            self._revolve_active
+            and (
+                self._revolve_origin is not None
+                or self._revolve_axis_start is not None
+            )
+        ):
             self._append_revolve_gizmo(length * 1.5, verts)
         else:
             anchor = self._selected_anchor()
@@ -1169,9 +1649,30 @@ class QRhiViewportWidget(QRhiWidget):
         self._seg(tip - v * s, tip + v * s, color, out)
 
     def _append_revolve_gizmo(self, radius: float, out: list) -> None:
+        if self._revolve_phase == "axis":
+            if self._revolve_axis_start is None or self._revolve_axis_end is None:
+                return
+            start = self._revolve_axis_start
+            end = self._revolve_axis_end
+            color = (1.0, 0.35, 0.95)
+            self._seg(start, end, color, out)
+            tick = self._gizmo_length() * 0.08
+            if self._revolve_section_normal is not None:
+                axis = end - start
+                axis_len = float(np.linalg.norm(axis))
+                if axis_len > 1.0e-9:
+                    axis = axis / axis_len
+                    side = np.cross(self._revolve_section_normal, axis)
+                    side_len = float(np.linalg.norm(side))
+                    if side_len > 1.0e-9:
+                        side = side / side_len
+                        self._seg(end - side * tick, end + side * tick, color, out)
+            return
         o = self._revolve_origin
         axis = self._revolve_axis
         u = self._revolve_radial
+        if o is None or axis is None or u is None:
+            return
         w = np.cross(axis, u)
         color = (1.0, 0.35, 0.95)
         self._seg(o - axis * radius, o + axis * radius, color, out)  # axis line
@@ -1222,6 +1723,13 @@ class QRhiViewportWidget(QRhiWidget):
         dt = now - last
         if dt <= 0.0:
             return
+        max_sample = (
+            float(self._performance_governor.config.max_frame_sample_ms)
+            / 1000.0
+        )
+        if dt > max_sample:
+            return
+        self._performance_governor.record_frame_ms(dt * 1000.0)
         inst = 1.0 / dt
         # Exponential smoothing; seed on the first real sample.
         self._fps_ema = inst if self._fps_ema == 0.0 else (
@@ -1298,8 +1806,17 @@ class QRhiViewportWidget(QRhiWidget):
                 e.position(), self._extrude_origin, self._extrude_normal)
             self._extrude_height = 0.0
         elif self._revolve_active and e.button() == Qt.MouseButton.LeftButton:
-            self._revolve_start_angle = self._revolve_angle(e.position())
-            self._revolve_deg = 0.0
+            if self._revolve_phase == "axis":
+                point = self._revolve_plane_point(e.position())
+                self._revolve_axis_start = point
+                self._revolve_axis_end = point
+                self._revolve_origin = point
+                self._dirty = point is not None
+            else:
+                self._revolve_start_angle = self._revolve_angle(e.position())
+                self._revolve_last_preview_ms = 0.0
+                self._revolve_last_preview_deg = None
+                self._revolve_deg = 0.0
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
         # Live coordinate readout (also fires on hover via mouse tracking).
@@ -1312,6 +1829,7 @@ class QRhiViewportWidget(QRhiWidget):
             self._create_hover = hover
             self._dirty = True
         if self._last_pos is None or not (e.buttons() & Qt.MouseButton.LeftButton):
+            self._update_hovered_object(e.position())
             return
         # A left-drag is in progress (orbit or any tool): use cheap interactive
         # frames until motion stops.
@@ -1386,6 +1904,17 @@ class QRhiViewportWidget(QRhiWidget):
             return
         if self._revolve_active and self._revolve_handle is not None:
             self._last_pos = e.position()
+            if self._revolve_phase == "axis":
+                if self._revolve_axis_start is None:
+                    return
+                point = self._revolve_plane_point(e.position())
+                if point is None:
+                    return
+                self._revolve_axis_end = point
+                self._set_revolve_axis_vector(self._revolve_axis_start, point)
+                self._update_readout()
+                self._dirty = True
+                return
             angle = self._revolve_angle(e.position())
             if angle is None:
                 return
@@ -1400,9 +1929,38 @@ class QRhiViewportWidget(QRhiWidget):
                 return
             self._revolve_deg = deg
             self._update_readout()
+            self._dirty = True
+            now_ms = time.monotonic() * 1000.0
+            if (
+                self._revolve_last_preview_deg is not None
+                and now_ms - self._revolve_last_preview_ms
+                < _REVOLVE_PREVIEW_INTERVAL_MS
+            ):
+                return
+            frame = _revolve_signal_frame(
+                self._revolve_axis,
+                self._revolve_radial,
+                deg,
+            )
+            if frame is None:
+                self._restore_committed_scene()
+                return
+            self._revolve_last_preview_ms = now_ms
+            self._revolve_last_preview_deg = deg
+            radial_direction, angle_degrees = frame
+            signal_axis_name = (
+                self._revolve_axis_name
+                if self._revolve_axis_name in {"u", "v"}
+                else "v"
+            )
             signals.viewport_revolve_preview_requested.emit(
-                int(self._revolve_handle), tuple(self._revolve_origin),
-                tuple(self._revolve_axis), tuple(self._revolve_radial), deg)
+                int(self._revolve_handle),
+                signal_axis_name,
+                tuple(self._revolve_origin),
+                tuple(self._revolve_axis),
+                radial_direction,
+                angle_degrees,
+            )
             return
         d = e.position() - self._last_pos
         self._last_pos = e.position()
@@ -1531,13 +2089,34 @@ class QRhiViewportWidget(QRhiWidget):
             self._last_pos = self._press_pos = None
             return
         if self._revolve_active and e.button() == Qt.MouseButton.LeftButton:
+            if self._revolve_phase == "axis":
+                self._finish_revolve_axis_phase()
+                self._last_pos = self._press_pos = None
+                return
             handle, deg = self._revolve_handle, self._revolve_deg
+            axis_name = (
+                self._revolve_axis_name
+                if self._revolve_axis_name in {"u", "v"}
+                else "v"
+            )
             origin = self._revolve_origin
             axis, radial = self._revolve_axis, self._revolve_radial
             self._end_revolve_tool()
-            if abs(deg) > 1e-3 and handle is not None:
+            frame = (
+                _revolve_signal_frame(axis, radial, deg)
+                if axis is not None and radial is not None
+                else None
+            )
+            if frame is not None and handle is not None and origin is not None:
+                radial_direction, angle_degrees = frame
                 signals.viewport_revolve_requested.emit(
-                    int(handle), tuple(origin), tuple(axis), tuple(radial), deg)
+                    int(handle),
+                    axis_name,
+                    tuple(origin),
+                    tuple(axis),
+                    radial_direction,
+                    angle_degrees,
+                )
             else:
                 self._restore_committed_scene()
             self._last_pos = self._press_pos = None
@@ -1604,7 +2183,7 @@ class QRhiViewportWidget(QRhiWidget):
 
     def _screen_ray(self, pos):
         """Return (origin, direction) of the camera ray through screen `pos`.
-        Matches the fragment shader's ray construction (incl. the Vulkan y-flip)."""
+        Matches the QRhi surface/grid camera convention."""
         cam = self._camera_values()
         cp = np.array(cam["u_camera_position"], dtype=np.float64)
         right = np.array(cam["u_camera_right"], dtype=np.float64)
@@ -1613,7 +2192,7 @@ class QRhiViewportWidget(QRhiWidget):
         fwd /= max(np.linalg.norm(fwd), 1e-9)
         w, h = max(self.width(), 1), max(self.height(), 1)
         suvx = (pos.x() - 0.5 * w) / h
-        suvy = -((pos.y() - 0.5 * h) / h)  # match the shader's Vulkan y-flip
+        suvy = -((pos.y() - 0.5 * h) / h)
         rd = 2.0 * suvx * right + 2.0 * suvy * up + self._focal * fwd
         rd /= max(np.linalg.norm(rd), 1e-9)
         return cp, rd
@@ -1631,8 +2210,65 @@ class QRhiViewportWidget(QRhiWidget):
         p = cp + rd * t
         return (float(p[0]), float(p[1]), float(p[2]))
 
+    def _update_hovered_object(self, pos) -> None:
+        now = time.perf_counter()
+        if now - self._last_hover_pick_t < 0.08:
+            return
+        self._last_hover_pick_t = now
+        hovered_id = self._pick_bounds_object_id(pos)
+        if hovered_id != self._hovered_id:
+            self._hovered_id = hovered_id
+            self._dirty = True
+
+    def _pick_bounds_object_id(self, pos) -> int:
+        tree = self._tree
+        if tree is None:
+            return 0
+        cp, rd = self._screen_ray(pos)
+        best_t = math.inf
+        best_id = 0
+        for node in getattr(tree, "components", ()):
+            object_id = int(getattr(node, "object_id", 0) or 0)
+            if object_id <= 0:
+                continue
+            try:
+                box = node.bounding_box()
+            except Exception:  # noqa: BLE001 - hover is best-effort.
+                continue
+            hit_t = self._ray_box_hit(cp, rd, box)
+            if hit_t is not None and hit_t < best_t:
+                best_t = hit_t
+                best_id = object_id
+        return best_id
+
+    def _ray_box_hit(self, origin, direction, box) -> float | None:
+        t_min = 0.0
+        t_max = self._max_ray_distance(origin)
+        bounds = (
+            (float(box.x_min), float(box.x_max)),
+            (float(box.y_min), float(box.y_max)),
+            (float(box.z_min), float(box.z_max)),
+        )
+        for axis, (lower, upper) in enumerate(bounds):
+            rd = float(direction[axis])
+            ro = float(origin[axis])
+            if abs(rd) < 1.0e-12:
+                if ro < lower or ro > upper:
+                    return None
+                continue
+            inv = 1.0 / rd
+            near = (lower - ro) * inv
+            far = (upper - ro) * inv
+            if near > far:
+                near, far = far, near
+            t_min = max(t_min, near)
+            t_max = min(t_max, far)
+            if t_min > t_max:
+                return None
+        return t_min if t_max >= 0.0 else None
+
     def _pick(self, pos) -> None:
-        """CPU-raymarch the scene tree under the cursor; select the hit object."""
+        """Evaluate the canonical SDF tree under the cursor for picking only."""
         tree = self._tree
         if tree is None or getattr(tree, "root", None) is None:
             return
