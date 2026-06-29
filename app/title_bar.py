@@ -32,7 +32,7 @@ class CustomTitleBar(QWidget):
     """The night-blue title bar shown at the top of the main window."""
 
     HEIGHT = 36
-    _LOGO_HEIGHT = 18
+    _LOGO_HEIGHT = 22
 
     def __init__(self, window: QWidget, suffix: str = "") -> None:
         super().__init__(window)
