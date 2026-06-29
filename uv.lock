@@ -259,16 +259,18 @@ name = "casocad"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "cadquery" },
     { name = "numpy" },
     { name = "pyarrow" },
     { name = "pyside6" },
-    { name = "torch" },
 ]
 
 [package.optional-dependencies]
 dev = [
     { name = "pytest" },
+]
+sdf-extra = [
+    { name = "cadquery" },
+    { name = "torch" },
 ]
 sim = [
     { name = "jax" },
@@ -279,16 +281,16 @@ sim-cuda = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cadquery", specifier = ">=2.8.0" },
+    { name = "cadquery", marker = "extra == 'sdf-extra'", specifier = ">=2.8.0" },
     { name = "jax", marker = "extra == 'sim'", specifier = ">=0.10.2" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'sim-cuda'", specifier = ">=0.10.2" },
     { name = "numpy", specifier = ">=2.0.0" },
     { name = "pyarrow", specifier = "==24.0.0" },
     { name = "pyside6", specifier = "==6.11.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
-    { name = "torch", specifier = ">=2.12.1" },
+    { name = "torch", marker = "extra == 'sdf-extra'", specifier = ">=2.12.1" },
 ]
-provides-extras = ["sim", "sim-cuda", "dev"]
+provides-extras = ["sim", "sim-cuda", "dev", "sdf-extra"]
 
 [[package]]
 name = "colorama"
