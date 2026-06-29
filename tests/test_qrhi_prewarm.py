@@ -11,7 +11,7 @@ from app.viewport.renderers.qrhi.surface_renderer import (
     _dynamic_line_payload,
     _safe_normal_array,
 )
-from app.viewport.surface_cache import (
+from app.viewport.surface_builder import (
     ViewportSurfaceCache,
     build_viewport_surface_scene,
 )

@@ -27,7 +27,7 @@ from PySide6.QtGui import (
     QShader,
 )
 
-from app.viewport.surface_cache import ViewportSurface, ViewportSurfaceScene
+from app.viewport.surface_builder import ViewportSurface, ViewportSurfaceScene
 
 from .vulkanize import UBO_BINDING, uniform_block_members, vulkanize
 

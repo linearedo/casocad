@@ -1,4 +1,4 @@
-"""Viewport surface cache, analytic primitive meshers, and the render dispatcher.
+"""Analytic primitive surface builders, the per-object surface cache, and the dispatcher.
 
 `build_viewport_surface` is the one routing point between the two rendering
 strategies:
@@ -69,7 +69,7 @@ from app.viewport.surface_types import (
     _object_color,
     _safe_node_bounds,
 )
-from app.viewport.surface_meshops import (
+from app.viewport.surface_geomops import (
     _MAX_DUAL_CONTOUR_WIREFRAME_TRIANGLES,
     _analytic_gradient,
     _mesh_normals,
@@ -100,7 +100,7 @@ from app.viewport.surface_clipping import clip_surface
 # (~0.7s for a 96^3 boolean), reached progressively so interaction stays smooth.
 _MAX_CONTOURED_2D_CELLS = 96
 _MAX_SAMPLED_2D_CELLS = 48
-# Quality ceiling for the revolve sweep mesher (profile x angular samples). The
+# Quality ceiling for the revolve sweep surface builder (profile x angular samples). The
 # cost grows ~quadratically, so this is a deliberate balance: 48 -> ~144 angular
 # + 48 profile segments (smooth) at ~0.3s, vs the old octagonal 8.
 _MAX_REVOLVE_VIEWPORT_RESOLUTION = 48
@@ -506,7 +506,7 @@ SurfaceBuilder = Callable[
     "ViewportSurface",
 ]
 
-# Optional analytic fast-path meshers keyed by SDF node type. The generic
+# Optional analytic fast-path surface builders keyed by SDF node type. The generic
 # dual-contour path already renders any bounded 3D SDF from bounding_box() +
 # to_numpy() alone, so this registry is a pure acceleration layer: adding a new
 # primitive's exact mesh is a co-located @_register_surface_builder decorator,

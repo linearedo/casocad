@@ -9,8 +9,8 @@ deformations), and it produces watertight/manifold output.
 It is the fallback for `surface_clipping`: the dispatcher tries the exact clip first
 and calls `contour_surface` only when an operand has no analytic mesh. Exact-Hermite
 edges + sharp-feature QEF + a memory-bounded narrow band keep it precise. This module
-depends only on `surface_types` and `surface_meshops`; it never imports the clip path
-or the primitive meshers.
+depends only on `surface_types` and `surface_geomops`; it never imports the clip path
+or the primitive surface builders.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from app.viewport.surface_types import (
     ViewportSurfaceKey,
     _empty_surface,
 )
-from app.viewport.surface_meshops import (
+from app.viewport.surface_geomops import (
     _MAX_DUAL_CONTOUR_WIREFRAME_TRIANGLES,
     _analytic_gradient,
     _normalize,

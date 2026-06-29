@@ -9,9 +9,9 @@ polygonisation.
 It renders nothing it cannot do exactly: when an operand has no analytic mesh (a
 field/smooth SDF, or a primitive outside the clip set) `clip_surface` returns None and
 the dispatcher falls back to Strategy B (`surface_contouring`). This module is
-self-contained — it only depends on `surface_types` and `surface_meshops`, and receives
+self-contained — it only depends on `surface_types` and `surface_geomops`, and receives
 operand meshes through an injected `OperandMeshProvider`, so it never imports the
-primitive meshers or the contouring fallback.
+primitive surface builders or the contouring fallback.
 """
 from __future__ import annotations
 
@@ -21,17 +21,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 from core.sdf import (
-    Box,
-    CappedCone,
-    Cone,
-    Cylinder,
     Difference,
-    Extrude,
     Intersection,
-    Revolve,
     SDFNode,
-    Sphere,
-    Torus,
     Union,
 )
 
@@ -40,7 +32,7 @@ from app.viewport.surface_types import (
     ViewportSurfaceKey,
     _empty_surface,
 )
-from app.viewport.surface_meshops import (
+from app.viewport.surface_geomops import (
     _MAX_DUAL_CONTOUR_WIREFRAME_TRIANGLES,
     _normalize_rows,
     _orient_triangles,
@@ -51,7 +43,7 @@ from app.viewport.surface_meshops import (
 
 # Supplies the analytic mesh (verts f64, normals f64, tris i64) of a meshable
 # primitive/sweep leaf, or None. Injected by the dispatcher so this module stays
-# independent of the primitive meshers.
+# independent of the primitive surface builders.
 OperandMeshProvider = Callable[
     [SDFNode, "ViewportSurfaceKey", "tuple[float, float, float]"],
     "tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]] | None",
@@ -135,58 +127,111 @@ def _clip_mesh_to_sdf(
     return all_pos, all_nrm, faces
 
 
-def _grid_box_mesh(
-    node: Box, n: int
-) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]:
-    """A box tessellated with an n x n grid per face.
+# A clip operand's coarse flat faces are uniformly subdivided until every edge is
+# shorter than (bounding-box extent / this), so a curved cut through an initially
+# 2-triangle face has nearby vertices to land on. 24 was the sweet spot in the seeding
+# gate: box/pyramid matched the old per-face grid box at far fewer triangles, no slivers.
+_CLIP_OPERAND_SEED_DIVISIONS = 24
+# Only big *well-shaped* faces are seeded. This excludes curved meshes (cylinder walls,
+# fan caps, sphere poles) whose large triangles are inherently thin — seeding those
+# would explode the triangle count without helping; they are cut by near-cut refinement
+# (`_tessellate_for_clip`) instead.
+_SEED_WELL_SHAPED_MIN_ANGLE = 15.0
 
-    Flat-face primitives must be subdivided for mesh-SDF clipping: a curved cut
-    through a face is captured only where the face has vertices. (The analytic
-    2-triangle box face would miss the cut entirely.)
+
+def _uniform_subdivide(
+    verts: NDArray[np.float64],
+    normals: NDArray[np.float64],
+    tris: NDArray[np.int64],
+    max_edge: float,
+    max_passes: int = 8,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]:
+    """Uniform 1->4 (red) subdivision until every edge is shorter than ``max_edge``.
+
+    Each triangle splits at its three edge midpoints into four similar children, so
+    the mesh densifies without changing triangle shape (no slivers) and stays
+    watertight (a shared edge splits to the same midpoint for both triangles).
+    Midpoint positions are linear; midpoint normals are averaged.
     """
-    center = np.asarray(node.center, dtype=np.float64)
-    axes = (
-        np.asarray(node.axis_u, dtype=np.float64),
-        np.asarray(node.axis_v, dtype=np.float64),
-        np.asarray(node.axis_w, dtype=np.float64),
+    verts = verts.astype(np.float64)
+    normals = normals.astype(np.float64)
+    tris = tris.astype(np.int64)
+    for _ in range(max_passes):
+        corners = verts[tris]
+        edge_len = np.stack(
+            (
+                np.linalg.norm(corners[:, 1] - corners[:, 0], axis=1),
+                np.linalg.norm(corners[:, 2] - corners[:, 1], axis=1),
+                np.linalg.norm(corners[:, 0] - corners[:, 2], axis=1),
+            ),
+            axis=1,
+        )
+        if edge_len.max() < max_edge:
+            break
+        edges = np.concatenate((tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]))
+        lo = np.minimum(edges[:, 0], edges[:, 1])
+        hi = np.maximum(edges[:, 0], edges[:, 1])
+        scale = np.int64(verts.shape[0] + 1)
+        unique_key, first = np.unique(lo * scale + hi, return_index=True)
+        ulo, uhi = lo[first], hi[first]
+        mid = 0.5 * (verts[ulo] + verts[uhi])
+        mid_normal = _normalize_rows(normals[ulo] + normals[uhi])
+        new_ids = verts.shape[0] + np.arange(unique_key.shape[0], dtype=np.int64)
+        order = np.argsort(unique_key)
+        sorted_key, sorted_vid = unique_key[order], new_ids[order]
+
+        def midpoint(u: NDArray[np.int64], w: NDArray[np.int64]) -> NDArray[np.int64]:
+            # Every edge has a midpoint (all triangles split), so searchsorted hits.
+            k = np.minimum(u, w) * scale + np.maximum(u, w)
+            return sorted_vid[np.searchsorted(sorted_key, k)]
+
+        m01 = midpoint(tris[:, 0], tris[:, 1])
+        m12 = midpoint(tris[:, 1], tris[:, 2])
+        m20 = midpoint(tris[:, 2], tris[:, 0])
+        v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
+        verts = np.concatenate((verts, mid))
+        normals = np.concatenate((normals, mid_normal))
+        tris = np.concatenate(
+            (
+                np.stack([v0, m01, m20], axis=1),
+                np.stack([m01, v1, m12], axis=1),
+                np.stack([m20, m12, v2], axis=1),
+                np.stack([m01, m12, m20], axis=1),
+            )
+        )
+    return verts, normals, tris
+
+
+def _seed_operand_mesh(
+    node: SDFNode,
+    mesh: tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]:
+    """Seed a coarse flat-faced operand mesh so a curved cut through a big undivided
+    face has vertices to land on. Returns the mesh untouched when it has no large
+    well-shaped face — curved meshes (already fine, or only thin triangles) are left
+    for near-cut refinement, never exploded by uniform subdivision."""
+    verts, normals, tris = mesh
+    box = node.bounding_box()
+    extent = max(
+        box.x_max - box.x_min, box.y_max - box.y_min, box.z_max - box.z_min, 1.0
     )
-    half = np.asarray(node.half_size, dtype=np.float64)
-    grid = np.linspace(-1.0, 1.0, n + 1)
-    gu, gv = np.meshgrid(grid, grid, indexing="ij")
-    verts: list[NDArray[np.float64]] = []
-    norms: list[NDArray[np.float64]] = []
-    faces: list[NDArray[np.int64]] = []
-    base = 0
-    # (fixed axis, sign) for each of the 6 faces; the other two axes span the grid.
-    for fixed, side in ((0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)):
-        a, b = [ax for ax in range(3) if ax != fixed]
-        normal = side * axes[fixed]
-        local = (
-            center
-            + side * half[fixed] * axes[fixed]
-            + (gu[..., None] * half[a]) * axes[a]
-            + (gv[..., None] * half[b]) * axes[b]
-        ).reshape(-1, 3)
-        verts.append(local)
-        norms.append(np.broadcast_to(normal, local.shape).copy())
-        # two triangles per grid cell, wound to face outward (+side).
-        ii, jj = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
-        v00 = (ii * (n + 1) + jj).reshape(-1) + base
-        v10 = v00 + (n + 1)
-        v01 = v00 + 1
-        v11 = v10 + 1
-        if side > 0.0:
-            faces.append(np.stack([v00, v10, v11], axis=1))
-            faces.append(np.stack([v00, v11, v01], axis=1))
-        else:
-            faces.append(np.stack([v00, v11, v10], axis=1))
-            faces.append(np.stack([v00, v01, v11], axis=1))
-        base += local.shape[0]
-    return (
-        np.concatenate(verts),
-        np.concatenate(norms),
-        np.concatenate(faces),
+    target = extent / _CLIP_OPERAND_SEED_DIVISIONS
+    corners = verts[tris]
+    max_edge = np.max(
+        np.stack(
+            (
+                np.linalg.norm(corners[:, 1] - corners[:, 0], axis=1),
+                np.linalg.norm(corners[:, 2] - corners[:, 1], axis=1),
+                np.linalg.norm(corners[:, 0] - corners[:, 2], axis=1),
+            ),
+            axis=1,
+        ),
+        axis=1,
     )
+    well_shaped = _triangle_min_angles(corners) > _SEED_WELL_SHAPED_MIN_ANGLE
+    if not np.any(well_shaped & (max_edge > target)):
+        return mesh
+    return _uniform_subdivide(verts, normals, tris, target)
 
 
 def _tessellate_for_clip(
@@ -271,14 +316,16 @@ def _clip_operand_mesh(
     color: tuple[float, float, float],
     operand_mesh: OperandMeshProvider,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]] | None:
-    """Adequately tessellated operand mesh for SDF clipping, or None.
+    """Cut-ready operand mesh for SDF clipping, or None.
 
-    Curved primitives come pre-tessellated from the analytic meshers (supplied by
-    ``operand_mesh``); the box is rebuilt as a per-face grid; nested booleans recurse.
-    Operands without a fine analytic mesh return None so the boolean falls back to
-    dual contouring.
+    Any leaf with a registered analytic surface builder supplies a mesh through
+    ``operand_mesh``; it is uniformly seeded (`_seed_operand_mesh`) so a curved cut
+    through a coarse flat face has vertices to land on. Nested booleans recurse. A
+    leaf with no analytic mesh returns None, so the boolean falls back to dual
+    contouring. Whether the clipped result is *good enough* — vs thin-walled /
+    non-convex operands that clip into sliver geometry — is decided afterwards by the
+    quality gate in `clip_surface`, not by a per-type whitelist here.
     """
-    n = max(8, int(key.resolution))
     if isinstance(node, (Union, Intersection, Difference)):
         nested = _clip_boolean_mesh(node, key, color, operand_mesh)
         if nested is None:
@@ -289,11 +336,10 @@ def _clip_operand_mesh(
             normals.astype(np.float64),
             faces.reshape(-1, 3).astype(np.int64),
         )
-    if isinstance(node, Box):
-        return _grid_box_mesh(node, n)
-    if isinstance(node, (Sphere, Cylinder, Cone, CappedCone, Torus, Extrude, Revolve)):
-        return operand_mesh(node, key, color)
-    return None
+    mesh = operand_mesh(node, key, color)
+    if mesh is None:
+        return None
+    return _seed_operand_mesh(node, mesh)
 
 
 def _clip_boolean_mesh(
@@ -364,6 +410,47 @@ def _clip_boolean_mesh(
     return vertices[used], normals[used], remap[index_array].astype(np.uint32)
 
 
+# A clipped result is rejected (-> dual-contour fallback) when its vertices do not
+# actually lie on the boolean surface. Thin-walled / non-convex operands (e.g. a box
+# frame, or a cylinder taller than the pyramid it cuts) clip into geometry that drifts
+# off the true surface; this gate routes them to the robust contour path, so no
+# per-type whitelist is needed. The threshold separates every good clip measured in the
+# seeding gate (rel-error <= ~9e-4) from the bad ones (rel-error >= ~0.08) with wide
+# margin. A min-angle/sliver test is deliberately NOT used: curved primitive meshes
+# (cylinder walls, fan caps) are legitimately full of thin triangles.
+_CLIP_MAX_RELATIVE_SURFACE_ERROR = 1.0e-2
+
+
+def _triangle_min_angles(tri: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Smallest interior angle (degrees) of each triangle in ``tri`` (M, 3, 3)."""
+    def angle_at(p: int, q: int, r: int) -> NDArray[np.float64]:
+        u = tri[:, q] - tri[:, p]
+        w = tri[:, r] - tri[:, p]
+        denom = np.linalg.norm(u, axis=1) * np.linalg.norm(w, axis=1)
+        cos = np.einsum("ij,ij->i", u, w) / np.maximum(denom, 1.0e-30)
+        return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+
+    return np.minimum.reduce([angle_at(0, 1, 2), angle_at(1, 2, 0), angle_at(2, 0, 1)])
+
+
+def _clip_quality_ok(
+    node: SDFNode,
+    vertices: NDArray[np.float32],
+    index_array: NDArray[np.uint32],
+) -> bool:
+    """True when the clipped mesh's vertices lie on the boolean surface. Thin /
+    non-convex operands fail here and fall back to dual contouring."""
+    idx = index_array.reshape(-1, 3)
+    v = vertices.astype(np.float64)
+    box = node.bounding_box()
+    extent = max(
+        box.x_max - box.x_min, box.y_max - box.y_min, box.z_max - box.z_min, 1.0
+    )
+    used = np.unique(idx)
+    surface_error = np.max(np.abs(node.to_numpy(v[used, 0], v[used, 1], v[used, 2])))
+    return surface_error <= _CLIP_MAX_RELATIVE_SURFACE_ERROR * extent
+
+
 def clip_surface(
     node: SDFNode,
     key: ViewportSurfaceKey,
@@ -372,14 +459,17 @@ def clip_surface(
 ) -> ViewportSurface | None:
     """Render a sharp boolean by clipping analytic operand meshes, or None.
 
-    Returns None when an operand has no analytic mesh, so the caller can fall
-    back to dual contouring. ``operand_mesh`` supplies the analytic mesh arrays
-    of a primitive/sweep leaf (the clip module owns the box grid and recursion).
+    Returns None when an operand has no analytic mesh, or when the clipped result
+    fails the quality gate (`_clip_quality_ok`) — in both cases the caller falls back
+    to dual contouring. ``operand_mesh`` supplies the analytic mesh arrays of a
+    primitive/sweep leaf; the clip module seeds coarse operand meshes and recurses.
     """
     result = _clip_boolean_mesh(node, key, color, operand_mesh)
     if result is None:
         return None
     vertices, normals, index_array = result
+    if not _clip_quality_ok(node, vertices, index_array):
+        return None
     triangle_count = int(index_array.size // 3)
     wire = (
         _wire_indices_from_triangles(index_array)

@@ -1,6 +1,6 @@
-"""Shared mesh primitives used by both rendering strategies.
+"""Shared surface-geometry primitives used by both rendering strategies.
 
-Pure-numpy helpers with no dependency on either strategy or the primitive meshers:
+Pure-numpy helpers with no dependency on either strategy or the primitive surface builders:
 triangle orientation, normals, wireframe edges, SDF gradient/edge root-finding, and
 edge-split subdivision. Both `surface_clipping` and `surface_contouring` import from
 here; this module imports nothing from the viewport package, so it is a leaf.

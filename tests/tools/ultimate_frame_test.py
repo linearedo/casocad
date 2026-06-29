@@ -491,6 +491,76 @@ class UltimateFrameRunner:
         node = self.window.document.node(handle)
         return int(getattr(node, "dimension", 0))
 
+    def _node_sphere(self, handle: int) -> tuple[tuple[float, float, float], float] | None:
+        """World-space (center, radius) of a 3D object's bounding box, or None when
+        unavailable/unbounded."""
+        node = self.window.document.node(handle)
+        bbox = getattr(node, "bounding_box", None)
+        if bbox is None:
+            return None
+        try:
+            box = node.bounding_box()
+        except Exception:  # noqa: BLE001 - some nodes have no finite box.
+            return None
+        lo = (box.x_min, box.y_min, box.z_min)
+        hi = (box.x_max, box.y_max, box.z_max)
+        if not all(math.isfinite(v) for v in (*lo, *hi)):
+            return None
+        center = tuple(0.5 * (a + b) for a, b in zip(lo, hi))
+        return center, 0.5 * math.dist(lo, hi)
+
+    def _maybe_combine_near(self, new_handle: int) -> int:
+        """With probability ``--combine-prob``, combine a freshly created 3D object
+        with the nearest existing 3D object whose bounding sphere overlaps it (so the
+        boolean is never empty). Returns the resulting handle (combined or original).
+        Same-loop objects share a ring and overlap; prior-loop objects are far and are
+        skipped, so booleans always produce visible geometry."""
+        if self.rng.random() >= self.args.combine_prob:
+            return new_handle
+        if self._node_dimension(new_handle) != 3:
+            return new_handle
+        new_sphere = self._node_sphere(new_handle)
+        if new_sphere is None:
+            return new_handle
+        center, radius = new_sphere
+        best: int | None = None
+        best_dist: float | None = None
+        for handle in self.created_handles:
+            if handle == new_handle or not self._alive(handle):
+                continue
+            if self._node_dimension(handle) != 3:
+                continue
+            if not self.window.document.can_combine(new_handle, handle):
+                continue
+            other = self._node_sphere(handle)
+            if other is None:
+                continue
+            dist = math.dist(center, other[0])
+            if dist <= radius + other[1] and (best_dist is None or dist < best_dist):
+                best, best_dist = handle, dist
+        if best is None:
+            return new_handle
+        operation = self.rng.choice(("union", "intersection", "difference"))
+        try:
+            combined = self.window.document.combine(new_handle, best, operation)
+        except Exception as exc:  # noqa: BLE001 - stress tool logs and continues.
+            self._record_failure(f"combine={operation}", exc)
+            return new_handle
+        for consumed in (new_handle, best):
+            if consumed in self.created_handles:
+                self.created_handles.remove(consumed)
+            if consumed in self.loop_handles:
+                self.loop_handles.remove(consumed)
+        self.created_handles.append(combined)
+        self.loop_handles.append(combined)
+        self.metrics.event(
+            "combine",
+            operation=operation,
+            result_handle=combined,
+            objects=len(self.window.document.objects),
+        )
+        return combined
+
     def _publish(self) -> None:
         version = int(self.window.document.version)
         self.window._publish_document(clear_selection=False, render=True)
@@ -610,6 +680,9 @@ class UltimateFrameRunner:
                 handle = solid
             self.loop_handles.append(handle)
             self.created_handles.append(handle)
+            pre_combine = handle
+            handle = self._maybe_combine_near(handle)
+            action_data["combined"] = handle != pre_combine
             self._publish()
             self.window.scene_tree.select_handle(handle)
             action_data["result_handle"] = handle
@@ -898,6 +971,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cooldown-ms", type=int, default=2500)
     parser.add_argument("--timeout-ms", type=int, default=120000)
     parser.add_argument("--report-every", type=int, default=8)
+    parser.add_argument(
+        "--combine-prob",
+        type=float,
+        default=0.4,
+        help=(
+            "Probability that a freshly created 3D object is combined (random "
+            "union/intersection/difference) with an existing object whose bounding "
+            "sphere overlaps it. Only overlapping operands are combined, so the "
+            "boolean is never empty. Set 0 to disable booleans."
+        ),
+    )
     parser.add_argument(
         "--large-scene-count",
         type=int,

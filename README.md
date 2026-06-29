@@ -1,4 +1,4 @@
-# casoCAD 0.1.1
+# casoCAD 0.1.2
 
 casoCAD is an experimental SDF-based CAD and lattice-grid generator.
 

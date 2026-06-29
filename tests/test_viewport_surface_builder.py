@@ -11,7 +11,7 @@ from app.viewport.renderers.qrhi.surface_renderer import (
     _chunk_from_surface,
     _dynamic_line_payload,
 )
-from app.viewport.surface_cache import (
+from app.viewport.surface_builder import (
     ViewportSurface,
     ViewportSurfaceCache,
     build_viewport_surface_scene,
@@ -520,7 +520,7 @@ def test_new_sdf_renders_via_generic_path_without_renderer_changes() -> None:
     from dataclasses import dataclass
 
     from core.sdf.base import BoundingBox3D, SDFNode
-    from app.viewport.surface_cache import (
+    from app.viewport.surface_builder import (
         _SURFACE_BUILDERS,
         ViewportSurfaceKey,
         build_viewport_surface,
@@ -561,7 +561,7 @@ def test_hermite_edge_roots_are_exact_and_grid_independent() -> None:
     """Phase A: analytic root-finding lands edge points on the true surface and
     yields exact normals, at any cell size (grid-independent precision)."""
     from core.sdf.primitives_3d import Sphere
-    from app.viewport.surface_cache import _refine_edge_hermite
+    from app.viewport.surface_builder import _refine_edge_hermite
 
     node = Sphere("s", object_id=0, center=(0.0, 0.0, 0.0), radius=0.73)
     rng = np.random.default_rng(0)
@@ -591,13 +591,14 @@ def test_hermite_edge_roots_are_exact_and_grid_independent() -> None:
 
 
 def test_non_clippable_boolean_falls_back_to_watertight_band() -> None:
-    """When an operand has no clip mesh (here a Pyramid, not in the clip set),
-    the boolean falls back to the dual-contour band, which is watertight/manifold."""
+    """When the clipped result fails the quality gate (here a thin-walled BoxFrame,
+    whose clip drifts off the true surface), the boolean falls back to the
+    dual-contour band, which is watertight/manifold."""
     from collections import Counter
 
     from core.sdf.operators import Intersection
-    from core.sdf.primitives_3d import Box, Pyramid
-    from app.viewport.surface_cache import (
+    from core.sdf.primitives_3d import Box, BoxFrame
+    from app.viewport.surface_builder import (
         _NARROW_BAND_MIN_RES,
         ViewportSurfaceKey,
         build_viewport_surface,
@@ -608,8 +609,8 @@ def test_non_clippable_boolean_falls_back_to_watertight_band() -> None:
         axis_u=(1.0, 0.0, 0.0), axis_v=(0.0, 1.0, 0.0), axis_w=(0.0, 0.0, 1.0),
         half_size=(0.7, 0.7, 0.7),
     )
-    pyramid = Pyramid("p", object_id=0, center=(0.0, 0.0, -0.2), base_half_size=0.8, half_height=0.9)
-    node = Intersection("i", object_id=12, left=box, right=pyramid)
+    frame = BoxFrame("f", object_id=0, center=(0.0, 0.0, 0.0), half_size=(0.8, 0.8, 0.8), thickness=0.12)
+    node = Intersection("i", object_id=12, left=box, right=frame)
     key = ViewportSurfaceKey(
         object_id=12, scene_revision=1, resolution=_NARROW_BAND_MIN_RES
     )
@@ -630,12 +631,46 @@ def test_non_clippable_boolean_falls_back_to_watertight_band() -> None:
     assert boundary < 0.001 * len(edge_use)
 
 
+def test_flat_solid_operand_clips_exactly_without_per_type_surface_builder() -> None:
+    """A Pyramid (flat-faced, no per-type clip mesher) clips exactly: its coarse
+    analytic mesh is generically seeded so the cut lands on the exact surface, with
+    consistent winding. Locks the consolidation that removed the clip whitelist."""
+    import numpy as np
+
+    from core.sdf.operators import Intersection
+    from core.sdf.primitives_3d import Box, Pyramid
+    from app.viewport.surface_builder import ViewportSurfaceKey, build_viewport_surface
+
+    box = Box(
+        "b", object_id=0, center=(0.0, 0.0, 0.0),
+        axis_u=(1.0, 0.0, 0.0), axis_v=(0.0, 1.0, 0.0), axis_w=(0.0, 0.0, 1.0),
+        half_size=(0.7, 0.7, 0.7),
+    )
+    pyramid = Pyramid("p", object_id=0, center=(0.0, 0.0, -0.2), base_half_size=0.8, half_height=0.9)
+    node = Intersection("i", object_id=12, left=pyramid, right=box)
+    surface = build_viewport_surface(
+        node, ViewportSurfaceKey(object_id=12, scene_revision=1, resolution=96)
+    )
+    assert "clipped" in surface.message
+    idx = surface.indices.reshape(-1, 3)
+    v = surface.vertices.astype(np.float64)
+    f = node.to_numpy(v[:, 0], v[:, 1], v[:, 2])
+    assert np.max(np.abs(f[np.unique(idx)])) < 1.0e-3
+    tri = v[idx]
+    face = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    length = np.linalg.norm(face, axis=1)
+    assert np.all(length > 1.0e-12)
+    vnorm = surface.normals.astype(np.float64)[idx].mean(axis=1)
+    vnorm /= np.maximum(np.linalg.norm(vnorm, axis=1), 1.0e-12)[:, None]
+    assert np.min(np.einsum("ij,ij->i", face / length[:, None], vnorm)) > -0.3
+
+
 def test_nested_boolean_clips_recursively() -> None:
     """A nested boolean of clippable operands renders through the exact recursive
     clip path (not grid dual contouring), placing vertices on the true surface."""
     from core.sdf.operators import Difference, Intersection
     from core.sdf.primitives_3d import Box, Cylinder, Sphere
-    from app.viewport.surface_cache import ViewportSurfaceKey, build_viewport_surface
+    from app.viewport.surface_builder import ViewportSurfaceKey, build_viewport_surface
 
     sphere = Sphere("s", object_id=0, center=(0.0, 0.0, 0.0), radius=0.9)
     box = Box(
@@ -673,7 +708,7 @@ def test_primitive_boolean_clips_to_exact_surface(op: str) -> None:
     winding is consistent (no folds/tears)."""
     from core.sdf.operators import Difference, Intersection, Union
     from core.sdf.primitives_3d import Box, Sphere
-    from app.viewport.surface_cache import ViewportSurfaceKey, build_viewport_surface
+    from app.viewport.surface_builder import ViewportSurfaceKey, build_viewport_surface
 
     sphere = Sphere("s", object_id=0, center=(0.0, 0.0, 0.0), radius=0.9)
     box = Box(
@@ -708,7 +743,7 @@ def test_boolean_mesh_has_no_folded_or_degenerate_triangles() -> None:
     the seam never shows tears/holes."""
     from core.sdf.operators import Difference, Intersection, Union
     from core.sdf.primitives_3d import Box, Sphere
-    from app.viewport.surface_cache import (
+    from app.viewport.surface_builder import (
         _NARROW_BAND_MIN_RES,
         ViewportSurfaceKey,
         build_viewport_surface,
@@ -746,7 +781,7 @@ def test_sharp_feature_qef_places_exact_edges_grid_independently() -> None:
     exactly on the surface, at coarse and fine resolution alike."""
     from core.sdf.operators import Intersection
     from core.sdf.primitives_3d import Box
-    from app.viewport.surface_cache import ViewportSurfaceKey, build_viewport_surface
+    from app.viewport.surface_builder import ViewportSurfaceKey, build_viewport_surface
 
     box_a = Box(
         "a", object_id=0, center=(0.0, 0.0, 0.0),
@@ -777,7 +812,7 @@ def test_clipped_boolean_uses_exact_operand_normals() -> None:
     grid-faceted shading)."""
     from core.sdf.operators import Intersection
     from core.sdf.primitives_3d import Box, Sphere
-    from app.viewport.surface_cache import ViewportSurfaceKey, build_viewport_surface
+    from app.viewport.surface_builder import ViewportSurfaceKey, build_viewport_surface
 
     sphere = Sphere("s", object_id=0, center=(0.0, 0.0, 0.0), radius=0.9)
     box = Box(

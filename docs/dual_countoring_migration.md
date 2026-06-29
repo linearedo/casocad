@@ -30,13 +30,13 @@ Tracked against the refactor contract; verified by tests and code paths cited be
 | 4 | No fake CAD fallback / no bbox replacement | Met | Generic path returns empty/failed, never a bbox solid; `test_new_sdf_renders_via_generic_path_without_renderer_changes` asserts real on-surface geometry |
 | 5 | Explicit, non-misleading fallback | Met | `_publish_surface_scene` keeps the last committed surface and warns when a build fails with no geometry (`viewport.py`) |
 | 6 | Backend-aware via QRhi contracts | Met | `QRhiSurfaceRenderer` uploads stable vertex/index buffers + QRhi pipelines; no Vulkan-only paths; clip/Y/depth conventions queried from `QRhi` |
-| 7 | Scalable primitive addition | Met | Generic DC renders any SDF from `to_numpy`+`bounding_box`; optional exact mesher via `@_register_surface_builder` registry, no central dispatch edits |
+| 7 | Scalable primitive addition | Met | Generic DC renders any SDF from `to_numpy`+`bounding_box`; optional exact surface builder via `@_register_surface_builder` registry, no central dispatch edits |
 
 ## Migration Steps
 
 1. Added a viewport-only surface cache.
 
-   File: `app/viewport/surface_cache.py`
+   File: `app/viewport/surface_builder.py`
 
    - Added `ViewportSurfaceKey`, keyed by `object_id`, `scene_revision`, and
      `resolution`.
@@ -48,7 +48,7 @@ Tracked against the refactor contract; verified by tests and code paths cited be
 
 2. Added generated viewport geometry for primitives and sweeps.
 
-   File: `app/viewport/surface_cache.py`
+   File: `app/viewport/surface_builder.py`
 
    - Added direct mesh builders for common 3D primitives: sphere, box, box frame,
      cylinder, cone, capped cone, pyramid, torus, polyline tube, and quadratic Bezier
@@ -63,7 +63,7 @@ Tracked against the refactor contract; verified by tests and code paths cited be
 
 3. Added real 1D and 2D outline rendering data.
 
-   File: `app/viewport/surface_cache.py`
+   File: `app/viewport/surface_builder.py`
 
    - Added 1D segment/profile surfaces as line geometry.
    - Added polyline and quadratic Bezier 1D curve sampling.
@@ -140,7 +140,7 @@ Tracked against the refactor contract; verified by tests and code paths cited be
 
    Files:
 
-   - `tests/test_viewport_surface_cache.py`
+   - `tests/test_viewport_surface_builder.py`
    - `tests/test_qrhi_prewarm.py`
    - `tests/test_qrhi_orientation_widget.py`
    - `tests/test_viewport_performance_governor.py`
@@ -259,7 +259,7 @@ Viewport/cache tests:
 ```bash
 .venv/bin/pytest -q \
   tests/test_mesh_render_cache.py \
-  tests/test_viewport_surface_cache.py \
+  tests/test_viewport_surface_builder.py \
   tests/test_qrhi_prewarm.py
 ```
 
@@ -288,7 +288,7 @@ Result: passed.
 
 ### Unbounded viewport-surface cache growth (FPS degradation over time)
 
-File: `app/viewport/surface_cache.py`
+File: `app/viewport/surface_builder.py`
 
 Symptom: users reported FPS degrading over an editing session until the app became
 laggy and unusable. Root cause was an unbounded CPU leak in `ViewportSurfaceCache`,
@@ -322,7 +322,7 @@ count; `_surfaces` remains bounded by revision pruning. Full suite: 238 passed.
 
 ### Feature-accurate intersection normals (outcome 0.5)
 
-File: `app/viewport/surface_cache.py`
+File: `app/viewport/surface_builder.py`
 
 The generic dual-contour path shaded vertices with normals derived from
 `np.gradient` over the sampled value field. Those are central differences across
@@ -344,19 +344,19 @@ the `RenderArtifactWorker` thread, so it never touches frame time. Regression:
 
 ### Registry-driven primitive dispatch (outcome 7)
 
-File: `app/viewport/surface_cache.py`
+File: `app/viewport/surface_builder.py`
 
 `_primitive_surface` was a hardcoded `isinstance` ladder: adding an analytic
-fast-path mesher meant editing central dispatch. Replaced with a type→builder
+fast-path surface builder meant editing central dispatch. Replaced with a type→builder
 registry (`_SURFACE_BUILDERS`) populated by a co-located `@_register_surface_builder`
-decorator on each mesher. Dispatch walks `type(node).__mro__` so subclass matching
+decorator on each surface builder. Dispatch walks `type(node).__mro__` so subclass matching
 behaves exactly as the old `isinstance` chain, at O(depth).
 
 This formalises the outcome-7 contract:
 
 - a new SDF that supplies `dimension`, `to_numpy`, and `bounding_box` renders
   immediately through the generic dual-contour path with **zero** renderer changes;
-- an optional exact mesher is added as one decorated function, never an edit to
+- an optional exact surface builder is added as one decorated function, never an edit to
   dispatch.
 
 Regression `test_new_sdf_renders_via_generic_path_without_renderer_changes` defines a
@@ -365,7 +365,7 @@ on-surface geometry (|f|<0.1 at every vertex), not a bounding-box stand-in.
 
 ### Boolean precision: progressive high-resolution dual contouring (outcome 0.5)
 
-Files: `app/viewport/surface_cache.py`, `app/artifacts.py`, `app/main_window.py`
+Files: `app/viewport/surface_builder.py`, `app/artifacts.py`, `app/main_window.py`
 
 Symptom: users reported boolean results "not refined at all / very bad". Two causes:
 
@@ -405,7 +405,7 @@ smooth, with quality invariant to base grid resolution — without ever blocking
 
 ### Phase A — Exact Hermite edge data
 
-File: `app/viewport/surface_cache.py`
+File: `app/viewport/surface_builder.py`
 
 Before: edge zero-crossings were linear-interpolated from grid corner values
 (`t = fa/(fa-fb)`) and edge normals interpolated from `np.gradient` of the value
@@ -436,7 +436,7 @@ Phase B (SVD/Lindstrom sharp-feature QEF).
 
 ### Phase B — Sharp-feature QEF (Lindstrom/Schaefer)
 
-File: `app/viewport/surface_cache.py`
+File: `app/viewport/surface_builder.py`
 
 Replaced the raw normal-equations solve (`np.linalg.solve(AᵀA, Aᵀb)`) with a
 mass-point-centred, truncated-eigendecomposition pseudo-inverse:
@@ -459,7 +459,7 @@ cut the cell count that dominates it. Regression:
 
 ### Phase C/D — Sparse narrow band (manifold, memory-bounded)
 
-File: `app/viewport/surface_cache.py`
+File: `app/viewport/surface_builder.py`
 
 The top precision tier (`resolution >= _NARROW_BAND_MIN_RES = 96`) contours a sparse
 narrow band: a coarse base grid locates the surface, only crossing coarse cells are
@@ -496,7 +496,7 @@ difference (box−sphere, box−cylinder) and union.
 
 ### Phase E — Exact boolean seam-curve welding
 
-File: `app/viewport/surface_cache.py`
+File: `app/viewport/surface_builder.py`
 
 The lever for *curved* boolean precision. A boolean crease lies on
 `{f_left = 0} ∩ {f_right = 0}` — where both operand surfaces pass — for every
@@ -533,7 +533,7 @@ blocked (outcome 0); precision arrives progressively without a freeze.
 
 ### Boolean quality hardening (user-reported: "union bad / holes / polygonized")
 
-Files: `app/viewport/surface_cache.py`, `app/artifacts.py`, `app/main_window.py`
+Files: `app/viewport/surface_builder.py`, `app/artifacts.py`, `app/main_window.py`
 
 Diagnosis from instrumenting the meshes:
 
@@ -564,7 +564,7 @@ winding, watertight.
 
 ### Exact boolean rendering via SDF-clipped analytic meshes
 
-File: `app/viewport/surface_cache.py`
+File: `app/viewport/surface_builder.py`
 
 The decisive quality fix for primitive booleans. Instead of dual contouring the
 combined field on a grid (which polygonises the smooth curved faces and the seam),
@@ -578,7 +578,7 @@ SDF:
 - `_grid_box_mesh` — the box is rebuilt as a per-face grid so a curved cut through a
   flat face is captured (the analytic 2-triangle face would miss it entirely).
 - `_clip_operand_mesh` — supplies adequately tessellated operand meshes (curved
-  primitives from the analytic meshers; box as a grid). Operands without a fine
+  primitives from the analytic surface builders; box as a grid). Operands without a fine
   analytic mesh (e.g. a nested boolean) return None and the boolean falls back to the
   dual-contour narrow band.
 - `_boolean_clip_surface` — clips each operand by the other per operator rule
@@ -625,8 +625,8 @@ a **boolean** operation (trim mesh A by operand B's SDF sign). It needs two oper
 a boolean between them.
 
 - A primitive or **sweep** (sphere, box, **revolve**, **extrude**, …) is a *leaf*. It is
-  produced by its own parametric mesher (`_primitive_surface` → `_revolve_profile_surface`
-  etc.); clipping plays no role in building it. Its smoothness is purely a mesher-sampling
+  produced by its own parametric surface builder (`_primitive_surface` → `_revolve_profile_surface`
+  etc.); clipping plays no role in building it. Its smoothness is purely a surface builder-sampling
   knob (profile × angular resolution), independent of clip-vs-contour.
 - A **boolean of** those leaves is where clipping applies — each leaf mesh is clipped
   against the other's SDF. So a revolve *is* clipped, but only as an *operand*
@@ -634,49 +634,99 @@ a boolean between them.
 
 |              | how it is made                      | role of clipping       |
 |--------------|-------------------------------------|------------------------|
-| primitive/sweep | parametric mesher (sample surface) | none — it is a leaf    |
+| primitive/sweep | parametric surface builder (sample surface) | none — it is a leaf    |
 | boolean of those | clip each leaf by the other's SDF | this *is* clipping     |
 
 ### Revolve resolution cap (8 → 48)
 
-The revolve sweep mesher was hard-capped at resolution 8 (`_MAX_REVOLVE_VIEWPORT_RESOLUTION`),
+The revolve sweep surface builder was hard-capped at resolution 8 (`_MAX_REVOLVE_VIEWPORT_RESOLUTION`),
 giving an octagonal profile. This made revolves chunky **both** standalone and as boolean
-operands (the clip meshes the operand with the same capped mesher). Raised to **48**
+operands (the clip builds the operand surface with the same capped surface builder). Raised to **48**
 (~144 angular + 48 profile segments). The cap is a deliberate balance — the sweep cost
 grows ~quadratically (profile × angular): cap 8 → 2.5k tris/18 ms, cap 48 → 55k tris/0.39 s,
 cap 128 → 393k tris/2.1 s. `REVOLVE_VIEWPORT_SURFACE_RESOLUTION` (the standalone tier) was
 raised to match. After the change, `revolve ∩ box` clips exactly (surf |f| ~2.2e-4) with a
 smooth operand instead of grid dual contouring. This was the actual cause behind
-"revolve booleans look bad" — a mesher cap, not the clip-vs-contour choice.
+"revolve booleans look bad" — a surface builder cap, not the clip-vs-contour choice.
+
+### Generic clip eligibility: seed-and-fall-back (no per-type clip whitelist)
+
+File: `app/viewport/surface_clipping.py`
+
+Clip eligibility used to be a hand-maintained `isinstance` whitelist in
+`_clip_operand_mesh` (`Sphere, Cylinder, Cone, CappedCone, Torus, Extrude, Revolve`)
+plus a box-only `_grid_box_mesh` rebuild helper. That duplicated the surface-builder
+registry, excluded primitives that *did* have surface builders (Pyramid, BoxFrame, tubes), and
+coupled the module to 8 concrete primitive types. Two measured gates drove a
+consolidation to a single generic rule:
+
+- **Gate 1** (retire `_grid_box_mesh`, feed the coarse 2-triangle box through the
+  existing near-cut `_tessellate_for_clip`): **failed**. A band refiner only subdivides
+  edges already near the cut, so a 2-triangle flat face gives it no foothold —
+  `box − cylinder` lost the hole entirely (12 triangles) and `box ∩ box` was 47%
+  slivers. The grid seed is genuinely necessary.
+- **Gate 2** (replace the grid with a *generic* uniform 1→4 seeder): **partial pass**.
+  Uniform subdivision is shape-preserving (no slivers) and matched the old grid box on
+  box/pyramid at fewer triangles, **and unlocked exact Pyramid clipping** (was a
+  DC-band mush at |f|≈1.5e-3, now machine-exact). But it broke thin-walled BoxFrame
+  (clip drifts to |f|≈0.12) — clipping is wrong for non-convex thin shells.
+
+Shipped design (`_clip_operand_mesh` → `_seed_operand_mesh` → quality gate):
+
+1. **Any** leaf with a registered analytic surface builder is offered to the clip path through
+   the injected `operand_mesh` provider — no type list. The whitelist and
+   `_grid_box_mesh` are deleted; the module no longer imports concrete primitive types
+   (only `Union/Intersection/Difference`), realising the independence its docstring
+   already claimed.
+2. `_seed_operand_mesh` uniformly subdivides **only big well-shaped faces**
+   (`_uniform_subdivide`, min-angle > `_SEED_WELL_SHAPED_MIN_ANGLE = 15°`, edge >
+   extent/`_CLIP_OPERAND_SEED_DIVISIONS = 24`). Box/pyramid faces seed; curved meshes
+   (cylinder walls, fan caps, sphere poles) are inherently thin and are **not** seeded
+   — seeding a cylinder explodes it 768 → 786k triangles for nothing. Curved operands
+   are still cut by near-cut `_tessellate_for_clip` exactly as before.
+3. `clip_surface` then **tries** the clip and validates the result: if the rendered
+   vertices drift off the boolean surface (`_clip_quality_ok`, rel-error >
+   `_CLIP_MAX_RELATIVE_SURFACE_ERROR = 1e-2`), it returns `None` and the dispatcher
+   falls back to the watertight dual-contour band. A sliver test is deliberately *not*
+   used — curved primitive meshes are legitimately full of thin triangles, so only
+   surface error discriminates (good clips ≤ ~9e-4, bad ≥ ~0.08; ~100× margin).
+
+Net: a new primitive gets exact clipped booleans **for free** when its mesh clips
+cleanly (curved, or convex flat solid), and self-excludes to the DC band when it does
+not — no per-shape clip surface builder, no whitelist, no broken geometry shipped. Verified by
+the real pipeline (box/sphere/pyramid/nested clip; BoxFrame and a cylinder-taller-than-
+pyramid difference fall back, both watertight). Regressions:
+`test_flat_solid_operand_clips_exactly_without_per_type_surface_builder`,
+`test_non_clippable_boolean_falls_back_to_watertight_band` (repointed Pyramid → BoxFrame).
 
 ## Module Architecture (two independent strategies, one dispatcher)
 
-The 3,500-line `surface_cache.py` was split so the two rendering strategies are clean,
+The 3,500-line `surface_builder.py` was split so the two rendering strategies are clean,
 independent modules behind one dispatch point. Dependency graph (acyclic):
 
 ```text
 surface_types     (leaf: ViewportSurface/Key/Scene + empty/failed/colour fallbacks)
-surface_meshops   (leaf: shared numpy mesh helpers — orient, normals, wire,
+surface_geomops   (leaf: shared numpy surface-geometry helpers — orient, normals, wire,
                    SDF gradient/edge root-finding, edge-split subdivision)
         ^   ^
         |   |
-surface_clipping   -> {types, meshops}   Strategy A: exact SDF-clipped analytic meshes
-surface_contouring -> {types, meshops}   Strategy B: dual-contour fallback (any SDF)
+surface_clipping   -> {types, geomops}   Strategy A: exact SDF-clipped analytic meshes
+surface_contouring -> {types, geomops}   Strategy B: dual-contour fallback (any SDF)
         ^   ^
         |   |
-surface_cache  -> {types, meshops, clipping, contouring}
-                  primitive mesh library + per-object cache + the dispatcher
+surface_builder  -> {types, geomops, clipping, contouring}
+                  primitive surface-builder library + per-object surface cache + the dispatcher
 ```
 
 - The two strategies do **not** import each other or the cache; each depends only on
   the two leaf modules (verified by AST). They are genuinely independent.
 - `surface_clipping` receives operand meshes through an injected `OperandMeshProvider`,
-  so it never imports the primitive meshers — keeping it decoupled from the dispatcher.
-- `build_viewport_surface` (in `surface_cache`) is the single routing point:
+  so it never imports the primitive surface builders — keeping it decoupled from the dispatcher.
+- `build_viewport_surface` (in `surface_builder`) is the single routing point:
   primitive/sweep → analytic mesh; sharp meshable boolean → `clip_surface`; everything
   else (field SDFs, non-meshable operands) → `contour_surface`.
-- `surface_cache.py` re-exports the public names, so existing
-  `from app.viewport.surface_cache import …` imports are unchanged.
+- `surface_builder.py` re-exports the public names, so existing
+  `from app.viewport.surface_builder import …` imports are unchanged.
 
 ## Notes
 

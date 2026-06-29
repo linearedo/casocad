@@ -50,10 +50,6 @@ from core.sdf import Difference, Intersection, PlacedSDF2D, Revolve, SDFTree, Un
 from core.sdf.base import BoundingBox3D, SDFNode
 from core.serialization import load_scene, save_scene
 from core.scene import INTERNAL_BOUNDARY_SELECTOR_PREFIX, SceneDocument
-from scenes.boolean_operations import build_scene as build_boolean_scene
-from scenes.lattice_benchmark import build_scene as build_benchmark_scene
-from scenes.pipe_3d import build_scene as build_pipe_scene
-from scenes.placed_section_tags import build_scene as build_tagging_scene
 
 logger = logging.getLogger(__name__)
 UNDO_HISTORY_LIMIT = 50
@@ -289,18 +285,6 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         new_default = file_menu.addAction("New Scene")
         new_default.triggered.connect(self._new_default_scene)
-        examples_menu = file_menu.addMenu("New Example")
-        for label, factory in (
-            ("Pipe with inlet/outlet", build_pipe_scene),
-            ("von Karman obstacle", SceneDocument.default),
-            ("Boolean operations", build_boolean_scene),
-            ("Placed section tags", build_tagging_scene),
-            ("Smooth union benchmark", build_benchmark_scene),
-        ):
-            action = examples_menu.addAction(label)
-            action.triggered.connect(
-                lambda checked=False, value=factory: self._load_example(value)
-            )
         file_menu.addSeparator()
         open_action = file_menu.addAction("Open Scene...")
         open_action.setShortcut("Ctrl+O")
@@ -1810,12 +1794,6 @@ class MainWindow(QMainWindow):
         self.document = SceneDocument()
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
-
-    def _load_example(self, factory: object) -> None:
-        undo_snapshot = self._history_snapshot()
-        self.document = factory()
-        self._record_undo_snapshot(undo_snapshot)
-        self._publish_document(frame=True)
 
     @Slot()
     def _open_scene(self) -> None:

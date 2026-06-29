@@ -1,1 +1,0 @@
-"""Programmable example scenes."""

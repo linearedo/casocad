@@ -7,7 +7,7 @@ from time import perf_counter
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from app.viewport.performance_governor import ViewportRenderBudget
-from app.viewport.surface_cache import (
+from app.viewport.surface_builder import (
     ViewportSurfaceCache,
     ViewportSurfaceScene,
     build_viewport_surface_scene,

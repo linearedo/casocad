@@ -21,7 +21,7 @@ from core.scene import SceneDocument
 from core.sdf import PlacedPolyline1D, PlacedSDF1D, PlacedSDF2D, PolylineProfile
 from core.sdf.base import SDFNode
 HANDLE_ROLE = Qt.ItemDataRole.UserRole
-SDF_ICON_DIR = Path(__file__).resolve().parents[2] / "assets" / "icons"
+SDF_ICON_DIR = Path(__file__).resolve().parents[1] / "assets" / "icons"
 SDF_MENU_ITEMS: tuple[tuple[str, str], ...] = (
     ("Segment 1D", "segment"),
     ("Polyline 1D", "polyline"),

@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from app.viewport.surface_cache import build_viewport_surface_scene
+from app.viewport.surface_builder import build_viewport_surface_scene
 from core.boundary import BoundaryRegion
 from core.boundary_patches import (
     boundary_patch_preview_node,

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from app.viewport.renderers.qrhi.viewport import _revolve_signal_frame
-from app.viewport.surface_cache import (
+from app.viewport.surface_builder import (
     ViewportSurfaceCache,
     build_viewport_surface_scene,
 )

@@ -28,6 +28,10 @@ sim-cuda = [
 dev = [
     "pytest>=8.0.0",
 ]
+sdf-extra = [
+    "torch>=2.12.1",
+    "cadquery>=2.8.0",
+]
 
 [build-system]
 requires = ["setuptools>=75.0", "wheel"]
