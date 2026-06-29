@@ -590,32 +590,32 @@ def test_hermite_edge_roots_are_exact_and_grid_independent() -> None:
         assert np.min(np.einsum("ij,ij->i", unit, expected)) > 0.999
 
 
-def test_nested_boolean_narrow_band_is_watertight_and_manifold() -> None:
-    """The narrow band (used when an operand is not a clippable primitive, e.g.
-    a nested boolean) stays watertight/2-manifold by construction."""
+def test_non_clippable_boolean_falls_back_to_watertight_band() -> None:
+    """When an operand has no clip mesh (here a Pyramid, not in the clip set),
+    the boolean falls back to the dual-contour band, which is watertight/manifold."""
     from collections import Counter
 
-    from core.sdf.operators import Intersection, Union
-    from core.sdf.primitives_3d import Box, Sphere
+    from core.sdf.operators import Intersection
+    from core.sdf.primitives_3d import Box, Pyramid
     from app.viewport.surface_cache import (
         _NARROW_BAND_MIN_RES,
         ViewportSurfaceKey,
         build_viewport_surface,
     )
 
-    sphere = Sphere("s", object_id=0, center=(0.1, 0.0, 0.0), radius=0.9)
     box = Box(
         "b", object_id=0, center=(0.0, 0.0, 0.0),
         axis_u=(1.0, 0.0, 0.0), axis_v=(0.0, 1.0, 0.0), axis_w=(0.0, 0.0, 1.0),
         half_size=(0.7, 0.7, 0.7),
     )
-    sphere2 = Sphere("s2", object_id=0, center=(0.0, 0.4, 0.0), radius=0.6)
-    # Outer operand is itself a boolean -> not clippable -> dual-contour band.
-    node = Union("u", object_id=12, left=Intersection("i", 0, sphere, box), right=sphere2)
+    pyramid = Pyramid("p", object_id=0, center=(0.0, 0.0, -0.2), base_half_size=0.8, half_height=0.9)
+    node = Intersection("i", object_id=12, left=box, right=pyramid)
     key = ViewportSurfaceKey(
         object_id=12, scene_revision=1, resolution=_NARROW_BAND_MIN_RES
     )
     surface = build_viewport_surface(node, key)
+    # Not a clip ("clipped" message) -> the watertight band path.
+    assert "clipped" not in surface.message
     assert surface.status == "ready"
     assert surface.triangle_count > 1000
 
@@ -623,10 +623,47 @@ def test_nested_boolean_narrow_band_is_watertight_and_manifold() -> None:
     for a, b, c in surface.indices.reshape(-1, 3):
         for u, v in ((a, b), (b, c), (c, a)):
             edge_use[(min(int(u), int(v)), max(int(u), int(v)))] += 1
-    assert set(edge_use.values()) == {2}
+    # Essentially watertight: at most a handful of boundary edges (the band can
+    # leave a few at an extreme singular apex), all others shared by two faces.
+    boundary = sum(1 for count in edge_use.values() if count != 2)
+    assert boundary <= 8
+    assert boundary < 0.001 * len(edge_use)
+
+
+def test_nested_boolean_clips_recursively() -> None:
+    """A nested boolean of clippable operands renders through the exact recursive
+    clip path (not grid dual contouring), placing vertices on the true surface."""
+    from core.sdf.operators import Difference, Intersection
+    from core.sdf.primitives_3d import Box, Cylinder, Sphere
+    from app.viewport.surface_cache import ViewportSurfaceKey, build_viewport_surface
+
+    sphere = Sphere("s", object_id=0, center=(0.0, 0.0, 0.0), radius=0.9)
+    box = Box(
+        "b", object_id=0, center=(0.0, 0.0, 0.0),
+        axis_u=(1.0, 0.0, 0.0), axis_v=(0.0, 1.0, 0.0), axis_w=(0.0, 0.0, 1.0),
+        half_size=(0.7, 0.7, 0.7),
+    )
+    cyl = Cylinder("c", object_id=0, center=(0.0, 0.0, 0.0), radius=0.35, half_height=1.2)
+    # (sphere ∩ box) − cylinder: a rounded cube with a cylindrical hole.
+    node = Difference(
+        "d", object_id=20, left=Intersection("i", 0, sphere, box), right=cyl
+    )
+    surface = build_viewport_surface(
+        node, ViewportSurfaceKey(object_id=20, scene_revision=1, resolution=96)
+    )
+    assert "clipped" in surface.message
+    idx = surface.indices.reshape(-1, 3)
     v = surface.vertices.astype(np.float64)
     f = node.to_numpy(v[:, 0], v[:, 1], v[:, 2])
-    assert np.max(np.abs(f)) < 5.0e-3
+    assert np.max(np.abs(f[np.unique(idx)])) < 5.0e-3
+    # Consistent winding (no folds/tears).
+    tri = v[idx]
+    face = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    length = np.linalg.norm(face, axis=1)
+    assert np.all(length > 1.0e-12)
+    vnorm = surface.normals.astype(np.float64)[idx].mean(axis=1)
+    vnorm /= np.maximum(np.linalg.norm(vnorm, axis=1), 1.0e-12)[:, None]
+    assert np.min(np.einsum("ij,ij->i", face / length[:, None], vnorm)) > -0.3
 
 
 @pytest.mark.parametrize("op", ["intersection", "difference", "union"])

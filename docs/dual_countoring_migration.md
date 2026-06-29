@@ -597,6 +597,17 @@ band. Regressions: `test_primitive_boolean_clips_to_exact_surface`,
 `test_clipped_boolean_uses_exact_operand_normals`,
 `test_nested_boolean_narrow_band_is_watertight_and_manifold`.
 
+**Recursive nested booleans.** `_clip_boolean_mesh` builds a boolean's clipped mesh as
+raw arrays; `_clip_operand_mesh` calls it when an operand is itself a boolean, so an
+arbitrarily nested tree of sharp booleans over meshable leaves (`(A∩B)−C`,
+`((A∩B)−C)∪D`, …) renders entirely through the exact clip path. Each operand mesh is
+clipped against the other operand's SDF (always available from the tree) and is
+cut-aware tessellated at every level. Verified `(sphere∩box)−cylinder` and the 3-deep
+`((sphere∩box)−cylinder)∪sphere` clip exactly (surf |f| ~2.4e-4, consistent winding) at
+res 96 in ~1.5–2.5 s. The dual-contour band remains the fallback only when an operand
+has no analytic mesh (a non-meshable/field SDF, or a primitive outside the clip set
+such as `Pyramid`), and for watertight export.
+
 **Extrude/Revolve operands.** Their analytic meshes have tall un-subdivided wall
 quads and fan caps, so a curved cut would be missed by the clip. `_tessellate_for_clip`
 adaptively refines (red-green `_split_marked_triangles`) the mesh edges that are long
@@ -606,6 +617,66 @@ refine to res-96 produced ~1M triangles (≈5 s); the band version produces ~90�
 triangles in ~0.4–0.65 s, exact to ~2e-4 with consistent winding. Extrude/Revolve are
 now in `_clip_operand_mesh`, so their booleans render exact clipped geometry instead of
 grid dual contouring.
+
+### Clipping is a boolean technique; primitives/sweeps are leaves
+
+A recurring point of confusion: clipping does **not** *generate* a shape — it is purely
+a **boolean** operation (trim mesh A by operand B's SDF sign). It needs two operands and
+a boolean between them.
+
+- A primitive or **sweep** (sphere, box, **revolve**, **extrude**, …) is a *leaf*. It is
+  produced by its own parametric mesher (`_primitive_surface` → `_revolve_profile_surface`
+  etc.); clipping plays no role in building it. Its smoothness is purely a mesher-sampling
+  knob (profile × angular resolution), independent of clip-vs-contour.
+- A **boolean of** those leaves is where clipping applies — each leaf mesh is clipped
+  against the other's SDF. So a revolve *is* clipped, but only as an *operand*
+  (`revolve ∩ box`), never to bring the revolve itself into existence.
+
+|              | how it is made                      | role of clipping       |
+|--------------|-------------------------------------|------------------------|
+| primitive/sweep | parametric mesher (sample surface) | none — it is a leaf    |
+| boolean of those | clip each leaf by the other's SDF | this *is* clipping     |
+
+### Revolve resolution cap (8 → 48)
+
+The revolve sweep mesher was hard-capped at resolution 8 (`_MAX_REVOLVE_VIEWPORT_RESOLUTION`),
+giving an octagonal profile. This made revolves chunky **both** standalone and as boolean
+operands (the clip meshes the operand with the same capped mesher). Raised to **48**
+(~144 angular + 48 profile segments). The cap is a deliberate balance — the sweep cost
+grows ~quadratically (profile × angular): cap 8 → 2.5k tris/18 ms, cap 48 → 55k tris/0.39 s,
+cap 128 → 393k tris/2.1 s. `REVOLVE_VIEWPORT_SURFACE_RESOLUTION` (the standalone tier) was
+raised to match. After the change, `revolve ∩ box` clips exactly (surf |f| ~2.2e-4) with a
+smooth operand instead of grid dual contouring. This was the actual cause behind
+"revolve booleans look bad" — a mesher cap, not the clip-vs-contour choice.
+
+## Module Architecture (two independent strategies, one dispatcher)
+
+The 3,500-line `surface_cache.py` was split so the two rendering strategies are clean,
+independent modules behind one dispatch point. Dependency graph (acyclic):
+
+```text
+surface_types     (leaf: ViewportSurface/Key/Scene + empty/failed/colour fallbacks)
+surface_meshops   (leaf: shared numpy mesh helpers — orient, normals, wire,
+                   SDF gradient/edge root-finding, edge-split subdivision)
+        ^   ^
+        |   |
+surface_clipping   -> {types, meshops}   Strategy A: exact SDF-clipped analytic meshes
+surface_contouring -> {types, meshops}   Strategy B: dual-contour fallback (any SDF)
+        ^   ^
+        |   |
+surface_cache  -> {types, meshops, clipping, contouring}
+                  primitive mesh library + per-object cache + the dispatcher
+```
+
+- The two strategies do **not** import each other or the cache; each depends only on
+  the two leaf modules (verified by AST). They are genuinely independent.
+- `surface_clipping` receives operand meshes through an injected `OperandMeshProvider`,
+  so it never imports the primitive meshers — keeping it decoupled from the dispatcher.
+- `build_viewport_surface` (in `surface_cache`) is the single routing point:
+  primitive/sweep → analytic mesh; sharp meshable boolean → `clip_surface`; everything
+  else (field SDFs, non-meshable operands) → `contour_surface`.
+- `surface_cache.py` re-exports the public names, so existing
+  `from app.viewport.surface_cache import …` imports are unchanged.
 
 ## Notes
 

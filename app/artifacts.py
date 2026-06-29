@@ -22,7 +22,7 @@ COARSE_VIEWPORT_SURFACE_RESOLUTION = 14
 # chunky while being drawn. The build is async, so this only adds surface-update
 # latency (~0.2s), never a GUI freeze.
 BOOLEAN_DRAW_RESOLUTION = 48
-REVOLVE_VIEWPORT_SURFACE_RESOLUTION = 8
+REVOLVE_VIEWPORT_SURFACE_RESOLUTION = 48
 REFINED_VIEWPORT_SURFACE_RESOLUTION = 128
 # Progressive refinement ladder. The first build is COARSE (instant, interactive);
 # after each build settles the artifact thread re-requests the next tier, so the
