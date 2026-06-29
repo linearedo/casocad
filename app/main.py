@@ -2,11 +2,30 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtWidgets import QApplication
 
 from .main_window import MainWindow
+
+_THEME_QSS = Path(__file__).resolve().parent / "assets" / "theme.qss"
+
+
+def _load_theme(application: QApplication) -> None:
+    """Apply the global appearance theme. Styling only — never touches layout,
+    so dock/splitter/window positions are unaffected."""
+    # Ask the platform for a dark color scheme, so the native window title bar
+    # (drawn by the OS/WM, not by our QSS) renders dark instead of white.
+    # Honoring it is up to the desktop environment; it's a no-op where unsupported.
+    style_hints = application.styleHints()
+    if hasattr(style_hints, "setColorScheme"):
+        style_hints.setColorScheme(Qt.ColorScheme.Dark)
+    try:
+        application.setStyleSheet(_THEME_QSS.read_text(encoding="utf-8"))
+    except OSError as exc:  # pragma: no cover - falls back to default Qt look
+        logging.getLogger(__name__).warning("Could not load theme: %s", exc)
 
 
 def main() -> int:
@@ -23,6 +42,7 @@ def main() -> int:
 
     application = QApplication(sys.argv)
     application.setApplicationName("casoCAD")
+    _load_theme(application)
     window = MainWindow()
     window.show()
     return application.exec()

@@ -1,5 +1,5 @@
 from .base import BoundingBox3D, SDFNode
-from .operators import Difference, Intersection, Union
+from .operators import Difference, Intersection, Union, Xor
 from .placed_1d import PlacedSDF1D
 from .placed_2d import PlacedPolyline1D, PlacedSDF2D
 from .primitives_1d import (
@@ -73,4 +73,5 @@ __all__ = [
     "Torus",
     "Translate",
     "Union",
+    "Xor",
 ]

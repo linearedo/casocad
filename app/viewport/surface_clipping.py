@@ -1,10 +1,10 @@
 """Strategy A — exact boolean rendering by SDF-clipping analytic meshes.
 
-This is the precise, fast path for *sharp* booleans (union/intersection/difference)
-whose operands have an analytic mesh (primitives, sweeps, and — recursively — nested
-booleans of those). Each operand's smooth mesh is clipped against the *other*
-operand's exact SDF, giving exact curved faces and a root-found seam with no grid
-polygonisation.
+This is the precise, fast path for *sharp* booleans
+(union/intersection/difference/xor) whose operands have an analytic mesh
+(primitives, sweeps, and — recursively — nested booleans of those). Each
+operand's smooth mesh is clipped against the *other* operand's exact SDF, giving
+exact curved faces and a root-found seam with no grid polygonisation.
 
 It renders nothing it cannot do exactly: when an operand has no analytic mesh (a
 field/smooth SDF, or a primitive outside the clip set) `clip_surface` returns None and
@@ -25,6 +25,7 @@ from core.sdf import (
     Intersection,
     SDFNode,
     Union,
+    Xor,
 )
 
 from app.viewport.surface_types import (
@@ -326,7 +327,7 @@ def _clip_operand_mesh(
     non-convex operands that clip into sliver geometry — is decided afterwards by the
     quality gate in `clip_surface`, not by a per-type whitelist here.
     """
-    if isinstance(node, (Union, Intersection, Difference)):
+    if isinstance(node, (Union, Intersection, Difference, Xor)):
         nested = _clip_boolean_mesh(node, key, color, operand_mesh)
         if nested is None:
             return None
@@ -357,7 +358,7 @@ def _clip_boolean_mesh(
     clip path. Returns (vertices f32, normals f32, indices u32) or None when an
     operand has no analytic mesh (then the caller falls back to dual contouring).
     """
-    if not isinstance(node, (Union, Intersection, Difference)):
+    if not isinstance(node, (Union, Intersection, Difference, Xor)):
         return None
     left = node.left
     right = node.right
@@ -374,8 +375,10 @@ def _clip_boolean_mesh(
         keep_l, keep_r, flip_r = True, True, False
     elif isinstance(node, Union):
         keep_l, keep_r, flip_r = False, False, False
-    else:  # Difference: A - B
+    elif isinstance(node, Difference):
         keep_l, keep_r, flip_r = False, True, True
+    else:
+        keep_l, keep_r, flip_r = False, False, False
 
     box = node.bounding_box()
     extent = max(
@@ -389,15 +392,47 @@ def _clip_boolean_mesh(
     operand_l = _tessellate_for_clip(*operand_l, right, target)
     operand_r = _tessellate_for_clip(*operand_r, left, target)
 
-    vl, nl, fl = _clip_mesh_to_sdf(*operand_l, right, keep_l, eps)
-    vr, nr, fr = _clip_mesh_to_sdf(*operand_r, left, keep_r, eps)
-    if flip_r:
-        nr = -nr
-        fr = fr[:, [0, 2, 1]]
+    if isinstance(node, Xor):
+        parts: list[
+            tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]
+        ] = []
+        for operand, clip, keep_inside, flip in (
+            (operand_l, right, False, False),
+            (operand_l, right, True, True),
+            (operand_r, left, False, False),
+            (operand_r, left, True, True),
+        ):
+            verts, normals, faces = _clip_mesh_to_sdf(*operand, clip, keep_inside, eps)
+            if faces.shape[0] == 0:
+                continue
+            if flip:
+                normals = -normals
+                faces = faces[:, [0, 2, 1]]
+            parts.append((verts, normals, faces))
+        if not parts:
+            return None
+        vertex_parts: list[NDArray[np.float64]] = []
+        normal_parts: list[NDArray[np.float64]] = []
+        face_parts: list[NDArray[np.int64]] = []
+        offset = 0
+        for verts, normals, faces in parts:
+            vertex_parts.append(verts)
+            normal_parts.append(normals)
+            face_parts.append(faces + offset)
+            offset += verts.shape[0]
+        vertices = np.concatenate(vertex_parts).astype(np.float32)
+        normals = np.concatenate(normal_parts).astype(np.float32)
+        faces = np.concatenate(face_parts)
+    else:
+        vl, nl, fl = _clip_mesh_to_sdf(*operand_l, right, keep_l, eps)
+        vr, nr, fr = _clip_mesh_to_sdf(*operand_r, left, keep_r, eps)
+        if flip_r:
+            nr = -nr
+            fr = fr[:, [0, 2, 1]]
 
-    vertices = np.concatenate([vl, vr]).astype(np.float32)
-    normals = np.concatenate([nl, nr]).astype(np.float32)
-    faces = np.concatenate([fl, fr + vl.shape[0]])
+        vertices = np.concatenate([vl, vr]).astype(np.float32)
+        normals = np.concatenate([nl, nr]).astype(np.float32)
+        faces = np.concatenate([fl, fr + vl.shape[0]])
     if faces.shape[0] == 0:
         return None
     index_array = _orient_triangles(

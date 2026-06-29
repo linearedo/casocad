@@ -4,7 +4,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from core.sdf.base import FloatArray, SDFNode
-from core.sdf.operators import Difference, Intersection, Union
+from core.sdf.operators import Difference, Intersection, Union, Xor
 from core.sdf.transforms import Rotate, Scale, Translate
 
 
@@ -13,7 +13,7 @@ def boundary_owner_ids(node: SDFNode) -> set[int]:
     if isinstance(node, (Translate, Rotate, Scale)):
         assert node.child is not None
         return boundary_owner_ids(node.child)
-    if isinstance(node, (Union, Intersection, Difference)):
+    if isinstance(node, (Union, Intersection, Difference, Xor)):
         assert node.left is not None and node.right is not None
         return boundary_owner_ids(node.left) | boundary_owner_ids(node.right)
     children = node.children()
@@ -91,7 +91,7 @@ def _profile_boolean_sources(
     profile = getattr(node, "profile", None)
     operation = getattr(profile, "operation", None)
     sources = node.children()
-    if operation not in {"union", "intersection", "difference"}:
+    if operation not in {"union", "intersection", "difference", "xor"}:
         return None
     if len(sources) != 2:
         return None
@@ -105,13 +105,15 @@ def _boolean_sources(
     profile_sources = _profile_boolean_sources(node)
     if profile_sources is not None:
         return profile_sources
-    if not isinstance(node, (Union, Intersection, Difference)):
+    if not isinstance(node, (Union, Intersection, Difference, Xor)):
         return None
     assert node.left is not None and node.right is not None
     if isinstance(node, Union):
         operation = "union"
     elif isinstance(node, Intersection):
         operation = "intersection"
+    elif isinstance(node, Xor):
+        operation = "xor"
     else:
         operation = "difference"
     return node.left, node.right, operation
@@ -159,9 +161,19 @@ def evaluate_with_attribution(
         elif operation == "intersection":
             choose_left = left_distance >= right_distance
             distance = np.maximum(left_distance, right_distance)
-        else:
+        elif operation == "difference":
             choose_left = left_distance >= -right_distance
             distance = np.maximum(left_distance, -right_distance)
+        else:
+            minimum = np.minimum(left_distance, right_distance)
+            negative_maximum = -np.maximum(left_distance, right_distance)
+            choose_minimum = minimum >= negative_maximum
+            choose_left = np.where(
+                choose_minimum,
+                left_distance <= right_distance,
+                left_distance >= right_distance,
+            )
+            distance = np.maximum(minimum, negative_maximum)
         return (
             np.asarray(distance, dtype=np.float64),
             np.where(choose_left, left_ids, right_ids).astype(np.uint16, copy=False),
@@ -215,7 +227,7 @@ def evaluate_volume_attribution(
         elif operation == "intersection":
             choose_left = left_distance >= right_distance
         else:
-            choose_left = left_distance <= right_distance
+            choose_left = (left_distance < 0.0) & (right_distance >= 0.0)
         return np.where(choose_left, left_ids, right_ids).astype(
             np.uint16,
             copy=False,

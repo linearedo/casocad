@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>casoCAD — Static Browser Demo</title>
+  <link rel="stylesheet" href="./style.css" />
+  <!-- Import map so the bare "three" specifier inside OrbitControls resolves in-browser -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.165.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.165.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <!-- Title / menu bar -->
+    <header id="topbar">
+      <div class="brand">
+        <span class="logo">caso<span class="logo-accent">CAD</span></span>
+        <span class="brand-sub">SDF · CFD domain authoring</span>
+      </div>
+      <div class="topbar-note">
+        Static browser demo. The real casoCAD app runs as a Python/PySide6 desktop application.
+      </div>
+      <div class="topbar-actions">
+        <span class="badge">DEMO</span>
+      </div>
+    </header>
+
+    <!-- Main 3-column workspace -->
+    <main id="workspace">
+      <!-- Left: scene tree -->
+      <aside id="left-panel" class="panel">
+        <div class="panel-head">
+          <span class="panel-title">Scene Tree</span>
+          <span class="panel-tag" id="tree-count">0</span>
+        </div>
+        <div class="toolbar">
+          <button class="tbtn" data-act="add-box">+ Box Domain</button>
+          <button class="tbtn" data-act="add-cyl">+ Cylinder Obstacle</button>
+          <button class="tbtn" data-act="add-bnd">+ Boundary Tag</button>
+          <button class="tbtn danger" data-act="clear">Clear Scene</button>
+        </div>
+        <ul id="scene-tree" class="tree">
+          <!-- populated by demo.js -->
+        </ul>
+        <div class="panel-foot">
+          <span class="muted">Objects exist only in browser memory.</span>
+        </div>
+      </aside>
+
+      <!-- Center: viewport -->
+      <section id="center-panel">
+        <div id="viewport">
+          <div id="viewport-overlay">
+            <div class="vp-tag">Perspective · Orbit</div>
+            <div class="vp-empty" id="vp-empty">
+              <div class="vp-empty-title">Empty scene</div>
+              <div class="vp-empty-sub">Grid &amp; axes shown. Add a domain to begin.</div>
+            </div>
+          </div>
+          <div id="vp-toolbar">
+            <button class="vbtn" data-act="fit">Fit View</button>
+            <button class="vbtn" data-act="toggle-opacity">Shell Opacity</button>
+            <button class="vbtn" data-act="toggle-boundary">Boundary Regions</button>
+            <button class="vbtn" data-act="mesh">Mesh Preview</button>
+            <button class="vbtn" data-act="export">Export Arrow</button>
+          </div>
+          <div id="cdn-fallback" class="hidden">
+            <div class="fallback-box">
+              <h2>3D viewport unavailable</h2>
+              <p>The Three.js library could not be loaded from the CDN.
+                 Check your network connection and reload the page.</p>
+              <p class="muted">This static demo requires CDN access to
+                 <code>unpkg.com</code>.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right: properties / domain / meshing -->
+      <aside id="right-panel" class="panel">
+        <div class="panel-head">
+          <span class="panel-title">Inspector</span>
+        </div>
+
+        <div class="section">
+          <div class="section-head">Properties</div>
+          <div id="properties" class="props">
+            <div class="empty-sel">No selection</div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">Domain</div>
+          <div id="domain-info" class="props">
+            <div class="kv"><span>Type</span><span id="dom-type">—</span></div>
+            <div class="kv"><span>Bounds</span><span id="dom-bounds">—</span></div>
+            <div class="kv"><span>Obstacles</span><span id="dom-obst">0</span></div>
+            <div class="kv"><span>Boundary tags</span><span id="dom-bnd">0</span></div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">Meshing &amp; Export</div>
+          <div class="props">
+            <button class="wbtn" data-act="mesh" id="btn-mesh" disabled>Generate Mesh Preview</button>
+            <button class="wbtn" data-act="export" id="btn-export" disabled>Export Arrow Case</button>
+            <div class="muted hint">Simulated only — no solver is invoked.</div>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- Bottom: status / log -->
+    <footer id="statusbar">
+      <div class="status-left">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">Ready</span>
+      </div>
+      <div class="status-log" id="log-strip">Initializing viewport…</div>
+      <div class="status-right">
+        <span id="fps-readout">—</span>
+      </div>
+    </footer>
+  </div>
+
+  <script type="module" src="./demo.js"></script>
+</body>
+</html>

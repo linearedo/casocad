@@ -45,6 +45,7 @@ from .sdf import (
     Torus,
     Translate,
     Union,
+    Xor,
 )
 from .sdf.base import SDFNode
 from .sdf.operators import BinarySDFOperator
@@ -420,6 +421,7 @@ def _node_type(node: SDFNode) -> str:
         Union: "union",
         Intersection: "intersection",
         Difference: "difference",
+        Xor: "xor",
         Translate: "translate",
         Rotate: "rotate",
         Scale: "scale",
@@ -535,6 +537,7 @@ def _node_from_record(
         "union": Union,
         "intersection": Intersection,
         "difference": Difference,
+        "xor": Xor,
     }
     if node_type in binary_types:
         return binary_types[node_type](

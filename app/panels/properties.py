@@ -5,8 +5,8 @@ from dataclasses import replace
 import re
 
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QValidator
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QFocusEvent, QKeyEvent, QMouseEvent, QValidator
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -279,7 +279,67 @@ def property_dimension_value(text: str) -> float:
     return value
 
 
-class CadDimensionSpinBox(QDoubleSpinBox):
+class _CadEditableSpinBox(QDoubleSpinBox):
+    """Spinbox that behaves like a direct CAD value field on focus."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._select_all_on_mouse_release = False
+        self._replace_on_next_key = False
+        self.lineEdit().installEventFilter(self)
+
+    def focusInEvent(self, event: QFocusEvent) -> None:
+        super().focusInEvent(event)
+        self._replace_on_next_key = True
+        QTimer.singleShot(0, self.lineEdit().selectAll)
+        self._select_all_on_mouse_release = event.reason() == Qt.FocusReason.MouseFocusReason
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self._replace_on_next_key and event.text():
+            self.lineEdit().selectAll()
+        self._replace_on_next_key = False
+        super().keyPressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        super().mouseReleaseEvent(event)
+        if self._select_all_on_mouse_release:
+            self.lineEdit().selectAll()
+            self._select_all_on_mouse_release = False
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if (
+            watched is self.lineEdit()
+            and event.type() == QEvent.Type.FocusIn
+        ):
+            self._replace_on_next_key = True
+            QTimer.singleShot(0, self.lineEdit().selectAll)
+        if (
+            watched is self.lineEdit()
+            and event.type() == QEvent.Type.MouseButtonPress
+        ):
+            self._replace_on_next_key = True
+        if (
+            watched is self.lineEdit()
+            and event.type() == QEvent.Type.KeyPress
+            and self._replace_on_next_key
+        ):
+            key_event = event
+            if isinstance(key_event, QKeyEvent) and key_event.text():
+                self.lineEdit().selectAll()
+            self._replace_on_next_key = False
+        if (
+            watched is self.lineEdit()
+            and event.type() == QEvent.Type.MouseButtonRelease
+            and self._select_all_on_mouse_release
+        ):
+            result = super().eventFilter(watched, event)
+            QTimer.singleShot(0, self.lineEdit().selectAll)
+            self._select_all_on_mouse_release = False
+            return result
+        return super().eventFilter(watched, event)
+
+
+class CadDimensionSpinBox(_CadEditableSpinBox):
     def valueFromText(self, text: str) -> float:
         try:
             return property_dimension_value(text)
@@ -299,7 +359,7 @@ class CadDimensionSpinBox(QDoubleSpinBox):
         return (QValidator.State.Acceptable, text, position)
 
 
-class CadScalarSpinBox(QDoubleSpinBox):
+class CadScalarSpinBox(_CadEditableSpinBox):
     def __init__(
         self,
         parent: QWidget | None = None,

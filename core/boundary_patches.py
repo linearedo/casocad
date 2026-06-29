@@ -34,6 +34,7 @@ from core.sdf import (
     Torus,
     Translate,
     Union,
+    Xor,
 )
 from core.sdf.base import SDFNode
 from core.sdf.operators import BinarySDFOperator
@@ -437,7 +438,7 @@ def _surface_patches_for_node(
                 normal_sign=-normal_sign,
             ),
         )
-    if isinstance(node, (Union, Intersection)):
+    if isinstance(node, (Union, Intersection, Xor)):
         assert node.left is not None and node.right is not None
         return (
             *_surface_patches_for_node(

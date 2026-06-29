@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QMainWindow,
+    QMenuBar,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.title_bar import install_title_bar
 from core.meshing import MeshableDomains, load_meshable_domains
 
 from .viewer.gpu_memory import (
@@ -132,6 +134,7 @@ class MeshingWorkspace(QMainWindow):
         self.setWindowTitle("casoCAD - Meshing Workspace")
         self.resize(1200, 760)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._menubar = QMenuBar(self)
         self._scene_path: Path | None = None
         self._domains = MeshableDomains(())
         self._last_artifact_path: Path | None = None
@@ -235,8 +238,12 @@ class MeshingWorkspace(QMainWindow):
         self.addDockWidget(
             Qt.DockWidgetArea.BottomDockWidgetArea, self.preview_dock)
         self.preview_dock.hide()
-        view_menu = self.menuBar().addMenu("&View")
+        view_menu = self._menubar.addMenu("&View")
         view_menu.addAction(self.preview_dock.toggleViewAction())
+
+        # casoCAD night-blue title bar, branded for this tool window.
+        self._title_bar, self._resizer = install_title_bar(
+            self, self._menubar, suffix="- Meshing Tool")
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Meshing", self)

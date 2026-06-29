@@ -76,3 +76,18 @@ class Difference(BinarySDFOperator):
     def bounding_box(self) -> BoundingBox3D:
         assert self.left is not None
         return self.left.bounding_box()
+
+
+@dataclass
+class Xor(BinarySDFOperator):
+    def to_numpy(
+        self, X: FloatArray, Y: FloatArray, Z: FloatArray
+    ) -> FloatArray:
+        assert self.left is not None and self.right is not None
+        left = self.left.to_numpy(X, Y, Z)
+        right = self.right.to_numpy(X, Y, Z)
+        return np.maximum(np.minimum(left, right), -np.maximum(left, right))
+
+    def bounding_box(self) -> BoundingBox3D:
+        assert self.left is not None and self.right is not None
+        return self.left.bounding_box().union(self.right.bounding_box())

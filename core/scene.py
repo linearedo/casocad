@@ -59,6 +59,7 @@ from .sdf import (
     Torus,
     Translate,
     Union,
+    Xor,
 )
 from .sdf.operators import BinarySDFOperator
 from .sdf.solid_from_2d import Revolve
@@ -1025,6 +1026,7 @@ class SceneDocument:
                 "union": Union,
                 "intersection": Intersection,
                 "difference": Difference,
+                "xor": Xor,
             }
             if operation not in constructors:
                 raise ValueError(f"unknown SDF operation: {operation}")

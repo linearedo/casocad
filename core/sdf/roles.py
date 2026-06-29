@@ -10,8 +10,8 @@ backbone that makes illegal geometry unrepresentable:
   of its own boundary a field is guaranteed exact on.
 * :class:`DomainKind` -- the physics tag on a top-level Domain (Fluid vs Solid).
   Geometry rules are identical for both; the tag only matters downstream.
-* :func:`result_role` -- the typed operator signatures of spec §4. The three
-  exact operators form a closed algebra; anything else is rejected.
+* :func:`result_role` -- typed role-collapsing operator signatures from spec §4.
+  The structural validator also covers both-sided operators such as XOR.
 * :class:`Domain` -- a Region promoted to a named, exported top-level cell.
 
 This first migration commit is **purely additive**: nothing else imports this
@@ -58,8 +58,7 @@ class IllegalOperandRole(ValueError):
     """
 
 
-# Typed operator signatures (spec §4): operator -> (left, right, result).
-# These three are the *entire* closed algebra; nothing else combines fields.
+# Typed role-collapsing operator signatures: operator -> (left, right, result).
 #   intersect(Region, Region)   -> Region   f = max(f_A, f_B)
 #   subtract (Region, Obstacle) -> Region   f = max(f_R, -f_O)  [non-commutative]
 #   union    (Obstacle,Obstacle)-> Obstacle f = min(f_A, f_B)
@@ -115,6 +114,7 @@ _KIND_SIGNATURE: dict[str, tuple[Role, Role, Role]] = {
     "difference": (Role.REGION, Role.OBSTACLE, Role.REGION),
     "union": (Role.OBSTACLE, Role.OBSTACLE, Role.OBSTACLE),
 }
+_BOTH_SIDED_OPERATOR_KINDS: frozenset[str] = frozenset({"xor"})
 
 # Role-transparent unary transforms (isometry / uniform scale): result role is
 # the child's result role (spec §6).
@@ -131,6 +131,8 @@ def node_result_roles(node: SDFNode) -> frozenset[Role]:
     """
 
     kind = node.kind
+    if kind in _BOTH_SIDED_OPERATOR_KINDS:
+        return _BOTH
     signature = _KIND_SIGNATURE.get(kind)
     if signature is not None:
         return frozenset({signature[2]})
@@ -153,7 +155,19 @@ def role_violations(node: SDFNode) -> list[str]:
 
     def visit(n: SDFNode) -> None:
         signature = _KIND_SIGNATURE.get(n.kind)
-        if signature is not None:
+        if n.kind in _BOTH_SIDED_OPERATOR_KINDS:
+            children = n.children()
+            if len(children) == 2:
+                for child, slot in ((children[0], "left"), (children[1], "right")):
+                    child_roles = node_result_roles(child)
+                    if not _BOTH.issubset(child_roles):
+                        violations.append(
+                            f"{n.kind}({n.name!r}) {slot} slot requires "
+                            f"both-sided exactness, but child "
+                            f"{child.kind}({child.name!r}) can only serve "
+                            f"{sorted(r.value for r in child_roles)}"
+                        )
+        elif signature is not None:
             want_left, want_right, _ = signature
             children = n.children()
             if len(children) == 2:

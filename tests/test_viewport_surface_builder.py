@@ -701,12 +701,12 @@ def test_nested_boolean_clips_recursively() -> None:
     assert np.min(np.einsum("ij,ij->i", face / length[:, None], vnorm)) > -0.3
 
 
-@pytest.mark.parametrize("op", ["intersection", "difference", "union"])
+@pytest.mark.parametrize("op", ["intersection", "difference", "union", "xor"])
 def test_primitive_boolean_clips_to_exact_surface(op: str) -> None:
     """Booleans of primitives clip smooth analytic operand meshes against each
     other's SDF: rendered vertices lie on the exact boolean surface and the
     winding is consistent (no folds/tears)."""
-    from core.sdf.operators import Difference, Intersection, Union
+    from core.sdf.operators import Difference, Intersection, Union, Xor
     from core.sdf.primitives_3d import Box, Sphere
     from app.viewport.surface_builder import ViewportSurfaceKey, build_viewport_surface
 
@@ -716,7 +716,12 @@ def test_primitive_boolean_clips_to_exact_surface(op: str) -> None:
         axis_u=(1.0, 0.0, 0.0), axis_v=(0.0, 1.0, 0.0), axis_w=(0.0, 0.0, 1.0),
         half_size=(0.7, 0.7, 0.7),
     )
-    ctor = {"intersection": Intersection, "difference": Difference, "union": Union}[op]
+    ctor = {
+        "intersection": Intersection,
+        "difference": Difference,
+        "union": Union,
+        "xor": Xor,
+    }[op]
     node = ctor("n", object_id=15, left=box, right=sphere)
     surface = build_viewport_surface(
         node, ViewportSurfaceKey(object_id=15, scene_revision=1, resolution=96)

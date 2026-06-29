@@ -71,6 +71,7 @@ class BinaryProfile1D(Profile1D):
             "union",
             "intersection",
             "difference",
+            "xor",
         }:
             raise ValueError(
                 f"unsupported 1D boolean operation: {self.operation}"
@@ -83,7 +84,9 @@ class BinaryProfile1D(Profile1D):
             return np.minimum(left, right)
         if self.operation == "intersection":
             return np.maximum(left, right)
-        return np.maximum(left, -right)
+        if self.operation == "difference":
+            return np.maximum(left, -right)
+        return np.maximum(np.minimum(left, right), -np.maximum(left, right))
 
     def bounds(self) -> tuple[float, float]:
         left = self.left.bounds()

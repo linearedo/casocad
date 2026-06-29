@@ -14,12 +14,15 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QMainWindow,
+    QMenuBar,
     QMessageBox,
     QLabel,
     QPushButton,
     QSlider,
     QToolBar,
 )
+
+from app.title_bar import install_title_bar
 
 from app.axis_labels import world_axis_label
 from app.artifacts import (
@@ -46,7 +49,15 @@ from core.model import (
     grammar_violations,
     model_from_document,
 )
-from core.sdf import Difference, Intersection, PlacedSDF2D, Revolve, SDFTree, Union
+from core.sdf import (
+    Difference,
+    Intersection,
+    PlacedSDF2D,
+    Revolve,
+    SDFTree,
+    Union,
+    Xor,
+)
 from core.sdf.base import BoundingBox3D, SDFNode
 from core.serialization import load_scene, save_scene
 from core.scene import INTERNAL_BOUNDARY_SELECTOR_PREFIX, SceneDocument
@@ -127,7 +138,7 @@ def viewport_render_resolution_for_tree(tree: object) -> tuple[int, bool]:
     """
     components = tuple(getattr(tree, "components", ()) or ())
     root = getattr(tree, "root", None)
-    if isinstance(root, (Union, Intersection, Difference)):
+    if isinstance(root, (Union, Intersection, Difference, Xor)):
         return BOOLEAN_DRAW_RESOLUTION, True
     nodes = tuple(getattr(tree, "nodes", ()) or ())
     if any(isinstance(node, Revolve) for node in (*components, *nodes)):
@@ -169,6 +180,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("casoCAD - Programmable SDF CAD")
         self.resize(1400, 860)
+        self._menubar = QMenuBar(self)
         self.document = SceneDocument()
         self._undo_stack: list[SceneDocument] = []
         self._redo_stack: list[SceneDocument] = []
@@ -187,6 +199,7 @@ class MainWindow(QMainWindow):
         self.viewport.set_refinement_callback(self._schedule_render_artifact)
         self._build_docks()
         self._build_menu()
+        self._install_title_bar()
         self._build_toolbar()
         self._connect_signals()
         self._seed_initial_viewport_scene()
@@ -212,6 +225,12 @@ class MainWindow(QMainWindow):
         dock.setObjectName(f"{title.lower()}Dock")
         dock.setWidget(widget)
         return dock
+
+    def _install_title_bar(self) -> None:
+        """Replace the native OS title bar with casoCAD's night-blue one (drawn by
+        the app, so it looks the same on every OS / desktop). The central widget,
+        docks and toolbars are untouched, so panel layout is unchanged."""
+        self._title_bar, self._resizer = install_title_bar(self, self._menubar)
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("CAD", self)
@@ -282,7 +301,7 @@ class MainWindow(QMainWindow):
         self._set_background_color(self._background_color)
 
     def _build_menu(self) -> None:
-        file_menu = self.menuBar().addMenu("&File")
+        file_menu = self._menubar.addMenu("&File")
         new_default = file_menu.addAction("New Scene")
         new_default.triggered.connect(self._new_default_scene)
         file_menu.addSeparator()
@@ -297,7 +316,7 @@ class MainWindow(QMainWindow):
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
 
-        edit_menu = self.menuBar().addMenu("&Edit")
+        edit_menu = self._menubar.addMenu("&Edit")
         copy_action = edit_menu.addAction("Copy")
         copy_action.setShortcut("Ctrl+C")
         copy_action.triggered.connect(self._copy_selection)
@@ -332,15 +351,15 @@ class MainWindow(QMainWindow):
         self._redo_action.triggered.connect(self._redo_document_edit)
         self._update_history_actions()
 
-        view_menu = self.menuBar().addMenu("&View")
+        view_menu = self._menubar.addMenu("&View")
         for dock in (self._scene_dock, self._properties_dock, self._log_dock):
             view_menu.addAction(dock.toggleViewAction())
 
-        domains_menu = self.menuBar().addMenu("&Domains")
+        domains_menu = self._menubar.addMenu("&Domains")
         validate_action = domains_menu.addAction("Validate Domains (disjointness)")
         validate_action.triggered.connect(self._validate_domains_disjoint)
 
-        meshing_menu = self.menuBar().addMenu("&Meshing")
+        meshing_menu = self._menubar.addMenu("&Meshing")
         workspace_action = meshing_menu.addAction("Open Meshing Workspace...")
         workspace_action.triggered.connect(self._open_meshing_workspace)
 
