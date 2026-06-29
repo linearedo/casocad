@@ -17,7 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # Sentinel: set on the re-exec so we don't prompt / re-exec a second time.
@@ -75,48 +75,18 @@ def _normalize_pci(raw: str) -> str:
 def gpu_selection_supported() -> bool:
     """Whether the user can pick a GPU for *graphics* on this OS.
 
-    macOS does not expose per-process GPU selection (one GPU on Apple Silicon;
-    OS-managed switching on Intel Macs), so we only offer the backend there.
-    Linux (PRIME/DRI) and Windows (multiple selectable adapters) do.
+    Only Linux exposes a reliable per-process GPU env switch for graphics
+    (PRIME / DRI_PRIME). macOS picks the GPU itself, and on Windows the GPU is
+    governed by the OS Graphics Preference / driver profile rather than a clean
+    env knob — so on both we only offer the backend.
     """
-    return platform.system() != "Darwin"
-
-
-def _detect_gpus_windows() -> list[Gpu]:
-    """Enumerate adapters via PowerShell's CIM video-controller query."""
-    out = _run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_VideoController | "
-            "Select-Object -ExpandProperty Name",
-        ]
-    )
-    gpus: list[Gpu] = []
-    for line in out.splitlines():
-        name = line.strip()
-        if not name:
-            continue
-        vendor = _vendor_of(name)
-        # On Windows the dedicated card is whichever isn't the integrated one;
-        # treat NVIDIA/AMD discrete parts as discrete, Intel as integrated.
-        discrete = vendor in ("nvidia", "amd")
-        gpus.append(Gpu(vendor=vendor, name=name, discrete=discrete))
-    return gpus
+    return platform.system() == "Linux"
 
 
 def detect_gpus() -> list[Gpu]:
     """Return the GPUs found on this machine, integrated first, discrete last."""
     if not gpu_selection_supported():
-        return []  # macOS: no GPU picker
-
-    if platform.system() == "Windows":
-        gpus = _detect_gpus_windows()
-        if not gpus:
-            gpus = [Gpu(vendor="unknown", name="Default GPU")]
-        gpus.sort(key=lambda g: g.discrete)
-        return gpus
+        return []  # macOS / Windows: GPU is chosen by the OS, not by us
 
     gpus: list[Gpu] = []
     if shutil.which("lspci"):
