@@ -748,6 +748,10 @@ class MainWindow(QMainWindow):
                 revision=preview.version,
                 surfaces=(*base_scene.surfaces, *artifact.surface_scene.surfaces),
                 build_ms=artifact.surface_scene.build_ms,
+                primary_object_ids=(
+                    base_scene.primary_object_ids
+                    | artifact.surface_scene.primary_object_ids
+                ),
             )
         )
 

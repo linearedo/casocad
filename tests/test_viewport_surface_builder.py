@@ -184,6 +184,48 @@ def test_2d_boolean_profile_renders_smooth_contoured_surface() -> None:
     assert surface.triangle_count > 250
 
 
+def test_component_surface_scene_can_filter_boolean_operands() -> None:
+    document = SceneDocument()
+    circle_handle = document.add_primitive_from_drag(
+        "circle",
+        (-0.35, -0.35, 0.0),
+        (0.35, 0.35, 0.0),
+    )
+    square_handle = document.add_primitive_from_drag(
+        "square",
+        (-0.2, -0.2, 0.0),
+        (0.2, 0.2, 0.0),
+    )
+    circle = document.node(circle_handle)
+    square = document.node(square_handle)
+    result_handle = document.combine(circle_handle, square_handle, "difference")
+    version, tree = document.visual_snapshot()
+
+    final_only = build_viewport_surface_scene(
+        tree,
+        version,
+        cache=ViewportSurfaceCache(resolution=32),
+    )
+    with_operands = build_viewport_surface_scene(
+        tree,
+        version,
+        cache=ViewportSurfaceCache(resolution=32),
+        include_component_surfaces=True,
+    )
+
+    assert final_only is not None
+    assert with_operands is not None
+    assert [surface.key.object_id for surface in final_only.surfaces] == [result_handle]
+    assert {
+        surface.key.object_id
+        for surface in with_operands.surfaces
+    } == {result_handle, circle.object_id, square.object_id}
+    assert [
+        surface.key.object_id
+        for surface in with_operands.with_components_visible(False).surfaces
+    ] == [result_handle]
+
+
 def test_2d_difference_profile_preserves_hole_fill() -> None:
     document = SceneDocument()
     outer_handle = document.add_primitive_from_drag(

@@ -215,7 +215,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._default_grid_spacing = 1.0
         self._sdf_opacity = 1.0
         self._gizmo_visible = True
-        self._components_visible = True
+        self._components_visible = False
         self._grid_plane = 0  # 0=XY, 1=XZ, 2=YZ
         self._view_anim = None  # (start_yaw, start_pitch, dyaw, dpitch)
         self._view_anim_clock = QElapsedTimer()
@@ -818,8 +818,9 @@ class QRhiViewportWidget(QRhiWidget):
         self._dirty = True
 
     def _publish_surface_scene(self, surface_scene) -> bool:
-        failed = tuple(getattr(surface_scene, "failed_messages", ()) or ())
-        has_geometry = bool(getattr(surface_scene, "has_geometry", False))
+        visible_scene = self._visible_surface_scene(surface_scene)
+        failed = tuple(getattr(visible_scene, "failed_messages", ()) or ())
+        has_geometry = bool(getattr(visible_scene, "has_geometry", False))
         if failed:
             signals.log_message.emit(
                 "warning",
@@ -828,8 +829,13 @@ class QRhiViewportWidget(QRhiWidget):
             )
             if not has_geometry:
                 return False
-        self.set_scene(surface_scene)
+        self.set_scene(visible_scene)
         return True
+
+    def _visible_surface_scene(self, surface_scene):
+        if surface_scene is None:
+            return None
+        return surface_scene.with_components_visible(self._components_visible)
 
     def frame_box(self, box) -> None:
         cx = (box.x_min + box.x_max) * 0.5
@@ -1338,7 +1344,7 @@ class QRhiViewportWidget(QRhiWidget):
         return True
 
     def committed_surface_scene(self):
-        return self._committed_surface_scene
+        return self._visible_surface_scene(self._committed_surface_scene)
 
     def paste_offset(self, *a):
         """Offset pasted/duplicated objects on the active grid plane so they
@@ -1419,7 +1425,11 @@ class QRhiViewportWidget(QRhiWidget):
         self._dirty = True
 
     def set_components_visible(self, visible: bool) -> None:
-        self._components_visible = bool(visible)
+        visible = bool(visible)
+        if self._components_visible == visible:
+            return
+        self._components_visible = visible
+        self._publish_surface_scene(self._committed_surface_scene)
         self._dirty = True
 
     def set_scene_selection(self, node) -> None:

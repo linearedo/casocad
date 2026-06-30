@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 import math
 from threading import RLock
 from time import perf_counter
-from typing import Callable, Literal
+from typing import Callable, Iterator, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -223,15 +223,26 @@ def build_viewport_surface_scene(
     revision: int,
     *,
     cache: ViewportSurfaceCache | None = None,
+    include_component_surfaces: bool = False,
 ) -> ViewportSurfaceScene | None:
     if tree is None:
         return None
     start = perf_counter()
     surface_cache = cache or ViewportSurfaceCache()
     components = tuple(getattr(tree, "components", ())) or (tree.root,)
+    primary_object_ids = frozenset(
+        int(component.object_id)
+        for component in components
+        if int(getattr(component, "object_id", 0)) > 0
+    )
+    candidates = (
+        _surface_component_nodes(components)
+        if include_component_surfaces
+        else components
+    )
     live = tuple(
         component
-        for component in components
+        for component in candidates
         if int(getattr(component, "object_id", 0)) > 0
     )
     surfaces = tuple(
@@ -245,7 +256,27 @@ def build_viewport_surface_scene(
         revision=int(revision),
         surfaces=surfaces,
         build_ms=(perf_counter() - start) * 1000.0,
+        primary_object_ids=primary_object_ids,
     )
+
+
+def _surface_component_nodes(components: tuple[SDFNode, ...]) -> tuple[SDFNode, ...]:
+    nodes: list[SDFNode] = []
+    seen: set[int] = set()
+    for component in components:
+        for node in _walk_surface_component(component):
+            object_id = int(getattr(node, "object_id", 0) or 0)
+            if object_id <= 0 or object_id in seen:
+                continue
+            seen.add(object_id)
+            nodes.append(node)
+    return tuple(nodes)
+
+
+def _walk_surface_component(node: SDFNode) -> Iterator[SDFNode]:
+    yield node
+    for child in node.children():
+        yield from _walk_surface_component(child)
 
 
 def _translation_cache_signature(

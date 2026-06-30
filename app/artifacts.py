@@ -104,6 +104,7 @@ def build_render_artifact(
         tree,
         render_snapshot.version,
         cache=surface_cache,
+        include_component_surfaces=True,
     )
     surface_ms = (perf_counter() - surface_start) * 1000.0
     total_ms = (perf_counter() - total_start) * 1000.0

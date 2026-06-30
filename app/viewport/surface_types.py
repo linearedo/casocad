@@ -7,7 +7,7 @@ nothing from the viewport package.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import numpy as np
@@ -61,6 +61,19 @@ class ViewportSurfaceScene:
     revision: int
     surfaces: tuple[ViewportSurface, ...]
     build_ms: float
+    primary_object_ids: frozenset[int] = frozenset()
+
+    def with_components_visible(self, visible: bool) -> ViewportSurfaceScene:
+        if visible or not self.primary_object_ids:
+            return self
+        primary = tuple(
+            surface
+            for surface in self.surfaces
+            if int(surface.key.object_id) in self.primary_object_ids
+        )
+        if len(primary) == len(self.surfaces):
+            return self
+        return replace(self, surfaces=primary)
 
     @property
     def has_geometry(self) -> bool:
