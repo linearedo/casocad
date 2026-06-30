@@ -141,7 +141,9 @@ def test_intersect_with_union_is_rejected() -> None:
     # Union result is outside-exact only; it cannot fill an inside-exact slot.
     obstacles = Union(name="obs", left=_sphere("o1"), right=_sphere("o2"))
     scene = Intersection(name="bad", left=obstacles, right=_box())
-    assert exactness_violations(scene)
+    violations = exactness_violations(scene)
+    assert any("Union cannot be used" in v for v in violations)
+    assert any("A meshable Domain needs exact interior distance" in v for v in violations)
     with pytest.raises(ExactnessError):
         validate_exactness(scene)
 
@@ -158,4 +160,5 @@ def test_difference_left_slot_rejects_obstacle_result() -> None:
     obstacles = Union(name="obs", left=_sphere("o1"), right=_sphere("o2"))
     scene = Difference(name="bad", left=obstacles, right=_box())
     violations = exactness_violations(scene)
-    assert any("left slot requires inside" in v for v in violations)
+    assert any("Union cannot be used as the left operand" in v for v in violations)
+    assert any("use this Union only as a subtraction cutter" in v for v in violations)

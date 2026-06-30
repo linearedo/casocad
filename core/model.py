@@ -31,7 +31,7 @@ from core.sdf.roles import Domain, DomainKind, exactness_violations
 
 
 class ModelCompileError(ValueError):
-    """Raised when a Model fails a compile-time invariant (role grammar §4 or
+    """Raised when a Model fails a compile-time invariant (exactness §4 or
     disjointness §7)."""
 
 
@@ -168,7 +168,7 @@ def compile_model(
         exactness_issues = exactness_violations(domain.region)
         if exactness_issues:
             raise ModelCompileError(
-                f"Domain {domain.name!r} violates the exact-operator grammar:\n  "
+                f"Domain {domain.name!r} cannot be compiled for meshing:\n  "
                 + "\n  ".join(exactness_issues)
             )
 

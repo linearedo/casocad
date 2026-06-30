@@ -91,7 +91,9 @@ def test_xor_is_not_in_exact_compiler_grammar() -> None:
         right=Sphere(name="sphere", radius=0.3),
     )
     assert node_exactness(node) is Exactness.NONE
-    assert exactness_violations(node)
+    violations = exactness_violations(node)
+    assert any("XOR 'xor' is not accepted for solver-ready Domains yet" in v for v in violations)
+    assert any("free SDF modeling" in v for v in violations)
 
     region_only = Difference(
         name="region",
