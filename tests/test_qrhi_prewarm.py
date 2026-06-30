@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import struct
+
 import numpy as np
 
 from app.viewport.renderers.qrhi.surface_renderer import (
@@ -9,6 +11,7 @@ from app.viewport.renderers.qrhi.surface_renderer import (
     _SurfaceChunk,
     _chunk_from_surface,
     _dynamic_line_payload,
+    _pack_surface_ubo,
     _safe_normal_array,
 )
 from app.viewport.surface_builder import (
@@ -33,6 +36,13 @@ def test_surface_renderer_has_no_tool_shader_prewarm_contract() -> None:
     assert not renderer.should_prewarm_tool_pipeline()
     assert renderer.prewarm_for_tool(None, "quadratic_bezier_surface") is None
     assert renderer.save_pipeline_cache() is None
+
+
+def test_surface_ubo_packs_opacity_after_mvp() -> None:
+    data = _pack_surface_ubo(np.eye(4, dtype=np.float32), 0.42)
+
+    assert len(data) == 80
+    assert abs(struct.unpack_from("<f", data, 64)[0] - 0.42) < 1.0e-6
 
 
 def test_indexed_surface_chunk_uses_stable_vertex_and_index_payloads() -> None:

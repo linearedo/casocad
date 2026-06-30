@@ -835,7 +835,9 @@ class QRhiViewportWidget(QRhiWidget):
     def _visible_surface_scene(self, surface_scene):
         if surface_scene is None:
             return None
-        return surface_scene.with_components_visible(self._components_visible)
+        return surface_scene.with_components_visible(
+            self._components_visible
+        ).with_selected_highlight(self._selected_id)
 
     def frame_box(self, box) -> None:
         cx = (box.x_min + box.x_max) * 0.5
@@ -1436,6 +1438,7 @@ class QRhiViewportWidget(QRhiWidget):
         """Sync the viewport highlight/gizmo with the tree-panel selection."""
         self._selected_id = int(getattr(node, "object_id", 0) or 0)
         self._selected_anchor_cache = self._anchor_from_node(node)
+        self._publish_surface_scene(self._committed_surface_scene)
         self._dirty = True
 
     def _anchor_from_node(self, node):

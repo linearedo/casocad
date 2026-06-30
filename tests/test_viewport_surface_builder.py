@@ -224,6 +224,23 @@ def test_component_surface_scene_can_filter_boolean_operands() -> None:
         surface.key.object_id
         for surface in with_operands.with_components_visible(False).surfaces
     ] == [result_handle]
+    highlighted = with_operands.with_selected_highlight(circle.object_id)
+    original_color = next(
+        surface.color
+        for surface in with_operands.surfaces
+        if surface.key.object_id == circle.object_id
+    )
+    highlighted_color = next(
+        surface.color
+        for surface in highlighted.surfaces
+        if surface.key.object_id == circle.object_id
+    )
+
+    assert highlighted_color != original_color
+    assert all(
+        highlighted_color[index] >= original_color[index]
+        for index in range(3)
+    )
 
 
 def test_2d_difference_profile_preserves_hole_fill() -> None:

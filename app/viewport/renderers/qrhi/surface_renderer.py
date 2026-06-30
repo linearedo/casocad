@@ -66,6 +66,7 @@ layout(location = 2) in vec3 in_color;
 layout(location = 0) out vec3 v_color;
 layout(std140, binding = 0) uniform SurfaceUBO {
     mat4 mvp;
+    float opacity;
 };
 vec3 safeNormal(vec3 value) {
     float len2 = dot(value, value);
@@ -87,8 +88,12 @@ _SURFACE_FRAG = """\
 #version 450
 layout(location = 0) in vec3 v_color;
 layout(location = 0) out vec4 frag_color;
+layout(std140, binding = 0) uniform SurfaceUBO {
+    mat4 mvp;
+    float opacity;
+};
 void main() {
-    frag_color = vec4(v_color, 1.0);
+    frag_color = vec4(v_color, clamp(opacity, 0.0, 1.0));
 }
 """
 
@@ -260,8 +265,8 @@ def _normalize(vector: NDArray[np.float64]) -> NDArray[np.float64]:
     return vector / norm
 
 
-def _pack_mat4(matrix: NDArray[np.float32]) -> bytes:
-    return struct.pack("<16f", *matrix.T.reshape(-1))
+def _pack_surface_ubo(matrix: NDArray[np.float32], opacity: float) -> bytes:
+    return struct.pack("<16f4f", *matrix.T.reshape(-1), float(opacity), 0.0, 0.0, 0.0)
 
 
 class QRhiSurfaceRenderer:
@@ -277,6 +282,7 @@ class QRhiSurfaceRenderer:
         self._surface_ubo = None
         self._surface_srb = None
         self._surface_pipeline = None
+        self._transparent_surface_pipeline = None
         self._wire_pipeline = None
         self._grid_ubo = None
         self._grid_ubo_members = None
@@ -321,7 +327,7 @@ class QRhiSurfaceRenderer:
         self._surface_ubo = rhi.newBuffer(
             QRhiBuffer.Type.Dynamic,
             QRhiBuffer.UsageFlag.UniformBuffer,
-            64,
+            80,
         )
         self._surface_ubo.create()
         self._grid_ubo_members = uniform_block_members(_GRID_FRAG)
@@ -434,6 +440,7 @@ class QRhiSurfaceRenderer:
         self.clear()
         for name in (
             "_surface_pipeline",
+            "_transparent_surface_pipeline",
             "_wire_pipeline",
             "_surface_srb",
             "_surface_ubo",
@@ -494,13 +501,16 @@ class QRhiSurfaceRenderer:
 
     def _build_surface_pipelines(self) -> None:
         assert self._rhi is not None
-        vertex_stage = QRhiShaderResourceBinding.StageFlag.VertexStage
+        surface_stages = (
+            QRhiShaderResourceBinding.StageFlag.VertexStage
+            | QRhiShaderResourceBinding.StageFlag.FragmentStage
+        )
         self._surface_srb = self._rhi.newShaderResourceBindings()
         self._surface_srb.setBindings(
             [
                 QRhiShaderResourceBinding.uniformBuffer(
                     0,
-                    vertex_stage,
+                    surface_stages,
                     self._surface_ubo,
                 )
             ]
@@ -520,12 +530,21 @@ class QRhiSurfaceRenderer:
             QRhiGraphicsPipeline.Topology.Triangles,
             depth_test=True,
             depth_write=True,
+            blend=False,
+            layout=layout,
+        )
+        self._transparent_surface_pipeline = self._new_surface_pipeline(
+            QRhiGraphicsPipeline.Topology.Triangles,
+            depth_test=True,
+            depth_write=False,
+            blend=True,
             layout=layout,
         )
         self._wire_pipeline = self._new_surface_pipeline(
             QRhiGraphicsPipeline.Topology.Lines,
             depth_test=True,
             depth_write=False,
+            blend=False,
             layout=layout,
         )
 
@@ -535,6 +554,7 @@ class QRhiSurfaceRenderer:
         *,
         depth_test: bool,
         depth_write: bool,
+        blend: bool,
         layout: QRhiVertexInputLayout,
     ):
         pipeline = self._rhi.newGraphicsPipeline()
@@ -542,6 +562,14 @@ class QRhiSurfaceRenderer:
         pipeline.setCullMode(QRhiGraphicsPipeline.CullMode.None_)
         pipeline.setDepthTest(depth_test)
         pipeline.setDepthWrite(depth_write)
+        if blend:
+            target = QRhiGraphicsPipeline.TargetBlend()
+            target.enable = True
+            target.srcColor = QRhiGraphicsPipeline.BlendFactor.SrcAlpha
+            target.dstColor = QRhiGraphicsPipeline.BlendFactor.OneMinusSrcAlpha
+            target.srcAlpha = QRhiGraphicsPipeline.BlendFactor.One
+            target.dstAlpha = QRhiGraphicsPipeline.BlendFactor.OneMinusSrcAlpha
+            pipeline.setTargetBlends([target])
         pipeline.setShaderStages(
             [
                 QRhiShaderStage(
@@ -648,7 +676,10 @@ class QRhiSurfaceRenderer:
         rub.updateDynamicBuffer(
             self._surface_ubo,
             0,
-            _pack_mat4(self._camera_matrix(width, height, camera)),
+            _pack_surface_ubo(
+                self._camera_matrix(width, height, camera),
+                float(camera.get("u_surface_opacity", 1.0)),
+            ),
         )
         if int(camera.get("u_show_grid", 1)) == 1:
             rub.updateDynamicBuffer(
@@ -701,8 +732,14 @@ class QRhiSurfaceRenderer:
             return
         draw_filled = bool(camera.get("filled_visible", True))
         draw_solid_wire = bool(camera.get("wireframe_visible", False))
-        if draw_filled and self._surface_pipeline is not None:
-            cb.setGraphicsPipeline(self._surface_pipeline)
+        opacity = max(0.0, min(1.0, float(camera.get("u_surface_opacity", 1.0))))
+        surface_pipeline = (
+            self._surface_pipeline
+            if opacity >= 0.999
+            else self._transparent_surface_pipeline
+        )
+        if draw_filled and surface_pipeline is not None:
+            cb.setGraphicsPipeline(surface_pipeline)
             cb.setViewport(QRhiViewport(0, 0, width, height))
             cb.setShaderResources(self._surface_srb)
             for chunk in self._chunks:

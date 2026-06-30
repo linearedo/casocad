@@ -75,6 +75,30 @@ class ViewportSurfaceScene:
             return self
         return replace(self, surfaces=primary)
 
+    def with_selected_highlight(self, object_id: int) -> ViewportSurfaceScene:
+        selected_id = int(object_id)
+        if selected_id <= 0:
+            return self
+        changed = False
+        surfaces: list[ViewportSurface] = []
+        for surface in self.surfaces:
+            if int(surface.key.object_id) != selected_id:
+                surfaces.append(surface)
+                continue
+            changed = True
+            surfaces.append(
+                replace(
+                    surface,
+                    color=tuple(
+                        min(1.0, float(component) * 1.35 + 0.16)
+                        for component in surface.color
+                    ),
+                )
+            )
+        if not changed:
+            return self
+        return replace(self, surfaces=tuple(surfaces))
+
     @property
     def has_geometry(self) -> bool:
         return any(surface.has_geometry for surface in self.surfaces)
