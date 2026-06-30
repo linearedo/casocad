@@ -9,6 +9,7 @@ from core.meshing import load_meshable_domains
 from core.scene import SceneDocument
 from core.serialization import load_scene, save_scene
 from core.sdf import CircleProfile, DistanceOffsetProfile, PlacedSDF2D
+from core.sdf.roles import DomainKind
 
 
 def test_save_scene_writes_name_based_json(tmp_path: Path) -> None:
@@ -27,8 +28,9 @@ def test_save_scene_writes_name_based_json(tmp_path: Path) -> None:
     }
     assert "object_id" not in payload["objects"]["flow_volume"]
     assert payload["boundary_regions"]["inlet"]["owner"] == "flow_volume"
-    assert payload["domains"]["fluid"]["root"] == "von_karman_fluid"
-    assert payload["domains"]["fluid"]["tags"] == ["inlet", "outlet"]
+    assert payload["domains"]["von_karman_fluid"]["type"] == "fluid"
+    assert payload["domains"]["von_karman_fluid"]["root"] == "von_karman_fluid"
+    assert payload["domains"]["von_karman_fluid"]["tags"] == ["inlet", "outlet"]
 
 
 def test_load_scene_reads_hand_authored_name_based_json(tmp_path: Path) -> None:
@@ -90,6 +92,27 @@ def test_load_scene_reads_hand_authored_name_based_json(tmp_path: Path) -> None:
     )
     assert values[0] > 0.0
     assert values[1] < 0.0
+    assert document.domain_kinds[document.fluid_domain.root.object_id] is DomainKind.FLUID
+
+
+def test_save_load_preserves_solid_domain_declaration(tmp_path: Path) -> None:
+    document = SceneDocument()
+    handle = document.add_primitive("box")
+    box = document.node(handle)
+    document.set_domain_root(handle, DomainKind.SOLID)
+    path = tmp_path / "solid.json"
+
+    save_scene(document, path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["domains"][box.name] == {
+        "type": "solid",
+        "root": box.name,
+    }
+
+    loaded = load_scene(path)
+    loaded_box = loaded.objects[0]
+    assert loaded.domain_kinds[loaded_box.object_id] is DomainKind.SOLID
+    assert loaded.fluid_domain is None
 
 
 def test_mesh_api_loads_new_scene_json() -> None:

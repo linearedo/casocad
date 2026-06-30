@@ -53,10 +53,16 @@ class Model:
             raise ValueError("Domain names must be unique within a Model")
 
 
+class _HasRoot(Protocol):
+    root: SDFNode
+
+
 class _HasObjects(Protocol):
     """Minimal structural view of a SceneDocument (avoids a core.scene import
-    cycle): anything exposing a list of top-level SDF objects."""
+    cycle): anything exposing the current declared fluid domain."""
 
+    fluid_domain: _HasRoot | None
+    domain_kinds: dict[int, DomainKind]
     objects: list[SDFNode]
 
 
@@ -65,28 +71,39 @@ def model_from_document(
     *,
     kinds: dict[str, DomainKind] | None = None,
 ) -> Model:
-    """Derive a :class:`Model` from a free-form ``SceneDocument`` (spec §5).
+    """Derive a :class:`Model` from explicitly declared document Domains.
 
-    Each top-level object becomes a named Domain. Existing scenes carry no
-    Fluid/Solid tag, so every Domain defaults to ``FLUID``; pass ``kinds`` (by
-    object name) to mark Solid domains. This is the additive bridge that lets the
-    current document feed :func:`compile_model` -- it does not yet replace
-    ``SceneDocument``.
-
-    The Model's unique-name invariant applies: top-level object names must be
-    distinct (they are, in normal documents).
+    Free top-level construction objects are not Domains by default: a user must
+    explicitly mark a Fluid or Solid Domain before validation/meshing compiles it.
     """
 
-    kinds = kinds or {}
-    domains = tuple(
-        Domain(
-            name=obj.name,
-            kind=kinds.get(obj.name, DomainKind.FLUID),
-            region=obj,
+    if not document.domain_kinds:
+        return Model()
+    nodes_by_id: dict[int, SDFNode] = {}
+
+    def visit(node: SDFNode) -> None:
+        if node.object_id > 0:
+            nodes_by_id[node.object_id] = node
+        for child in node.children():
+            visit(child)
+
+    for root in document.objects:
+        visit(root)
+
+    overrides = kinds or {}
+    domains = []
+    for object_id, kind in sorted(document.domain_kinds.items()):
+        root = nodes_by_id.get(object_id)
+        if root is None:
+            continue
+        domains.append(
+            Domain(
+                name=root.name,
+                kind=overrides.get(root.name, kind),
+                region=root,
+            )
         )
-        for obj in document.objects
-    )
-    return Model(domains=domains)
+    return Model(domains=tuple(domains))
 
 
 def domains_overlap(

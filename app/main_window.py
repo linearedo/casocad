@@ -59,6 +59,7 @@ from core.sdf import (
     Xor,
 )
 from core.sdf.base import BoundingBox3D, SDFNode
+from core.sdf.roles import DomainKind
 from core.serialization import load_scene, save_scene
 from core.scene import INTERNAL_BOUNDARY_SELECTOR_PREFIX, SceneDocument
 
@@ -375,8 +376,7 @@ class MainWindow(QMainWindow):
         self._meshing_workspace = None
 
     def _model_or_none(self):
-        """Adapt the live document to a Model, or None if it cannot form one
-        (e.g. duplicate top-level names mid-edit). See core.model.model_from_document."""
+        """Adapt explicitly declared document Domains to a compiler Model."""
         try:
             return model_from_document(self.document)
         except ValueError:
@@ -419,7 +419,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Validate Domains",
-                "Top-level object names must be unique to form Domains.",
+                "The declared Domain names must be unique.",
+            )
+            return
+        if not model.domains:
+            QMessageBox.warning(
+                self,
+                "Validate Domains",
+                "No Domains are defined. Select an SDF object and choose "
+                "'Set as Domain' before validating solver-ready geometry.",
             )
             return
         problems = grammar_violations(model) + disjointness_violations(model)
@@ -487,6 +495,7 @@ class MainWindow(QMainWindow):
         signals.sdf_op_preview_requested.connect(self._on_sdf_op_preview_requested)
         signals.transform_requested.connect(self._on_transform_requested)
         signals.solid_from_2d_requested.connect(self._on_solid_from_2d)
+        signals.set_domain_requested.connect(self._on_set_domain)
         signals.set_fluid_root_requested.connect(self._on_set_fluid_root)
         signals.set_tag_enabled_requested.connect(self._on_set_tag_enabled)
         signals.create_boundary_region_requested.connect(
@@ -1751,11 +1760,20 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_set_fluid_root(self, handles: list[int]) -> None:
+        self._on_set_domain(handles, DomainKind.FLUID.value)
+
+    @Slot(object, str)
+    def _on_set_domain(self, handles: list[int], kind: str) -> None:
         if len(handles) != 1:
+            return
+        try:
+            domain_kind = DomainKind(kind)
+        except ValueError:
+            signals.log_message.emit("warning", f"Unknown Domain kind: {kind}")
             return
         undo_snapshot = self._history_snapshot()
         try:
-            self.document.set_fluid_root(handles[0])
+            self.document.set_domain_root(handles[0], domain_kind)
         except (ValueError, KeyError) as error:
             signals.log_message.emit("warning", str(error))
             return

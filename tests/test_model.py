@@ -130,20 +130,42 @@ def test_compile_fails_on_role_grammar_violation() -> None:
 
 
 def test_model_from_default_document_compiles() -> None:
-    # The default von-Karman scene (Difference(box, cylinder)) -> a one-Domain
-    # Model that passes both compile invariants.
+    # The default von-Karman scene declares one FluidDomain root.
     document = SceneDocument.default()
     model = model_from_document(document)
-    assert len(model.domains) == len(document.objects)
+    assert len(model.domains) == 1
+    assert document.fluid_domain is not None
+    assert model.domains[0].region is document.fluid_domain.root
     assert all(d.kind is DomainKind.FLUID for d in model.domains)
     compile_model(model)  # no raise
 
 
 def test_model_from_document_honours_solid_kind_override() -> None:
     document = SceneDocument.default()
-    name = document.objects[0].name
+    assert document.fluid_domain is not None
+    name = document.fluid_domain.root.name
     model = model_from_document(document, kinds={name: DomainKind.SOLID})
     assert model.domains[0].kind is DomainKind.SOLID
+
+
+def test_model_from_document_ignores_undeclared_construction_objects() -> None:
+    document = SceneDocument()
+    document.add_primitive("sphere")
+    document.add_primitive("box")
+    model = model_from_document(document)
+    assert model.domains == ()
+
+
+def test_model_from_document_uses_declared_solid_domain() -> None:
+    document = SceneDocument()
+    handle = document.add_primitive("box")
+    box = document.node(handle)
+    document.set_domain_root(handle, DomainKind.SOLID)
+    model = model_from_document(document)
+    assert len(model.domains) == 1
+    assert model.domains[0].name == box.name
+    assert model.domains[0].kind is DomainKind.SOLID
+    assert model.domains[0].region is box
 
 
 # --- grammar_violations: the cheap live-diagnostics half --------------------

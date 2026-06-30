@@ -51,6 +51,7 @@ from .sdf.base import SDFNode
 from .sdf.operators import BinarySDFOperator
 from .sdf.primitives_1d import Profile1D
 from .sdf.primitives_2d import Profile2D
+from .sdf.roles import DomainKind
 from .sdf.transforms import UnaryTransform
 
 SCENE_FORMAT_VERSION = 1
@@ -91,22 +92,34 @@ def save_scene(document: SceneDocument, path: str | Path) -> None:
             key: _boundary_region_to_record(region, names)
             for _object_id, key, region in region_items
         }
-    if document.fluid_domain is not None:
-        domain = document.fluid_domain
-        payload["domains"] = {
-            "fluid": {
-                "type": "fluid",
-                "root": names.node_keys[id(domain.root)],
-                "tags": [
-                    names.key_for_tag(tag)
-                    for tag in domain.tag_objects
-                ],
-                "selectors": [
-                    names.node_keys[id(selector)]
-                    for selector in domain.selector_objects
-                ],
-            }
+    domain_records: dict[str, Any] = {}
+    nodes_by_object_id = {
+        node.object_id: node
+        for node in names.nodes_by_key.values()
+        if node.object_id > 0
+    }
+    fluid = document.fluid_domain
+    effective_domain_kinds = dict(document.domain_kinds)
+    if fluid is not None:
+        effective_domain_kinds.setdefault(fluid.root.object_id, DomainKind.FLUID)
+    for object_id, kind in sorted(effective_domain_kinds.items()):
+        root = nodes_by_object_id.get(object_id)
+        if root is None:
+            continue
+        root_key = names.node_keys[id(root)]
+        record: dict[str, Any] = {
+            "type": kind.value,
+            "root": root_key,
         }
+        if fluid is not None and fluid.root is root:
+            record["tags"] = [names.key_for_tag(tag) for tag in fluid.tag_objects]
+            record["selectors"] = [
+                names.node_keys[id(selector)]
+                for selector in fluid.selector_objects
+            ]
+        domain_records[root_key] = record
+    if domain_records:
+        payload["domains"] = domain_records
     Path(path).write_text(
         json.dumps(payload, indent=2) + "\n",
         encoding="utf-8",
@@ -164,17 +177,27 @@ def load_scene(path: str | Path) -> SceneDocument:
         roots,
         boundary_regions=list(regions_by_name.values()),
     )
-    domains = payload.get("domains", {})
-    if domains:
-        if not isinstance(domains, dict):
+    raw_domains = payload.get("domains", {})
+    if raw_domains:
+        if not isinstance(raw_domains, dict):
             raise ValueError("domains must be a name-keyed object")
-        fluid_record = domains.get("fluid") or domains.get("main")
-        if fluid_record is not None:
-            if not isinstance(fluid_record, dict):
-                raise ValueError("fluid domain must be a JSON object")
-            root_name = str(fluid_record["root"])
+        for domain_key, domain_record in raw_domains.items():
+            if not isinstance(domain_record, dict):
+                raise ValueError(f"domain '{domain_key}' must be a JSON object")
+            root_name = str(domain_record["root"])
+            root = build(root_name)
+            try:
+                kind = DomainKind(str(domain_record.get("type", "fluid")))
+            except ValueError as error:
+                raise ValueError(
+                    f"domain '{domain_key}' has unknown type "
+                    f"{domain_record.get('type')!r}"
+                ) from error
+            document.domain_kinds[root.object_id] = kind
+            if kind is not DomainKind.FLUID:
+                continue
             tags = []
-            for tag_name in fluid_record.get("tags", []):
+            for tag_name in domain_record.get("tags", []):
                 key = str(tag_name)
                 if key in regions_by_name:
                     tags.append(regions_by_name[key])
@@ -188,8 +211,11 @@ def load_scene(path: str | Path) -> SceneDocument:
                             f"fluid tag '{key}' has an unsupported dimension"
                         )
                     tags.append(tag)
-            selectors = tuple(build(str(name)) for name in fluid_record.get("selectors", []))
-            document.fluid_domain = FluidDomain(build(root_name), tuple(tags), selectors)
+            selectors = tuple(
+                build(str(name)) for name in domain_record.get("selectors", [])
+            )
+            if document.fluid_domain is None:
+                document.fluid_domain = FluidDomain(root, tuple(tags), selectors)
     document._reindex()
     return document
 

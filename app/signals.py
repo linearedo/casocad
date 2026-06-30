@@ -34,6 +34,7 @@ class AppSignals(QObject):
     sdf_op_preview_requested = Signal(str, object)
     transform_requested = Signal(str, object)
     solid_from_2d_requested = Signal(str, object)
+    set_domain_requested = Signal(object, str)
     set_fluid_root_requested = Signal(object)
     set_tag_enabled_requested = Signal(object, bool)
     create_boundary_region_requested = Signal(object)

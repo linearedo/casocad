@@ -20,6 +20,7 @@ from .boundary_patches import (
 )
 from .domain import FluidDomain
 from .preconditions import revolve_violations
+from .sdf.roles import DomainKind
 from .sdf import (
     QuadraticBezierCurveProfile,
     QuadraticBezierSurfaceProfile,
@@ -98,6 +99,7 @@ class SceneDocument:
     objects: list[SDFNode] = field(default_factory=list)
     fluid_domain: FluidDomain | None = None
     boundary_regions: list[BoundaryRegion] = field(default_factory=list)
+    domain_kinds: dict[int, DomainKind] = field(default_factory=dict)
     version: int = 0
     _next_object_id: int = field(default=1, init=False, repr=False)
     _handles: dict[int, SceneItem] = field(default_factory=dict, init=False, repr=False)
@@ -121,6 +123,11 @@ class SceneDocument:
         )
         self._next_object_id = maximum_id + 1
         self._reindex()
+        if self.fluid_domain is not None:
+            self.domain_kinds.setdefault(
+                self.fluid_domain.root.object_id,
+                DomainKind.FLUID,
+            )
         self._refresh_fluid_domain()
 
     @property
@@ -163,6 +170,7 @@ class SceneDocument:
         document.objects = [root]
         document.boundary_regions = [inlet, outlet]
         document.fluid_domain = FluidDomain(root, (inlet, outlet))
+        document.domain_kinds[root.object_id] = DomainKind.FLUID
         document._reindex()
         return document
 
@@ -1219,6 +1227,19 @@ class SceneDocument:
             else ()
         )
         self.fluid_domain = FluidDomain(node, tags, selectors)
+        self.domain_kinds[node.object_id] = DomainKind.FLUID
+        self.mark_changed()
+
+    def set_domain_root(self, handle: int, kind: DomainKind) -> None:
+        node = self.node(handle)
+        if not isinstance(node, SDFNode) or node.dimension not in {2, 3}:
+            raise ValueError("Domain root must be a 2D or 3D SDF")
+        if kind is DomainKind.FLUID:
+            self.set_fluid_root(handle)
+            return
+        if self.fluid_domain is not None and self.fluid_domain.root is node:
+            self.fluid_domain = None
+        self.domain_kinds[node.object_id] = kind
         self.mark_changed()
 
     @staticmethod
@@ -2059,6 +2080,7 @@ class SceneDocument:
     ) -> tuple[
         list[SDFNode],
         FluidDomain | None,
+        dict[int, DomainKind],
         list[BoundaryRegion],
         int,
         int,
@@ -2066,22 +2088,39 @@ class SceneDocument:
     ]:
         self.refresh_derived_geometry()
         memo: dict[int, object] = {}
-        objects, fluid_domain, boundary_regions, version, next_object_id = deepcopy(
+        (
+            objects,
+            fluid_domain,
+            domain_kinds,
+            boundary_regions,
+            version,
+            next_object_id,
+        ) = deepcopy(
             (
                 self.objects,
                 self.fluid_domain,
+                self.domain_kinds,
                 self.boundary_regions,
                 self.version,
                 self._next_object_id,
             ),
             memo,
         )
-        return objects, fluid_domain, boundary_regions, version, next_object_id, memo
+        return (
+            objects,
+            fluid_domain,
+            domain_kinds,
+            boundary_regions,
+            version,
+            next_object_id,
+            memo,
+        )
 
     def snapshot(self) -> SceneDocument:
         (
             objects,
             fluid_domain,
+            domain_kinds,
             boundary_regions,
             version,
             next_object_id,
@@ -2090,6 +2129,7 @@ class SceneDocument:
         snapshot = SceneDocument(
             objects=objects,
             fluid_domain=fluid_domain,
+            domain_kinds=domain_kinds,
             boundary_regions=boundary_regions,
             version=version,
         )
@@ -2274,6 +2314,11 @@ class SceneDocument:
             node for root in self.objects for node in self._iter_nodes(root)
         )
         live_sdf_ids = {node.object_id for node in live_sdf_nodes}
+        self.domain_kinds = {
+            object_id: kind
+            for object_id, kind in self.domain_kinds.items()
+            if object_id in live_sdf_ids
+        }
         self.boundary_regions = [
             region
             for region in self.boundary_regions
@@ -2287,6 +2332,7 @@ class SceneDocument:
         if id(self.fluid_domain.root) not in live:
             self.fluid_domain = None
             return
+        self.domain_kinds[self.fluid_domain.root.object_id] = DomainKind.FLUID
         tags = tuple(
             tag for tag in self.fluid_domain.tag_objects if id(tag) in live
         )

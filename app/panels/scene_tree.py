@@ -18,6 +18,7 @@ from app.panels.display import display_kind
 from app.signals import signals
 from core.boundary import BoundaryRegion
 from core.scene import SceneDocument
+from core.sdf.roles import DomainKind
 from core.sdf import PlacedPolyline1D, PlacedSDF1D, PlacedSDF2D, PolylineProfile
 from core.sdf.base import SDFNode
 HANDLE_ROLE = Qt.ItemDataRole.UserRole
@@ -119,10 +120,14 @@ class SceneTreePanel(QWidget):
             if isinstance(node, SDFNode) and document.is_internal_scene_node(node):
                 continue
             role = ""
+            if isinstance(node, SDFNode):
+                domain_kind = document.domain_kinds.get(node.object_id)
+                if domain_kind is DomainKind.FLUID:
+                    role = "Fluid Domain"
+                elif domain_kind is DomainKind.SOLID:
+                    role = "Solid Domain"
             if document.fluid_domain is not None:
-                if node is document.fluid_domain.root:
-                    role = "Fluid root"
-                elif node in document.fluid_domain.tag_objects:
+                if node in document.fluid_domain.tag_objects:
                     role = (
                         "Boundary tag"
                         if isinstance(
@@ -266,14 +271,20 @@ class SceneTreePanel(QWidget):
                     value, self.selected_handles()
                 )
             )
-        set_root = menu.addAction("Set as Fluid Domain")
-        set_root.setEnabled(
+        domain_menu = menu.addMenu("Set as Domain")
+        domain_enabled = (
             isinstance(selected_node, SDFNode)
             and selected_node.dimension in {2, 3}
         )
-        set_root.triggered.connect(
-            lambda: signals.set_fluid_root_requested.emit(self.selected_handles())
-        )
+        for label, kind in (("Fluid", "fluid"), ("Solid", "solid")):
+            action = domain_menu.addAction(label)
+            action.setEnabled(domain_enabled)
+            action.triggered.connect(
+                lambda checked=False, value=kind: signals.set_domain_requested.emit(
+                    self.selected_handles(),
+                    value,
+                )
+            )
         enable_tag = menu.addAction("Enable Lattice Tag")
         fluid_root = (
             self._document.fluid_domain.root
