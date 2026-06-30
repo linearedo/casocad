@@ -13,56 +13,64 @@ from core.sdf import (
 from core.sdf.roles import (
     Domain,
     DomainKind,
-    IllegalOperandRole,
-    Role,
-    node_result_roles,
-    result_role,
-    role_violations,
-    validate_roles,
+    Exactness,
+    ExactnessError,
+    exactness_violations,
+    node_exactness,
+    result_exactness,
+    validate_exactness,
 )
 
 
-# --- result_role: the legal closed algebra (spec §4) ------------------------
+# --- result_exactness: the legal closed algebra (spec §4) --------------------
 
 
-def test_intersect_region_region_is_region() -> None:
-    assert result_role("intersect", Role.REGION, Role.REGION) is Role.REGION
+def test_intersect_inside_inside_is_inside() -> None:
+    assert (
+        result_exactness("intersect", Exactness.SDF_INSIDE, Exactness.SDF_INSIDE)
+        is Exactness.SDF_INSIDE
+    )
 
 
-def test_subtract_region_obstacle_is_region() -> None:
-    assert result_role("subtract", Role.REGION, Role.OBSTACLE) is Role.REGION
+def test_subtract_inside_outside_is_inside() -> None:
+    assert (
+        result_exactness("subtract", Exactness.SDF_INSIDE, Exactness.SDF_OUTSIDE)
+        is Exactness.SDF_INSIDE
+    )
 
 
-def test_union_obstacle_obstacle_is_obstacle() -> None:
-    assert result_role("union", Role.OBSTACLE, Role.OBSTACLE) is Role.OBSTACLE
+def test_union_outside_outside_is_outside() -> None:
+    assert (
+        result_exactness("union", Exactness.SDF_OUTSIDE, Exactness.SDF_OUTSIDE)
+        is Exactness.SDF_OUTSIDE
+    )
 
 
-# --- result_role: illegal combinations are unrepresentable ------------------
+# --- result_exactness: illegal combinations are unrepresentable --------------
 
 
 def test_intersect_with_obstacle_rejected() -> None:
-    # An obstacle is only outside-exact; its interior is a bound, so it can
-    # never be an Intersect operand.
-    with pytest.raises(IllegalOperandRole):
-        result_role("intersect", Role.REGION, Role.OBSTACLE)
+    # Outside-exact results cannot fill an inside-exact Intersect slot.
+    with pytest.raises(ExactnessError):
+        result_exactness("intersect", Exactness.SDF_INSIDE, Exactness.SDF_OUTSIDE)
 
 
 def test_subtract_is_non_commutative() -> None:
-    # subtract(Region, Obstacle) is legal; the reverse is not a legal expression.
-    with pytest.raises(IllegalOperandRole):
-        result_role("subtract", Role.OBSTACLE, Role.REGION)
+    # subtract(inside-exact, outside-exact) is legal; the reverse is not.
+    with pytest.raises(ExactnessError):
+        result_exactness("subtract", Exactness.SDF_OUTSIDE, Exactness.SDF_INSIDE)
 
 
 def test_union_of_regions_rejected() -> None:
-    # Union is the obstacle composer only; min is exterior-exact, so a union of
-    # regions would corrupt the interior.
-    with pytest.raises(IllegalOperandRole):
-        result_role("union", Role.REGION, Role.REGION)
+    # Union composes outside-exact fields; a union of inside-exact-only fields
+    # would corrupt the interior.
+    with pytest.raises(ExactnessError):
+        result_exactness("union", Exactness.SDF_INSIDE, Exactness.SDF_INSIDE)
 
 
 def test_unknown_operator_rejected() -> None:
-    with pytest.raises(IllegalOperandRole):
-        result_role("smooth_union", Role.REGION, Role.REGION)
+    with pytest.raises(ExactnessError):
+        result_exactness("smooth_union", Exactness.SDF_INSIDE, Exactness.SDF_INSIDE)
 
 
 # --- Domain container -------------------------------------------------------
@@ -93,32 +101,32 @@ def _sphere(name: str = "s") -> Sphere:
     return Sphere(name=name, radius=0.3)
 
 
-def test_node_result_roles_leaf_is_both() -> None:
-    assert node_result_roles(_box()) == {Role.REGION, Role.OBSTACLE}
+def test_node_exactness_leaf_is_both() -> None:
+    assert node_exactness(_box()) is Exactness.SDF_BOTH
 
 
-def test_node_result_roles_intersection_is_region_only() -> None:
+def test_node_exactness_intersection_is_inside_exact_only() -> None:
     node = Intersection(name="i", left=_box(), right=_sphere())
-    assert node_result_roles(node) == {Role.REGION}
+    assert node_exactness(node) is Exactness.SDF_INSIDE
 
 
-def test_node_result_roles_union_is_obstacle_only() -> None:
+def test_node_exactness_union_is_outside_exact_only() -> None:
     node = Union(name="u", left=_box(), right=_sphere())
-    assert node_result_roles(node) == {Role.OBSTACLE}
+    assert node_exactness(node) is Exactness.SDF_OUTSIDE
 
 
 def test_transform_is_role_transparent() -> None:
-    # A transform over a union still serves only the Obstacle role.
+    # A transform over a union still serves only the outside-exact role.
     union = Union(name="u", left=_box("a"), right=_box("b"))
     moved = Translate(name="t", child=union, offset=(1.0, 0.0, 0.0))
-    assert node_result_roles(moved) == {Role.OBSTACLE}
+    assert node_exactness(moved) is Exactness.SDF_OUTSIDE
 
 
 def test_von_karman_difference_is_valid() -> None:
-    # Difference(Region box, Obstacle cylinder) — the canonical fluid carve.
+    # Difference(inside-exact box, outside-exact cylinder) is the canonical carve.
     scene = Difference(name="fluid", left=_box(), right=_sphere())
-    assert role_violations(scene) == []
-    validate_roles(scene)  # no raise
+    assert exactness_violations(scene) == []
+    validate_exactness(scene)  # no raise
 
 
 def test_subtract_union_of_obstacles_is_valid() -> None:
@@ -126,28 +134,28 @@ def test_subtract_union_of_obstacles_is_valid() -> None:
     # obstacle slot).
     obstacles = Union(name="obs", left=_sphere("o1"), right=_sphere("o2"))
     scene = Difference(name="fluid", left=_box(), right=obstacles)
-    assert role_violations(scene) == []
+    assert exactness_violations(scene) == []
 
 
 def test_intersect_with_union_is_rejected() -> None:
-    # Union result is Obstacle-only; it cannot fill an Intersect's Region slot.
+    # Union result is outside-exact only; it cannot fill an inside-exact slot.
     obstacles = Union(name="obs", left=_sphere("o1"), right=_sphere("o2"))
     scene = Intersection(name="bad", left=obstacles, right=_box())
-    assert role_violations(scene)
-    with pytest.raises(IllegalOperandRole):
-        validate_roles(scene)
+    assert exactness_violations(scene)
+    with pytest.raises(ExactnessError):
+        validate_exactness(scene)
 
 
 def test_union_of_region_result_is_rejected() -> None:
-    # A Difference result is Region-only; it cannot fill a Union's Obstacle slot.
+    # A Difference result is inside-exact only; it cannot fill an outside-exact slot.
     region = Difference(name="r", left=_box(), right=_sphere())
     scene = Union(name="bad", left=region, right=_sphere("o2"))
-    assert role_violations(scene)
+    assert exactness_violations(scene)
 
 
 def test_difference_left_slot_rejects_obstacle_result() -> None:
-    # The left (Region) slot of Subtract cannot take a Union (Obstacle) result.
+    # The left inside-exact slot of Subtract cannot take a Union result.
     obstacles = Union(name="obs", left=_sphere("o1"), right=_sphere("o2"))
     scene = Difference(name="bad", left=obstacles, right=_box())
-    violations = role_violations(scene)
-    assert any("left slot requires region" in v for v in violations)
+    violations = exactness_violations(scene)
+    assert any("left slot requires inside" in v for v in violations)

@@ -2,8 +2,18 @@ from __future__ import annotations
 
 import numpy as np
 
-from core.meshing import MeshableDomain, MeshableDomains, load_meshable_domains
+import pytest
+
+from core.meshing import (
+    MeshableDomain,
+    MeshableDomains,
+    load_meshable_domains,
+    meshable_domains_from_model,
+)
+from core.model import Model, ModelCompileError
 from core.sdf.base import BoundingBox3D
+from core.sdf import Sphere
+from core.sdf.roles import Domain, DomainKind
 
 
 def test_load_meshable_domains_from_scene_json() -> None:
@@ -65,3 +75,51 @@ def test_meshable_domains_reports_ambiguous_kind() -> None:
         assert "ambiguous" in str(exc)
     else:
         raise AssertionError("expected ambiguous kind lookup to fail")
+
+
+def test_meshable_domains_from_exact_model() -> None:
+    model = Model(
+        domains=(
+            Domain(
+                name="water",
+                kind=DomainKind.FLUID,
+                region=Sphere(name="water", center=(0.0, 0.0, 0.0), radius=0.5),
+            ),
+            Domain(
+                name="pipe",
+                kind=DomainKind.SOLID,
+                region=Sphere(name="pipe", center=(2.0, 0.0, 0.0), radius=0.25),
+            ),
+        )
+    )
+
+    domains = meshable_domains_from_model(model)
+
+    assert len(domains) == 2
+    assert domains["water"].kind == ("fluid",)
+    assert domains["pipe"].kind == ("solid",)
+    values = domains["water"].domain_sdf(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
+    )
+    assert values[0] < 0.0
+    assert values[1] > 0.0
+
+
+def test_meshable_domains_from_model_compiles_before_meshing() -> None:
+    model = Model(
+        domains=(
+            Domain(
+                name="a",
+                kind=DomainKind.FLUID,
+                region=Sphere(name="a", center=(0.0, 0.0, 0.0), radius=0.5),
+            ),
+            Domain(
+                name="b",
+                kind=DomainKind.SOLID,
+                region=Sphere(name="b", center=(0.2, 0.0, 0.0), radius=0.5),
+            ),
+        )
+    )
+
+    with pytest.raises(ModelCompileError):
+        meshable_domains_from_model(model)

@@ -9,8 +9,10 @@ import numpy as np
 
 from core.boundary import BoundaryRegion
 from core.boundary_patches import surface_selector_volume
+from core.model import Model, compile_model
 from core.serialization import load_scene
 from core.sdf.base import BoundingBox3D, FloatArray, SDFNode
+from core.sdf.roles import DomainKind
 
 
 SDFCallable = Callable[[np.ndarray], np.ndarray]
@@ -140,6 +142,35 @@ def _boundary_region_callable(
     return outside
 
 
+def meshable_domains_from_model(
+    model: Model,
+    *,
+    validate: bool = True,
+    resolution: int = 32,
+) -> MeshableDomains:
+    """Expose an exact-SDF ``Model`` through the public meshing API.
+
+    ``compile_model`` is the mesh-time hard gate: invalid role wiring,
+    generator precondition failures, or overlapping Domains are refused before
+    a mesher script receives field callables.
+    """
+
+    if validate:
+        compile_model(model, resolution=resolution)
+    return MeshableDomains(
+        tuple(
+            MeshableDomain(
+                name=domain.name,
+                kind=(domain.kind.value,),
+                dimension=domain.region.dimension,
+                bounds=domain.region.bounding_box(),
+                domain_sdf=sdf_callable(domain.region),
+            )
+            for domain in model.domains
+        )
+    )
+
+
 def load_meshable_domains(scene_path: str | Path) -> MeshableDomains:
     """Load meshable domains from a saved casoCAD ``scene.json``.
 
@@ -172,7 +203,7 @@ def load_meshable_domains(scene_path: str | Path) -> MeshableDomains:
         (
             MeshableDomain(
                 name=root.name,
-                kind=("fluid",),
+                kind=(DomainKind.FLUID.value,),
                 dimension=root.dimension,
                 bounds=fluid.bounding_box(),
                 domain_sdf=sdf_callable(root),
@@ -187,5 +218,6 @@ __all__ = [
     "MeshableDomains",
     "SDFCallable",
     "load_meshable_domains",
+    "meshable_domains_from_model",
     "sdf_callable",
 ]

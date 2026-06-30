@@ -5,8 +5,8 @@ from __future__ import annotations
 A :class:`Model` is the document-level object of the safe geometry compiler. Two
 invariants make a Model *compilable* (:func:`compile_model`):
 
-1. **Role grammar** -- every Domain's region satisfies the slot-role grammar
-   (``core.sdf.roles``, §4): exactness is enforced *by construction*.
+1. **Exactness grammar** -- every Domain's region satisfies the slot-exactness
+   grammar (``core.sdf.roles``, §4): exactness is enforced *by construction*.
 2. **Disjointness** -- the Domains are mutually disjoint (§7). Unlike exactness,
    this is a **checked invariant**: overlap is a *compile error*, not something
    the type system can prevent. ``overlap(A, B)`` iff some point is interior to
@@ -27,7 +27,7 @@ import numpy as np
 
 from core.preconditions import precondition_violations
 from core.sdf.base import SDFNode
-from core.sdf.roles import Domain, DomainKind, role_violations
+from core.sdf.roles import Domain, DomainKind, exactness_violations
 
 
 class ModelCompileError(ValueError):
@@ -138,7 +138,7 @@ def disjointness_violations(
 
 
 def grammar_violations(model: Model) -> list[str]:
-    """Return role-grammar violations across all Domains (empty = OK).
+    """Return exactness-grammar violations across all Domains (empty = OK).
 
     This is the *cheap half* of :func:`compile_model` -- a pure tree walk (§4),
     with no disjointness sampling. Suitable for **live** per-edit diagnostics:
@@ -149,7 +149,7 @@ def grammar_violations(model: Model) -> list[str]:
 
     violations: list[str] = []
     for domain in model.domains:
-        for issue in role_violations(domain.region):
+        for issue in exactness_violations(domain.region):
             violations.append(f"Domain {domain.name!r}: {issue}")
     return violations
 
@@ -159,17 +159,17 @@ def compile_model(
 ) -> None:
     """Validate a Model's compile-time invariants; raise on the first failure.
 
-    Checks, in order: (1) every Domain region satisfies the role grammar (§4);
+    Checks, in order: (1) every Domain region satisfies the exactness grammar (§4);
     (2) the Domains are mutually disjoint (§7). Raises :class:`ModelCompileError`
     if either fails. No-op on a valid Model.
     """
 
     for domain in model.domains:
-        role_issues = role_violations(domain.region)
-        if role_issues:
+        exactness_issues = exactness_violations(domain.region)
+        if exactness_issues:
             raise ModelCompileError(
                 f"Domain {domain.name!r} violates the exact-operator grammar:\n  "
-                + "\n  ".join(role_issues)
+                + "\n  ".join(exactness_issues)
             )
 
     for domain in model.domains:

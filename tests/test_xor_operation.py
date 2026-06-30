@@ -17,7 +17,7 @@ from core.sdf import (
     Sphere,
     Xor,
 )
-from core.sdf.roles import Role, node_result_roles, role_violations
+from core.sdf.roles import Exactness, exactness_violations, node_exactness
 
 
 def test_xor_operator_uses_exact_sdf_formula() -> None:
@@ -84,14 +84,14 @@ def test_scene_combine_xor_saves_and_loads(tmp_path: Path) -> None:
     assert isinstance(loaded.objects[0], Xor)
 
 
-def test_xor_role_validation_requires_both_sided_operands() -> None:
+def test_xor_is_not_in_exact_compiler_grammar() -> None:
     node = Xor(
         name="xor",
         left=Box(name="box", half_size=(1.0, 1.0, 1.0)),
         right=Sphere(name="sphere", radius=0.3),
     )
-    assert node_result_roles(node) == {Role.REGION, Role.OBSTACLE}
-    assert role_violations(node) == []
+    assert node_exactness(node) is Exactness.NONE
+    assert exactness_violations(node)
 
     region_only = Difference(
         name="region",
@@ -99,4 +99,4 @@ def test_xor_role_validation_requires_both_sided_operands() -> None:
         right=Sphere(name="hole", radius=0.3),
     )
     invalid = Xor(name="invalid", left=region_only, right=Sphere(name="s"))
-    assert role_violations(invalid)
+    assert exactness_violations(invalid)

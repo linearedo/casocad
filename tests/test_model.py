@@ -102,7 +102,7 @@ def test_compile_fails_on_overlap() -> None:
 
 
 def test_compile_passes_for_valid_carve_domain() -> None:
-    # Difference(Region, Obstacle) is the canonical fluid carve.
+    # Difference(inside-exact, outside-exact) is the canonical fluid carve.
     region = Difference(
         name="fluid",
         left=Box(name="box", half_size=(1.0, 1.0, 1.0)),
@@ -112,7 +112,7 @@ def test_compile_passes_for_valid_carve_domain() -> None:
 
 
 def test_compile_fails_on_role_grammar_violation() -> None:
-    # Union result is Obstacle-only; it cannot fill an Intersect Region slot.
+    # Union result is outside-exact only; it cannot fill an inside-exact slot.
     bad = Intersection(
         name="bad",
         left=Union(

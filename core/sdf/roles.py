@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-"""Semantic role / type system for the exact-SDF CFD kernel.
+"""Exactness system for the exact-SDF CFD kernel.
 
 casoCAD is a *safe geometry compiler*: the only expressible geometry is a set of
 named, interior-exact-distance Domains (spec v2). This module is the type
 backbone that makes illegal geometry unrepresentable:
 
-* :class:`Role` -- the algebra-side role (Region vs Obstacle), i.e. *which side*
-  of its own boundary a field is guaranteed exact on.
+* :class:`Exactness` -- which side of its own boundary a field is guaranteed
+  exact on.
 * :class:`DomainKind` -- the physics tag on a top-level Domain (Fluid vs Solid).
   Geometry rules are identical for both; the tag only matters downstream.
-* :func:`result_role` -- typed role-collapsing operator signatures from spec §4.
-  The structural validator also covers both-sided operators such as XOR.
-* :class:`Domain` -- a Region promoted to a named, exported top-level cell.
+* :func:`result_exactness` -- typed exactness-collapsing operator signatures from
+  spec §4.
+* :class:`Domain` -- a named, exported top-level cell whose root must be
+  inside-exact.
 
 This first migration commit is **purely additive**: nothing else imports this
 module yet. Later steps wire it into ``operators.py``, ``scene.py``, and
@@ -22,20 +23,23 @@ Reference: ``docs/exact_signed_distance_field_cfd_migration_v2.md`` (§2–§4, 
 """
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, Flag, auto
 
 from .base import SDFNode
 
 
-class Role(Enum):
-    """Algebra-side role: which side of its boundary a field is exact on (§3).
+class Exactness(Flag):
+    """Which side of its boundary a field is exact on (§3).
 
-    ``REGION``   -> inside-exact  (a fluid/solid building block).
-    ``OBSTACLE`` -> outside-exact (subtracted to carve a neighbour).
+    ``SDF_INSIDE`` -> exact inside the shape; valid as a Domain root.
+    ``SDF_OUTSIDE`` -> exact outside the shape; valid as a subtraction cutter.
+    ``SDF_BOTH`` -> full exact signed distance field.
     """
 
-    REGION = "region"
-    OBSTACLE = "obstacle"
+    NONE = 0
+    SDF_INSIDE = auto()
+    SDF_OUTSIDE = auto()
+    SDF_BOTH = SDF_INSIDE | SDF_OUTSIDE
 
 
 class DomainKind(Enum):
@@ -49,8 +53,8 @@ class DomainKind(Enum):
     SOLID = "solid"
 
 
-class IllegalOperandRole(ValueError):
-    """Raised when an exact operator gets operands of the wrong :class:`Role`.
+class ExactnessError(ValueError):
+    """Raised when an exact operator gets operands with the wrong exactness.
 
     This is the compiler refusing to build non-exact geometry: the typed grammar
     of spec §4 makes the illegal combination unrepresentable rather than merely
@@ -58,116 +62,148 @@ class IllegalOperandRole(ValueError):
     """
 
 
-# Typed role-collapsing operator signatures: operator -> (left, right, result).
-#   intersect(Region, Region)   -> Region   f = max(f_A, f_B)
-#   subtract (Region, Obstacle) -> Region   f = max(f_R, -f_O)  [non-commutative]
-#   union    (Obstacle,Obstacle)-> Obstacle f = min(f_A, f_B)
-_OPERATOR_SIGNATURES: dict[str, tuple[Role, Role, Role]] = {
-    "intersect": (Role.REGION, Role.REGION, Role.REGION),
-    "subtract": (Role.REGION, Role.OBSTACLE, Role.REGION),
-    "union": (Role.OBSTACLE, Role.OBSTACLE, Role.OBSTACLE),
+# Typed exactness-collapsing operator signatures: operator -> (left, right, result).
+#   intersect(inside, inside) -> inside   f = max(f_A, f_B)
+#   subtract (inside, outside)-> inside   f = max(f_R, -f_O)  [non-commutative]
+#   union    (outside,outside)-> outside  f = min(f_A, f_B)
+_OPERATOR_SIGNATURES: dict[str, tuple[Exactness, Exactness, Exactness]] = {
+    "intersect": (Exactness.SDF_INSIDE, Exactness.SDF_INSIDE, Exactness.SDF_INSIDE),
+    "subtract": (Exactness.SDF_INSIDE, Exactness.SDF_OUTSIDE, Exactness.SDF_INSIDE),
+    "union": (Exactness.SDF_OUTSIDE, Exactness.SDF_OUTSIDE, Exactness.SDF_OUTSIDE),
 }
 
 
-def result_role(operator: str, left: Role, right: Role) -> Role:
-    """Validate operand roles for an exact operator and return its result role.
+def _exactness_label(exactness: Exactness) -> str:
+    if exactness is Exactness.NONE:
+        return "none"
+    if exactness is Exactness.SDF_BOTH:
+        return "both"
+    labels: list[str] = []
+    if Exactness.SDF_INSIDE in exactness:
+        labels.append("inside")
+    if Exactness.SDF_OUTSIDE in exactness:
+        labels.append("outside")
+    return "+".join(labels)
 
-    Raises :class:`IllegalOperandRole` if ``operator`` is unknown or the operand
-    roles do not match its signature. ``subtract`` is non-commutative:
-    ``(REGION, OBSTACLE)`` is legal, ``(OBSTACLE, REGION)`` is not.
+
+def result_exactness(
+    operator: str,
+    left: Exactness,
+    right: Exactness,
+) -> Exactness:
+    """Validate operand exactness for an operator and return result exactness.
+
+    Raises :class:`ExactnessError` if ``operator`` is unknown or the operands do
+    not provide the exactness required by its slots. ``subtract`` is
+    non-commutative: ``(SDF_INSIDE, SDF_OUTSIDE)`` is legal, the reverse is not.
     """
 
     try:
         want_left, want_right, result = _OPERATOR_SIGNATURES[operator]
     except KeyError:
-        raise IllegalOperandRole(
+        raise ExactnessError(
             f"unknown exact operator {operator!r}; "
             f"allowed: {sorted(_OPERATOR_SIGNATURES)}"
         ) from None
-    if (left, right) != (want_left, want_right):
-        raise IllegalOperandRole(
-            f"{operator}({left.value}, {right.value}) is not exact-safe; "
-            f"required {operator}({want_left.value}, {want_right.value})"
+    if want_left not in left or want_right not in right:
+        raise ExactnessError(
+            f"{operator}({_exactness_label(left)}, {_exactness_label(right)}) "
+            "is not exact-safe; required "
+            f"{operator}({_exactness_label(want_left)}, "
+            f"{_exactness_label(want_right)})"
         )
     return result
 
 
-# --- Slot-role validation engine (explicit-at-the-operator-slot, spec §4) ----
+# --- Slot exactness validation engine (explicit-at-the-operator-slot, spec §4)
 #
-# Roles are NOT stored on nodes. Each operator has fixed *slots* with required
-# roles, and a node's *result role* is determined structurally by its top
-# operator. A leaf primitive (or an exact generator / transform thereof) is
-# exact on BOTH sides, so it can fill EITHER slot — that is what lets the *same*
-# pipe node be a Region in one place and an Obstacle in another (role per use).
+# Exactness is NOT stored on nodes. Each operator has fixed slots with required
+# exactness, and a node's result exactness is determined structurally by its top
+# operator. A leaf primitive (or an exact generator / transform thereof) has
+# Exactness.SDF_BOTH, so it can fill either slot -- that is what lets the same
+# pipe node be a Domain root in one place and a subtraction cutter in another.
 #
 # This is a validation pass, not constructor enforcement: the raw operator
 # dataclasses stay general (the app is also a free SDF renderer), and the Model
-# build (§5) / the typed authoring API call validate_roles() to refuse a
+# build (§5) / the typed authoring API call validate_exactness() to refuse a
 # non-exact CFD scene. node.kind strings are used for dispatch to avoid importing
 # operators/transforms here (no import cycle).
 
-_BOTH: frozenset[Role] = frozenset({Role.REGION, Role.OBSTACLE})
+_BOTH = Exactness.SDF_BOTH
 
-# operator kind -> (left-slot role, right-slot role, result role)
-_KIND_SIGNATURE: dict[str, tuple[Role, Role, Role]] = {
-    "intersection": (Role.REGION, Role.REGION, Role.REGION),
-    "difference": (Role.REGION, Role.OBSTACLE, Role.REGION),
-    "union": (Role.OBSTACLE, Role.OBSTACLE, Role.OBSTACLE),
+# operator kind -> (left-slot exactness, right-slot exactness, result exactness)
+_KIND_SIGNATURE: dict[str, tuple[Exactness, Exactness, Exactness]] = {
+    "intersection": (
+        Exactness.SDF_INSIDE,
+        Exactness.SDF_INSIDE,
+        Exactness.SDF_INSIDE,
+    ),
+    "difference": (
+        Exactness.SDF_INSIDE,
+        Exactness.SDF_OUTSIDE,
+        Exactness.SDF_INSIDE,
+    ),
+    "union": (
+        Exactness.SDF_OUTSIDE,
+        Exactness.SDF_OUTSIDE,
+        Exactness.SDF_OUTSIDE,
+    ),
 }
-_BOTH_SIDED_OPERATOR_KINDS: frozenset[str] = frozenset({"xor"})
 
-# Role-transparent unary transforms (isometry / uniform scale): result role is
-# the child's result role (spec §6).
+# XOR is intentionally not part of the exact compiler grammar: coincident or
+# touching boundaries can cancel, making the standard XOR SDF non-exact.
+_NON_EXACT_OPERATOR_KINDS: frozenset[str] = frozenset({"xor"})
+
+# Exactness-transparent unary transforms (isometry / uniform scale): result
+# exactness is the child's exactness (spec §6).
 _TRANSFORM_KINDS: frozenset[str] = frozenset({"translate", "rotate", "scale"})
 
 
-def node_result_roles(node: SDFNode) -> frozenset[Role]:
-    """Roles this node's result can serve as (spec §4).
+def node_exactness(node: SDFNode) -> Exactness:
+    """Exactness this node's result can provide (spec §4).
 
-    * an exact leaf / generator -> ``{REGION, OBSTACLE}`` (exact both sides),
-    * ``intersection`` / ``difference`` -> ``{REGION}`` (inside-exact only),
-    * ``union`` -> ``{OBSTACLE}`` (outside-exact only),
-    * a role-transparent transform -> its child's result roles.
+    * an exact leaf / generator -> ``SDF_BOTH``,
+    * ``intersection`` / ``difference`` -> inside-exact only,
+    * ``union`` -> outside-exact only,
+    * a role-transparent transform -> its child's exactness.
     """
 
     kind = node.kind
-    if kind in _BOTH_SIDED_OPERATOR_KINDS:
-        return _BOTH
+    if kind in _NON_EXACT_OPERATOR_KINDS:
+        return Exactness.NONE
     signature = _KIND_SIGNATURE.get(kind)
     if signature is not None:
-        return frozenset({signature[2]})
+        return signature[2]
     if kind in _TRANSFORM_KINDS:
         children = node.children()
         if children:
-            return node_result_roles(children[0])
+            return node_exactness(children[0])
     return _BOTH
 
 
-def role_violations(node: SDFNode) -> list[str]:
-    """Return human-readable slot-role violations in the subtree (empty = OK).
+def exactness_violations(
+    node: SDFNode,
+    *,
+    required: Exactness | None = Exactness.SDF_INSIDE,
+) -> list[str]:
+    """Return human-readable exactness violations in the subtree (empty = OK).
 
     For every operator node, each operand must be able to fill its slot's
-    required role (its ``node_result_roles`` must contain that role). Leaves fill
-    either slot; a ``union`` result cannot fill a Region slot; etc.
+    required exactness (its ``node_exactness`` must include that exactness). Leaves
+    fill either slot; a ``union`` result cannot fill an inside-exact slot; etc.
     """
 
     violations: list[str] = []
+    if required is not None and required not in node_exactness(node):
+        violations.append(
+            f"{node.kind}({node.name!r}) root requires "
+            f"{_exactness_label(required)}, but can only serve "
+            f"{_exactness_label(node_exactness(node))}"
+        )
 
     def visit(n: SDFNode) -> None:
         signature = _KIND_SIGNATURE.get(n.kind)
-        if n.kind in _BOTH_SIDED_OPERATOR_KINDS:
-            children = n.children()
-            if len(children) == 2:
-                for child, slot in ((children[0], "left"), (children[1], "right")):
-                    child_roles = node_result_roles(child)
-                    if not _BOTH.issubset(child_roles):
-                        violations.append(
-                            f"{n.kind}({n.name!r}) {slot} slot requires "
-                            f"both-sided exactness, but child "
-                            f"{child.kind}({child.name!r}) can only serve "
-                            f"{sorted(r.value for r in child_roles)}"
-                        )
-        elif signature is not None:
+        if signature is not None:
             want_left, want_right, _ = signature
             children = n.children()
             if len(children) == 2:
@@ -176,12 +212,19 @@ def role_violations(node: SDFNode) -> list[str]:
                     (left, want_left, "left"),
                     (right, want_right, "right"),
                 ):
-                    if want not in node_result_roles(child):
+                    child_exactness = node_exactness(child)
+                    if want not in child_exactness:
                         violations.append(
                             f"{n.kind}({n.name!r}) {slot} slot requires "
-                            f"{want.value}, but child {child.kind}({child.name!r}) "
-                            f"can only serve {sorted(r.value for r in node_result_roles(child))}"
+                            f"{_exactness_label(want)}, but child "
+                            f"{child.kind}({child.name!r}) can only serve "
+                            f"{_exactness_label(child_exactness)}"
                         )
+        elif n.kind in _NON_EXACT_OPERATOR_KINDS:
+            violations.append(
+                f"{n.kind}({n.name!r}) is not part of the exact-SDF compiler "
+                "grammar"
+            )
         for child in n.children():
             visit(child)
 
@@ -189,13 +232,13 @@ def role_violations(node: SDFNode) -> list[str]:
     return violations
 
 
-def validate_roles(node: SDFNode) -> None:
-    """Raise :class:`IllegalOperandRole` if the subtree has any slot-role
+def validate_exactness(node: SDFNode) -> None:
+    """Raise :class:`ExactnessError` if the subtree has any exactness
     violation (spec §4). No-op on a valid tree."""
 
-    violations = role_violations(node)
+    violations = exactness_violations(node)
     if violations:
-        raise IllegalOperandRole(
+        raise ExactnessError(
             "scene violates the exact-operator grammar:\n  "
             + "\n  ".join(violations)
         )
@@ -203,7 +246,7 @@ def validate_roles(node: SDFNode) -> None:
 
 @dataclass(frozen=True)
 class Domain:
-    """A Region promoted to a named, exported top-level cell (spec §2).
+    """A named, exported top-level cell (spec §2).
 
     ``region`` is the inside-exact SDF root; ``kind`` is the physics tag. The
     Domain-level disjointness invariant (§7) is a *Model*-level check, not
@@ -220,12 +263,12 @@ class Domain:
 
 
 __all__ = [
-    "Role",
+    "Exactness",
     "DomainKind",
-    "IllegalOperandRole",
-    "result_role",
-    "node_result_roles",
-    "role_violations",
-    "validate_roles",
+    "ExactnessError",
+    "result_exactness",
+    "node_exactness",
+    "exactness_violations",
+    "validate_exactness",
     "Domain",
 ]
