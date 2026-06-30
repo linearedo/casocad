@@ -128,6 +128,27 @@ vec3 gridA(vec3 ro, vec3 rd, float mt, vec3 col, float s) {
     float fade=clamp(1./(1.+tt*tt*.002),0.,1.);
     return mix(col,vec3(.62,.75,.92),line*s*fade);
 }
+// One world axis (line through the origin along `axis`) drawn with a
+// screen-space-constant width via ray-vs-line distance, like a normal CAD.
+vec3 axisLine(vec3 ro, vec3 rd, float mt, vec3 col, vec3 axis, vec3 acol) {
+    if(u_show_grid==0) return col;
+    float b=dot(rd,axis);
+    float den=1.-b*b;
+    if(abs(den)<1e-6) return col;          // ray parallel to the axis
+    float d=dot(rd,ro);
+    float e=dot(axis,ro);
+    float t=(b*e-d)/den;                    // closest param along the camera ray
+    if(t<=0.||t>=mt) return col;
+    float s=(e-b*d)/den;                    // closest param along the axis
+    vec3 pr=ro+rd*t;
+    vec3 pa=axis*s;
+    float dist=length(pr-pa);
+    float wpp=t*2./(u_focal_length*max(u_resolution.y,1.));  // world units / pixel
+    float px=dist/max(wpp,1e-9);
+    float linev=1.-smoothstep(.9,2.2,px);
+    float fade=clamp(1./(1.+t*t*.0008),0.,1.);
+    return mix(col,acol,linev*fade);
+}
 void main() {
     vec2 px = gl_FragCoord.xy;
     vec2 uv = (px - 0.5*u_resolution)/max(u_resolution.y, 1.0);
@@ -135,8 +156,15 @@ void main() {
     vec3 fwd = normalize(u_camera_target - u_camera_position);
     vec3 rd = normalize(2.0*uv.x*normalize(u_camera_right)
                       + 2.0*uv.y*normalize(u_camera_up) + u_focal_length*fwd);
-    frag_color = vec4(gridA(u_camera_position, rd, u_max_ray_distance,
-                            u_background_color, 0.6), 1.0);
+    vec3 col = gridA(u_camera_position, rd, u_max_ray_distance,
+                     u_background_color, 0.6);
+    col = axisLine(u_camera_position, rd, u_max_ray_distance, col,
+                   vec3(1.,0.,0.), vec3(1.00,0.34,0.25));   // X red
+    col = axisLine(u_camera_position, rd, u_max_ray_distance, col,
+                   vec3(0.,1.,0.), vec3(0.33,0.92,0.41));   // Y green
+    col = axisLine(u_camera_position, rd, u_max_ray_distance, col,
+                   vec3(0.,0.,1.), vec3(0.36,0.57,1.00));   // Z blue
+    frag_color = vec4(col, 1.0);
 }
 """
 
