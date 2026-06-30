@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 import pytest
@@ -11,6 +13,8 @@ from core.meshing import (
     meshable_domains_from_model,
 )
 from core.model import Model, ModelCompileError
+from core.scene import SceneDocument
+from core.serialization import save_scene
 from core.sdf.base import BoundingBox3D
 from core.sdf import Sphere
 from core.sdf.roles import Domain, DomainKind
@@ -123,3 +127,19 @@ def test_meshable_domains_from_model_compiles_before_meshing() -> None:
 
     with pytest.raises(ModelCompileError):
         meshable_domains_from_model(model)
+
+
+def test_load_meshable_domains_includes_saved_solid_domain(tmp_path: Path) -> None:
+    document = SceneDocument()
+    handle = document.add_primitive("box")
+    box = document.node(handle)
+    document.set_domain_root(handle, DomainKind.SOLID)
+    path = tmp_path / "solid.json"
+    save_scene(document, path)
+
+    domains = load_meshable_domains(path)
+
+    assert len(domains) == 1
+    assert domains[0].name == box.name
+    assert domains[0].kind == ("solid",)
+    assert domains["solid"] is domains[0]

@@ -496,6 +496,7 @@ class MainWindow(QMainWindow):
         signals.transform_requested.connect(self._on_transform_requested)
         signals.solid_from_2d_requested.connect(self._on_solid_from_2d)
         signals.set_domain_requested.connect(self._on_set_domain)
+        signals.unset_domain_requested.connect(self._on_unset_domain)
         signals.set_fluid_root_requested.connect(self._on_set_fluid_root)
         signals.set_tag_enabled_requested.connect(self._on_set_tag_enabled)
         signals.create_boundary_region_requested.connect(
@@ -1774,6 +1775,19 @@ class MainWindow(QMainWindow):
         undo_snapshot = self._history_snapshot()
         try:
             self.document.set_domain_root(handles[0], domain_kind)
+        except (ValueError, KeyError) as error:
+            signals.log_message.emit("warning", str(error))
+            return
+        self._record_undo_snapshot(undo_snapshot)
+        self._publish_document(clear_selection=False)
+
+    @Slot(object)
+    def _on_unset_domain(self, handles: list[int]) -> None:
+        if len(handles) != 1:
+            return
+        undo_snapshot = self._history_snapshot()
+        try:
+            self.document.unset_domain_root(handles[0])
         except (ValueError, KeyError) as error:
             signals.log_message.emit("warning", str(error))
             return

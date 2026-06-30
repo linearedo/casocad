@@ -168,6 +168,28 @@ def test_model_from_document_uses_declared_solid_domain() -> None:
     assert model.domains[0].region is box
 
 
+def test_unset_domain_root_removes_declared_solid_domain() -> None:
+    document = SceneDocument()
+    handle = document.add_primitive("box")
+    document.set_domain_root(handle, DomainKind.SOLID)
+
+    document.unset_domain_root(handle)
+
+    assert document.domain_kinds == {}
+    assert model_from_document(document).domains == ()
+
+
+def test_unset_domain_root_clears_fluid_domain() -> None:
+    document = SceneDocument()
+    handle = document.add_primitive("box")
+    document.set_domain_root(handle, DomainKind.FLUID)
+
+    document.unset_domain_root(handle)
+
+    assert document.fluid_domain is None
+    assert document.domain_kinds == {}
+
+
 # --- grammar_violations: the cheap live-diagnostics half --------------------
 
 

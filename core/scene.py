@@ -1242,6 +1242,17 @@ class SceneDocument:
         self.domain_kinds[node.object_id] = kind
         self.mark_changed()
 
+    def unset_domain_root(self, handle: int) -> None:
+        node = self.node(handle)
+        if not isinstance(node, SDFNode):
+            raise ValueError("Domain root must be an SDF object")
+        changed = self.domain_kinds.pop(node.object_id, None) is not None
+        if self.fluid_domain is not None and self.fluid_domain.root is node:
+            self.fluid_domain = None
+            changed = True
+        if changed:
+            self.mark_changed()
+
     @staticmethod
     def _compatible_domain_tags(
         root: SDFNode,

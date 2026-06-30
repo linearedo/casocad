@@ -9,7 +9,7 @@ import numpy as np
 
 from core.boundary import BoundaryRegion
 from core.boundary_patches import surface_selector_volume
-from core.model import Model, compile_model
+from core.model import Model, compile_model, model_from_document
 from core.serialization import load_scene
 from core.sdf.base import BoundingBox3D, FloatArray, SDFNode
 from core.sdf.roles import DomainKind
@@ -142,49 +142,10 @@ def _boundary_region_callable(
     return outside
 
 
-def meshable_domains_from_model(
-    model: Model,
-    *,
-    validate: bool = True,
-    resolution: int = 32,
-) -> MeshableDomains:
-    """Expose an exact-SDF ``Model`` through the public meshing API.
-
-    ``compile_model`` is the mesh-time hard gate: invalid role wiring,
-    generator precondition failures, or overlapping Domains are refused before
-    a mesher script receives field callables.
-    """
-
-    if validate:
-        compile_model(model, resolution=resolution)
-    return MeshableDomains(
-        tuple(
-            MeshableDomain(
-                name=domain.name,
-                kind=(domain.kind.value,),
-                dimension=domain.region.dimension,
-                bounds=domain.region.bounding_box(),
-                domain_sdf=sdf_callable(domain.region),
-            )
-            for domain in model.domains
-        )
-    )
-
-
-def load_meshable_domains(scene_path: str | Path) -> MeshableDomains:
-    """Load meshable domains from a saved casoCAD ``scene.json``.
-
-    The current scene format stores one ``fluid_domain``. Future exact-SDF
-    ``Model``/``Domain`` objects can feed the same ``MeshableDomain`` contract
-    without changing external mesher scripts.
-    """
-
-    document = load_scene(scene_path)
-    fluid = document.fluid_domain
-    if fluid is None:
-        return MeshableDomains(())
-
-    root = fluid.root
+def _fluid_boundary_tags(document: object, root: SDFNode) -> tuple[tuple[str, SDFCallable], ...]:
+    fluid = getattr(document, "fluid_domain", None)
+    if fluid is None or fluid.root is not root:
+        return ()
     selector_by_id = {
         selector.object_id: selector
         for selector in fluid.selector_objects
@@ -198,18 +159,59 @@ def load_meshable_domains(scene_path: str | Path) -> MeshableDomains:
                 tags.append((tag.name, query))
         elif isinstance(tag, SDFNode):
             tags.append((tag.name, sdf_callable(tag)))
+    return tuple(tags)
 
+
+def meshable_domains_from_model(
+    model: Model,
+    *,
+    validate: bool = True,
+    resolution: int = 32,
+    boundary_tags: dict[str, tuple[tuple[str, SDFCallable], ...]] | None = None,
+) -> MeshableDomains:
+    """Expose an exact-SDF ``Model`` through the public meshing API.
+
+    ``compile_model`` is the mesh-time hard gate: invalid role wiring,
+    generator precondition failures, or overlapping Domains are refused before
+    a mesher script receives field callables.
+    """
+
+    if validate:
+        compile_model(model, resolution=resolution)
+    boundary_tags = boundary_tags or {}
     return MeshableDomains(
-        (
+        tuple(
             MeshableDomain(
-                name=root.name,
-                kind=(DomainKind.FLUID.value,),
-                dimension=root.dimension,
-                bounds=fluid.bounding_box(),
-                domain_sdf=sdf_callable(root),
-                boundary_tags=tuple(tags),
-            ),
+                name=domain.name,
+                kind=(domain.kind.value,),
+                dimension=domain.region.dimension,
+                bounds=domain.region.bounding_box(),
+                domain_sdf=sdf_callable(domain.region),
+                boundary_tags=boundary_tags.get(domain.name, ()),
+            )
+            for domain in model.domains
         )
+    )
+
+
+def load_meshable_domains(scene_path: str | Path) -> MeshableDomains:
+    """Load meshable domains from a saved casoCAD ``scene.json``.
+
+    Declared Fluid/Solid Domains feed the same ``MeshableDomain`` contract.
+    Fluid boundary tags are exposed when the declared Domain is also the legacy
+    ``fluid_domain`` root.
+    """
+
+    document = load_scene(scene_path)
+    model = model_from_document(document)
+    tags = {
+        domain.name: _fluid_boundary_tags(document, domain.region)
+        for domain in model.domains
+        if domain.kind is DomainKind.FLUID
+    }
+    return meshable_domains_from_model(
+        model,
+        boundary_tags=tags,
     )
 
 

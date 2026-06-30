@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QItemSelectionModel, Qt
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QMenu,
@@ -52,6 +52,10 @@ SDF_MENU_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("2D", SDF_MENU_ITEMS[4:12]),
     ("3D", SDF_MENU_ITEMS[12:]),
 )
+DOMAIN_ROW_COLORS = {
+    DomainKind.FLUID: QColor("#6f96bf"),
+    DomainKind.SOLID: QColor("#9a9da3"),
+}
 
 
 def sdf_icon_path(kind: str) -> Path:
@@ -120,6 +124,7 @@ class SceneTreePanel(QWidget):
             if isinstance(node, SDFNode) and document.is_internal_scene_node(node):
                 continue
             role = ""
+            domain_kind = None
             if isinstance(node, SDFNode):
                 domain_kind = document.domain_kinds.get(node.object_id)
                 if domain_kind is DomainKind.FLUID:
@@ -140,6 +145,10 @@ class SceneTreePanel(QWidget):
                 [node.name, display_kind(node), f"{node.dimension}D", role]
             )
             item.setData(0, HANDLE_ROLE, handle)
+            if domain_kind in DOMAIN_ROW_COLORS:
+                brush = QBrush(DOMAIN_ROW_COLORS[domain_kind])
+                for column in range(item.columnCount()):
+                    item.setForeground(column, brush)
             if parent_handle is None:
                 self.tree.addTopLevelItem(item)
             else:
@@ -285,6 +294,15 @@ class SceneTreePanel(QWidget):
                     value,
                 )
             )
+        unset_domain = domain_menu.addAction("Unset Domain")
+        unset_domain.setEnabled(
+            domain_enabled
+            and self._document is not None
+            and selected_node.object_id in self._document.domain_kinds
+        )
+        unset_domain.triggered.connect(
+            lambda: signals.unset_domain_requested.emit(self.selected_handles())
+        )
         enable_tag = menu.addAction("Enable Lattice Tag")
         fluid_root = (
             self._document.fluid_domain.root
