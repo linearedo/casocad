@@ -53,6 +53,9 @@ class QRhiMeshViewerWidget(QRhiWidget):
         self._loaded_chunk_count = 0
         self._target = np.array([0.0, 0.0, 0.0], dtype=np.float64)
         self._distance = 6.0
+        # Framed-mesh scale (meters). Camera floors scale with it so mm-scale
+        # meshes frame and zoom correctly instead of hitting meter floors.
+        self._view_scale = 1.0
         self._yaw = math.radians(35.0)
         self._pitch = math.radians(28.0)
         self._last_pos = None
@@ -142,11 +145,19 @@ class QRhiMeshViewerWidget(QRhiWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         self._last_pos = None
 
+    def _zoom_limits(self) -> tuple[float, float]:
+        """Distance envelope, widened (never shrunk) so a small framed mesh
+        stays zoomable while meter-scale meshes keep the old limits."""
+        return 0.01 * min(1.0, self._view_scale), 1.0e6
+
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y() or event.pixelDelta().y()
         if delta == 0:
             return
-        self._distance = max(0.01, min(1.0e6, self._distance * math.exp(-delta * 0.0012)))
+        minimum, maximum = self._zoom_limits()
+        self._distance = max(
+            minimum, min(maximum, self._distance * math.exp(-delta * 0.0012))
+        )
         self.update()
 
     def closeEvent(self, event) -> None:
@@ -197,7 +208,12 @@ class QRhiMeshViewerWidget(QRhiWidget):
         center = (lo + hi) * 0.5
         diagonal = float(np.linalg.norm(hi - lo))
         self._target = center
-        self._distance = max(diagonal * 1.8, 2.0)
+        if diagonal > 1.0e-9:
+            self._view_scale = diagonal
+            self._distance = diagonal * 1.8
+        else:
+            # Degenerate bounds (empty/point mesh): keep the default view.
+            self._distance = 2.0
 
     def _camera_values(self) -> dict[str, object]:
         cos_pitch = math.cos(self._pitch)
