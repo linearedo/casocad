@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import struct
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,14 @@ from app.viewport.surface_builder import ViewportSurface, ViewportSurfaceScene
 
 from .vulkanize import UBO_BINDING, uniform_block_members, vulkanize
 
+_SHADER_DIR = Path(__file__).resolve().parent / "shaders"
+
+
+def _shader_source(filename: str) -> str:
+    """GLSL lives in shaders/*.vert|*.frag; vulkanize() and the UBO
+    parser consume the loaded source exactly as the inline strings."""
+    return (_SHADER_DIR / filename).read_text(encoding="utf-8")
+
 
 log = logging.getLogger(__name__)
 
@@ -50,127 +59,13 @@ _LINE_VERTEX_PATTERN = (
     (0.0, 1.0),
 )
 
-_FULLSCREEN_VERT = """\
-#version 450
-void main() {
-    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
-}
-"""
+_FULLSCREEN_VERT = _shader_source("fullscreen.vert")
 
-_SURFACE_VERT = """\
-#version 450
-layout(location = 0) in vec3 in_position;
-layout(location = 1) in vec3 in_normal;
-layout(location = 2) in vec3 in_color;
-layout(location = 0) out vec3 v_color;
-layout(std140, binding = 0) uniform SurfaceUBO {
-    mat4 mvp;
-    float opacity;
-};
-vec3 safeNormal(vec3 value) {
-    float len2 = dot(value, value);
-    if (!(len2 > 1.0e-12) || !(len2 < 1.0e12)) {
-        return vec3(0.0, 0.0, 1.0);
-    }
-    return value * inversesqrt(len2);
-}
-void main() {
-    vec3 n = safeNormal(in_normal);
-    vec3 light = normalize(vec3(0.35, 0.45, 0.82));
-    float diffuse = abs(dot(n, light)) * 0.45 + 0.55;
-    v_color = clamp(in_color * diffuse, 0.0, 1.0);
-    gl_Position = mvp * vec4(in_position, 1.0);
-}
-"""
+_SURFACE_VERT = _shader_source("surface.vert")
 
-_SURFACE_FRAG = """\
-#version 450
-layout(location = 0) in vec3 v_color;
-layout(location = 0) out vec4 frag_color;
-layout(std140, binding = 0) uniform SurfaceUBO {
-    mat4 mvp;
-    float opacity;
-};
-void main() {
-    frag_color = vec4(v_color, clamp(opacity, 0.0, 1.0));
-}
-"""
+_SURFACE_FRAG = _shader_source("surface.frag")
 
-_GRID_FRAG = """\
-#version 460
-layout(location = 0) out vec4 frag_color;
-uniform vec2 u_resolution;
-uniform vec3 u_camera_position;
-uniform vec3 u_camera_target;
-uniform vec3 u_camera_right;
-uniform vec3 u_camera_up;
-uniform float u_focal_length;
-uniform float u_max_ray_distance;
-uniform vec3 u_background_color;
-uniform int u_show_grid;
-uniform float u_grid_spacing;
-uniform int u_grid_plane;
-uniform int u_fb_y_up;
-vec3 gridA(vec3 ro, vec3 rd, float mt, vec3 col, float s) {
-    if(u_show_grid==0) return col;
-    vec3 n=u_grid_plane==1?vec3(0.,1.,0.):
-             (u_grid_plane==2?vec3(1.,0.,0.):vec3(0.,0.,1.));
-    float den=dot(rd,n);
-    if(abs(den)<1e-6) return col;
-    float tt=-dot(ro,n)/den;
-    if(tt<=0. || tt>=mt) return col;
-    vec3 p=ro+rd*tt;
-    vec2 g=u_grid_plane==1?p.xz:(u_grid_plane==2?p.yz:p.xy);
-    vec2 w=fwidth(g);
-    vec2 a=abs(fract(g/u_grid_spacing+.5)-.5)*u_grid_spacing;
-    float line=1.-smoothstep(0.,max(max(w.x,w.y),1e-5)*1.5,min(a.x,a.y));
-    // Fade over a distance proportional to the cell size (1 m baseline), so
-    // coarse grids (km work) stay visible across their own cells.
-    float ft=tt/max(u_grid_spacing,1.);
-    float fade=clamp(1./(1.+ft*ft*.002),0.,1.);
-    return mix(col,vec3(.62,.75,.92),line*s*fade);
-}
-// One world axis (line through the origin along `axis`) drawn with a
-// screen-space-constant width via ray-vs-line distance, like a normal CAD.
-vec3 axisLine(vec3 ro, vec3 rd, float mt, vec3 col, vec3 axis, vec3 acol) {
-    if(u_show_grid==0) return col;
-    float b=dot(rd,axis);
-    float den=1.-b*b;
-    if(abs(den)<1e-6) return col;          // ray parallel to the axis
-    float d=dot(rd,ro);
-    float e=dot(axis,ro);
-    float t=(b*e-d)/den;                    // closest param along the camera ray
-    if(t<=0.||t>=mt) return col;
-    float s=(e-b*d)/den;                    // closest param along the axis
-    vec3 pr=ro+rd*t;
-    vec3 pa=axis*s;
-    float dist=length(pr-pa);
-    float wpp=t*2./(u_focal_length*max(u_resolution.y,1.));  // world units / pixel
-    float px=dist/max(wpp,1e-9);
-    float linev=1.-smoothstep(.9,2.2,px);
-    float ft=t/max(u_grid_spacing,1.);
-    float fade=clamp(1./(1.+ft*ft*.0008),0.,1.);
-    return mix(col,acol,linev*fade);
-}
-void main() {
-    vec2 px = gl_FragCoord.xy;
-    vec2 uv = (px - 0.5*u_resolution)/max(u_resolution.y, 1.0);
-    if (u_fb_y_up == 0) uv.y = -uv.y;
-    vec3 fwd = normalize(u_camera_target - u_camera_position);
-    vec3 rd = normalize(2.0*uv.x*normalize(u_camera_right)
-                      + 2.0*uv.y*normalize(u_camera_up) + u_focal_length*fwd);
-    vec3 col = gridA(u_camera_position, rd, u_max_ray_distance,
-                     u_background_color, 0.6);
-    col = axisLine(u_camera_position, rd, u_max_ray_distance, col,
-                   vec3(1.,0.,0.), vec3(1.00,0.34,0.25));   // X red
-    col = axisLine(u_camera_position, rd, u_max_ray_distance, col,
-                   vec3(0.,1.,0.), vec3(0.33,0.92,0.41));   // Y green
-    col = axisLine(u_camera_position, rd, u_max_ray_distance, col,
-                   vec3(0.,0.,1.), vec3(0.36,0.57,1.00));   // Z blue
-    frag_color = vec4(col, 1.0);
-}
-"""
+_GRID_FRAG = _shader_source("grid_axes.frag")
 
 _LINE_UBO_MEMBERS = (
     ("vec3", "cam_pos", None),
@@ -184,57 +79,9 @@ _LINE_UBO_MEMBERS = (
     ("float", "clip_y_sign", None),
 )
 
-_LINE_VERT = """\
-#version 450
-layout(location = 0) in vec3 in_a;
-layout(location = 1) in vec3 in_b;
-layout(location = 2) in vec3 in_col;
-layout(location = 3) in vec2 in_param;
-layout(location = 0) out vec3 v_col;
-layout(std140, binding = 0) uniform LineUBO {
-    vec3 cam_pos;
-    vec3 cam_right;
-    vec3 cam_up;
-    vec3 cam_target;
-    float focal;
-    float aspect;
-    vec2 res;
-    float half_px;
-    float clip_y_sign;
-};
-vec4 project(vec3 P) {
-    vec3 fwd = normalize(cam_target - cam_pos);
-    vec3 r = normalize(cam_right);
-    vec3 u = normalize(cam_up);
-    vec3 v = P - cam_pos;
-    return vec4(focal * dot(v, r) * aspect, -focal * dot(v, u),
-                0.0, max(dot(v, fwd), 1e-4));
-}
-void main() {
-    vec4 ca = project(in_a);
-    vec4 cb = project(in_b);
-    vec2 sa = (ca.xy / ca.w * 0.5 + 0.5) * res;
-    vec2 sb = (cb.xy / cb.w * 0.5 + 0.5) * res;
-    vec2 dir = sb - sa;
-    float len = length(dir);
-    dir = len > 1e-5 ? dir / len : vec2(1.0, 0.0);
-    vec2 nrm = vec2(-dir.y, dir.x);
-    vec4 cthis = in_param.x < 0.5 ? ca : cb;
-    vec2 sthis = in_param.x < 0.5 ? sa : sb;
-    vec2 soff = sthis + nrm * in_param.y * half_px;
-    vec2 ndc = soff / res * 2.0 - 1.0;
-    gl_Position = vec4(ndc.x * cthis.w, ndc.y * cthis.w * clip_y_sign,
-                       cthis.z, cthis.w);
-    v_col = in_col;
-}
-"""
+_LINE_VERT = _shader_source("line.vert")
 
-_LINE_FRAG = """\
-#version 450
-layout(location = 0) in vec3 v_col;
-layout(location = 0) out vec4 frag_color;
-void main() { frag_color = vec4(v_col, 1.0); }
-"""
+_LINE_FRAG = _shader_source("line.frag")
 
 _ALIGN = {"float": 4, "int": 4, "uint": 4, "vec2": 8, "vec3": 16, "vec4": 16}
 _SIZE = {"float": 4, "int": 4, "uint": 4, "vec2": 8, "vec3": 12, "vec4": 16}

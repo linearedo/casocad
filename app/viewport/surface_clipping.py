@@ -438,6 +438,11 @@ def _clip_boolean_mesh(
     index_array = _orient_triangles(
         vertices, normals, faces.reshape(-1).astype(np.uint32)
     )
+    # Orientation drops zero-area triangles; coincident/tangent operand faces
+    # can degenerate the whole clip. Report "no clip" so the caller falls back
+    # to dual contouring instead of raising on zero-size reductions downstream.
+    if index_array.size == 0:
+        return None
     # Drop the operand verts the clip discarded (roughly half), remapping indices.
     used = np.unique(index_array)
     remap = np.full(vertices.shape[0], -1, dtype=np.int64)
@@ -482,6 +487,8 @@ def _clip_quality_ok(
         box.x_max - box.x_min, box.y_max - box.y_min, box.z_max - box.z_min, 1.0
     )
     used = np.unique(idx)
+    if used.size == 0:
+        return False
     surface_error = np.max(np.abs(node.to_numpy(v[used, 0], v[used, 1], v[used, 2])))
     return surface_error <= _CLIP_MAX_RELATIVE_SURFACE_ERROR * extent
 

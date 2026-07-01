@@ -980,3 +980,48 @@ def test_render_artifact_uses_requested_surface_resolution() -> None:
     assert coarse.timings.surface_resolution == 40
     assert refined.timings.surface_resolution == 80
     assert refined.timings.surface_triangle_count > coarse.timings.surface_triangle_count
+
+
+def test_clip_quality_gate_rejects_empty_clip_instead_of_raising() -> None:
+    """Regression: an all-degenerate clip used to hit np.max on a zero-size
+    array ("reduction operation maximum which has no identity"), marking the
+    whole boolean surface failed -> hidden in the viewport after a move."""
+    from app.viewport.surface_clipping import _clip_quality_ok
+    from core.sdf import Sphere
+
+    node = Sphere(name="s", object_id=1, radius=0.5)
+    vertices = np.zeros((0, 3), dtype=np.float32)
+    indices = np.zeros(0, dtype=np.uint32)
+
+    assert _clip_quality_ok(node, vertices, indices) is False
+
+
+def test_degenerate_clip_falls_back_to_dual_contouring(monkeypatch) -> None:
+    """When orientation drops every clipped triangle (coincident/tangent
+    operand faces), the boolean must fall back to dual contouring and stay
+    visible, not raise and vanish as a failed chunk."""
+    from app.viewport import surface_clipping
+    from app.viewport.surface_builder import build_viewport_surface
+    from app.viewport.surface_types import ViewportSurfaceKey
+
+    document = SceneDocument()
+    sphere = document.add_primitive_from_drag(
+        "sphere", (-0.4, -0.4, 0.0), (0.4, 0.4, 0.0)
+    )
+    box = document.add_primitive_from_drag(
+        "box", (-0.3, -0.3, 0.0), (0.3, 0.3, 0.0)
+    )
+    node = document.node(document.combine(sphere, box, "intersection"))
+
+    monkeypatch.setattr(
+        surface_clipping,
+        "_orient_triangles",
+        lambda _v, _n, _i: np.zeros(0, dtype=np.uint32),
+    )
+    key = ViewportSurfaceKey(
+        object_id=node.object_id, scene_revision=1, resolution=48
+    )
+    surface = build_viewport_surface(node, key)
+
+    assert surface.status == "ready"
+    assert surface.has_geometry

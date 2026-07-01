@@ -41,7 +41,7 @@ build-backend = "setuptools.build_meta"
 include = ["app*", "core*"]
 
 [tool.setuptools.package-data]
-"app.viewport" = ["shaders/*.vert", "shaders/*.frag", "shaders/*.glsl"]
+"app.viewport.renderers.qrhi" = ["shaders/*.vert", "shaders/*.frag", "shaders/*.glsl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -408,12 +408,13 @@ class UltimateFrameRunner:
             self.synthetic_wait_timer.stop()
 
     def _orbit_camera(self) -> None:
-        viewport = self.window.viewport
-        viewport._yaw += self.args.orbit_yaw_step
-        viewport._pitch = max(
+        camera = self.window.viewport._camera
+        camera.yaw += self.args.orbit_yaw_step
+        camera.pitch = max(
             -1.2,
-            min(1.2, viewport._pitch + math.sin(time.perf_counter() * 0.7) * 0.0009),
+            min(1.2, camera.pitch + math.sin(time.perf_counter() * 0.7) * 0.0009),
         )
+        viewport = self.window.viewport
         begin_interaction = getattr(viewport, "_begin_interaction", None)
         if callable(begin_interaction):
             begin_interaction()

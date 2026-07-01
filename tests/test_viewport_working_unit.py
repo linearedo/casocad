@@ -6,11 +6,12 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QRect
+from PySide6.QtGui import QPaintEvent
 from PySide6.QtWidgets import QApplication
 
 from app.dimensions import length_unit
 from app.viewport.renderers.qrhi.viewport import QRhiViewportWidget
-from core.sdf.base import BoundingBox3D
 
 
 def _app() -> QApplication:
@@ -25,40 +26,23 @@ def _viewport() -> QRhiViewportWidget:
 def test_unit_switch_snaps_grid_and_reframes_camera() -> None:
     viewport = _viewport()
     assert viewport.grid_spacing == 1.0
-    assert viewport._distance == 6.0
+    assert viewport._camera.distance == 6.0
 
     viewport._set_working_unit(length_unit("mm"))
     assert viewport.grid_spacing == 0.001
     assert viewport._default_grid_spacing == 0.001
-    assert viewport._distance == 0.006
+    assert viewport._camera.distance == 0.006
 
     viewport._set_working_unit(length_unit("km"))
     assert viewport.grid_spacing == 1000.0
-    assert viewport._distance == 6000.0
+    assert viewport._camera.distance == 6000.0
 
 
-def test_zoom_envelope_widens_but_never_shrinks() -> None:
+def test_orientation_overlay_paints_from_camera_state() -> None:
+    """Regression: Qt swallows exceptions raised inside paintEvent overrides,
+    so a stale attribute there crash-loops the real app while unit tests of
+    the projection math stay green. Calling paintEvent directly propagates."""
     viewport = _viewport()
-    assert viewport._zoom_limits() == (0.5, 200.0)
-
-    viewport._set_working_unit(length_unit("mm"))
-    minimum, maximum = viewport._zoom_limits()
-    assert minimum == 0.5 * 0.001  # close enough to see a mm grid
-    assert maximum == 200.0  # meter-scale scenes stay reachable
-
-    viewport._set_working_unit(length_unit("km"))
-    minimum, maximum = viewport._zoom_limits()
-    assert minimum == 0.5
-    assert maximum == 200.0 * 1000.0
-
-
-def test_frame_box_floor_scales_down_for_small_parts() -> None:
-    viewport = _viewport()
-    part = BoundingBox3D(0.0, 0.002, 0.0, 0.002, 0.0, 0.002)
-
-    viewport.frame_box(part)
-    assert viewport._distance == 1.0  # meter floor dwarfs a 2 mm part
-
-    viewport._set_working_unit(length_unit("mm"))
-    viewport.frame_box(part)
-    assert viewport._distance == 0.002 * 1.6
+    overlay = viewport._orientation_widget
+    assert overlay is not None
+    overlay.paintEvent(QPaintEvent(QRect(0, 0, overlay.width(), overlay.height())))

@@ -28,13 +28,15 @@ from PySide6.QtWidgets import (
 )
 
 from app.axis_labels import world_axis_label
-from app.dimensions import DEFAULT_LENGTH_UNIT, parse_dimension_entry
+from app.dimensions import DEFAULT_LENGTH_UNIT
 from app.signals import signals
+from app.viewport.camera import DEFAULT_VIEW_DISTANCE, ViewportCamera
 from app.viewport.performance_governor import (
     ViewportPerformanceGovernor,
     ViewportRenderBudget,
 )
 
+from .create_tool import CreateTool
 from .surface_renderer import QRhiSurfaceRenderer
 
 _BACKENDS = {
@@ -44,9 +46,6 @@ _BACKENDS = {
     "d3d11": getattr(QRhiWidget.Api, "Direct3D11", None),
 }
 _REVOLVE_PREVIEW_INTERVAL_MS = 80.0
-# The familiar startup framing: 6 m away from a 1 m grid. Working-unit
-# switches reproduce this view scaled by the unit factor.
-_DEFAULT_VIEW_DISTANCE = 6.0
 
 
 def _revolve_signal_frame(
@@ -174,8 +173,8 @@ class _OrientationWidget(QWidget):
         length = 30.0
         axes = sorted(
             _orientation_axis_projection(
-                self._viewport._yaw,
-                self._viewport._pitch,
+                self._viewport._camera.yaw,
+                self._viewport._camera.pitch,
             ),
             key=lambda item: item[3],
         )
@@ -206,20 +205,14 @@ class QRhiViewportWidget(QRhiWidget):
         self._performance_governor = ViewportPerformanceGovernor()
         self._refinement_cb = None
         self._renderer_ready = False
-        # orbit camera state
-        self._target = np.array([0.0, 0.0, 0.0])
-        self._distance = _DEFAULT_VIEW_DISTANCE
-        self._yaw = math.radians(35.0)
-        self._pitch = math.radians(28.0)
-        self._focal = 1.5
+        # orbit camera: owns view state and the working-scale envelope (the
+        # grid stays a truthful world-space snap reference; the camera and
+        # tool floors scale with camera.view_scale, never the grid)
+        self._camera = ViewportCamera()
         self._bg = (0.07, 0.08, 0.10)
         self._show_grid = True
         self._grid_spacing = 1.0
         self._default_grid_spacing = 1.0
-        # working-scale factor (meters per working unit): the grid stays a
-        # truthful world-space snap reference, so camera floors/ceilings and
-        # tool sizes scale with this instead of the grid adapting to the view
-        self._view_scale = 1.0
         self._sdf_opacity = 1.0
         self._gizmo_visible = True
         self._components_visible = False
@@ -274,22 +267,14 @@ class QRhiViewportWidget(QRhiWidget):
         self._revolve_last_preview_ms = 0.0
         self._revolve_last_preview_deg = None
         self._revolve_deg = 0.0
-        # boundary cutter tool state (cutter = a drawn shape routed via
-        # active_boundary_cutter_tool, consumed in main_window._on_viewport_shape_drawn)
-        self._boundary_cutter_tool = None
         self._boundary_region_selected = False
         self._committed_surface_scene = None   # last committed scene (restore target)
         self._committed_scene_payload = None
         self._preview_kind = None
         self._boolean_preview_commit_pending = False
-        # drag-to-create tool state (Draw button -> viewport_create_requested)
-        self._create_kind = None
-        self._create_start_world = None
-        self._point_pts = None       # multi-click point list (point-shape kinds)
-        self._point_hover = None     # current hover point for the preview
-        self._create_anchor = None   # locked start (deferred click -> typed size)
-        self._create_hover = None    # hover for the rubber-band preview
-        self._dimension_input = ""   # typed dimension buffer
+        # drag/point create tool (Draw button -> viewport_create_requested);
+        # also carries the boundary-cutter routing consumed by main_window
+        self._create_tool = CreateTool(self)
         self._working_unit = DEFAULT_LENGTH_UNIT  # unit for bare typed sizes
         self._snap_enabled = True  # snap grid-plane points to grid spacing
         self._command_panel = None
@@ -332,19 +317,11 @@ class QRhiViewportWidget(QRhiWidget):
         the familiar startup framing at the new scale. Committed geometry is
         world-space and never moves; only the camera does."""
         self._working_unit = unit
-        self._view_scale = float(unit.factor)
+        self._camera.view_scale = float(unit.factor)
+        self._camera.reframe_to_working_scale()
         self._default_grid_spacing = float(unit.factor)
         self._grid_spacing = float(unit.factor)
-        self._distance = _DEFAULT_VIEW_DISTANCE * self._view_scale
         self._dirty = True
-
-    def _zoom_limits(self) -> tuple[float, float]:
-        """Camera distance envelope, widened (never shrunk) so the working
-        scale and the meter-scale defaults both stay reachable."""
-        return (
-            0.5 * min(1.0, self._view_scale),
-            200.0 * max(1.0, self._view_scale),
-        )
 
     def _build_command_panel(self) -> None:
         """The bottom-center viewport command overlay (recovered from the old
@@ -476,18 +453,18 @@ class QRhiViewportWidget(QRhiWidget):
             dist = math.sqrt(dx * dx + dy * dy + dz * dz)
             text = (f"Move   Δ({dx:+.3f}, {dy:+.3f}, {dz:+.3f})   "
                     f"|Δ|={dist:.3f}")
-        elif self._create_anchor is not None:
-            typed = self._dimension_input or "_"
-            text = (f"{self._create_kind}   size: {typed} "
+        elif self._create_tool.anchor is not None:
+            typed = self._create_tool.dimension_input or "_"
+            text = (f"{self._create_tool.kind}   size: {typed} "
                     f"[{self._working_unit.key}]   "
                     "(Enter creates, or click end)")
-        elif self._point_pts is not None:
-            text = (f"{self._create_kind}   points: {len(self._point_pts)}   "
+        elif self._create_tool.points is not None:
+            text = (f"{self._create_tool.kind}   points: {len(self._create_tool.points)}   "
                     "(Enter creates, Backspace undoes)")
-        elif self._create_kind is not None and \
-                self._create_start_world is not None and hover is not None:
-            sx, sy, sz = self._create_start_world
-            text = (f"{self._create_kind}   "
+        elif self._create_tool.kind is not None and \
+                self._create_tool.start_world is not None and hover is not None:
+            sx, sy, sz = self._create_tool.start_world
+            text = (f"{self._create_tool.kind}   "
                     f"size ({abs(hover[0]-sx):.3f}, {abs(hover[1]-sy):.3f}, "
                     f"{abs(hover[2]-sz):.3f})")
         elif hover is not None:
@@ -633,12 +610,13 @@ class QRhiViewportWidget(QRhiWidget):
         self._animate_view_to(math.radians(yaw_deg), math.radians(pitch_deg))
 
     def _animate_view_to(self, target_yaw: float, target_pitch: float) -> None:
-        dyaw = ((target_yaw - self._yaw + math.pi) % (2 * math.pi)) - math.pi
-        dpitch = target_pitch - self._pitch
+        camera = self._camera
+        dyaw = ((target_yaw - camera.yaw + math.pi) % (2 * math.pi)) - math.pi
+        dpitch = target_pitch - camera.pitch
         if max(abs(dyaw), abs(dpitch)) <= 1e-6:
             self._dirty = True
             return
-        self._view_anim = (self._yaw, self._pitch, dyaw, dpitch)
+        self._view_anim = (camera.yaw, camera.pitch, dyaw, dpitch)
         self._view_anim_clock.restart()
         self._view_anim_timer.start(16)
 
@@ -649,8 +627,8 @@ class QRhiViewportWidget(QRhiWidget):
         t = min(1.0, self._view_anim_clock.elapsed() / 260.0)
         eased = t * t * (3.0 - 2.0 * t)  # smoothstep
         y0, p0, dy, dp = self._view_anim
-        self._yaw = y0 + dy * eased
-        self._pitch = p0 + dp * eased
+        self._camera.yaw = y0 + dy * eased
+        self._camera.pitch = p0 + dp * eased
         if t >= 1.0:
             self._view_anim = None
             self._view_anim_timer.stop()
@@ -724,8 +702,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._dirty = True
 
     def frame_target(self, target=(0.0, 0.0, 0.0), distance: float = 6.0) -> None:
-        self._target = np.array(target, dtype=np.float64)
-        self._distance = float(distance)
+        self._camera.frame_target(target, distance)
         self._dirty = True
 
     # --- ViewportWidget drop-in compatibility ------------------------------
@@ -869,13 +846,7 @@ class QRhiViewportWidget(QRhiWidget):
         ).with_selected_highlight(self._selected_id)
 
     def frame_box(self, box) -> None:
-        cx = (box.x_min + box.x_max) * 0.5
-        cy = (box.y_min + box.y_max) * 0.5
-        cz = (box.z_min + box.z_max) * 0.5
-        extent = max(box.x_max - box.x_min, box.y_max - box.y_min,
-                     box.z_max - box.z_min, 1e-3)
-        self._target = np.array([cx, cy, cz], dtype=np.float64)
-        self._distance = max(extent * 1.6, min(1.0, self._view_scale))
+        self._camera.frame_box(box)
         self._dirty = True
 
     def set_background_color(self, color) -> None:
@@ -961,7 +932,8 @@ class QRhiViewportWidget(QRhiWidget):
     }
 
     def _gizmo_length(self) -> float:
-        return max(self._distance * 0.18, 0.4 * self._view_scale)
+        camera = self._camera
+        return max(camera.distance * 0.18, 0.4 * camera.view_scale)
 
     def _ray_plane_hit(self, pos, axis: str):
         """Intersect the cursor ray with the plane through the rotate pivot whose
@@ -1204,98 +1176,16 @@ class QRhiViewportWidget(QRhiWidget):
             return None
         return math.atan2(float(np.dot(rel, w)), float(np.dot(rel, u)))
 
-    # --- draw / create tool (real) ---
-    # kinds built from a click sequence rather than a single drag
-    _POINT_CREATE_KINDS = {
-        "polyline", "quadratic_bezier_curve", "quadratic_bezier_polycurve",
-        "polyline_tube", "quadratic_bezier_tube", "quadratic_bezier_surface", "polygon",
-    }
+    # --- draw / create tool (state machine lives in create_tool.CreateTool) ---
 
     def _plane_id(self) -> str:
         return ("xy", "xz", "yz")[self._grid_plane]
 
     def begin_create_tool(self, kind: str) -> None:
-        """Arm create: drag-kinds sketch with one drag (viewport_shape_drawn);
-        point-kinds collect clicks then commit on Enter (viewport_point_shape_drawn)."""
-        self.end_move_tool()
-        self.end_rotate_tool()
-        self._end_extrude_tool()
-        self._end_revolve_tool()
-        self._create_kind = str(kind)
-        self._create_start_world = None
-        self._create_anchor = None
-        self._create_hover = None
-        self._dimension_input = ""
-        point_mode = kind in self._POINT_CREATE_KINDS
-        self._point_pts = [] if point_mode else None
-        self._point_hover = None
-        self._renderer.prewarm_for_tool(
-            self._committed_surface_scene,
-            kind,
-            compile_pipeline=(
-                not point_mode or self._renderer.should_prewarm_tool_pipeline()
-            ),
-        )
-        self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setFocus()
-        if point_mode:
-            msg = (f"Click points on the {self.reference_plane_label} grid to "
-                   f"draw {kind}. Enter creates, Backspace undoes, Esc cancels.")
-        else:
-            msg = (f"Drag on the {self.reference_plane_label} grid to create "
-                   f"{kind}. Esc cancels.")
-        signals.log_message.emit("info", msg)
+        self._create_tool.begin(kind)
 
     def cancel_create_tool(self) -> None:
-        if self._create_kind is None:
-            return
-        self._create_kind = None
-        self._create_start_world = None
-        self._create_anchor = None
-        self._create_hover = None
-        self._dimension_input = ""
-        self._point_pts = None
-        self._point_hover = None
-        self._boundary_cutter_tool = None
-        self.unsetCursor()
-        self._dirty = True
-
-    def _commit_point_shape(self) -> None:
-        """Emit the collected point-shape if it has enough points."""
-        if not self._point_pts or len(self._point_pts) < 2:
-            signals.log_message.emit("warning", "Add at least two points first.")
-            return
-        kind = self._create_kind
-        points = tuple(self._point_pts)
-        plane = self._plane_id()
-        # Emit before resetting so a synchronous handler can still read
-        # active_boundary_cutter_tool (cutter routing).
-        signals.viewport_point_shape_drawn.emit(kind, points, plane)
-        self.cancel_create_tool()
-
-    def _emit_drag_shape(self, start, end) -> None:
-        kind = self._create_kind
-        signals.viewport_shape_drawn.emit(kind, start, end, None)
-        self.cancel_create_tool()
-
-    def _commit_typed_dimension(self) -> None:
-        """Create the anchored shape at an exact typed size (W or W x H)."""
-        if self._create_anchor is None or not self._dimension_input:
-            return
-        try:
-            dims = parse_dimension_entry(
-                self._dimension_input, self._working_unit.factor
-            )
-        except ValueError as error:
-            signals.log_message.emit("warning", str(error))
-            return
-        w = dims[0] * self._working_unit.factor
-        h = (dims[1] if len(dims) > 1 else dims[0]) * self._working_unit.factor
-        ui, vi = self._PLANE_AXIS_INDICES[self._grid_plane]
-        end = list(self._create_anchor)
-        end[ui] += w
-        end[vi] += h
-        self._emit_drag_shape(self._create_anchor, (end[0], end[1], end[2]))
+        self._create_tool.cancel()
 
     # --- snapping (real) ---
     def set_snap_enabled(self, enabled: bool) -> None:
@@ -1332,7 +1222,9 @@ class QRhiViewportWidget(QRhiWidget):
         self._dirty = True
 
     def set_grid_spacing(self, spacing: float) -> None:
-        self._grid_spacing = max(float(spacing), 1e-4 * min(1.0, self._view_scale))
+        self._grid_spacing = max(
+            float(spacing), 1e-4 * min(1.0, self._camera.view_scale)
+        )
         self._dirty = True
 
     def configure_grid(self, box=None, dx=None, *a, **k) -> None:
@@ -1384,14 +1276,14 @@ class QRhiViewportWidget(QRhiWidget):
         don't stack exactly on the original. A grid-step diagonal nudge plus a
         small random jitter keeps repeated pastes visibly separated."""
         ui, vi = self._PLANE_AXIS_INDICES[self._grid_plane]
-        step = max(self._grid_spacing, 0.1 * min(1.0, self._view_scale))
+        step = max(self._grid_spacing, 0.1 * min(1.0, self._camera.view_scale))
         off = [0.0, 0.0, 0.0]
         off[ui] = step * (1.0 + random.uniform(-0.25, 0.25))
         off[vi] = step * (1.0 + random.uniform(-0.25, 0.25))
         return (off[0], off[1], off[2])
 
     def active_boundary_cutter_tool(self, *a):
-        return self._boundary_cutter_tool
+        return self._create_tool.boundary_cutter
 
     def set_boundary_region_selection_entries(self, *a, **k) -> None:
         """main_window passes (selectors, normals, regions); we only need to know
@@ -1406,24 +1298,7 @@ class QRhiViewportWidget(QRhiWidget):
                              ("Cylinder", "cylinder"), ("Cone", "cone"))
 
     def begin_boundary_cutter_tool(self, cutter_kind: str, shape_kind=None) -> None:
-        """Arm a boundary cutter: draw `shape_kind` on the grid; the drawn shape
-        is routed as a planar/surface cutter for the selected BoundaryRegion."""
-        if not self._boundary_region_selected:
-            signals.log_message.emit(
-                "warning", "Select a BoundaryRegion before creating a cutter.")
-            return
-        if cutter_kind == "planar":
-            shape = shape_kind or "polyline"
-        elif cutter_kind == "surface":
-            shape = shape_kind or "sphere"
-        else:
-            raise ValueError(f"unknown boundary cutter kind: {cutter_kind}")
-        self.begin_create_tool(shape)
-        self._boundary_cutter_tool = (cutter_kind, shape)
-        signals.log_message.emit(
-            "info",
-            f"{cutter_kind.title()} cutter armed — draw the {shape} to cut the "
-            "selected BoundaryRegion.")
+        self._create_tool.begin_boundary_cutter(cutter_kind, shape_kind)
 
     # no-op stubs for the dropped viewport tools
     def _noop(self, *a, **k) -> None:
@@ -1525,7 +1400,7 @@ class QRhiViewportWidget(QRhiWidget):
 
     def frame_default_grid(self) -> None:
         self.frame_target(
-            (0.0, 0.0, 0.0), _DEFAULT_VIEW_DISTANCE * self._view_scale
+            (0.0, 0.0, 0.0), DEFAULT_VIEW_DISTANCE * self._camera.view_scale
         )
 
     # -- QRhiWidget hooks ----------------------------------------------------
@@ -1611,14 +1486,14 @@ class QRhiViewportWidget(QRhiWidget):
         verts: list[float] = []
         if not self._gizmo_visible:
             return None
-        if self._point_pts is not None:
+        if self._create_tool.points is not None:
             self._append_point_shape_preview(verts)
             if not verts:
                 return None
             arr = np.asarray(verts, dtype=np.float32)
             return (arr.tobytes(), arr.size // 11)
-        band_start = self._create_anchor or self._create_start_world
-        if band_start is not None and self._create_hover is not None:
+        band_start = self._create_tool.anchor or self._create_tool.start_world
+        if band_start is not None and self._create_tool.hover is not None:
             self._append_rubber_band(band_start, verts)
             if not verts:
                 return None
@@ -1656,7 +1531,7 @@ class QRhiViewportWidget(QRhiWidget):
         """Rectangle from the drag/anchor start to the hover, on the active plane."""
         ui, vi = self._PLANE_AXIS_INDICES[self._grid_plane]
         a = np.array(start)
-        c = np.array(self._create_hover)
+        c = np.array(self._create_tool.hover)
         color = (0.20, 0.95, 0.95)
         p00 = a.copy()
         p10 = a.copy(); p10[ui] = c[ui]
@@ -1668,10 +1543,10 @@ class QRhiViewportWidget(QRhiWidget):
     def _append_point_shape_preview(self, out: list) -> None:
         """Cyan polyline through the collected points, with a dashed-feel segment
         to the current hover; small ticks mark each placed point."""
-        pts = list(self._point_pts or ())
+        pts = list(self._create_tool.points or ())
         preview = list(pts)
-        if self._point_hover is not None:
-            preview.append(self._point_hover)
+        if self._create_tool.point_hover is not None:
+            preview.append(self._create_tool.point_hover)
         color = (0.20, 0.95, 0.95)
         for a, b in zip(preview, preview[1:]):
             self._seg(a, b, color, out)
@@ -1788,24 +1663,13 @@ class QRhiViewportWidget(QRhiWidget):
     # -- camera --------------------------------------------------------------
 
     def _camera_values(self) -> dict:
-        cp = math.cos(self._pitch)
-        offset = np.array([cp * math.cos(self._yaw),
-                           cp * math.sin(self._yaw),
-                           math.sin(self._pitch)])
-        pos = self._target + self._distance * offset
-        fwd = self._target - pos
-        fwd = fwd / max(np.linalg.norm(fwd), 1e-9)
-        world_up = np.array([0.0, 0.0, 1.0])
-        if abs(np.dot(fwd, world_up)) > 0.99:
-            world_up = np.array([0.0, 1.0, 0.0])
-        right = np.cross(fwd, world_up); right /= max(np.linalg.norm(right), 1e-9)
-        up = np.cross(right, fwd)
+        pos, _fwd, right, up = self._camera.basis()
         return {
             "u_camera_position": tuple(pos),
-            "u_camera_target": tuple(self._target),
+            "u_camera_target": tuple(self._camera.target),
             "u_camera_right": tuple(right),
             "u_camera_up": tuple(up),
-            "u_focal_length": self._focal,
+            "u_focal_length": self._camera.focal,
             "u_max_ray_distance": self._max_ray_distance(pos),
             "u_surface_opacity": self._sdf_opacity,
             "u_background_color": self._bg,
@@ -1821,7 +1685,7 @@ class QRhiViewportWidget(QRhiWidget):
     def mousePressEvent(self, e: QMouseEvent) -> None:
         self._last_pos = e.position()
         self._press_pos = e.position()
-        if self._create_kind is not None and e.button() == Qt.MouseButton.LeftButton:
+        if self._create_tool.kind is not None and e.button() == Qt.MouseButton.LeftButton:
             point = self._snap_world(
                 self._screen_to_grid(e.position()), e.modifiers())
             if point is None:
@@ -1829,15 +1693,15 @@ class QRhiViewportWidget(QRhiWidget):
                     "warning",
                     "The camera ray does not reach the reference grid plane.",
                 )
-            elif self._point_pts is not None:  # point-shape: collect clicks
-                self._point_pts.append(point)
-                self._point_hover = point
+            elif self._create_tool.points is not None:  # point-shape: collect clicks
+                self._create_tool.points.append(point)
+                self._create_tool.point_hover = point
                 self._update_readout(point)
                 self._dirty = True
-            elif self._create_anchor is not None:  # anchored: this click is the end
-                self._emit_drag_shape(self._create_anchor, point)
+            elif self._create_tool.anchor is not None:  # anchored: this click is the end
+                self._create_tool.emit_drag_shape(self._create_tool.anchor, point)
             else:  # drag-shape: record the drag start
-                self._create_start_world = point
+                self._create_tool.start_world = point
         elif self._move_active and e.button() == Qt.MouseButton.LeftButton:
             self._move_start_grid = self._snap_world(
                 self._screen_to_grid(e.position()), e.modifiers())
@@ -1868,11 +1732,11 @@ class QRhiViewportWidget(QRhiWidget):
         # Live coordinate readout (also fires on hover via mouse tracking).
         hover = self._snap_world(self._screen_to_grid(e.position()), e.modifiers())
         self._update_readout(hover)
-        if self._point_pts is not None:  # live point-shape preview follows cursor
-            self._point_hover = hover
+        if self._create_tool.points is not None:  # live point-shape preview follows cursor
+            self._create_tool.point_hover = hover
             self._dirty = True
-        if self._create_anchor is not None:  # rubber-band to the locked anchor
-            self._create_hover = hover
+        if self._create_tool.anchor is not None:  # rubber-band to the locked anchor
+            self._create_tool.hover = hover
             self._dirty = True
         if self._last_pos is None or not (e.buttons() & Qt.MouseButton.LeftButton):
             self._update_hovered_object(e.position())
@@ -1882,17 +1746,17 @@ class QRhiViewportWidget(QRhiWidget):
         self._begin_interaction()
         # While a create tool is armed, a left-drag sketches the shape — don't
         # orbit; show a live ghost + rubber-band from the drag start.
-        if self._create_kind is not None:
+        if self._create_tool.kind is not None:
             self._last_pos = e.position()
-            if self._point_pts is None and self._create_start_world is not None:
+            if self._create_tool.points is None and self._create_tool.start_world is not None:
                 cur = self._snap_world(
                     self._screen_to_grid(e.position()), e.modifiers())
-                if cur is not None and cur != self._create_hover:
-                    self._create_hover = cur
+                if cur is not None and cur != self._create_tool.hover:
+                    self._create_tool.hover = cur
                     self._dirty = True
-                    if cur != self._create_start_world:
+                    if cur != self._create_tool.start_world:
                         signals.viewport_shape_preview_requested.emit(
-                            self._create_kind, self._create_start_world, cur, None)
+                            self._create_tool.kind, self._create_tool.start_world, cur, None)
             return
         if self._move_active and self._move_handle is not None:
             # Snapped translation across the active grid plane; preview only.
@@ -2010,8 +1874,7 @@ class QRhiViewportWidget(QRhiWidget):
             return
         d = e.position() - self._last_pos
         self._last_pos = e.position()
-        self._yaw -= d.x() * 0.01
-        self._pitch = max(-1.5, min(1.5, self._pitch + d.y() * 0.01))
+        self._camera.orbit(d.x(), d.y())
         self._dirty = True
 
     def _nudge_with_arrows(self, key) -> bool:
@@ -2048,32 +1911,32 @@ class QRhiViewportWidget(QRhiWidget):
 
     def keyPressEvent(self, e) -> None:
         key = e.key()
-        if key == Qt.Key.Key_Escape and self._create_kind is not None:
+        if key == Qt.Key.Key_Escape and self._create_tool.kind is not None:
             self.cancel_create_tool()
             self._restore_committed_scene()
             signals.log_message.emit("info", "Create tool cancelled.")
             return
-        if self._point_pts is not None and key in (
+        if self._create_tool.points is not None and key in (
                 Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._commit_point_shape()
+            self._create_tool.commit_point_shape()
             return
-        if self._point_pts is not None and key == Qt.Key.Key_Backspace:
-            if self._point_pts:
-                self._point_pts.pop()
+        if self._create_tool.points is not None and key == Qt.Key.Key_Backspace:
+            if self._create_tool.points:
+                self._create_tool.points.pop()
                 self._dirty = True
             return
         # Typed dimensions while an anchored drag-create is pending.
-        if self._create_anchor is not None:
+        if self._create_tool.anchor is not None:
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self._commit_typed_dimension()
+                self._create_tool.commit_typed_dimension()
                 return
             if key == Qt.Key.Key_Backspace:
-                self._dimension_input = self._dimension_input[:-1]
+                self._create_tool.dimension_input = self._create_tool.dimension_input[:-1]
                 self._update_readout()
                 return
             ch = e.text()
             if ch and ch in "0123456789.x, ":
-                self._dimension_input += ch
+                self._create_tool.dimension_input += ch
                 self._update_readout()
                 return
         if key == Qt.Key.Key_Escape and self._move_active:
@@ -2104,21 +1967,16 @@ class QRhiViewportWidget(QRhiWidget):
         if self._nudge_with_arrows(key):
             return
         # WASD + QE fly: translate the view (target + camera) together.
-        cam = self._camera_values()
-        right = np.array(cam["u_camera_right"], dtype=np.float64)
-        fwd = np.array(cam["u_camera_target"], dtype=np.float64) \
-            - np.array(cam["u_camera_position"], dtype=np.float64)
-        n = np.linalg.norm(fwd)
-        fwd = fwd / n if n > 1e-9 else fwd
+        camera = self._camera
+        _pos, fwd, right, _up = camera.basis()
         world_up = np.array([0.0, 0.0, 1.0])
-        step = max(self._distance * 0.06, 0.05 * self._view_scale)
         move = {
             Qt.Key.Key_W: fwd, Qt.Key.Key_S: -fwd,
             Qt.Key.Key_D: right, Qt.Key.Key_A: -right,
             Qt.Key.Key_E: world_up, Qt.Key.Key_Q: -world_up,
         }.get(key)
         if move is not None:
-            self._target = self._target + move * step
+            camera.target = camera.target + move * camera.fly_step()
             self._dirty = True
         else:
             super().keyPressEvent(e)
@@ -2197,20 +2055,20 @@ class QRhiViewportWidget(QRhiWidget):
             self._press_pos = None
             return
         if (
-            self._create_kind is not None
-            and self._point_pts is None
+            self._create_tool.kind is not None
+            and self._create_tool.points is None
             and e.button() == Qt.MouseButton.LeftButton
         ):
-            start = self._create_start_world
+            start = self._create_tool.start_world
             end = self._snap_world(self._screen_to_grid(e.position()), e.modifiers())
             moved = (self._press_pos is not None
                      and (e.position() - self._press_pos).manhattanLength() >= 4)
             if start is not None and end is not None and moved:
-                self._emit_drag_shape(start, end)  # real drag -> commit
+                self._create_tool.emit_drag_shape(start, end)  # real drag -> commit
             elif start is not None:
                 # click: lock the anchor; type a size + Enter, or click the end.
-                self._create_anchor = start
-                self._create_start_world = None
+                self._create_tool.anchor = start
+                self._create_tool.start_world = None
                 self._restore_committed_scene()  # drop any drag-preview ghost
                 signals.log_message.emit(
                     "info",
@@ -2230,18 +2088,9 @@ class QRhiViewportWidget(QRhiWidget):
     def _screen_ray(self, pos):
         """Return (origin, direction) of the camera ray through screen `pos`.
         Matches the QRhi surface/grid camera convention."""
-        cam = self._camera_values()
-        cp = np.array(cam["u_camera_position"], dtype=np.float64)
-        right = np.array(cam["u_camera_right"], dtype=np.float64)
-        up = np.array(cam["u_camera_up"], dtype=np.float64)
-        fwd = np.array(cam["u_camera_target"], dtype=np.float64) - cp
-        fwd /= max(np.linalg.norm(fwd), 1e-9)
-        w, h = max(self.width(), 1), max(self.height(), 1)
-        suvx = (pos.x() - 0.5 * w) / h
-        suvy = -((pos.y() - 0.5 * h) / h)
-        rd = 2.0 * suvx * right + 2.0 * suvy * up + self._focal * fwd
-        rd /= max(np.linalg.norm(rd), 1e-9)
-        return cp, rd
+        return self._camera.screen_ray(
+            pos.x(), pos.y(), self.width(), self.height()
+        )
 
     def _screen_to_grid(self, pos):
         """Intersect the screen ray with the active grid plane (0=XY,1=XZ,2=YZ).
@@ -2338,7 +2187,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._dirty = True
 
     def _max_ray_distance(self, camera_position) -> float:
-        base = 100.0 * max(1.0, self._view_scale)
+        base = 100.0 * max(1.0, self._camera.view_scale)
         if self._scene_center is None:
             return base
         camera = np.asarray(camera_position, dtype=np.float64)
@@ -2352,10 +2201,7 @@ class QRhiViewportWidget(QRhiWidget):
         dy = e.angleDelta().y() or e.pixelDelta().y()
         if dy == 0:
             return
-        minimum, maximum = self._zoom_limits()
-        self._distance = max(
-            minimum, min(maximum, self._distance * math.exp(-dy * 0.0012))
-        )
+        self._camera.zoom_by(dy)
         self._begin_interaction()
 
 
