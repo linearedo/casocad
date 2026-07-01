@@ -41,6 +41,7 @@ class AppSignals(QObject):
     create_boundary_region_requested = Signal(object)
     create_polygon_from_polyline_requested = Signal(object)
     undo_snapshot_ready = Signal(object)
+    working_unit_changed = Signal(object)
     node_edited = Signal()
     log_message = Signal(str, str)
 

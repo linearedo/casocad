@@ -17,7 +17,12 @@ from PySide6.QtWidgets import (
 )
 
 from app.axis_labels import world_axis_label
-from app.dimensions import parse_measurement_entry, parse_scalar_entry
+from app.dimensions import (
+    DEFAULT_LENGTH_UNIT,
+    LengthUnit,
+    parse_measurement_entry,
+    parse_scalar_entry,
+)
 from app.panels.display import display_kind
 from app.signals import signals
 from core.boundary import BoundaryRegion
@@ -54,6 +59,10 @@ from core.sdf import (
     PlacedPolyline1D,
 )
 from core.sdf.base import BoundingBox3D, SDFNode
+
+# Wide unit-independent spin rails (meters); real validation is the model's.
+DIMENSION_SPIN_LIMIT = 1.0e9
+POSITIVE_LENGTH_MINIMUM = 1.0e-9
 
 
 def full_size_from_half_size(values: tuple[float, ...]) -> tuple[float, ...]:
@@ -147,9 +156,10 @@ def bounding_box_size(box: BoundingBox3D) -> tuple[float, float, float]:
 def read_only_vector_text(
     values: tuple[float, ...],
     axis_labels: tuple[str, ...] | None = None,
+    unit: LengthUnit = DEFAULT_LENGTH_UNIT,
 ) -> str:
     return "  ".join(
-        f"{label} {value:.5g} m"
+        f"{label} {value / unit.factor:.5g} {unit.key}"
         for label, value in zip(
             vector_component_labels(len(values), axis_labels),
             values,
@@ -264,16 +274,35 @@ def values_equal(left: object, right: object) -> bool:
     return left == right
 
 
-def property_dimension_value(text: str) -> float:
+def dimension_entry_expressions(text: str, unit: LengthUnit) -> tuple[str, ...]:
+    """Parse candidates for a spinbox entry: the raw text first (explicit
+    units like "10mm" in meters mode win), then the text without the display
+    suffix, dropped only when it is what breaks the parse (Qt keeps the
+    suffix in the line edit, so entries arrive as e.g. "3cm mm")."""
     expression = text.strip()
-    if expression.endswith("m") and not expression.endswith(
-        ("mm", "cm"),
-    ):
-        expression = expression[:-1].strip()
-    values = parse_measurement_entry(expression)
+    candidates = [expression]
+    if expression.lower().endswith(unit.key):
+        candidates.append(expression[: -len(unit.key)].rstrip())
+    return tuple(candidates)
+
+
+def property_dimension_value(
+    text: str, unit: LengthUnit = DEFAULT_LENGTH_UNIT
+) -> float:
+    """Parse one dimension entry into meters; bare numbers are read in the
+    working unit."""
+    values = None
+    for expression in dimension_entry_expressions(text, unit):
+        try:
+            values = parse_measurement_entry(expression, unit.factor)
+            break
+        except ValueError:
+            continue
+    if values is None:
+        raise ValueError("invalid dimension entry")
     if len(values) != 1:
         raise ValueError("property dimension fields accept one value")
-    value = float(values[0])
+    value = float(values[0]) * unit.factor
     if not np.isfinite(value):
         raise ValueError("property dimension value must be finite")
     return value
@@ -340,20 +369,46 @@ class _CadEditableSpinBox(QDoubleSpinBox):
 
 
 class CadDimensionSpinBox(_CadEditableSpinBox):
+    """Spinbox whose value() is always meters (the model unit) while text is
+    displayed and parsed in the active working unit."""
+
+    _SINGLE_STEP_WORKING_UNITS = 0.01
+    _DISPLAY_DECIMALS = 9
+    # Class-level default: Qt renders text during __init__, before set_unit.
+    _unit = DEFAULT_LENGTH_UNIT
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # Decimals bound the internal meters rounding, so they stay high and
+        # unit-independent; textFromValue trims the display instead.
+        self.setDecimals(self._DISPLAY_DECIMALS)
+        self.set_unit(DEFAULT_LENGTH_UNIT)
+
+    def unit(self) -> LengthUnit:
+        return self._unit
+
+    def set_unit(self, unit: LengthUnit) -> None:
+        self._unit = unit
+        self.setSingleStep(self._SINGLE_STEP_WORKING_UNITS * unit.factor)
+        self.setSuffix(f" {unit.key}")
+
+    def textFromValue(self, value: float) -> str:
+        scaled = value / self._unit.factor
+        text = f"{scaled:.{self._DISPLAY_DECIMALS}f}".rstrip("0").rstrip(".")
+        return "0" if text in {"", "-0"} else text
+
     def valueFromText(self, text: str) -> float:
         try:
-            return property_dimension_value(text)
+            return property_dimension_value(text, self._unit)
         except ValueError:
             return self.value()
 
     def validate(self, text: str, position: int) -> tuple[QValidator.State, str, int]:
-        expression = text.strip()
-        if expression.endswith("m") and not expression.endswith(("mm", "cm")):
-            expression = expression[:-1].strip()
+        expression = dimension_entry_expressions(text, self._unit)[-1]
         if not expression or expression in {"-", "+", ".", "(", "-(", "+("}:
             return (QValidator.State.Intermediate, text, position)
         try:
-            property_dimension_value(text)
+            property_dimension_value(text, self._unit)
         except ValueError:
             return (QValidator.State.Intermediate, text, position)
         return (QValidator.State.Acceptable, text, position)
@@ -403,9 +458,16 @@ class PropertiesPanel(QWidget):
         self._layout = QFormLayout(self)
         self._document: SceneDocument | None = None
         self._node: SDFNode | BoundaryRegion | None = None
+        self._unit = DEFAULT_LENGTH_UNIT
         self._show_empty("Select one scene node.")
         signals.document_changed.connect(self._on_document_changed)
         signals.node_selected.connect(self._on_node_selected)
+        signals.working_unit_changed.connect(self._on_working_unit_changed)
+
+    def _on_working_unit_changed(self, unit: LengthUnit) -> None:
+        self._unit = unit
+        if self._node is not None:
+            self._build_form()
 
     def _on_document_changed(self, document: SceneDocument) -> None:
         self._document = document
@@ -496,7 +558,7 @@ class PropertiesPanel(QWidget):
                     "half_height",
                     half_length_from_full_length(value),
                 ),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
         elif isinstance(node, CappedCone):
             self._add_full_length(
@@ -516,7 +578,7 @@ class PropertiesPanel(QWidget):
                     "half_height",
                     half_length_from_full_length(value),
                 ),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
         elif isinstance(node, Cone):
             self._add_full_length(
@@ -531,7 +593,7 @@ class PropertiesPanel(QWidget):
                     "half_height",
                     half_length_from_full_length(value),
                 ),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
         elif isinstance(node, Pyramid):
             self._add_full_length(
@@ -546,7 +608,7 @@ class PropertiesPanel(QWidget):
                     "half_height",
                     half_length_from_full_length(value),
                 ),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
         elif isinstance(node, BoxFrame):
             self._add_full_size(
@@ -558,7 +620,7 @@ class PropertiesPanel(QWidget):
                 "Edge thickness",
                 node.thickness,
                 lambda value: self._set_value("thickness", value),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
         elif isinstance(node, Torus):
             self._add_float(
@@ -568,7 +630,7 @@ class PropertiesPanel(QWidget):
                     "major_radius",
                     half_length_from_full_length(value),
                 ),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
             self._add_float(
                 "Minor diameter",
@@ -577,7 +639,7 @@ class PropertiesPanel(QWidget):
                     "minor_radius",
                     half_length_from_full_length(value),
                 ),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
         elif isinstance(node, Translate):
             self._add_vector(
@@ -683,7 +745,7 @@ class PropertiesPanel(QWidget):
                 "Radius",
                 node.radius,
                 lambda value: self._set_value("radius", value),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
             self._add_float(
                 "Inner radius",
@@ -737,7 +799,7 @@ class PropertiesPanel(QWidget):
                 "Height",
                 node.height,
                 lambda value: self._set_value("height", value),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
             self._add_float(
                 "Center offset",
@@ -763,7 +825,7 @@ class PropertiesPanel(QWidget):
                     "half_length",
                     half_length_from_full_length(value),
                 ),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
             )
 
     def _add_profile_fields(self, node: PlacedSDF2D) -> None:
@@ -790,7 +852,7 @@ class PropertiesPanel(QWidget):
             minimum = (
                 rounded_rectangle_full_size_minimum(profile.corner_radius)
                 if isinstance(profile, RoundedRectangleProfile)
-                else 0.001
+                else POSITIVE_LENGTH_MINIMUM
             )
             self._add_full_size(
                 "Size",
@@ -810,7 +872,7 @@ class PropertiesPanel(QWidget):
                 "Corner radius",
                 profile.corner_radius,
                 lambda value: self._set_profile_value("corner_radius", value),
-                0.001,
+                POSITIVE_LENGTH_MINIMUM,
                 rounded_rectangle_corner_radius_maximum(profile.half_size),
             )
         if isinstance(profile, EllipseProfile):
@@ -927,20 +989,20 @@ class PropertiesPanel(QWidget):
             return
         self._layout.addRow(
             "Bounds center",
-            QLabel(read_only_vector_text(bounding_box_center(box))),
+            QLabel(read_only_vector_text(bounding_box_center(box), unit=self._unit)),
         )
         self._layout.addRow(
             "Bounds size",
-            QLabel(read_only_vector_text(bounding_box_size(box))),
+            QLabel(read_only_vector_text(bounding_box_size(box), unit=self._unit)),
         )
 
-    def _spin(self, value: float, minimum: float = -1000.0) -> QDoubleSpinBox:
+    def _spin(
+        self, value: float, minimum: float = -DIMENSION_SPIN_LIMIT
+    ) -> QDoubleSpinBox:
         spin = CadDimensionSpinBox()
-        spin.setDecimals(5)
-        spin.setRange(minimum, 1000.0)
-        spin.setSingleStep(0.01)
-        spin.setSuffix(" m")
+        spin.setRange(minimum, DIMENSION_SPIN_LIMIT)
         spin.setKeyboardTracking(False)
+        spin.set_unit(self._unit)
         spin.setValue(value)
         return spin
 
@@ -949,8 +1011,8 @@ class PropertiesPanel(QWidget):
         label: str,
         value: float,
         setter: Callable[[float], None],
-        minimum: float = -1000.0,
-        maximum: float = 1000.0,
+        minimum: float = -DIMENSION_SPIN_LIMIT,
+        maximum: float = DIMENSION_SPIN_LIMIT,
     ) -> None:
         spin = self._spin(value, minimum)
         spin.setMaximum(maximum)
@@ -975,7 +1037,7 @@ class PropertiesPanel(QWidget):
         label: str,
         value: tuple[float, ...],
         setter: Callable[[tuple[float, ...]], None],
-        minimum: float = -1000.0,
+        minimum: float = -DIMENSION_SPIN_LIMIT,
         axis_labels: tuple[str, ...] | None = None,
     ) -> None:
         spins = [self._spin(component, minimum) for component in value]
@@ -1000,7 +1062,7 @@ class PropertiesPanel(QWidget):
         label: str,
         half_size: tuple[float, ...],
         setter: Callable[[tuple[float, ...]], None],
-        minimum: float = 0.001,
+        minimum: float = POSITIVE_LENGTH_MINIMUM,
         axis_labels: tuple[str, ...] | None = None,
     ) -> None:
         self._add_vector(

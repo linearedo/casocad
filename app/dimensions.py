@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import re
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -22,6 +23,11 @@ UNIT_FACTORS = {
     "millimeters": 0.001,
     "millimetre": 0.001,
     "millimetres": 0.001,
+    "km": 1000.0,
+    "kilometer": 1000.0,
+    "kilometers": 1000.0,
+    "kilometre": 1000.0,
+    "kilometres": 1000.0,
     "in": 0.0254,
     "inch": 0.0254,
     "inches": 0.0254,
@@ -32,11 +38,12 @@ UNIT_FACTORS = {
     "'": 0.3048,
 }
 DIMENSION_UNIT_PATTERN = (
+    "kilometers|kilometer|kilometres|kilometre|"
     "millimeters|millimeter|millimetres|millimetre|"
     "centimeters|centimeter|centimetres|centimetre|"
     "meters|meter|metres|metre|"
     "inches|inch|feet|foot|"
-    "mm|cm|m|in|ft|\"|'"
+    "km|mm|cm|m|in|ft|\"|'"
 )
 DIMENSION_INPUT_PATTERN = re.compile(
     r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
@@ -47,17 +54,58 @@ DIMENSION_SEPARATOR_PATTERN = re.compile(r"[\s,;xX]+")
 DIMENSION_EXPRESSION_SEPARATOR_PATTERN = re.compile(r"\s*[,;xX]\s*")
 DIMENSION_ENTRY_BASE_ALLOWED = set("0123456789.,xX; \"'")
 DIMENSION_ENTRY_UNIT_WORD_ALLOWED = set(
-    "millimeterscentimetresmetersinchesfoot"
+    "kilometresmillimeterscentimetresmetersinchesfoot"
 )
 DIMENSION_ENTRY_FORMULA_ALLOWED = set("*/()+-")
 DISPLACEMENT_SIGN_CHARS = set("+-")
 DIMENSION_ENTRY_START_CHARS = set("0123456789.(")
 
 
-def parse_measurement_entry(text: str) -> tuple[float, ...]:
+@dataclass(frozen=True)
+class LengthUnit:
+    """A user-selectable working unit for dimension entry and display.
+
+    ``key`` is the canonical abbreviation (also used as the display suffix)
+    and must be parseable, so adding a unit means one ``LengthUnit`` row here
+    plus its spellings in ``UNIT_FACTORS`` / ``DIMENSION_UNIT_PATTERN``.
+    """
+
+    key: str
+    label: str
+    factor: float  # meters per unit
+
+
+LENGTH_UNITS: tuple[LengthUnit, ...] = (
+    LengthUnit("km", "Kilometers", UNIT_FACTORS["km"]),
+    LengthUnit("m", "Meters", UNIT_FACTORS["m"]),
+    LengthUnit("cm", "Centimeters", UNIT_FACTORS["cm"]),
+    LengthUnit("mm", "Millimeters", UNIT_FACTORS["mm"]),
+)
+DEFAULT_LENGTH_UNIT = LENGTH_UNITS[1]
+
+
+def length_unit(key: str) -> LengthUnit:
+    for unit in LENGTH_UNITS:
+        if unit.key == key:
+            return unit
+    raise KeyError(f"unknown working unit: {key}")
+
+
+def _literal_factor(unit: str, unit_factor: float) -> float:
+    """Meters per typed literal: explicit units win, bare numbers are read in
+    the working unit."""
+    return UNIT_FACTORS[unit] if unit else unit_factor
+
+
+def parse_measurement_entry(
+    text: str, unit_factor: float = 1.0
+) -> tuple[float, ...]:
+    """Parse dimension text into values expressed in the working unit
+    (``unit_factor`` meters per unit; the default keeps meters in, meters
+    out)."""
     try:
         return tuple(
-            _parse_measurement_expression(part)
+            _parse_measurement_expression(part, unit_factor)
             for part in _split_measurement_expressions(text)
         )
     except ValueError:
@@ -68,7 +116,9 @@ def parse_measurement_entry(text: str) -> tuple[float, ...]:
         unit = (match.group(2) or "").lower()
         if unit not in UNIT_FACTORS:
             raise ValueError(f"unknown unit: {match.group(2)}")
-        values.append(float(match.group(1)) * UNIT_FACTORS[unit])
+        values.append(
+            float(match.group(1)) * _literal_factor(unit, unit_factor) / unit_factor
+        )
         consumed.append((match.start(), match.end()))
     if not values:
         raise ValueError("dimension entries must contain at least one number")
@@ -99,8 +149,8 @@ def _split_measurement_expressions(text: str) -> tuple[str, ...]:
     raise ValueError("dimension entries must contain at least one number")
 
 
-def _parse_measurement_expression(text: str) -> float:
-    expression = _replace_measurement_literals(text)
+def _parse_measurement_expression(text: str, unit_factor: float = 1.0) -> float:
+    expression = _replace_measurement_literals(text, unit_factor)
     try:
         parsed = ast.parse(expression, mode="eval")
         value = _evaluate_measurement_ast(parsed)
@@ -111,7 +161,7 @@ def _parse_measurement_expression(text: str) -> float:
     return float(value)
 
 
-def _replace_measurement_literals(text: str) -> str:
+def _replace_measurement_literals(text: str, unit_factor: float = 1.0) -> str:
     pieces: list[str] = []
     cursor = 0
     found = False
@@ -128,7 +178,9 @@ def _replace_measurement_literals(text: str) -> str:
         if unit not in UNIT_FACTORS:
             raise ValueError(f"unknown unit: {match.group(2)}")
         pieces.append(prefix)
-        pieces.append(str(float(number_text) * UNIT_FACTORS[unit]))
+        pieces.append(
+            str(float(number_text) * _literal_factor(unit, unit_factor) / unit_factor)
+        )
         cursor = match.end()
         found = True
     if not found:
@@ -173,15 +225,19 @@ def parse_scalar_entry(text: str) -> float:
     return float(value)
 
 
-def parse_dimension_entry(text: str) -> tuple[float, ...]:
-    values = parse_measurement_entry(text)
+def parse_dimension_entry(
+    text: str, unit_factor: float = 1.0
+) -> tuple[float, ...]:
+    values = parse_measurement_entry(text, unit_factor)
     if not values or any(value <= 0.0 or not np.isfinite(value) for value in values):
         raise ValueError("dimension entries must be positive finite numbers")
     return values
 
 
-def parse_displacement_entry(text: str) -> tuple[float, ...]:
-    values = parse_measurement_entry(text)
+def parse_displacement_entry(
+    text: str, unit_factor: float = 1.0
+) -> tuple[float, ...]:
+    values = parse_measurement_entry(text, unit_factor)
     if not values or any(not np.isfinite(value) for value in values):
         raise ValueError("displacement entries must be finite numbers")
     return values

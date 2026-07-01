@@ -94,6 +94,13 @@ REFERENCE_PLANE_AXES_3D = {
 }
 
 
+def _scaled_points_2d(
+    points: tuple[tuple[float, float], ...] | list[tuple[float, float]],
+    scale: float,
+) -> tuple[tuple[float, float], ...]:
+    return tuple((u * scale, v * scale) for u, v in points)
+
+
 @dataclass
 class SceneDocument:
     objects: list[SDFNode] = field(default_factory=list)
@@ -189,52 +196,91 @@ class SceneDocument:
         return f"{kind}_{index}"
 
     def create_primitive(
-        self, kind: str, name: str | None = None
+        self, kind: str, name: str | None = None, *, scale: float = 1.0
     ) -> Primitive3D:
+        """Create a 3D primitive with default sizes of `scale` scene units
+        (the app passes the working unit's meters-per-unit factor)."""
         object_id = self._allocate_object_id()
         common = {"name": name or self._default_name(kind), "object_id": object_id}
         factories = {
-            "sphere": lambda: Sphere(**common, radius=0.5),
-            "box": lambda: Box(**common, half_size=(0.5, 0.5, 0.5)),
-            "cylinder": lambda: Cylinder(**common, radius=0.4, half_height=0.6),
+            "sphere": lambda: Sphere(**common, radius=0.5 * scale),
+            "box": lambda: Box(
+                **common, half_size=(0.5 * scale, 0.5 * scale, 0.5 * scale)
+            ),
+            "cylinder": lambda: Cylinder(
+                **common, radius=0.4 * scale, half_height=0.6 * scale
+            ),
             "capped_cone": lambda: CappedCone(
                 **common,
-                radius_a=0.45,
-                radius_b=0.25,
-                half_height=0.6,
+                radius_a=0.45 * scale,
+                radius_b=0.25 * scale,
+                half_height=0.6 * scale,
             ),
-            "cone": lambda: Cone(**common, radius=0.45, half_height=0.6),
+            "cone": lambda: Cone(
+                **common, radius=0.45 * scale, half_height=0.6 * scale
+            ),
             "pyramid": lambda: Pyramid(
                 **common,
-                base_half_size=0.45,
-                half_height=0.6,
+                base_half_size=0.45 * scale,
+                half_height=0.6 * scale,
             ),
             "box_frame": lambda: BoxFrame(
                 **common,
-                half_size=(0.5, 0.5, 0.5),
-                thickness=0.08,
+                half_size=(0.5 * scale, 0.5 * scale, 0.5 * scale),
+                thickness=0.08 * scale,
             ),
-            "torus": lambda: Torus(**common, major_radius=0.5, minor_radius=0.15),
-            "polyline_tube": lambda: PolylineTube(**common),
-            "quadratic_bezier_tube": lambda: QuadraticBezierTube(**common),
+            "torus": lambda: Torus(
+                **common, major_radius=0.5 * scale, minor_radius=0.15 * scale
+            ),
+            "polyline_tube": lambda: PolylineTube(
+                **common,
+                points=(
+                    (-0.75 * scale, 0.0, 0.0),
+                    (0.0, 0.5 * scale, 0.0),
+                    (0.75 * scale, 0.0, 0.0),
+                ),
+                radius=0.12 * scale,
+            ),
+            "quadratic_bezier_tube": lambda: QuadraticBezierTube(
+                **common,
+                points=(
+                    (-0.75 * scale, 0.0, 0.0),
+                    (0.0, 0.55 * scale, 0.0),
+                    (0.75 * scale, 0.0, 0.0),
+                ),
+                radius=0.12 * scale,
+            ),
         }
         if kind not in factories:
             raise ValueError(f"unknown 3D primitive type: {kind}")
         return factories[kind]()
 
     def create_placed_2d(
-        self, kind: str, name: str | None = None
+        self, kind: str, name: str | None = None, *, scale: float = 1.0
     ) -> PlacedSDF2D:
         object_id = self._allocate_object_id()
         factories = {
-            "circle": CircleProfile,
-            "rectangle": RectangleProfile,
-            "square": SquareProfile,
-            "rounded_rectangle": RoundedRectangleProfile,
-            "ellipse": EllipseProfile,
-            "regular_polygon": RegularPolygonProfile,
-            "polygon": PolygonProfile,
-            "quadratic_bezier_surface": QuadraticBezierSurfaceProfile,
+            "circle": lambda: CircleProfile(radius=0.5 * scale),
+            "rectangle": lambda: RectangleProfile(
+                half_size=(0.5 * scale, 0.35 * scale)
+            ),
+            "square": lambda: SquareProfile(half_size=0.5 * scale),
+            "rounded_rectangle": lambda: RoundedRectangleProfile(
+                half_size=(0.5 * scale, 0.35 * scale),
+                corner_radius=0.1 * scale,
+            ),
+            "ellipse": lambda: EllipseProfile(
+                semi_axes=(0.6 * scale, 0.35 * scale)
+            ),
+            "regular_polygon": lambda: RegularPolygonProfile(radius=0.5 * scale),
+            "polygon": lambda: PolygonProfile(
+                points=_scaled_points_2d(PolygonProfile().points, scale)
+            ),
+            "quadratic_bezier_surface": lambda: QuadraticBezierSurfaceProfile(
+                points=_scaled_points_2d(
+                    QuadraticBezierSurfaceProfile().points, scale
+                )
+            ),
         }
         if kind not in factories:
             raise ValueError(f"unknown 2D profile type: {kind}")
@@ -247,12 +293,14 @@ class SceneDocument:
     def create_placed_1d(
         self,
         name: str | None = None,
+        *,
+        scale: float = 1.0,
     ) -> PlacedSDF1D:
         object_id = self._allocate_object_id()
         return PlacedSDF1D(
             name=name or self._default_name("segment"),
             object_id=object_id,
-            profile=SegmentProfile(),
+            profile=SegmentProfile(half_length=0.5 * scale),
         )
 
     def create_polyline(
@@ -501,21 +549,29 @@ class SceneDocument:
             axis_v=axis_v,
         )
 
-    def add_primitive(self, kind: str) -> int:
+    def add_primitive(self, kind: str, *, scale: float = 1.0) -> int:
+        """Add a primitive with default sizes of `scale` scene units, so new
+        objects match the working unit; committed objects are never rescaled."""
         if kind in {"segment", "interval"}:
-            node: SDFNode = self.create_placed_1d()
+            node: SDFNode = self.create_placed_1d(scale=scale)
         elif kind == "polyline":
-            node = self.create_polyline(PolylineProfile().points)
+            node = self.create_polyline(
+                _scaled_points_2d(PolylineProfile().points, scale)
+            )
         elif kind == "quadratic_bezier_curve":
-            node = self.create_quadratic_bezier_curve(QuadraticBezierCurveProfile().points)
+            node = self.create_quadratic_bezier_curve(
+                _scaled_points_2d(QuadraticBezierCurveProfile().points, scale)
+            )
         elif kind == "quadratic_bezier_polycurve":
-            node = self.create_quadratic_bezier_curve(DEFAULT_QUADRATIC_BEZIER_POLYCURVE_POINTS)
+            node = self.create_quadratic_bezier_curve(
+                _scaled_points_2d(DEFAULT_QUADRATIC_BEZIER_POLYCURVE_POINTS, scale)
+            )
         elif kind == "polyline_tube":
-            node = self.create_primitive(kind)
+            node = self.create_primitive(kind, scale=scale)
         elif kind == "quadratic_bezier_tube":
-            node = self.create_primitive(kind)
+            node = self.create_primitive(kind, scale=scale)
         elif kind == "quadratic_bezier_surface":
-            node = self.create_placed_2d(kind)
+            node = self.create_placed_2d(kind, scale=scale)
         elif kind in {
             "circle",
             "rectangle",
@@ -525,10 +581,10 @@ class SceneDocument:
             "regular_polygon",
             "polygon",
         }:
-            node = self.create_placed_2d(kind)
+            node = self.create_placed_2d(kind, scale=scale)
         else:
-            node = self.create_primitive(kind)
-            offset = 0.25 * len(self.objects)
+            node = self.create_primitive(kind, scale=scale)
+            offset = 0.25 * scale * len(self.objects)
             if hasattr(node, "center"):
                 node.center = (offset, 0.0, 0.0)
         self.objects.append(node)
@@ -542,8 +598,14 @@ class SceneDocument:
         start: tuple[float, float, float],
         end: tuple[float, float, float],
         parameters: dict[str, float] | None = None,
+        *,
+        scale: float = 1.0,
     ) -> int:
+        """Sizes come from the world-space drag; `scale` (scene units, the
+        working unit's meters-per-unit factor) only sets the degenerate-drag
+        minimums and the parameter defaults."""
         parameters = parameters or {}
+        minimum_half = 0.05 * scale
         start_array = np.asarray(start, dtype=np.float64)
         end_array = np.asarray(end, dtype=np.float64)
         center = 0.5 * (start_array + end_array)
@@ -551,13 +613,13 @@ class SceneDocument:
         axis_u = tuple(1.0 if index == axis_a else 0.0 for index in range(3))
         axis_v = tuple(1.0 if index == axis_b else 0.0 for index in range(3))
         extent_a = float(
-            max(abs(end_array[axis_a] - start_array[axis_a]) * 0.5, 0.05)
+            max(abs(end_array[axis_a] - start_array[axis_a]) * 0.5, minimum_half)
         )
         extent_b = float(
-            max(abs(end_array[axis_b] - start_array[axis_b]) * 0.5, 0.05)
+            max(abs(end_array[axis_b] - start_array[axis_b]) * 0.5, minimum_half)
         )
         planar_delta = end_array[[axis_a, axis_b]] - start_array[[axis_a, axis_b]]
-        radius = max(float(np.linalg.norm(planar_delta)) * 0.5, 0.05)
+        radius = max(float(np.linalg.norm(planar_delta)) * 0.5, minimum_half)
         if kind in {"segment", "interval"}:
             direction = end_array - start_array
             length = float(np.linalg.norm(direction))
@@ -568,7 +630,9 @@ class SceneDocument:
                 if length > 1e-12
                 else (1.0, 0.0, 0.0)
             )
-            node.profile = SegmentProfile(half_length=max(0.5 * length, 0.05))
+            node.profile = SegmentProfile(
+                half_length=max(0.5 * length, minimum_half)
+            )
             node.__post_init__()
         elif kind == "polyline":
             node = self.create_polyline(
@@ -605,7 +669,7 @@ class SceneDocument:
                     tuple(float(value) for value in start_array),
                     tuple(float(value) for value in end_array),
                 ),
-                radius=float(parameters.get("radius", 0.12)),
+                radius=float(parameters.get("radius", 0.12 * scale)),
             )
         elif kind == "quadratic_bezier_tube":
             control = 0.5 * (start_array + end_array)
@@ -619,7 +683,7 @@ class SceneDocument:
                     tuple(float(value) for value in control + axis_offset),
                     tuple(float(value) for value in end_array),
                 ),
-                radius=float(parameters.get("radius", 0.12)),
+                radius=float(parameters.get("radius", 0.12 * scale)),
             )
         elif kind in {
             "circle",
@@ -645,7 +709,7 @@ class SceneDocument:
                 half_size = (extent_a, extent_b)
                 node.profile = RoundedRectangleProfile(
                     half_size=half_size,
-                    corner_radius=max(0.01, min(half_size) * 0.2),
+                    corner_radius=max(0.01 * scale, min(half_size) * 0.2),
                 )
             elif kind == "ellipse":
                 node.profile = EllipseProfile(semi_axes=(extent_a, extent_b))
@@ -672,7 +736,7 @@ class SceneDocument:
                 node.profile = RegularPolygonProfile(radius=radius)
             node.__post_init__()
         else:
-            node = self.create_primitive(kind)
+            node = self.create_primitive(kind, scale=scale)
             world_center = tuple(float(value) for value in center)
             if isinstance(node, Sphere):
                 node.center = world_center
@@ -682,7 +746,7 @@ class SceneDocument:
                 box_delta = np.abs(end_array - start_array)
                 if np.count_nonzero(box_delta > 1e-9) == 3:
                     half_size = [
-                        float(max(0.5 * value, 0.05))
+                        float(max(0.5 * value, minimum_half))
                         for value in box_delta
                     ]
                 else:
@@ -695,9 +759,9 @@ class SceneDocument:
                 node.center = world_center
                 radial_delta = float(np.linalg.norm((end_array - start_array)[:2]))
                 height_delta = abs(float(end_array[2] - start_array[2]))
-                node.radius = max(0.5 * radial_delta, 0.05)
+                node.radius = max(0.5 * radial_delta, minimum_half)
                 node.half_height = (
-                    max(0.5 * height_delta, 0.05)
+                    max(0.5 * height_delta, minimum_half)
                     if height_delta > 1e-9
                     else max(extent_a, extent_b)
                 )
@@ -705,15 +769,15 @@ class SceneDocument:
                 node.center = world_center
                 radial_delta = float(np.linalg.norm((end_array - start_array)[:2]))
                 height_delta = abs(float(end_array[2] - start_array[2]))
-                node.radius_a = max(0.5 * radial_delta, 0.05)
+                node.radius_a = max(0.5 * radial_delta, minimum_half)
                 top_diameter = parameters.get("top_diameter")
                 node.radius_b = (
-                    max(0.5 * float(top_diameter), 0.02)
+                    max(0.5 * float(top_diameter), 0.02 * scale)
                     if top_diameter is not None
-                    else max(node.radius_a * 0.45, 0.025)
+                    else max(node.radius_a * 0.45, 0.025 * scale)
                 )
                 node.half_height = (
-                    max(0.5 * height_delta, 0.05)
+                    max(0.5 * height_delta, minimum_half)
                     if height_delta > 1e-9
                     else max(extent_a, extent_b)
                 )
@@ -721,18 +785,18 @@ class SceneDocument:
                 node.center = world_center
                 radial_delta = float(np.linalg.norm((end_array - start_array)[:2]))
                 height_delta = abs(float(end_array[2] - start_array[2]))
-                node.radius = max(0.5 * radial_delta, 0.05)
+                node.radius = max(0.5 * radial_delta, minimum_half)
                 node.half_height = (
-                    max(0.5 * height_delta, 0.05)
+                    max(0.5 * height_delta, minimum_half)
                     if height_delta > 1e-9
                     else max(extent_a, extent_b)
                 )
             elif isinstance(node, Pyramid):
                 node.center = world_center
                 box_delta = np.abs(end_array - start_array)
-                node.base_half_size = max(extent_a, extent_b, 0.05)
+                node.base_half_size = max(extent_a, extent_b, minimum_half)
                 node.half_height = (
-                    max(0.5 * float(box_delta[2]), 0.05)
+                    max(0.5 * float(box_delta[2]), minimum_half)
                     if box_delta[2] > 1e-9
                     else max(extent_a, extent_b)
                 )
@@ -741,7 +805,7 @@ class SceneDocument:
                 box_delta = np.abs(end_array - start_array)
                 if np.count_nonzero(box_delta > 1e-9) == 3:
                     half_size = [
-                        float(max(0.5 * value, 0.05))
+                        float(max(0.5 * value, minimum_half))
                         for value in box_delta
                     ]
                 else:
@@ -750,15 +814,15 @@ class SceneDocument:
                     half_size[axis_a] = extent_a
                     half_size[axis_b] = extent_b
                 node.half_size = tuple(half_size)
-                node.thickness = max(min(node.half_size) * 0.14, 0.015)
+                node.thickness = max(min(node.half_size) * 0.14, 0.015 * scale)
             elif isinstance(node, Torus):
                 node.center = world_center
                 node.major_radius = radius
                 minor_diameter = parameters.get("minor_diameter")
                 node.minor_radius = (
-                    max(0.5 * float(minor_diameter), 0.02)
+                    max(0.5 * float(minor_diameter), 0.02 * scale)
                     if minor_diameter is not None
-                    else max(radius * 0.25, 0.02)
+                    else max(radius * 0.25, 0.02 * scale)
                 )
         self.objects.append(node)
         self._reindex()

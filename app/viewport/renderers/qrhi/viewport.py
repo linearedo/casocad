@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.axis_labels import world_axis_label
-from app.dimensions import parse_dimension_entry
+from app.dimensions import DEFAULT_LENGTH_UNIT, parse_dimension_entry
 from app.signals import signals
 from app.viewport.performance_governor import (
     ViewportPerformanceGovernor,
@@ -44,6 +44,9 @@ _BACKENDS = {
     "d3d11": getattr(QRhiWidget.Api, "Direct3D11", None),
 }
 _REVOLVE_PREVIEW_INTERVAL_MS = 80.0
+# The familiar startup framing: 6 m away from a 1 m grid. Working-unit
+# switches reproduce this view scaled by the unit factor.
+_DEFAULT_VIEW_DISTANCE = 6.0
 
 
 def _revolve_signal_frame(
@@ -205,7 +208,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._renderer_ready = False
         # orbit camera state
         self._target = np.array([0.0, 0.0, 0.0])
-        self._distance = 6.0
+        self._distance = _DEFAULT_VIEW_DISTANCE
         self._yaw = math.radians(35.0)
         self._pitch = math.radians(28.0)
         self._focal = 1.5
@@ -213,6 +216,10 @@ class QRhiViewportWidget(QRhiWidget):
         self._show_grid = True
         self._grid_spacing = 1.0
         self._default_grid_spacing = 1.0
+        # working-scale factor (meters per working unit): the grid stays a
+        # truthful world-space snap reference, so camera floors/ceilings and
+        # tool sizes scale with this instead of the grid adapting to the view
+        self._view_scale = 1.0
         self._sdf_opacity = 1.0
         self._gizmo_visible = True
         self._components_visible = False
@@ -283,6 +290,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._create_anchor = None   # locked start (deferred click -> typed size)
         self._create_hover = None    # hover for the rubber-band preview
         self._dimension_input = ""   # typed dimension buffer
+        self._working_unit = DEFAULT_LENGTH_UNIT  # unit for bare typed sizes
         self._snap_enabled = True  # snap grid-plane points to grid spacing
         self._command_panel = None
         self._orientation_widget = None
@@ -316,7 +324,27 @@ class QRhiViewportWidget(QRhiWidget):
         self._build_error_label()
         self._build_fps_label()
         signals.viewport_create_requested.connect(self.begin_create_tool)
+        signals.working_unit_changed.connect(self._set_working_unit)
         signals.log_message.connect(self._on_log_message)
+
+    def _set_working_unit(self, unit) -> None:
+        """Full workspace rescale: snap grid to one working unit and reproduce
+        the familiar startup framing at the new scale. Committed geometry is
+        world-space and never moves; only the camera does."""
+        self._working_unit = unit
+        self._view_scale = float(unit.factor)
+        self._default_grid_spacing = float(unit.factor)
+        self._grid_spacing = float(unit.factor)
+        self._distance = _DEFAULT_VIEW_DISTANCE * self._view_scale
+        self._dirty = True
+
+    def _zoom_limits(self) -> tuple[float, float]:
+        """Camera distance envelope, widened (never shrunk) so the working
+        scale and the meter-scale defaults both stay reachable."""
+        return (
+            0.5 * min(1.0, self._view_scale),
+            200.0 * max(1.0, self._view_scale),
+        )
 
     def _build_command_panel(self) -> None:
         """The bottom-center viewport command overlay (recovered from the old
@@ -450,7 +478,8 @@ class QRhiViewportWidget(QRhiWidget):
                     f"|Δ|={dist:.3f}")
         elif self._create_anchor is not None:
             typed = self._dimension_input or "_"
-            text = (f"{self._create_kind}   size: {typed}   "
+            text = (f"{self._create_kind}   size: {typed} "
+                    f"[{self._working_unit.key}]   "
                     "(Enter creates, or click end)")
         elif self._point_pts is not None:
             text = (f"{self._create_kind}   points: {len(self._point_pts)}   "
@@ -846,7 +875,7 @@ class QRhiViewportWidget(QRhiWidget):
         extent = max(box.x_max - box.x_min, box.y_max - box.y_min,
                      box.z_max - box.z_min, 1e-3)
         self._target = np.array([cx, cy, cz], dtype=np.float64)
-        self._distance = max(extent * 1.6, 1.0)
+        self._distance = max(extent * 1.6, min(1.0, self._view_scale))
         self._dirty = True
 
     def set_background_color(self, color) -> None:
@@ -932,7 +961,7 @@ class QRhiViewportWidget(QRhiWidget):
     }
 
     def _gizmo_length(self) -> float:
-        return max(self._distance * 0.18, 0.4)
+        return max(self._distance * 0.18, 0.4 * self._view_scale)
 
     def _ray_plane_hit(self, pos, axis: str):
         """Intersect the cursor ray with the plane through the rotate pivot whose
@@ -1254,12 +1283,14 @@ class QRhiViewportWidget(QRhiWidget):
         if self._create_anchor is None or not self._dimension_input:
             return
         try:
-            dims = parse_dimension_entry(self._dimension_input)
+            dims = parse_dimension_entry(
+                self._dimension_input, self._working_unit.factor
+            )
         except ValueError as error:
             signals.log_message.emit("warning", str(error))
             return
-        w = dims[0]
-        h = dims[1] if len(dims) > 1 else dims[0]
+        w = dims[0] * self._working_unit.factor
+        h = (dims[1] if len(dims) > 1 else dims[0]) * self._working_unit.factor
         ui, vi = self._PLANE_AXIS_INDICES[self._grid_plane]
         end = list(self._create_anchor)
         end[ui] += w
@@ -1301,7 +1332,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._dirty = True
 
     def set_grid_spacing(self, spacing: float) -> None:
-        self._grid_spacing = max(float(spacing), 1e-4)
+        self._grid_spacing = max(float(spacing), 1e-4 * min(1.0, self._view_scale))
         self._dirty = True
 
     def configure_grid(self, box=None, dx=None, *a, **k) -> None:
@@ -1353,7 +1384,7 @@ class QRhiViewportWidget(QRhiWidget):
         don't stack exactly on the original. A grid-step diagonal nudge plus a
         small random jitter keeps repeated pastes visibly separated."""
         ui, vi = self._PLANE_AXIS_INDICES[self._grid_plane]
-        step = max(self._grid_spacing, 0.1)
+        step = max(self._grid_spacing, 0.1 * min(1.0, self._view_scale))
         off = [0.0, 0.0, 0.0]
         off[ui] = step * (1.0 + random.uniform(-0.25, 0.25))
         off[vi] = step * (1.0 + random.uniform(-0.25, 0.25))
@@ -1493,7 +1524,9 @@ class QRhiViewportWidget(QRhiWidget):
         self._dirty = True
 
     def frame_default_grid(self) -> None:
-        self.frame_target((0.0, 0.0, 0.0), 6.0)
+        self.frame_target(
+            (0.0, 0.0, 0.0), _DEFAULT_VIEW_DISTANCE * self._view_scale
+        )
 
     # -- QRhiWidget hooks ----------------------------------------------------
 
@@ -2078,7 +2111,7 @@ class QRhiViewportWidget(QRhiWidget):
         n = np.linalg.norm(fwd)
         fwd = fwd / n if n > 1e-9 else fwd
         world_up = np.array([0.0, 0.0, 1.0])
-        step = max(self._distance * 0.06, 0.05)
+        step = max(self._distance * 0.06, 0.05 * self._view_scale)
         move = {
             Qt.Key.Key_W: fwd, Qt.Key.Key_S: -fwd,
             Qt.Key.Key_D: right, Qt.Key.Key_A: -right,
@@ -2305,11 +2338,12 @@ class QRhiViewportWidget(QRhiWidget):
         self._dirty = True
 
     def _max_ray_distance(self, camera_position) -> float:
+        base = 100.0 * max(1.0, self._view_scale)
         if self._scene_center is None:
-            return 100.0
+            return base
         camera = np.asarray(camera_position, dtype=np.float64)
         to_scene = float(np.linalg.norm(camera - self._scene_center))
-        return max(100.0, to_scene + self._scene_radius * 4.0)
+        return max(base, to_scene + self._scene_radius * 4.0)
 
     def wheelEvent(self, e: QWheelEvent) -> None:
         # angleDelta (mouse wheel, ~120/notch) or pixelDelta (touchpad, small).
@@ -2318,7 +2352,10 @@ class QRhiViewportWidget(QRhiWidget):
         dy = e.angleDelta().y() or e.pixelDelta().y()
         if dy == 0:
             return
-        self._distance = max(0.5, min(200.0, self._distance * math.exp(-dy * 0.0012)))
+        minimum, maximum = self._zoom_limits()
+        self._distance = max(
+            minimum, min(maximum, self._distance * math.exp(-dy * 0.0012))
+        )
         self._begin_interaction()
 
 

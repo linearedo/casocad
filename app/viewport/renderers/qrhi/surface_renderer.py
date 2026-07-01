@@ -125,7 +125,10 @@ vec3 gridA(vec3 ro, vec3 rd, float mt, vec3 col, float s) {
     vec2 w=fwidth(g);
     vec2 a=abs(fract(g/u_grid_spacing+.5)-.5)*u_grid_spacing;
     float line=1.-smoothstep(0.,max(max(w.x,w.y),1e-5)*1.5,min(a.x,a.y));
-    float fade=clamp(1./(1.+tt*tt*.002),0.,1.);
+    // Fade over a distance proportional to the cell size (1 m baseline), so
+    // coarse grids (km work) stay visible across their own cells.
+    float ft=tt/max(u_grid_spacing,1.);
+    float fade=clamp(1./(1.+ft*ft*.002),0.,1.);
     return mix(col,vec3(.62,.75,.92),line*s*fade);
 }
 // One world axis (line through the origin along `axis`) drawn with a
@@ -146,7 +149,8 @@ vec3 axisLine(vec3 ro, vec3 rd, float mt, vec3 col, vec3 axis, vec3 acol) {
     float wpp=t*2./(u_focal_length*max(u_resolution.y,1.));  // world units / pixel
     float px=dist/max(wpp,1e-9);
     float linev=1.-smoothstep(.9,2.2,px);
-    float fade=clamp(1./(1.+t*t*.0008),0.,1.);
+    float ft=t/max(u_grid_spacing,1.);
+    float fade=clamp(1./(1.+ft*ft*.0008),0.,1.);
     return mix(col,acol,linev*fade);
 }
 void main() {

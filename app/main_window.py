@@ -8,23 +8,26 @@ import sys
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Slot
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QColorDialog,
     QDockWidget,
     QFileDialog,
     QMainWindow,
+    QMenu,
     QMenuBar,
     QMessageBox,
     QLabel,
     QPushButton,
     QSlider,
     QToolBar,
+    QToolButton,
 )
 
 from app.title_bar import install_title_bar
 
 from app.axis_labels import world_axis_label
+from app.dimensions import DEFAULT_LENGTH_UNIT, LENGTH_UNITS, LengthUnit
 from app.artifacts import (
     ArtifactManager,
     BOOLEAN_DRAW_RESOLUTION,
@@ -186,6 +189,7 @@ class MainWindow(QMainWindow):
         self._undo_stack: list[SceneDocument] = []
         self._redo_stack: list[SceneDocument] = []
         self._clipboard_nodes: list[SDFNode] = []
+        self._working_unit = DEFAULT_LENGTH_UNIT
         self.viewport = ViewportWidget()
         self._background_color = QColor(DEFAULT_BACKGROUND_HEX)
         self.setCentralWidget(self.viewport)
@@ -255,10 +259,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(snap_action)
         self._grid_spacing_spin = CadDimensionSpinBox(toolbar)
         self._grid_spacing_spin.setObjectName("gridSpacingSpin")
-        self._grid_spacing_spin.setDecimals(4)
-        self._grid_spacing_spin.setRange(0.001, 1000.0)
-        self._grid_spacing_spin.setSingleStep(0.01)
-        self._grid_spacing_spin.setSuffix(" m")
+        self._grid_spacing_spin.setRange(1.0e-9, 1.0e9)
         self._grid_spacing_spin.setKeyboardTracking(False)
         self._grid_spacing_spin.setValue(self.viewport.grid_spacing)
         self._grid_spacing_spin.setFixedWidth(120)
@@ -269,6 +270,7 @@ class MainWindow(QMainWindow):
             self.viewport.set_grid_spacing
         )
         toolbar.addWidget(self._grid_spacing_spin)
+        toolbar.addWidget(self._build_unit_button(toolbar))
         auto_snap_action = toolbar.addAction("Auto")
         auto_snap_action.setObjectName("autoGridSpacingAction")
         auto_snap_action.setToolTip("Return snap spacing to the scene-based grid")
@@ -300,6 +302,50 @@ class MainWindow(QMainWindow):
         self._background_color_button.clicked.connect(self._choose_background_color)
         toolbar.addWidget(self._background_color_button)
         self._set_background_color(self._background_color)
+
+    def _build_unit_button(self, toolbar: QToolBar) -> QToolButton:
+        """Scrollable unit menu on the snap-grid dimension control; the menu
+        is generated from LENGTH_UNITS so new units only extend the registry."""
+        button = QToolButton(toolbar)
+        button.setObjectName("workingUnitButton")
+        button.setText(self._working_unit.key)
+        button.setToolTip(
+            "Working unit for dimension fields and new SDF defaults; "
+            "committed SDFs keep their size"
+        )
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(button)
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        for unit in LENGTH_UNITS:
+            action = menu.addAction(f"{unit.label} ({unit.key})")
+            action.setCheckable(True)
+            action.setChecked(unit == self._working_unit)
+            action.triggered.connect(
+                lambda checked=False, unit=unit: self._set_working_unit(unit)
+            )
+            group.addAction(action)
+        button.setMenu(menu)
+        self._unit_button = button
+        return button
+
+    def _set_working_unit(self, unit: LengthUnit) -> None:
+        if unit == self._working_unit:
+            return
+        self._working_unit = unit
+        self._unit_button.setText(unit.key)
+        self._grid_spacing_spin.set_unit(unit)
+        # Full workspace rescale: the viewport snaps the grid to one working
+        # unit and reframes the camera to that scale; mirror the new spacing
+        # in the toolbar field.
+        signals.working_unit_changed.emit(unit)
+        self._sync_grid_spacing_control()
+        signals.log_message.emit(
+            "info",
+            f"Working unit set to {unit.label.lower()} ({unit.key}): grid "
+            f"snapped to 1 {unit.key} and view reframed; committed SDFs "
+            "keep their size.",
+        )
 
     def _build_menu(self) -> None:
         file_menu = self._menubar.addMenu("&File")
@@ -705,7 +751,9 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_add_primitive(self, kind: str) -> None:
         undo_snapshot = self._history_snapshot()
-        handle = self.document.add_primitive(kind)
+        handle = self.document.add_primitive(
+            kind, scale=self._working_unit.factor
+        )
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
         self.scene_tree.select_handle(handle)
@@ -722,6 +770,7 @@ class MainWindow(QMainWindow):
                 start,
                 end,
                 parameters=parameters,
+                scale=self._working_unit.factor,
             )
             node = preview.node(handle)
             if not isinstance(node, SDFNode):
@@ -783,6 +832,7 @@ class MainWindow(QMainWindow):
                     start,
                     end,
                     parameters=parameters,
+                    scale=self._working_unit.factor,
                 )
         except ValueError as error:
             signals.log_message.emit("warning", str(error))
