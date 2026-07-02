@@ -157,6 +157,25 @@ open. A non-exact field would silently close the connected (FSI/conjugate) one.
 
 ---
 
+## D10 — Boundary regions: one identity (owner + cut chain), one cutter
+
+**Decision.** A `BoundaryRegion` is identified by **owner provenance (§4) + an
+ordered chain of `(ghost, side)` cuts + an opaque string tag** — nothing else.
+Ghost knives are embedded in the region's JSON record (never scene objects);
+one `BoundaryCutter` tool replaces PlanarCutter/SurfaceCutter; splitting
+replaces the parent region with two children that partition it exactly; the
+same classifier (`core/boundary_region.py`) serves viewport highlighting and
+the meshing API (`MeshableBoundaryRegion.contains`/`owner_sdf`). Tags are
+never interpreted by the kernel — physics meaning belongs to mesher scripts.
+
+**Why.** Three parallel identity systems (patch/direction, intervals, volume
+selectors) made regions ambiguous, non-composable (a second cut silently
+dropped the first), and partially invisible to the meshing API. One identity
+makes every region savable, reloadable, and callable by construction. Full
+design + implementation log: `design_docs/boundary_region_v2.md`.
+
+---
+
 ## Open / deferred (decided to defer, not decided against)
 
 - **Mesh-time disjointness gate** — wire when a real mesher exists (currently only

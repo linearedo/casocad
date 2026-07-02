@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from .boundary import BoundaryRegion
+from .boundary import BoundaryCut, BoundaryRegion
 from .domain import FluidDomain
 from .scene import SceneDocument
 from .sdf import (
@@ -216,8 +217,40 @@ def load_scene(path: str | Path) -> SceneDocument:
             )
             if document.fluid_domain is None:
                 document.fluid_domain = FluidDomain(root, tuple(tags), selectors)
+    _drop_orphaned_internal_selectors(document)
     document._reindex()
     return document
+
+
+def _drop_orphaned_internal_selectors(document: SceneDocument) -> None:
+    """Remove hidden ``__boundary_selector_*`` nodes left behind by the legacy
+    format once no region references them (volume selectors are migrated into
+    cut chains at load; interval selectors may still need theirs)."""
+    referenced: set[int] = set()
+    prefix = "selector:"
+    for region in document.boundary_regions:
+        if region.selector_id is not None and region.selector_id.startswith(prefix):
+            try:
+                referenced.add(int(region.selector_id[len(prefix):]))
+            except ValueError:
+                continue
+    document.objects = [
+        node
+        for node in document.objects
+        if not (
+            document.is_internal_scene_node(node)
+            and node.object_id not in referenced
+        )
+    ]
+    fluid = document.fluid_domain
+    if fluid is not None:
+        kept = tuple(
+            selector
+            for selector in fluid.selector_objects
+            if selector.object_id in referenced
+        )
+        if len(kept) != len(fluid.selector_objects):
+            document.fluid_domain = FluidDomain(fluid.root, fluid.tag_objects, kept)
 
 
 class _ObjectIdAllocator:
@@ -641,6 +674,31 @@ def _node_from_record(
     raise ValueError(f"unknown SDF node type: {node_type}")
 
 
+def _ghost_to_record(node: SDFNode) -> dict[str, Any]:
+    """Self-contained record of a cut ghost (boundary_region_v2 §5).
+
+    Ghosts are always leaf shapes (the cutter draws one shape at a time), so
+    the record never needs child references."""
+    names = _SceneNames({node.name or "ghost": node}, {})
+    try:
+        record = _node_to_record(node, names)
+    except KeyError as error:
+        raise TypeError(
+            "boundary cut ghosts must be self-contained leaf shapes"
+        ) from error
+    record["name"] = node.name or "ghost"
+    return record
+
+
+def _no_ghost_references(name: str) -> SDFNode:
+    raise ValueError(f"boundary cut ghosts cannot reference scene objects: {name}")
+
+
+def _ghost_from_record(data: dict[str, Any]) -> SDFNode:
+    name = str(data.get("name", "ghost"))
+    return _node_from_record(name, data, _no_ghost_references, 0)
+
+
 def _boundary_region_to_record(
     region: BoundaryRegion,
     names: _SceneNames,
@@ -660,16 +718,34 @@ def _boundary_region_to_record(
         data["patch_type"] = region.patch_type
     if region.outside_direction is not None:
         data["outside_direction"] = region.outside_direction
-    if region.selector_id is not None:
+    if region.tag is not None:
+        data["tag"] = region.tag
+    cuts: list[dict[str, Any]] = []
+    # Legacy volume selectors are inlined at save time so the file is always
+    # the new self-contained format; interval selectors (2D curve params)
+    # remain in the legacy fields until 2D parity (v2 §9).
+    if region.selector_id is not None and region.selector_start is None:
+        selector_key = _selector_name(region.selector_id, names)
+        cuts.append(
+            {
+                "side": region.selector_side,
+                "ghost": _ghost_to_record(names.nodes_by_key[selector_key]),
+            }
+        )
+    elif region.selector_id is not None:
         data["selector"] = _selector_name(region.selector_id, names)
-    if region.selector_type is not None:
-        data["selector_type"] = region.selector_type
-    if region.selector_side != "inside":
-        data["selector_side"] = region.selector_side
-    if region.selector_start is not None:
+        if region.selector_type is not None:
+            data["selector_type"] = region.selector_type
+        if region.selector_side != "inside":
+            data["selector_side"] = region.selector_side
         data["selector_start"] = region.selector_start
-    if region.selector_end is not None:
         data["selector_end"] = region.selector_end
+    cuts.extend(
+        {"side": cut.side, "ghost": _ghost_to_record(cut.ghost)}
+        for cut in region.cuts
+    )
+    if cuts:
+        data["cuts"] = cuts
     return data
 
 
@@ -680,10 +756,33 @@ def _boundary_region_from_record(
     object_id: int,
 ) -> BoundaryRegion:
     owner = build(str(data["owner"]))
+    cuts: list[BoundaryCut] = []
     selector_id = None
+    is_interval = data.get("selector_start") is not None
     if data.get("selector") is not None:
         selector = build(str(data["selector"]))
-        selector_id = f"selector:{selector.object_id}"
+        if is_interval:
+            # 2D interval selectors stay legacy until 2D parity (v2 §9).
+            selector_id = f"selector:{selector.object_id}"
+        else:
+            # One-way migration: a legacy volume selector becomes the first
+            # entry of the cut chain; the hidden node is dropped afterwards.
+            knife = deepcopy(selector)
+            knife.object_id = 0
+            cuts.append(
+                BoundaryCut(str(data.get("selector_side") or "inside"), knife)
+            )
+    raw_cuts = data.get("cuts", [])
+    if not isinstance(raw_cuts, list):
+        raise ValueError(f"boundary region '{key}' cuts must be a list")
+    for raw_cut in raw_cuts:
+        if not isinstance(raw_cut, dict) or not isinstance(raw_cut.get("ghost"), dict):
+            raise ValueError(
+                f"boundary region '{key}' cuts must be objects with a ghost record"
+            )
+        cuts.append(
+            BoundaryCut(str(raw_cut.get("side", "inside")), _ghost_from_record(raw_cut["ghost"]))
+        )
     return BoundaryRegion(
         name=_display_name(key, data),
         object_id=object_id,
@@ -706,7 +805,7 @@ def _boundary_region_from_record(
         selector_id=selector_id,
         selector_type=(
             str(data["selector_type"])
-            if data.get("selector_type") is not None
+            if data.get("selector_type") is not None and is_interval
             else None
         ),
         selector_side=str(data.get("selector_side") or "inside"),
@@ -720,6 +819,8 @@ def _boundary_region_from_record(
             if data.get("selector_end") is not None
             else None
         ),
+        cuts=tuple(cuts),
+        tag=(str(data["tag"]) if data.get("tag") is not None else None),
     )
 
 

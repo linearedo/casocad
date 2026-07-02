@@ -143,3 +143,47 @@ def test_load_meshable_domains_includes_saved_solid_domain(tmp_path: Path) -> No
     assert domains[0].name == box.name
     assert domains[0].kind == ("solid",)
     assert domains["solid"] is domains[0]
+
+
+def test_boundary_regions_are_callable_from_mesher_scripts(tmp_path) -> None:
+    """boundary_region_v2 §6: EVERY region is addressable and classifiable —
+    including direction-only ones the old contract silently dropped."""
+    from core.boundary import BoundaryRegion
+    from core.scene import SceneDocument
+    from core.sdf import Box, Sphere
+    from core.serialization import save_scene
+
+    document = SceneDocument.default()
+    box = next(n for _h, n, _p in document.walk() if isinstance(n, Box))
+    whole = document.node(document.add_boundary_region(box.object_id))
+    assert isinstance(whole, BoundaryRegion)
+    ghost = Sphere(name="knife", object_id=0, center=(-1.6, 0.0, 0.0), radius=0.5)
+    (inside_handle, _), _ = document.split_boundary_region(whole, ghost)
+    document.node(inside_handle).tag = "inlet"
+    path = tmp_path / "scene.json"
+    save_scene(document, path)
+
+    domain = load_meshable_domains(path)["von_karman_fluid"]
+    names = domain.boundary_regions.keys()
+    assert any("inside" in name for name in names)
+    assert "inlet" in names and "outlet" in names  # direction-only regions callable
+
+    jet = next(r for r in domain.boundary_regions if r.tag == "inlet")
+    face_points = np.array(
+        [
+            [-1.6, 0.0, 0.0],   # centre of the -X face: inside the knife
+            [-1.6, 0.6, 0.3],   # far corner of the -X face: outside the knife
+            [1.6, 0.0, 0.0],    # +X face: wrong side of the box entirely
+        ]
+    )
+    mask = jet.contains(face_points)
+    assert mask.tolist() == [True, False, False]
+    # owner_sdf is the exact field of the generating surface
+    assert abs(float(jet.owner_sdf(np.array([[-1.6, 0.0, 0.0]]))[0])) < 1e-9
+    # selector_sdf is negative inside the kept knife-half
+    assert float(jet.selector_sdf(np.array([[-1.6, 0.0, 0.0]]))[0]) < 0.0
+    assert float(jet.selector_sdf(np.array([[-1.6, 0.6, 0.3]]))[0]) > 0.0
+
+    legacy_inlet = domain.boundary_regions["inlet"]
+    assert legacy_inlet.selector_sdf is None
+    assert legacy_inlet.contains(face_points).tolist() == [True, True, False]

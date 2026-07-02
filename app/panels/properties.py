@@ -517,6 +517,8 @@ class PropertiesPanel(QWidget):
             self._layout.addRow(
                 "Boundary owner ID", QLabel(str(node.owner_object_id))
             )
+            if node.patch_id is not None:
+                self._layout.addRow("Patch", QLabel(node.patch_id))
             self._layout.addRow(
                 "Outside direction",
                 QLabel(
@@ -525,6 +527,28 @@ class PropertiesPanel(QWidget):
                     else "all owner surfaces"
                 ),
             )
+            # Opaque physics tag (boundary_region_v2 §4): the kernel never
+            # interprets it; presets are UI suggestions only.
+            tag = QComboBox()
+            tag.setObjectName("boundaryRegionTagCombo")
+            tag.setEditable(True)
+            tag.addItems(("", "wall", "inlet", "outlet", "symmetry"))
+            tag.setCurrentText(node.tag or "")
+            apply_tag = lambda: self._set_value(  # noqa: E731
+                "tag", tag.currentText().strip() or None
+            )
+            tag.activated.connect(lambda _index: apply_tag())
+            tag.lineEdit().editingFinished.connect(apply_tag)
+            self._layout.addRow("Tag", tag)
+            if node.cuts:
+                lineage = "\n".join(
+                    f"{index}. {type(cut.ghost).__name__} '{cut.ghost.name}' "
+                    f"— keep {cut.side}"
+                    for index, cut in enumerate(node.cuts, start=1)
+                )
+                cuts_label = QLabel(lineage)
+                cuts_label.setWordWrap(True)
+                self._layout.addRow("Cuts", cuts_label)
             return
         self._add_bounding_box_summary(node)
         if isinstance(node, (Sphere, Box, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Torus)):

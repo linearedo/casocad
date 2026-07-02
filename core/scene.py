@@ -7,7 +7,8 @@ from typing import Iterator
 
 import numpy as np
 
-from .boundary import BoundaryRegion
+from .boundary import BoundaryCut, BoundaryRegion
+from .boundary_region import boundary_region_mask, sample_boundary_points
 from .boundary_patches import (
     BoundaryPatchHit,
     BoundaryCurvePatch,
@@ -1566,6 +1567,10 @@ class SceneDocument:
         base_region: BoundaryRegion,
         selector: SDFNode,
     ) -> int:
+        """DEPRECATED (boundary_region_v2): legacy single-selector region.
+
+        Kept only for the 2D/interval machinery until 2D parity (v2 §9); the
+        UI creates cut chains via :meth:`split_boundary_region` instead."""
         if self.fluid_domain is None:
             raise ValueError("select a FluidDomain root first")
         if base_region not in self.boundary_regions:
@@ -1619,11 +1624,116 @@ class SceneDocument:
         self.mark_changed()
         return self.handle_for(region)
 
+    def split_boundary_region(
+        self,
+        base_region: BoundaryRegion,
+        ghost: SDFNode,
+    ) -> tuple[tuple[int, int], tuple[str, ...]]:
+        """Split a BoundaryRegion with a ghost knife (boundary_region_v2 §2).
+
+        The two children partition the parent exactly and REPLACE it; the
+        ghost is deep-copied into their cut chains and never becomes a scene
+        object. Legacy single-selector parents are converted to a cut-chain
+        entry first, so old and new cuts compose. Returns the child handles
+        plus the sides whose child matched no sampled boundary point (a
+        warning for the UI, not an error)."""
+        if self.fluid_domain is None:
+            raise ValueError("select a FluidDomain root first")
+        if base_region not in self.boundary_regions:
+            raise ValueError("base boundary region is not part of this document")
+        if base_region.selector_start is not None:
+            raise ValueError(
+                "interval-selector regions cannot be split; recreate them "
+                "with the boundary cutter"
+            )
+        base_cuts: list[BoundaryCut] = list(base_region.cuts)
+        if base_region.selector_id is not None:
+            legacy = self._legacy_selector_cut(base_region)
+            if legacy is None:
+                raise ValueError(
+                    "this region references a selector that is no longer available"
+                )
+            base_cuts.insert(0, legacy)
+        root = self.fluid_domain.root
+        cut_index = len(base_cuts) + 1
+        children: list[BoundaryRegion] = []
+        for side in ("inside", "outside"):
+            knife = deepcopy(ghost)
+            knife.object_id = 0
+            children.append(
+                BoundaryRegion(
+                    name=f"{base_region.name} / cut{cut_index} {side}",
+                    object_id=self._allocate_object_id(),
+                    owner_object_id=base_region.owner_object_id,
+                    outside_direction=base_region.outside_direction,
+                    patch_id=base_region.patch_id,
+                    patch_type=base_region.patch_type,
+                    cuts=(*deepcopy(base_cuts), BoundaryCut(side, knife)),
+                    tag=base_region.tag,
+                )
+            )
+        self.boundary_regions = [
+            region for region in self.boundary_regions if region is not base_region
+        ] + children
+        tags = tuple(
+            tag for tag in self.fluid_domain.tag_objects if tag is not base_region
+        ) + tuple(children)
+        self.fluid_domain = FluidDomain(
+            root, tags, self.fluid_domain.selector_objects
+        )
+        self._reindex()
+        self.mark_changed()
+        empty_sides: list[str] = []
+        try:
+            samples, band = sample_boundary_points(root)
+        except (ValueError, NotImplementedError):
+            samples, band = np.zeros((0, 3)), 0.0
+        if samples.size:
+            for child in children:
+                if not boundary_region_mask(
+                    root, child, samples, tolerance=band
+                ).any():
+                    empty_sides.append(child.cuts[-1].side)
+        return (
+            (self.handle_for(children[0]), self.handle_for(children[1])),
+            tuple(empty_sides),
+        )
+
+    def _legacy_selector_cut(self, region: BoundaryRegion) -> BoundaryCut | None:
+        """Convert a legacy single-selector reference into a cut-chain entry."""
+        assert self.fluid_domain is not None
+        prefix = "selector:"
+        selector_id = region.selector_id or ""
+        if not selector_id.startswith(prefix):
+            return None
+        try:
+            selector_object_id = int(selector_id[len(prefix):])
+        except ValueError:
+            return None
+        node = next(
+            (
+                selector
+                for selector in self.fluid_domain.selector_objects
+                if selector.object_id == selector_object_id
+            ),
+            None,
+        )
+        if node is None:
+            return None
+        knife = deepcopy(node)
+        knife.object_id = 0
+        return BoundaryCut(region.selector_side, knife)
+
     def add_boundary_selector_split_regions(
         self,
         base_region: BoundaryRegion,
         selector: SDFNode,
     ) -> tuple[int, int]:
+        """DEPRECATED (boundary_region_v2): legacy selector-reference split.
+
+        No UI path reaches this anymore; :meth:`split_boundary_region` is the
+        replacement (cut chains, parent replaced, ghost never a scene object).
+        Kept so legacy-state migration remains testable until 2D parity."""
         if self.fluid_domain is None:
             raise ValueError("select a FluidDomain root first")
         if base_region not in self.boundary_regions:

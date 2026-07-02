@@ -9,6 +9,11 @@ import numpy as np
 
 from core.boundary import BoundaryRegion
 from core.boundary_patches import surface_selector_volume
+from core.boundary_region import (
+    boundary_region_mask,
+    cut_volume,
+    find_node_by_object_id,
+)
 from core.model import Model, compile_model, model_from_document
 from core.serialization import load_scene
 from core.sdf.base import BoundingBox3D, FloatArray, SDFNode
@@ -16,6 +21,68 @@ from core.sdf.roles import DomainKind
 
 
 SDFCallable = Callable[[np.ndarray], np.ndarray]
+PointsPredicate = Callable[[np.ndarray], np.ndarray]
+
+
+@dataclass(frozen=True)
+class MeshableBoundaryRegion:
+    """One boundary region, callable from mesher scripts (v2 §6).
+
+    * ``contains`` -- exact membership of (N, 3) world points; the same
+      classifier the viewport uses, so what is highlighted is what you get.
+    * ``owner_sdf`` -- the exact field of the region's generating surface
+      (y+ layers, grading, refinement bands).
+    * ``selector_sdf`` -- combined signed field of the cut chain (negative
+      inside every kept knife-half); ``None`` for whole-surface regions.
+    * ``tag`` -- opaque physics label; the kernel never interprets it.
+    """
+
+    name: str
+    tag: str | None
+    owner_object_id: int
+    contains: PointsPredicate
+    owner_sdf: SDFCallable
+    selector_sdf: SDFCallable | None = None
+
+
+@dataclass(frozen=True)
+class MeshableBoundaryRegions:
+    """Name-keyed collection of a domain's boundary regions."""
+
+    _items: tuple[MeshableBoundaryRegion, ...] = ()
+
+    def __iter__(self) -> Iterator[MeshableBoundaryRegion]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @overload
+    def __getitem__(self, key: int) -> MeshableBoundaryRegion: ...
+
+    @overload
+    def __getitem__(self, key: slice) -> tuple[MeshableBoundaryRegion, ...]: ...
+
+    @overload
+    def __getitem__(self, key: str) -> MeshableBoundaryRegion: ...
+
+    def __getitem__(
+        self,
+        key: int | slice | str,
+    ) -> MeshableBoundaryRegion | tuple[MeshableBoundaryRegion, ...]:
+        if isinstance(key, (int, slice)):
+            return self._items[key]
+        for region in self._items:
+            if region.name == key:
+                return region
+        available = ", ".join(self.keys())
+        raise KeyError(f"unknown boundary region {key!r}; available: {available}")
+
+    def keys(self) -> tuple[str, ...]:
+        return tuple(region.name for region in self._items)
+
+    def as_tuple(self) -> tuple[MeshableBoundaryRegion, ...]:
+        return self._items
 
 
 @dataclass(frozen=True)
@@ -26,6 +93,7 @@ class MeshableDomain:
     bounds: BoundingBox3D
     domain_sdf: SDFCallable
     boundary_tags: tuple[tuple[str, SDFCallable], ...] = ()
+    boundary_regions: MeshableBoundaryRegions = MeshableBoundaryRegions()
 
 
 @dataclass(frozen=True)
@@ -142,7 +210,70 @@ def _boundary_region_callable(
     return outside
 
 
+def _cut_chain_field(root: SDFNode, region: BoundaryRegion) -> SDFCallable | None:
+    """Combined signed field of a region's cut chain: negative exactly where
+    every knife-half is satisfied (max over per-cut signed fields)."""
+    if not region.cuts:
+        return None
+    parts: list[tuple[float, SDFCallable]] = []
+    for cut in region.cuts:
+        volume = cut_volume(root, cut)
+        parts.append((1.0 if cut.side == "inside" else -1.0, sdf_callable(volume)))
+
+    def field(points: np.ndarray) -> np.ndarray:
+        return np.maximum.reduce([sign * query(points) for sign, query in parts])
+
+    return field
+
+
+def _region_contains(root: SDFNode, region: BoundaryRegion) -> PointsPredicate:
+    def contains(points: np.ndarray) -> np.ndarray:
+        return boundary_region_mask(root, region, _ensure_points(points))
+
+    return contains
+
+
+def _fluid_boundary_regions(
+    document: object,
+    root: SDFNode,
+) -> MeshableBoundaryRegions:
+    fluid = getattr(document, "fluid_domain", None)
+    if fluid is None or fluid.root is not root:
+        return MeshableBoundaryRegions()
+    selector_by_id = {
+        selector.object_id: selector
+        for selector in fluid.selector_objects
+        if selector.object_id > 0
+    }
+    regions: list[MeshableBoundaryRegion] = []
+    for tag in fluid.tag_objects:
+        if not isinstance(tag, BoundaryRegion):
+            continue
+        owner = find_node_by_object_id(root, tag.owner_object_id)
+        if owner is None:
+            continue
+        try:
+            selector_field = _cut_chain_field(root, tag)
+        except (TypeError, ValueError, NotImplementedError):
+            selector_field = None
+        if selector_field is None:
+            selector_field = _boundary_region_callable(root, tag, selector_by_id)
+        regions.append(
+            MeshableBoundaryRegion(
+                name=tag.name,
+                tag=tag.tag,
+                owner_object_id=tag.owner_object_id,
+                contains=_region_contains(root, tag),
+                owner_sdf=sdf_callable(owner),
+                selector_sdf=selector_field,
+            )
+        )
+    return MeshableBoundaryRegions(tuple(regions))
+
+
 def _fluid_boundary_tags(document: object, root: SDFNode) -> tuple[tuple[str, SDFCallable], ...]:
+    """Back-compat SDF-backed tag list: knife fields for selector/cut-chain
+    regions, raw fields for placed 1D/2D tag objects."""
     fluid = getattr(document, "fluid_domain", None)
     if fluid is None or fluid.root is not root:
         return ()
@@ -154,7 +285,12 @@ def _fluid_boundary_tags(document: object, root: SDFNode) -> tuple[tuple[str, SD
     tags: list[tuple[str, SDFCallable]] = []
     for tag in fluid.tag_objects:
         if isinstance(tag, BoundaryRegion):
-            query = _boundary_region_callable(root, tag, selector_by_id)
+            try:
+                query = _cut_chain_field(root, tag)
+            except (TypeError, ValueError, NotImplementedError):
+                query = None
+            if query is None:
+                query = _boundary_region_callable(root, tag, selector_by_id)
             if query is not None:
                 tags.append((tag.name, query))
         elif isinstance(tag, SDFNode):
@@ -168,6 +304,7 @@ def meshable_domains_from_model(
     validate: bool = True,
     resolution: int = 32,
     boundary_tags: dict[str, tuple[tuple[str, SDFCallable], ...]] | None = None,
+    boundary_regions: dict[str, MeshableBoundaryRegions] | None = None,
 ) -> MeshableDomains:
     """Expose an exact-SDF ``Model`` through the public meshing API.
 
@@ -179,6 +316,7 @@ def meshable_domains_from_model(
     if validate:
         compile_model(model, resolution=resolution)
     boundary_tags = boundary_tags or {}
+    boundary_regions = boundary_regions or {}
     return MeshableDomains(
         tuple(
             MeshableDomain(
@@ -188,6 +326,9 @@ def meshable_domains_from_model(
                 bounds=domain.region.bounding_box(),
                 domain_sdf=sdf_callable(domain.region),
                 boundary_tags=boundary_tags.get(domain.name, ()),
+                boundary_regions=boundary_regions.get(
+                    domain.name, MeshableBoundaryRegions()
+                ),
             )
             for domain in model.domains
         )
@@ -198,26 +339,36 @@ def load_meshable_domains(scene_path: str | Path) -> MeshableDomains:
     """Load meshable domains from a saved casoCAD ``scene.json``.
 
     Declared Fluid/Solid Domains feed the same ``MeshableDomain`` contract.
-    Fluid boundary tags are exposed when the declared Domain is also the legacy
-    ``fluid_domain`` root.
+    Fluid boundary regions/tags are exposed when the declared Domain is also
+    the legacy ``fluid_domain`` root.
     """
 
     document = load_scene(scene_path)
     model = model_from_document(document)
+    fluid_domains = [
+        domain for domain in model.domains if domain.kind is DomainKind.FLUID
+    ]
     tags = {
         domain.name: _fluid_boundary_tags(document, domain.region)
-        for domain in model.domains
-        if domain.kind is DomainKind.FLUID
+        for domain in fluid_domains
+    }
+    regions = {
+        domain.name: _fluid_boundary_regions(document, domain.region)
+        for domain in fluid_domains
     }
     return meshable_domains_from_model(
         model,
         boundary_tags=tags,
+        boundary_regions=regions,
     )
 
 
 __all__ = [
+    "MeshableBoundaryRegion",
+    "MeshableBoundaryRegions",
     "MeshableDomain",
     "MeshableDomains",
+    "PointsPredicate",
     "SDFCallable",
     "load_meshable_domains",
     "meshable_domains_from_model",

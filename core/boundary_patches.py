@@ -458,21 +458,24 @@ def _surface_patches_for_node(
         return _cylinder_surface_patches(node, cut_surface, normal_sign)
     if isinstance(node, (Cone, CappedCone)):
         return _cylinder_surface_patches(node, cut_surface, normal_sign)
-    if isinstance(node, (Sphere, Torus)):
-        patch_id = _patch_id("surface", cut_surface)
-        return (
-            BoundarySurfacePatch(
-                owner_object_id=node.object_id,
-                patch_id=patch_id,
-                patch_type="cut_surface" if cut_surface else "surface",
-                owner=node,
-                normal=None,
-                normal_sign=normal_sign,
-            ),
-        )
     if isinstance(node, BinarySDFOperator):
         return tuple()
-    return tuple()
+    if node.object_id <= 0 or node.dimension != 3:
+        return tuple()
+    # Generic fallback (boundary_region_v2 §7): every 3D provenance leaf owns
+    # at least its whole surface, so any primitive/generator/tube is
+    # hover-selectable and taggable; finer scoping is the cutter's job.
+    patch_id = _patch_id("surface", cut_surface)
+    return (
+        BoundarySurfacePatch(
+            owner_object_id=node.object_id,
+            patch_id=patch_id,
+            patch_type="cut_surface" if cut_surface else "surface",
+            owner=node,
+            normal=None,
+            normal_sign=normal_sign,
+        ),
+    )
 
 
 def _box_patch_preview_node(
@@ -1581,7 +1584,18 @@ def _surface_patch_contains(
             return abs(float(local[2] + owner.half_height)) <= max(4.0 * tolerance, PATCH_TOLERANCE)
         if patch_name == "+Z_cap":
             return abs(float(local[2] - owner.half_height)) <= max(4.0 * tolerance, PATCH_TOLERANCE)
-    return True
+    # Generic whole-surface patch: the point must lie on the owner's own
+    # zero set (also correct for cut surfaces, whose owner is the obstacle).
+    value = float(
+        np.asarray(
+            owner.to_numpy(
+                np.asarray([point[0]], dtype=np.float64),
+                np.asarray([point[1]], dtype=np.float64),
+                np.asarray([point[2]], dtype=np.float64),
+            )
+        )[0]
+    )
+    return abs(value) <= max(4.0 * tolerance, PATCH_TOLERANCE)
 
 
 def _curve_patch_contains(

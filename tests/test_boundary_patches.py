@@ -974,15 +974,17 @@ def test_selector_backed_boundary_region_serializes_selector_objects(
     save_scene(document, path)
     loaded = load_scene(path)
 
+    # boundary_region_v2: volume selectors migrate into self-contained cut
+    # chains on load; the selector list is no longer used for them.
     assert loaded.fluid_domain is not None
-    assert [item.object_id for item in loaded.fluid_domain.selector_objects] == [2]
-    selector_regions = [
-        region for region in loaded.boundary_regions if region.selector_id is not None
-    ]
-    assert len(selector_regions) == 1
-    assert selector_regions[0].selector_id == "selector:2"
-    assert selector_regions[0].selector_type == "surface_split_curve"
-    assert selector_regions[0].selector_side == "inside"
+    assert loaded.fluid_domain.selector_objects == ()
+    chained = [region for region in loaded.boundary_regions if region.cuts]
+    assert len(chained) == 1
+    assert chained[0].selector_id is None
+    assert chained[0].cuts[0].side == "inside"
+    assert chained[0].cuts[0].ghost.name == "split"
+    # the visible selector object stays ordinary scene geometry
+    assert any(node.name == "split" for node in loaded.objects)
 
 
 def test_outside_selector_boundary_region_serializes_selector_side(
@@ -1012,12 +1014,12 @@ def test_outside_selector_boundary_region_serializes_selector_side(
     save_scene(document, path)
     loaded = load_scene(path)
 
-    selector_regions = [
-        region for region in loaded.boundary_regions if region.selector_id is not None
-    ]
-    assert len(selector_regions) == 1
-    assert selector_regions[0].selector_id == "selector:2"
-    assert selector_regions[0].selector_side == "outside"
+    # boundary_region_v2: the outside selector becomes an outside cut.
+    chained = [region for region in loaded.boundary_regions if region.cuts]
+    assert len(chained) == 1
+    assert chained[0].selector_id is None
+    assert chained[0].cuts[0].side == "outside"
+    assert chained[0].cuts[0].ghost.name == "small_inlet"
 
 
 def testsurface_split_selector_mask_restricts_3d_boundary_samples() -> None:

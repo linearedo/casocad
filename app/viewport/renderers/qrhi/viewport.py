@@ -36,6 +36,7 @@ from app.viewport.performance_governor import (
     ViewportRenderBudget,
 )
 
+from .boundary_tool import BoundaryTool
 from .create_tool import CreateTool
 from .surface_renderer import QRhiSurfaceRenderer
 
@@ -275,6 +276,9 @@ class QRhiViewportWidget(QRhiWidget):
         # drag/point create tool (Draw button -> viewport_create_requested);
         # also carries the boundary-cutter routing consumed by main_window
         self._create_tool = CreateTool(self)
+        # hover/select boundary tool (BoundaryRegion button)
+        self._boundary_tool = BoundaryTool(self)
+        self._boundary_hover_id = 0
         self._working_unit = DEFAULT_LENGTH_UNIT  # unit for bare typed sizes
         self._snap_enabled = True  # snap grid-plane points to grid spacing
         self._command_panel = None
@@ -367,31 +371,20 @@ class QRhiViewportWidget(QRhiWidget):
             signals.viewport_boundary_tool_requested.emit)
         layout.addWidget(boundary_button, 1, 0)
 
-        planar_button = QPushButton("PlanarCutter", panel)
-        planar_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        planar_button.setToolTip(
-            "Draw a planar cutter on the selected BoundaryRegion")
-        planar_menu = QMenu(planar_button)
-        for label, shape in self._PLANAR_CUTTER_KINDS:
-            planar_menu.addAction(label).triggered.connect(
-                lambda _=False, s=shape: self.begin_boundary_cutter_tool(
-                    "planar", s))
-        planar_button.setMenu(planar_menu)
-        layout.addWidget(planar_button, 1, 1)
+        cutter_button = QPushButton("BoundaryCutter", panel)
+        cutter_button.setObjectName("viewportBoundaryCutterButton")
+        cutter_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        cutter_button.setToolTip(
+            "Draw any shape as a knife to split the selected BoundaryRegion "
+            "in two (the knife never becomes a scene object)")
+        cutter_menu = QMenu(cutter_button)
+        for label, shape in self._CUTTER_KINDS:
+            cutter_menu.addAction(label).triggered.connect(
+                lambda _=False, s=shape: self.begin_boundary_cutter_tool(s))
+        cutter_button.setMenu(cutter_menu)
+        layout.addWidget(cutter_button, 1, 1)
 
-        surface_button = QPushButton("SurfaceCutter", panel)
-        surface_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        surface_button.setToolTip(
-            "Draw a surface cutter for the selected BoundaryRegion")
-        surface_menu = QMenu(surface_button)
-        for label, shape in self._SURFACE_CUTTER_KINDS:
-            surface_menu.addAction(label).triggered.connect(
-                lambda _=False, s=shape: self.begin_boundary_cutter_tool(
-                    "surface", s))
-        surface_button.setMenu(surface_menu)
-        layout.addWidget(surface_button, 1, 2)
-
-        self._cutter_buttons = (planar_button, surface_button)
+        self._cutter_buttons = (cutter_button,)
         self._update_cutter_buttons_enabled()
         panel.adjustSize()
         self._command_panel = panel
@@ -841,9 +834,10 @@ class QRhiViewportWidget(QRhiWidget):
     def _visible_surface_scene(self, surface_scene):
         if surface_scene is None:
             return None
+        highlight_id = self._boundary_hover_id or self._selected_id
         return surface_scene.with_components_visible(
             self._components_visible
-        ).with_selected_highlight(self._selected_id)
+        ).with_selected_highlight(highlight_id)
 
     def frame_box(self, box) -> None:
         self._camera.frame_box(box)
@@ -859,6 +853,7 @@ class QRhiViewportWidget(QRhiWidget):
         previews a snapped translation; release commits it once. Esc cancels."""
         self.cancel_create_tool()
         self.end_rotate_tool()
+        self._boundary_tool.cancel()
         self._move_handle = handle
         self._move_active = True
         self._move_start_grid = None
@@ -892,6 +887,7 @@ class QRhiViewportWidget(QRhiWidget):
         normal through its pivot, snapped to 15deg; release commits once."""
         self.end_move_tool()
         self.cancel_create_tool()
+        self._boundary_tool.cancel()
         pivot = self._selected_anchor()
         if pivot is None:
             signals.log_message.emit(
@@ -1292,20 +1288,58 @@ class QRhiViewportWidget(QRhiWidget):
         self._boundary_region_selected = bool(regions)
         self._update_cutter_buttons_enabled()
 
-    _PLANAR_CUTTER_KINDS = (("Segment", "segment"), ("Polyline", "polyline"),
-                            ("Quadratic Bezier Polycurve", "quadratic_bezier_polycurve"))
-    _SURFACE_CUTTER_KINDS = (("Sphere", "sphere"), ("Box", "box"),
-                             ("Cylinder", "cylinder"), ("Cone", "cone"))
+    # One cutter, any knife shape: lines/profiles extrude through the scene,
+    # 3D shapes cut by their own volume (boundary_region_v2 §3).
+    _CUTTER_KINDS = (
+        ("Segment", "segment"),
+        ("Polyline", "polyline"),
+        ("Quadratic Bezier Polycurve", "quadratic_bezier_polycurve"),
+        ("Sphere", "sphere"),
+        ("Box", "box"),
+        ("Cylinder", "cylinder"),
+        ("Cone", "cone"),
+    )
 
-    def begin_boundary_cutter_tool(self, cutter_kind: str, shape_kind=None) -> None:
-        self._create_tool.begin_boundary_cutter(cutter_kind, shape_kind)
+    def begin_boundary_cutter_tool(self, shape_kind: str) -> None:
+        self._create_tool.begin_boundary_cutter(shape_kind)
+
+    # --- boundary region hover/select tool (real; boundary_region_v2 §7) ---
+
+    def begin_boundary_region_tool(self, root, selectors=()) -> None:
+        self._boundary_tool.begin(root, selectors)
+
+    def set_boundary_hover(self, owner_object_id, _outside_direction, _normal, _hit) -> None:
+        """Track the hovered boundary owner (tints its chunk where one is
+        visible; the patch-shell overlay is the primary visual)."""
+        hover_id = int(owner_object_id or 0)
+        if hover_id == self._boundary_hover_id:
+            return
+        self._boundary_hover_id = hover_id
+        if self._committed_surface_scene is not None and self._preview_kind is None:
+            self._publish_surface_scene(self._committed_surface_scene)
+        self._dirty = True
+
+    def show_boundary_patch_highlight(self, surface) -> None:
+        """Overlay the hovered patch as a bright classifier-derived surface on
+        top of the committed scene (None clears it)."""
+        committed = self._committed_surface_scene
+        if surface is None or committed is None:
+            if self._preview_kind == "boundary_hover":
+                self._restore_committed_scene()
+            return
+        scene = replace(
+            committed,
+            surfaces=(*committed.surfaces, surface),
+            primary_object_ids=(
+                committed.primary_object_ids | {int(surface.key.object_id)}
+            ),
+            build_ms=0.0,
+        )
+        self.show_scene_preview(scene, preview_kind="boundary_hover")
 
     # no-op stubs for the dropped viewport tools
     def _noop(self, *a, **k) -> None:
         return None
-
-    set_boundary_hover = _noop
-    begin_boundary_region_tool = _noop
     def apply_committed_move_preview(self, *a, **k) -> None:
         del a, k
     # --- boolean preview (real; main_window builds the combined render) ---
@@ -1685,6 +1719,11 @@ class QRhiViewportWidget(QRhiWidget):
     def mousePressEvent(self, e: QMouseEvent) -> None:
         self._last_pos = e.position()
         self._press_pos = e.position()
+        if self._boundary_tool.active and e.button() == Qt.MouseButton.LeftButton:
+            self._boundary_tool.commit()
+            self._last_pos = None
+            self._press_pos = None
+            return
         if self._create_tool.kind is not None and e.button() == Qt.MouseButton.LeftButton:
             point = self._snap_world(
                 self._screen_to_grid(e.position()), e.modifiers())
@@ -1732,6 +1771,10 @@ class QRhiViewportWidget(QRhiWidget):
         # Live coordinate readout (also fires on hover via mouse tracking).
         hover = self._snap_world(self._screen_to_grid(e.position()), e.modifiers())
         self._update_readout(hover)
+        if self._boundary_tool.active and not (
+            e.buttons() & Qt.MouseButton.LeftButton
+        ):
+            self._boundary_tool.update_hover(e.position())
         if self._create_tool.points is not None:  # live point-shape preview follows cursor
             self._create_tool.point_hover = hover
             self._dirty = True
@@ -1911,6 +1954,10 @@ class QRhiViewportWidget(QRhiWidget):
 
     def keyPressEvent(self, e) -> None:
         key = e.key()
+        if key == Qt.Key.Key_Escape and self._boundary_tool.active:
+            self._boundary_tool.cancel()
+            signals.log_message.emit("info", "Boundary tool cancelled.")
+            return
         if key == Qt.Key.Key_Escape and self._create_tool.kind is not None:
             self.cancel_create_tool()
             self._restore_committed_scene()

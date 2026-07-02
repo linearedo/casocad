@@ -48,6 +48,9 @@ class CreateTool:
         viewport.end_rotate_tool()
         viewport._end_extrude_tool()
         viewport._end_revolve_tool()
+        boundary_tool = getattr(viewport, "_boundary_tool", None)
+        if boundary_tool is not None:
+            boundary_tool.cancel()
         self.kind = str(kind)
         self.start_world = None
         self.anchor = None
@@ -125,22 +128,18 @@ class CreateTool:
         end[vi] += h
         self.emit_drag_shape(self.anchor, (end[0], end[1], end[2]))
 
-    def begin_boundary_cutter(self, cutter_kind: str, shape_kind=None) -> None:
-        """Arm a boundary cutter: draw `shape_kind` on the grid; the drawn shape
-        is routed as a planar/surface cutter for the selected BoundaryRegion."""
+    def begin_boundary_cutter(self, shape_kind: str) -> None:
+        """Arm the Boundary Cutter (boundary_region_v2 §7): draw any shape on
+        the grid; the drawn shape becomes the ghost knife that splits the
+        selected BoundaryRegion into inside/outside. The knife is never a
+        scene object."""
         if not self._viewport._boundary_region_selected:
             signals.log_message.emit(
-                "warning", "Select a BoundaryRegion before creating a cutter.")
+                "warning", "Select a BoundaryRegion before using the cutter.")
             return
-        if cutter_kind == "planar":
-            shape = shape_kind or "polyline"
-        elif cutter_kind == "surface":
-            shape = shape_kind or "sphere"
-        else:
-            raise ValueError(f"unknown boundary cutter kind: {cutter_kind}")
-        self.begin(shape)
-        self.boundary_cutter = (cutter_kind, shape)
+        self.begin(shape_kind)
+        self.boundary_cutter = shape_kind
         signals.log_message.emit(
             "info",
-            f"{cutter_kind.title()} cutter armed — draw the {shape} to cut the "
+            f"Boundary Cutter armed — draw the {shape_kind} knife across the "
             "selected BoundaryRegion.")
