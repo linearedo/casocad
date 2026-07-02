@@ -1,6 +1,7 @@
 """SceneDocument.split_boundary_region (boundary_region_v2 §2 Phase 2):
 children partition and replace the parent, ghosts never enter the scene
-graph, legacy selector regions convert into the chain, empty sides warn."""
+graph, legacy selector regions convert into the chain, and a knife that
+misses the region refuses the split."""
 from __future__ import annotations
 
 import numpy as np
@@ -31,7 +32,7 @@ def test_split_replaces_parent_and_keeps_ghost_out_of_scene() -> None:
     objects_before = list(document.objects)
     ghost = Sphere(name="knife", object_id=0, center=(-1.6, 0.0, 0.0), radius=0.5)
 
-    (inside_handle, outside_handle), _empty = document.split_boundary_region(
+    inside_handle, outside_handle = document.split_boundary_region(
         region, ghost
     )
 
@@ -50,11 +51,11 @@ def test_nested_split_composes_chains_and_partitions() -> None:
     document, box, region = _scene_with_whole_surface_region()
     root = document.fluid_domain.root
     sphere = Sphere(name="k1", object_id=0, center=(-1.6, 0.0, 0.0), radius=0.5)
-    (inside_handle, outside_handle), _ = document.split_boundary_region(region, sphere)
+    inside_handle, outside_handle = document.split_boundary_region(region, sphere)
     outside = document.node(outside_handle)
 
     upper = Box(name="k2", object_id=0, center=(0.0, 1.0, 0.0), half_size=(4.0, 1.0, 1.0))
-    (top_handle, bottom_handle), _ = document.split_boundary_region(outside, upper)
+    top_handle, bottom_handle = document.split_boundary_region(outside, upper)
     top = document.node(top_handle)
     bottom = document.node(bottom_handle)
 
@@ -68,13 +69,18 @@ def test_nested_split_composes_chains_and_partitions() -> None:
     assert (total == 1).all()
 
 
-def test_empty_side_is_reported_not_forbidden() -> None:
+def test_missed_knife_refuses_the_split_and_keeps_the_parent() -> None:
+    import pytest
+
     document, _box, region = _scene_with_whole_surface_region()
+    regions_before = list(document.boundary_regions)
     faraway = Sphere(name="k", object_id=0, center=(50.0, 50.0, 50.0), radius=0.1)
 
-    (_handles), empty = document.split_boundary_region(region, faraway)
+    with pytest.raises(ValueError, match="does not cross"):
+        document.split_boundary_region(region, faraway)
 
-    assert empty == ("inside",)
+    assert document.boundary_regions == regions_before
+    assert region in document.boundary_regions
 
 
 def test_legacy_selector_region_converts_into_chain() -> None:
@@ -90,7 +96,7 @@ def test_legacy_selector_region_converts_into_chain() -> None:
     assert legacy_inside.selector_id is not None and not legacy_inside.cuts
 
     knife = Box(name="k2", object_id=0, center=(0.0, 1.0, 0.0), half_size=(4.0, 1.0, 1.0))
-    (top_handle, _bottom_handle), _ = document.split_boundary_region(
+    top_handle, _bottom_handle = document.split_boundary_region(
         legacy_inside, knife
     )
     top = document.node(top_handle)

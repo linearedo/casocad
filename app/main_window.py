@@ -747,6 +747,10 @@ class MainWindow(QMainWindow):
             artifact.surface_scene,
             artifact.timings,
         )
+        # Rebuilds reset the preview state; keep selected regions lit.
+        selected_regions = self._selected_boundary_regions()
+        if selected_regions:
+            self._update_selected_region_highlight(selected_regions)
 
     @Slot(int, str)
     def _on_render_artifact_failed(self, version: int, message: str) -> None:
@@ -936,11 +940,14 @@ class MainWindow(QMainWindow):
         """Split the selected region with a ghost knife (boundary_region_v2 §7).
 
         The knife never becomes a scene object; the two children replace the
-        parent region."""
+        parent region. A knife that misses the region is refused by the
+        document and nothing changes."""
         undo_snapshot = self._history_snapshot()
         try:
-            handles, empty_sides = self.document.split_boundary_region(
-                base_region, ghost
+            handles = self.document.split_boundary_region(
+                base_region,
+                ghost,
+                validation_points=self._boundary_validation_points(),
             )
         except (KeyError, ValueError) as error:
             signals.log_message.emit("warning", str(error))
@@ -949,14 +956,30 @@ class MainWindow(QMainWindow):
         self._publish_document()
         self.scene_tree.select_handles(list(handles))
         self.viewport.setFocus()
-        for side in empty_sides:
-            signals.log_message.emit(
-                "warning",
-                f"Boundary cut: the '{side}' side selects no boundary points.",
-            )
         self.statusBar().showMessage(
             "Boundary region split into inside/outside.", 5000
         )
+
+    def _boundary_validation_points(self) -> np.ndarray | None:
+        """Dense on-surface points (the Domain's display-mesh vertices) for
+        the split emptiness check, so small-but-real cuts aren't rejected by
+        coarse sampling."""
+        fluid = self.document.fluid_domain
+        scene = self.viewport.committed_surface_scene()
+        if fluid is None or scene is None:
+            return None
+        chunk = next(
+            (
+                surface
+                for surface in scene.surfaces
+                if int(surface.key.object_id) == int(fluid.root.object_id)
+                and surface.has_geometry
+            ),
+            None,
+        )
+        if chunk is None:
+            return None
+        return np.asarray(chunk.vertices, dtype=np.float64)
 
     def _on_boundary_cutter_armed(self) -> None:
         """Arming the cutter highlights the region that is about to be cut."""
@@ -1940,12 +1963,41 @@ class MainWindow(QMainWindow):
             tuple(boundary_regions),
         )
         self.viewport.set_scene_selection(scene_selection)
+        self._update_selected_region_highlight(boundary_regions)
         if selected_names:
             self.statusBar().showMessage(
                 f"Selection: {', '.join(selected_names)}"
             )
         else:
             self.statusBar().clearMessage()
+
+    def _update_selected_region_highlight(
+        self,
+        regions: list[BoundaryRegion],
+    ) -> None:
+        """Selected BoundaryRegions light up with the same classifier-derived
+        overlay the hover tool uses (regions have no scene chunk of their
+        own, so the per-object selection tint cannot show them)."""
+        surfaces = []
+        for index, region in enumerate(regions[:4]):
+            surface = self._region_highlight_surface(
+                region,
+                overlay_object_id=self._BOUNDARY_HIGHLIGHT_OBJECT_ID + index,
+            )
+            if surface is not None:
+                surfaces.append(surface)
+        self.viewport.show_boundary_patch_highlight(tuple(surfaces) or None)
+
+    def _selected_boundary_regions(self) -> list[BoundaryRegion]:
+        regions: list[BoundaryRegion] = []
+        for handle in self.scene_tree.selected_handles():
+            try:
+                node = self.document.node(handle)
+            except KeyError:
+                continue
+            if isinstance(node, BoundaryRegion):
+                regions.append(node)
+        return regions
 
     @Slot(str, object)
     def _on_transform_requested(

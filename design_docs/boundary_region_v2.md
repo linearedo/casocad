@@ -81,8 +81,11 @@ diagonal), never absolute meters. Fixes problem 8 and survives mm/km work.
   pure conjunction — order does not change the point set.
 - The cut **tree**: splitting replaces the parent region with its two children
   (undo restores). The "rest" is never lost — it *is* the `outside` sibling.
-- An empty child (knife missed the region) is legal; the tool samples the
-  parent and **warns**, it does not forbid.
+- A knife that misses the region (either side empty) is a **no-op cut and
+  is refused** — the parent stays untouched. (Revised from "warn, don't
+  forbid" after real use: an empty child plus a duplicate-of-parent child is
+  pure clutter.) Emptiness is validated against dense display-mesh vertices
+  plus coarse grid sampling, before any mutation.
 
 ---
 

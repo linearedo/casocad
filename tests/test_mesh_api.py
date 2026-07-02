@@ -158,7 +158,7 @@ def test_boundary_regions_are_callable_from_mesher_scripts(tmp_path) -> None:
     whole = document.node(document.add_boundary_region(box.object_id))
     assert isinstance(whole, BoundaryRegion)
     ghost = Sphere(name="knife", object_id=0, center=(-1.6, 0.0, 0.0), radius=0.5)
-    (inside_handle, _), _ = document.split_boundary_region(whole, ghost)
+    inside_handle, _ = document.split_boundary_region(whole, ghost)
     document.node(inside_handle).tag = "inlet"
     path = tmp_path / "scene.json"
     save_scene(document, path)

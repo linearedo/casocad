@@ -1628,15 +1628,21 @@ class SceneDocument:
         self,
         base_region: BoundaryRegion,
         ghost: SDFNode,
-    ) -> tuple[tuple[int, int], tuple[str, ...]]:
+        *,
+        validation_points: np.ndarray | None = None,
+    ) -> tuple[int, int]:
         """Split a BoundaryRegion with a ghost knife (boundary_region_v2 §2).
 
         The two children partition the parent exactly and REPLACE it; the
         ghost is deep-copied into their cut chains and never becomes a scene
         object. Legacy single-selector parents are converted to a cut-chain
-        entry first, so old and new cuts compose. Returns the child handles
-        plus the sides whose child matched no sampled boundary point (a
-        warning for the UI, not an error)."""
+        entry first, so old and new cuts compose.
+
+        A knife that misses the region (either side selects no boundary
+        points) is a no-op cut and is REFUSED — the parent stays untouched.
+        ``validation_points`` lets callers supply dense on-surface points
+        (e.g. display-mesh vertices) so small-but-real cuts aren't rejected
+        by the coarse fallback sampling."""
         if self.fluid_domain is None:
             raise ValueError("select a FluidDomain root first")
         if base_region not in self.boundary_regions:
@@ -1672,6 +1678,31 @@ class SceneDocument:
                     tag=base_region.tag,
                 )
             )
+        # Validate BEFORE mutating: both sides must select boundary points.
+        point_sets: list[tuple[np.ndarray, float]] = []
+        try:
+            samples, band = sample_boundary_points(root)
+            if samples.size:
+                point_sets.append((samples, band))
+        except (ValueError, NotImplementedError):
+            band = 0.0
+        if validation_points is not None:
+            dense = np.asarray(validation_points, dtype=np.float64)
+            if dense.ndim == 2 and dense.shape[1] == 3 and dense.size:
+                point_sets.append((dense, band if band > 0.0 else None))
+        for child in children:
+            populated = any(
+                boundary_region_mask(
+                    root, child, points, tolerance=tolerance
+                ).any()
+                for points, tolerance in point_sets
+            )
+            if point_sets and not populated:
+                side = child.cuts[-1].side
+                raise ValueError(
+                    f"the knife does not cross the selected region (its "
+                    f"'{side}' side selects no boundary points); nothing was cut"
+                )
         self.boundary_regions = [
             region for region in self.boundary_regions if region is not base_region
         ] + children
@@ -1683,21 +1714,7 @@ class SceneDocument:
         )
         self._reindex()
         self.mark_changed()
-        empty_sides: list[str] = []
-        try:
-            samples, band = sample_boundary_points(root)
-        except (ValueError, NotImplementedError):
-            samples, band = np.zeros((0, 3)), 0.0
-        if samples.size:
-            for child in children:
-                if not boundary_region_mask(
-                    root, child, samples, tolerance=band
-                ).any():
-                    empty_sides.append(child.cuts[-1].side)
-        return (
-            (self.handle_for(children[0]), self.handle_for(children[1])),
-            tuple(empty_sides),
-        )
+        return (self.handle_for(children[0]), self.handle_for(children[1]))
 
     def _legacy_selector_cut(self, region: BoundaryRegion) -> BoundaryCut | None:
         """Convert a legacy single-selector reference into a cut-chain entry."""

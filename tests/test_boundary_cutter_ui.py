@@ -158,7 +158,7 @@ def _split_minus_x_face(window):
         window.document.add_boundary_region(box.object_id, patch_id="-X")
     )
     knife = Sphere(name="k", object_id=0, center=(-1.6, 0.0, 0.0), radius=0.4)
-    handles, _ = window.document.split_boundary_region(region, knife)
+    handles = window.document.split_boundary_region(region, knife)
     window._publish_document()
     return handles
 
@@ -225,3 +225,25 @@ def test_cutter_drag_shows_two_color_split_preview() -> None:
     assert window._BOUNDARY_CUT_OUTSIDE_COLOR in colors
     assert all(s.indices.size > 0 for s in surfaces)
     window.viewport.cancel_create_tool()
+
+
+def test_tree_selection_highlights_boundary_region() -> None:
+    window = _window()
+    region = _select_whole_surface_region(window)
+    _wait_for_committed_scene(window)
+
+    # re-select now that the committed scene exists, then check the overlay
+    window.scene_tree.tree.clearSelection()
+    window.scene_tree.select_handle(window.document.handle_for(region))
+    scene = window.viewport._renderer._scene
+    overlay = [
+        s for s in (scene.surfaces if scene else ())
+        if int(s.key.object_id) >= 999_000
+    ]
+    assert overlay and overlay[0].indices.size > 0
+
+    window.scene_tree.tree.clearSelection()
+    scene = window.viewport._renderer._scene
+    assert not any(
+        int(s.key.object_id) >= 999_000 for s in (scene.surfaces if scene else ())
+    )

@@ -96,6 +96,16 @@
   an empty throwaway document (cheap per mouse-move).
 - Overlay plumbing generalized: `show_boundary_patch_highlight` accepts one
   or many surfaces; Esc/commit/tool-switch all clear it.
+- **A missed knife refuses the split** (user feedback): if either side of
+  a cut selects no boundary points, `split_boundary_region` raises before
+  mutating and the parent survives — no more empty-child + duplicate pairs.
+  Validation uses the Domain display-mesh vertices (dense) plus the coarse
+  grid fallback, so small-but-real cuts still pass.
+- **Scene-panel selection lights regions up too**: selecting BoundaryRegions
+  in the tree shows the same classifier overlay (regions have no scene chunk,
+  so the per-object selection tint cannot show them), up to four at once,
+  cleared on deselect and re-applied after every rebuild
+  (`_update_selected_region_highlight` + the artifact-ready hook).
 
 ## Follow-ups (tracked in v2 §9)
 

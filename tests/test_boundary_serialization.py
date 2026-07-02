@@ -25,7 +25,7 @@ def test_cut_chain_round_trips(tmp_path) -> None:
     box = next(n for _h, n, _p in document.walk() if isinstance(n, Box))
     region = document.node(document.add_boundary_region(box.object_id))
     ghost = Sphere(name="knife", object_id=0, center=(-1.6, 0.0, 0.0), radius=0.5)
-    (inside_handle, _), _ = document.split_boundary_region(region, ghost)
+    inside_handle, _ = document.split_boundary_region(region, ghost)
     inside = document.node(inside_handle)
     inside.tag = "inlet"
 
