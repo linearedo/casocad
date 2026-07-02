@@ -1319,19 +1319,27 @@ class QRhiViewportWidget(QRhiWidget):
             self._publish_surface_scene(self._committed_surface_scene)
         self._dirty = True
 
-    def show_boundary_patch_highlight(self, surface) -> None:
-        """Overlay the hovered patch as a bright classifier-derived surface on
-        top of the committed scene (None clears it)."""
+    def show_boundary_patch_highlight(self, surfaces) -> None:
+        """Overlay classifier-derived highlight surfaces (hovered patch, or
+        the cutter's inside/outside split preview) on top of the committed
+        scene. Accepts one surface, a sequence, or None/empty to clear."""
         committed = self._committed_surface_scene
-        if surface is None or committed is None:
+        if surfaces is None:
+            overlay = ()
+        elif isinstance(surfaces, (tuple, list)):
+            overlay = tuple(s for s in surfaces if s is not None)
+        else:
+            overlay = (surfaces,)
+        if not overlay or committed is None:
             if self._preview_kind == "boundary_hover":
                 self._restore_committed_scene()
             return
         scene = replace(
             committed,
-            surfaces=(*committed.surfaces, surface),
+            surfaces=(*committed.surfaces, *overlay),
             primary_object_ids=(
-                committed.primary_object_ids | {int(surface.key.object_id)}
+                committed.primary_object_ids
+                | {int(surface.key.object_id) for surface in overlay}
             ),
             build_ms=0.0,
         )

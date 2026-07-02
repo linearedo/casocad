@@ -80,6 +80,7 @@ class CreateTool:
     def cancel(self) -> None:
         if self.kind is None:
             return
+        was_cutter = self.boundary_cutter is not None
         self.kind = None
         self.start_world = None
         self.anchor = None
@@ -88,6 +89,8 @@ class CreateTool:
         self.points = None
         self.point_hover = None
         self.boundary_cutter = None
+        if was_cutter:
+            self._viewport.show_boundary_patch_highlight(None)
         self._viewport.unsetCursor()
         self._viewport._dirty = True
 
@@ -139,7 +142,9 @@ class CreateTool:
             return
         self.begin(shape_kind)
         self.boundary_cutter = shape_kind
+        # main_window highlights the region that is about to be cut
+        signals.boundary_cutter_armed.emit()
         signals.log_message.emit(
             "info",
             f"Boundary Cutter armed — draw the {shape_kind} knife across the "
-            "selected BoundaryRegion.")
+            "highlighted BoundaryRegion.")

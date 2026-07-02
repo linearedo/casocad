@@ -44,7 +44,7 @@ from app.panels.properties import CadDimensionSpinBox, PropertiesPanel
 from app.panels.scene_tree import SceneTreePanel
 from app.signals import signals
 from app.viewport.renderers.qrhi.viewport import QRhiViewportWidget as ViewportWidget
-from core.boundary import BoundaryRegion
+from core.boundary import BoundaryCut, BoundaryRegion
 from core.boundary_direction import owner_outside_direction_vector
 from core.boundary_patches import BoundaryPatchHit
 from core.boundary_region import (
@@ -504,6 +504,7 @@ class MainWindow(QMainWindow):
         )
         signals.viewport_point_shape_drawn.connect(self._on_viewport_point_shape_drawn)
         signals.viewport_move_tool_requested.connect(self._start_viewport_move)
+        signals.boundary_cutter_armed.connect(self._on_boundary_cutter_armed)
         signals.viewport_boundary_tool_requested.connect(
             self._start_boundary_region_tool
         )
@@ -764,9 +765,11 @@ class MainWindow(QMainWindow):
         self.scene_tree.select_handle(handle)
 
     def _on_viewport_shape_preview(self, kind, start, end, parameters) -> None:
-        """Live ghost of a shape being drawn (non-committing). Boundary cutters
-        are skipped — they need a selected region and special handling."""
+        """Live ghost of a shape being drawn (non-committing). While the
+        Boundary Cutter is armed the ghost is the SPLIT preview instead: the
+        selected region recolored into its would-be inside/outside children."""
         if self.viewport.active_boundary_cutter_tool() is not None:
+            self._show_boundary_cut_preview(kind, start, end, parameters)
             return
         try:
             preview = self.document.snapshot()
@@ -869,7 +872,7 @@ class MainWindow(QMainWindow):
                 )
                 return
             try:
-                scratch = self.document.snapshot()
+                scratch = SceneDocument()
                 handle = scratch.add_point_shape_from_world_points(
                     self._point_cutter_kind(kind),
                     points,
@@ -955,6 +958,69 @@ class MainWindow(QMainWindow):
             "Boundary region split into inside/outside.", 5000
         )
 
+    def _on_boundary_cutter_armed(self) -> None:
+        """Arming the cutter highlights the region that is about to be cut."""
+        base_region = self._selected_boundary_region_for_cutter()
+        if base_region is None:
+            return
+        self.viewport.show_boundary_patch_highlight(
+            self._region_highlight_surface(base_region)
+        )
+
+    def _show_boundary_cut_preview(self, kind, start, end, parameters) -> None:
+        """Live split preview while dragging the knife: the selected region
+        recolored into its would-be children (cyan = inside, orange =
+        outside), driven by the same classifier the commit will use."""
+        base_region = self._selected_boundary_region_for_cutter()
+        if base_region is None:
+            return
+        try:
+            ghost = self._drag_cutter_ghost(base_region, kind, start, end, parameters)
+        except (KeyError, ValueError):
+            return
+        surfaces = self._boundary_cut_preview_surfaces(base_region, ghost)
+        if surfaces:
+            self.viewport.show_boundary_patch_highlight(surfaces)
+
+    def _boundary_cut_preview_surfaces(
+        self,
+        base_region: BoundaryRegion,
+        ghost: SDFNode,
+    ) -> tuple:
+        base_cuts = list(base_region.cuts)
+        if base_region.selector_id is not None:
+            legacy = self.document._legacy_selector_cut(base_region)
+            if legacy is not None:
+                base_cuts.insert(0, legacy)
+        surfaces = []
+        for side, overlay_id, color in (
+            (
+                "inside",
+                self._BOUNDARY_HIGHLIGHT_OBJECT_ID,
+                self._BOUNDARY_HIGHLIGHT_COLOR,
+            ),
+            (
+                "outside",
+                self._BOUNDARY_CUT_OUTSIDE_OBJECT_ID,
+                self._BOUNDARY_CUT_OUTSIDE_COLOR,
+            ),
+        ):
+            child = BoundaryRegion(
+                name=f"__cut_preview_{side}__",
+                object_id=0,
+                owner_object_id=base_region.owner_object_id,
+                outside_direction=base_region.outside_direction,
+                patch_id=base_region.patch_id,
+                patch_type=base_region.patch_type,
+                cuts=(*base_cuts, BoundaryCut(side, ghost)),
+            )
+            surface = self._region_highlight_surface(
+                child, overlay_object_id=overlay_id, color=color
+            )
+            if surface is not None:
+                surfaces.append(surface)
+        return tuple(surfaces)
+
     def _drag_cutter_ghost(
         self,
         base_region: BoundaryRegion,
@@ -963,9 +1029,9 @@ class MainWindow(QMainWindow):
         end: tuple[float, float, float],
         parameters: dict[str, float] | None,
     ) -> SDFNode:
-        """Build the knife node for a drag gesture on a scratch document, so
-        it never touches the scene graph."""
-        scratch = self.document.snapshot()
+        """Build the knife node on a throwaway document, so it never touches
+        the scene graph (and stays cheap enough for per-move previews)."""
+        scratch = SceneDocument()
         if kind == "segment":
             handle = self._segment_cutter_ghost_handle(
                 scratch, base_region, start, end
@@ -1486,23 +1552,78 @@ class MainWindow(QMainWindow):
         self.viewport.show_boundary_patch_highlight(
             self._boundary_patch_highlight_surface(selection)
         )
-        if owner is not None:
+        hovered_region = self._hovered_boundary_region(selection)
+        if hovered_region is not None:
+            self.statusBar().showMessage(
+                f"Boundary region: {hovered_region.name} — click to select"
+            )
+        elif owner is not None:
             selector_suffix = (
                 f" / {selection.selector.side}"
                 if selection.selector is not None
                 else ""
             )
             self.statusBar().showMessage(
-                f"Boundary patch: {owner.name} {selection.patch_id}{selector_suffix}"
+                f"Boundary patch: {owner.name} {selection.patch_id}"
+                f"{selector_suffix} — click to tag"
             )
 
     _BOUNDARY_HIGHLIGHT_OBJECT_ID = 999_983
+    _BOUNDARY_CUT_OUTSIDE_OBJECT_ID = 999_984
     _BOUNDARY_HIGHLIGHT_COLOR = (0.25, 0.95, 1.0)
+    _BOUNDARY_CUT_OUTSIDE_COLOR = (1.0, 0.62, 0.25)
+
+    def _hovered_boundary_region(
+        self, hit: BoundaryPatchHit
+    ) -> BoundaryRegion | None:
+        """Resolve the EXISTING region under the cursor by classifying the
+        hit point against every region — cut-chain children included. The
+        most specific match wins (longest chain, then patch scope)."""
+        fluid = self.document.fluid_domain
+        if fluid is None:
+            return None
+        root = fluid.root
+        point = np.asarray([hit.point], dtype=np.float64)
+        candidates = []
+        for region in self.document.boundary_regions:
+            try:
+                if boundary_region_mask(root, region, point)[0]:
+                    candidates.append(region)
+            except (ValueError, NotImplementedError):
+                continue
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda region: (len(region.cuts), region.patch_id is not None),
+        )
 
     def _boundary_patch_highlight_surface(self, hit: BoundaryPatchHit):
-        """Overlay mesh for the hovered patch (boundary_region_v2 §7): take
-        the Domain's committed display surface — already built and exact —
-        and keep only the triangles the region classifier accepts, so what
+        """Overlay for the hover tool: the existing region under the cursor
+        when there is one (so cutter-made children highlight as themselves),
+        otherwise the raw patch the click would tag."""
+        region = self._hovered_boundary_region(hit)
+        if region is not None:
+            return self._region_highlight_surface(region)
+        probe = BoundaryRegion(
+            name="__boundary_hover__",
+            object_id=0,
+            owner_object_id=hit.owner_object_id,
+            patch_id=hit.patch_id,
+            patch_type=hit.patch_type,
+        )
+        return self._region_highlight_surface(probe)
+
+    def _region_highlight_surface(
+        self,
+        region: BoundaryRegion,
+        *,
+        overlay_object_id: int | None = None,
+        color: tuple[float, float, float] | None = None,
+    ):
+        """Overlay mesh for one region (boundary_region_v2 §7): take the
+        Domain's committed display surface — already built and exact — and
+        keep only the triangles the region classifier accepts, so what
         lights up is literally `contains()`. Triangles are pushed slightly
         off-surface so they never z-fight the scene."""
         fluid = self.document.fluid_domain
@@ -1525,13 +1646,6 @@ class MainWindow(QMainWindow):
         )
         if chunk is None:
             return None
-        probe = BoundaryRegion(
-            name="__boundary_hover__",
-            object_id=0,
-            owner_object_id=hit.owner_object_id,
-            patch_id=hit.patch_id,
-            patch_type=hit.patch_type,
-        )
         vertices = np.asarray(chunk.vertices, dtype=np.float64)
         box = root.bounding_box()
         diagonal = float(
@@ -1542,10 +1656,10 @@ class MainWindow(QMainWindow):
         # Clip-path meshes lie exactly on the surface, so the tight
         # scale-relative tolerance keeps patch edges crisp; dual-contoured
         # scenes carry ~cell-size vertex error and need the wider band.
-        mask = boundary_region_mask(root, probe, vertices)
+        mask = boundary_region_mask(root, region, vertices)
         if not mask.any():
-            band = max(region_tolerance(root, probe), diagonal / 64.0)
-            mask = boundary_region_mask(root, probe, vertices, tolerance=band)
+            band = max(region_tolerance(root, region), diagonal / 64.0)
+            mask = boundary_region_mask(root, region, vertices, tolerance=band)
         triangles = np.asarray(chunk.indices, dtype=np.uint32).reshape(-1, 3)
         keep = mask[triangles].all(axis=1)
         if not keep.any():
@@ -1558,12 +1672,19 @@ class MainWindow(QMainWindow):
         lifted = (vertices[used] + normals * (diagonal * 1.0e-3)).astype(np.float32)
         return replace(
             chunk,
-            key=replace(chunk.key, object_id=self._BOUNDARY_HIGHLIGHT_OBJECT_ID),
+            key=replace(
+                chunk.key,
+                object_id=(
+                    overlay_object_id
+                    if overlay_object_id is not None
+                    else self._BOUNDARY_HIGHLIGHT_OBJECT_ID
+                ),
+            ),
             vertices=lifted,
             normals=normals.astype(np.float32),
             indices=remap[kept].reshape(-1).astype(np.uint32),
             wire_indices=np.zeros(0, dtype=np.uint32),
-            color=self._BOUNDARY_HIGHLIGHT_COLOR,
+            color=color if color is not None else self._BOUNDARY_HIGHLIGHT_COLOR,
             bounds_min=tuple(float(v) for v in lifted.min(axis=0)),
             bounds_max=tuple(float(v) for v in lifted.max(axis=0)),
         )
@@ -1573,6 +1694,15 @@ class MainWindow(QMainWindow):
         self,
         selection: BoundaryPatchHit,
     ) -> None:
+        # Clicking an EXISTING region selects it (cutter-made children
+        # included); only untagged patches create a new region.
+        region = self._hovered_boundary_region(selection)
+        if region is not None:
+            self.scene_tree.select_handle(self.document.handle_for(region))
+            self.statusBar().showMessage(
+                f"Selected boundary region: {region.name}", 5000
+            )
+            return
         self._create_boundary_region_from_hit(selection)
 
     @Slot(object)

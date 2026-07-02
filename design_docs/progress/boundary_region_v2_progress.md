@@ -79,6 +79,24 @@
   `test_pick_difference_cut_surface_is_attributed_to_obstacle_patch`) — the
   obstacle wall is otherwise unreachable from outside.
 
+## UX round 2 (post-implementation, user feedback 2026-07-02)
+
+- **Hover resolves EXISTING regions, cut-chain children included**: the hit
+  point is classified against every region (`_hovered_boundary_region`, most
+  specific match wins — longest chain, then patch scope). Hovering a disk
+  child highlights the disk, the status bar names the region, and clicking
+  SELECTS it in the tree instead of tagging a duplicate. Untagged patches
+  keep the old click-to-tag behavior.
+- **Arming the cutter highlights the region about to be cut** (new
+  `boundary_cutter_armed` signal → cyan overlay of the selected region).
+- **Live split preview while dragging the knife**: the selected region is
+  recolored into its would-be children — cyan = inside, orange = outside —
+  driven by the same classifier the commit uses
+  (`_boundary_cut_preview_surfaces`). Knife ghosts for previews are built on
+  an empty throwaway document (cheap per mouse-move).
+- Overlay plumbing generalized: `show_boundary_patch_highlight` accepts one
+  or many surfaces; Esc/commit/tool-switch all clear it.
+
 ## Follow-ups (tracked in v2 §9)
 
 - 2D domain parity (interval selectors → 2D ghosts), then delete the

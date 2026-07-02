@@ -63,6 +63,7 @@ class AppSignals(QObject):
 
     # -- boundary regions ---------------------------------------------------------
     viewport_boundary_tool_requested = Signal()
+    boundary_cutter_armed = Signal()
     viewport_boundary_hovered = Signal(object)
     viewport_boundary_region_requested = Signal(object)
     create_boundary_region_requested = Signal(object)
