@@ -17,6 +17,7 @@ from app.signals import signals
 POINT_CREATE_KINDS = {
     "polyline", "quadratic_bezier_curve", "quadratic_bezier_polycurve",
     "polyline_tube", "quadratic_bezier_tube", "quadratic_bezier_surface", "polygon",
+    "smooth_polyline",  # boundary-cutter only: on-surface shortest-path knife
 }
 
 
@@ -80,7 +81,6 @@ class CreateTool:
     def cancel(self) -> None:
         if self.kind is None:
             return
-        was_cutter = self.boundary_cutter is not None
         self.kind = None
         self.start_world = None
         self.anchor = None
@@ -89,8 +89,6 @@ class CreateTool:
         self.points = None
         self.point_hover = None
         self.boundary_cutter = None
-        if was_cutter:
-            self._viewport.show_boundary_patch_highlight(None)
         self._viewport.unsetCursor()
         self._viewport._dirty = True
 
@@ -102,14 +100,18 @@ class CreateTool:
         kind = self.kind
         points = tuple(self.points)
         plane = self._viewport._plane_id()
+        was_cutter = self.boundary_cutter is not None
         # Emit before resetting so a synchronous handler can still read
         # active_boundary_cutter_tool (cutter routing).
         signals.viewport_point_shape_drawn.emit(kind, points, plane)
-        self.cancel()
+        if not was_cutter:
+            self.cancel()
 
     def emit_drag_shape(self, start, end) -> None:
+        was_cutter = self.boundary_cutter is not None
         signals.viewport_shape_drawn.emit(self.kind, start, end, None)
-        self.cancel()
+        if not was_cutter:
+            self.cancel()
 
     def commit_typed_dimension(self) -> None:
         """Create the anchored shape at an exact typed size (W or W x H),
@@ -133,9 +135,9 @@ class CreateTool:
 
     def begin_boundary_cutter(self, shape_kind: str) -> None:
         """Arm the Boundary Cutter (boundary_region_v2 §7): draw any shape on
-        the grid; the drawn shape becomes the ghost knife that splits the
-        selected BoundaryRegion into inside/outside. The knife is never a
-        scene object."""
+        the selected boundary; the drawn shape becomes the ghost knife that
+        splits the selected BoundaryRegion into inside/outside. The knife is
+        never a scene object."""
         if not self._viewport._boundary_region_selected:
             signals.log_message.emit(
                 "warning", "Select a BoundaryRegion before using the cutter.")
@@ -146,5 +148,5 @@ class CreateTool:
         signals.boundary_cutter_armed.emit()
         signals.log_message.emit(
             "info",
-            f"Boundary Cutter armed — draw the {shape_kind} knife across the "
+            f"Boundary Cutter armed — draw the {shape_kind} knife on the "
             "highlighted BoundaryRegion.")

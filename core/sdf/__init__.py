@@ -1,4 +1,5 @@
 from .base import BoundingBox3D, SDFNode
+from .curtain import NormalCurtain
 from .operators import Difference, Intersection, Union, Xor
 from .placed_1d import PlacedSDF1D
 from .placed_2d import PlacedPolyline1D, PlacedSDF2D
@@ -49,6 +50,7 @@ __all__ = [
     "OffsetProfile",
     "Extrude",
     "Intersection",
+    "NormalCurtain",
     "OffsetProfile1D",
     "PlacedPolyline1D",
     "PlacedSDF2D",

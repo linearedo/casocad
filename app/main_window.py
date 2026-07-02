@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 import sys
 
 import numpy as np
@@ -47,8 +49,10 @@ from app.viewport.renderers.qrhi.viewport import QRhiViewportWidget as ViewportW
 from core.boundary import BoundaryCut, BoundaryRegion
 from core.boundary_direction import owner_outside_direction_vector
 from core.boundary_patches import BoundaryPatchHit
+from core.boundary_paths import smooth_polyline_knife
 from core.boundary_region import (
     boundary_region_mask,
+    cut_volume,
     find_node_by_object_id,
     region_tolerance,
 )
@@ -58,9 +62,12 @@ from core.model import (
     model_from_document,
 )
 from core.sdf import (
+    Box,
     Difference,
     Intersection,
+    NormalCurtain,
     PlacedSDF2D,
+    QuadraticBezierSurfaceProfile,
     Revolve,
     SDFTree,
     Union,
@@ -160,6 +167,26 @@ def viewport_render_resolution_for_tree(tree: object) -> tuple[int, bool]:
     return COARSE_VIEWPORT_SURFACE_RESOLUTION, True
 
 
+def _zero_subtree_object_ids(node: SDFNode) -> None:
+    """Detach a transient subtree from document identity so SDFTree
+    auto-numbers it without colliding with ghost/document ids."""
+    node.object_id = 0
+    for child in node.children():
+        _zero_subtree_object_ids(child)
+
+
+def _odd_span_points(
+    points: tuple[tuple[float, float], ...],
+) -> tuple[tuple[float, float], ...]:
+    """Quadratic bezier spans pair anchor-control-anchor, so an even count
+    leaves the final span without its end anchor; close the last leg straight
+    by inserting its midpoint as the control."""
+    if len(points) % 2 == 1:
+        return tuple(points)
+    (ax, ay), (bx, by) = points[-2], points[-1]
+    return (*points[:-1], (0.5 * (ax + bx), 0.5 * (ay + by)), points[-1])
+
+
 def scene_item_handles(document: SceneDocument) -> list[int]:
     return [handle for handle, _node, _parent in document.walk()]
 
@@ -195,6 +222,10 @@ class MainWindow(QMainWindow):
         self._redo_stack: list[SceneDocument] = []
         self._clipboard_nodes: list[SDFNode] = []
         self._working_unit = DEFAULT_LENGTH_UNIT
+        self._active_boundary_cutter_region: BoundaryRegion | None = None
+        self._knife_volume_surface_cache: (
+            tuple[tuple[str, int], object, float] | None
+        ) = None
         self.viewport = ViewportWidget()
         self._background_color = QColor(DEFAULT_BACKGROUND_HEX)
         self.setCentralWidget(self.viewport)
@@ -501,6 +532,9 @@ class MainWindow(QMainWindow):
         signals.viewport_shape_drawn.connect(self._on_viewport_shape_drawn)
         signals.viewport_shape_preview_requested.connect(
             self._on_viewport_shape_preview
+        )
+        signals.viewport_point_shape_preview_requested.connect(
+            self._on_viewport_point_shape_preview
         )
         signals.viewport_point_shape_drawn.connect(self._on_viewport_point_shape_drawn)
         signals.viewport_move_tool_requested.connect(self._start_viewport_move)
@@ -876,14 +910,7 @@ class MainWindow(QMainWindow):
                 )
                 return
             try:
-                scratch = SceneDocument()
-                handle = scratch.add_point_shape_from_world_points(
-                    self._point_cutter_kind(kind),
-                    points,
-                    reference_plane,
-                )
-                ghost = scratch.node(handle)
-                assert isinstance(ghost, SDFNode)
+                ghost = self._point_cutter_ghost(kind, points, reference_plane)
             except ValueError as error:
                 signals.log_message.emit("warning", str(error))
                 return
@@ -910,14 +937,28 @@ class MainWindow(QMainWindow):
 
     def _selected_boundary_region_for_cutter(self) -> BoundaryRegion | None:
         handles = self.scene_tree.selected_handles()
-        if len(handles) != 1:
-            return None
-        try:
-            node = self.document.node(handles[0])
-        except KeyError:
-            return None
-        if isinstance(node, BoundaryRegion):
-            return node
+        if len(handles) == 1:
+            try:
+                node = self.document.node(handles[0])
+            except KeyError:
+                node = None
+            if isinstance(node, BoundaryRegion):
+                self._active_boundary_cutter_region = node
+                return node
+        cached = self._active_boundary_cutter_region
+        if (
+            self._boundary_cutter_shape() is not None
+            and cached in self.document.boundary_regions
+        ):
+            return cached
+        regions = tuple(getattr(self.viewport, "_boundary_cutter_regions", ()) or ())
+        if (
+            self._boundary_cutter_shape() is not None
+            and len(regions) == 1
+            and regions[0] in self.document.boundary_regions
+        ):
+            self._active_boundary_cutter_region = regions[0]
+            return regions[0]
         return None
 
     def _boundary_cutter_shape(self) -> str | None:
@@ -925,12 +966,36 @@ class MainWindow(QMainWindow):
 
     def _point_cutter_kind(self, kind: str) -> str:
         """Point-collected knives classify by their filled area, not the bare
-        curve, so open curves close into their surface counterparts."""
+        curve, so open curves close into their surface counterparts. The
+        smooth polyline is its own kind: an on-surface path, not a fill."""
         if kind == "polyline":
             return "polygon"
         if kind == "quadratic_bezier_polycurve":
             return "quadratic_bezier_surface"
         return kind
+
+    def _point_cutter_ghost(
+        self,
+        kind: str,
+        points: tuple[tuple[float, float, float], ...],
+        reference_plane: str,
+    ) -> SDFNode:
+        """Knife node for a point-collected cutter gesture (commit and
+        preview share it). Built on a throwaway document — or directly, for
+        the smooth polyline — so it never touches the scene graph."""
+        kind = self._point_cutter_kind(kind)
+        if kind == "smooth_polyline":
+            fluid = self.document.fluid_domain
+            if fluid is None:
+                raise ValueError("select a FluidDomain root first")
+            return smooth_polyline_knife(fluid.root, tuple(points))
+        scratch = SceneDocument()
+        handle = self._surface_point_cutter_ghost_handle(
+            scratch, kind, points, reference_plane
+        )
+        ghost = scratch.node(handle)
+        assert isinstance(ghost, SDFNode)
+        return ghost
 
     def _apply_boundary_cut(
         self,
@@ -951,10 +1016,22 @@ class MainWindow(QMainWindow):
             )
         except (KeyError, ValueError) as error:
             signals.log_message.emit("warning", str(error))
+            overlays = tuple(
+                surface
+                for surface in (
+                    self._region_highlight_surface(base_region),
+                    self._cutter_volume_debug_surface(ghost, force=True),
+                )
+                if surface is not None
+            )
+            if overlays:
+                self.viewport.show_boundary_patch_highlight(overlays)
             return
         self._record_undo_snapshot(undo_snapshot)
         self._publish_document()
         self.scene_tree.select_handles(list(handles))
+        self._active_boundary_cutter_region = None
+        self.viewport.cancel_create_tool()
         self.viewport.setFocus()
         self.statusBar().showMessage(
             "Boundary region split into inside/outside.", 5000
@@ -986,9 +1063,30 @@ class MainWindow(QMainWindow):
         base_region = self._selected_boundary_region_for_cutter()
         if base_region is None:
             return
+        self._active_boundary_cutter_region = base_region
         self.viewport.show_boundary_patch_highlight(
             self._region_highlight_surface(base_region)
         )
+
+    def _on_viewport_point_shape_preview(
+        self,
+        kind: str,
+        points: tuple[tuple[float, float, float], ...],
+        reference_plane: str,
+    ) -> None:
+        if self._boundary_cutter_shape() is None:
+            return
+        base_region = self._selected_boundary_region_for_cutter()
+        if base_region is None:
+            return
+        try:
+            ghost = self._point_cutter_ghost(kind, points, reference_plane)
+        except ValueError:
+            surface = self._region_highlight_surface(base_region)
+            if surface is not None:
+                self.viewport.show_boundary_patch_highlight(surface)
+            return
+        self._show_cut_preview_overlays(base_region, ghost)
 
     def _show_boundary_cut_preview(self, kind, start, end, parameters) -> None:
         """Live split preview while dragging the knife: the selected region
@@ -1000,10 +1098,30 @@ class MainWindow(QMainWindow):
         try:
             ghost = self._drag_cutter_ghost(base_region, kind, start, end, parameters)
         except (KeyError, ValueError):
+            surface = self._region_highlight_surface(base_region)
+            if surface is not None:
+                self.viewport.show_boundary_patch_highlight(surface)
             return
-        surfaces = self._boundary_cut_preview_surfaces(base_region, ghost)
-        if surfaces:
-            self.viewport.show_boundary_patch_highlight(surfaces)
+        self._show_cut_preview_overlays(base_region, ghost)
+
+    def _show_cut_preview_overlays(
+        self,
+        base_region: BoundaryRegion,
+        ghost: SDFNode,
+    ) -> None:
+        """Split preview plus the knife volume itself: the exact 3D field the
+        classifier tests (lower-dimensional knives show their extruded solid),
+        so a knife that misses the region is visibly missing it."""
+        overlays = list(self._boundary_cut_preview_surfaces(base_region, ghost))
+        if not overlays:
+            surface = self._region_highlight_surface(base_region)
+            if surface is not None:
+                overlays.append(surface)
+        knife = self._cutter_volume_debug_surface(ghost)
+        if knife is not None:
+            overlays.append(knife)
+        if overlays:
+            self.viewport.show_boundary_patch_highlight(tuple(overlays))
 
     def _boundary_cut_preview_surfaces(
         self,
@@ -1044,6 +1162,107 @@ class MainWindow(QMainWindow):
                 surfaces.append(surface)
         return tuple(surfaces)
 
+    def _cutter_volume_debug_surface(self, ghost: SDFNode, *, force: bool = False):
+        """Tessellate the knife's 3D classification volume (cut_volume: the
+        ghost itself, or the extrusion of a lower-dimensional ghost clipped
+        to the Domain bounds), so the solid that actually slices the region
+        is visible while cutting.
+
+        Rebuilds are throttled: within the rebuild window a changed knife
+        reuses the previous mesh (the split preview still updates live) and
+        the next preview refreshes it, so knife drags stay fluid."""
+        fluid = self.document.fluid_domain
+        if fluid is None:
+            return None
+        cache_key = (repr(ghost), self.document.version)
+        cached = self._knife_volume_surface_cache
+        if cached is not None:
+            key, surface, built_at = cached
+            if key == cache_key:
+                return surface
+            if (
+                not force
+                and perf_counter() - built_at < self._KNIFE_VOLUME_REBUILD_SECONDS
+            ):
+                return surface
+        surface = self._build_cutter_volume_debug_surface(fluid.root, ghost)
+        self._knife_volume_surface_cache = (cache_key, surface, perf_counter())
+        return surface
+
+    def _build_cutter_volume_debug_surface(self, root: SDFNode, ghost: SDFNode):
+        try:
+            volume = cut_volume(root, BoundaryCut("inside", ghost))
+        except (ValueError, NotImplementedError):
+            return None
+        node = deepcopy(volume)
+        if ghost.dimension < 3 or isinstance(ghost, NormalCurtain):
+            # Extruded knives run span*4 through the scene and curtain
+            # fields are unbounded half-spaces; clip to the Domain bounds
+            # so the mesh stays local.
+            try:
+                bounds = root.bounding_box()
+            except (ValueError, NotImplementedError):
+                return None
+            clip = Box(
+                name="__knife_clip__",
+                object_id=0,
+                center=(
+                    0.5 * (bounds.x_min + bounds.x_max),
+                    0.5 * (bounds.y_min + bounds.y_max),
+                    0.5 * (bounds.z_min + bounds.z_max),
+                ),
+                half_size=tuple(
+                    max(0.5 * (upper - lower), 1.0e-6) * 1.05
+                    for lower, upper in (
+                        (bounds.x_min, bounds.x_max),
+                        (bounds.y_min, bounds.y_max),
+                        (bounds.z_min, bounds.z_max),
+                    )
+                ),
+            )
+            node = Intersection(
+                name="__knife_volume__",
+                object_id=0,
+                left=node,
+                right=clip,
+            )
+        _zero_subtree_object_ids(node)
+        tree = SDFTree(root=node, components=(node,))
+        try:
+            artifact = build_render_artifact(
+                RenderSceneSnapshot(
+                    version=self.document.version,
+                    tree=tree,
+                    surface_resolution=self._KNIFE_VOLUME_RESOLUTION,
+                    refine_after=False,
+                )
+            )
+        except (ValueError, NotImplementedError):
+            return None
+        scene = artifact.surface_scene
+        if scene is None:
+            return None
+        chunk = next(
+            (
+                surface
+                for surface in scene.surfaces
+                if surface.has_geometry
+                and surface.indices is not None
+                and surface.indices.size
+            ),
+            None,
+        )
+        if chunk is None:
+            return None
+        return replace(
+            chunk,
+            key=replace(
+                chunk.key, object_id=self._BOUNDARY_CUTTER_VOLUME_OBJECT_ID
+            ),
+            wire_indices=np.zeros(0, dtype=np.uint32),
+            color=self._BOUNDARY_CUTTER_VOLUME_COLOR,
+        )
+
     def _drag_cutter_ghost(
         self,
         base_region: BoundaryRegion,
@@ -1071,6 +1290,102 @@ class MainWindow(QMainWindow):
         assert isinstance(ghost, SDFNode)
         return ghost
 
+    def _surface_point_cutter_ghost_handle(
+        self,
+        scratch: SceneDocument,
+        kind: str,
+        points: tuple[tuple[float, float, float], ...],
+        reference_plane: str,
+    ) -> int:
+        """Filled knife from surface-clicked points. Two clicks (or a
+        collinear run) enclose no area, so they become the straight
+        half-plane knife instead of a degenerate polygon."""
+        if kind not in {"polygon", "quadratic_bezier_surface"}:
+            return scratch.add_point_shape_from_world_points(
+                kind,
+                points,
+                reference_plane,
+            )
+        origin, axis_u, axis_v, local_points, planar = (
+            self._surface_points_local_frame(points)
+        )
+        if not planar:
+            return self._straight_knife_handle(scratch, points[0], points[-1])
+        if kind == "polygon":
+            return scratch.add_polygon(
+                local_points,
+                origin=origin,
+                axis_u=axis_u,
+                axis_v=axis_v,
+            )
+        return scratch.add_placed_2d_profile(
+            QuadraticBezierSurfaceProfile(points=_odd_span_points(local_points)),
+            origin=origin,
+            axis_u=axis_u,
+            axis_v=axis_v,
+        )
+
+    def _surface_points_local_frame(
+        self,
+        points: tuple[tuple[float, float, float], ...],
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[tuple[float, float], ...],
+        bool,
+    ]:
+        """Local plane frame for surface-clicked knife points. The final flag
+        is False when the points themselves span no plane (two clicks, or a
+        collinear run) and the normal had to come from the SDF surface —
+        callers should fall back to a straight knife then."""
+        arrays = [np.asarray(point, dtype=np.float64) for point in points]
+        if len(arrays) < 2:
+            raise ValueError("boundary cutter needs at least two points")
+        origin = arrays[0]
+        axis_u = next(
+            (
+                point - origin
+                for point in arrays[1:]
+                if float(np.linalg.norm(point - origin)) > 1.0e-9
+            ),
+            None,
+        )
+        if axis_u is None:
+            raise ValueError("boundary cutter points must not all coincide")
+        axis_u = axis_u / float(np.linalg.norm(axis_u))
+        normal = None
+        for first, second in zip(arrays[1:], arrays[2:]):
+            candidate = np.cross(first - origin, second - origin)
+            length = float(np.linalg.norm(candidate))
+            if length > 1.0e-9:
+                normal = candidate / length
+                break
+        planar = normal is not None
+        if normal is None:
+            normal = self._sdf_surface_normal(origin)
+        axis_v = np.cross(normal, axis_u)
+        axis_v_length = float(np.linalg.norm(axis_v))
+        if axis_v_length <= 1.0e-9:
+            raise ValueError("boundary cutter points do not define a local frame")
+        axis_v = axis_v / axis_v_length
+        # ponytail: surface-guided gesture, local planar cutter; add intrinsic
+        # surface curves only if solver semantics need geodesic cuts.
+        local_points = tuple(
+            (
+                float(np.dot(point - origin, axis_u)),
+                float(np.dot(point - origin, axis_v)),
+            )
+            for point in arrays
+        )
+        return (
+            tuple(float(value) for value in origin),
+            tuple(float(value) for value in axis_u),
+            tuple(float(value) for value in axis_v),
+            local_points,
+            planar,
+        )
+
     def _segment_cutter_ghost_handle(
         self,
         scratch: SceneDocument,
@@ -1080,12 +1395,27 @@ class MainWindow(QMainWindow):
     ) -> int:
         _selectors, normals = self._viewport_boundary_region_entries([base_region])
         normal = np.asarray(normals[0], dtype=np.float64)
+        if float(np.linalg.norm(normal)) <= 1.0e-9:
+            normal = self._sdf_surface_normal(start)
+        return self._straight_knife_handle(scratch, start, end, normal=normal)
+
+    def _straight_knife_handle(
+        self,
+        scratch: SceneDocument,
+        start: tuple[float, float, float],
+        end: tuple[float, float, float],
+        normal: np.ndarray | None = None,
+    ) -> int:
+        """Half-plane ghost: a giant polygon on the plane spanned by the
+        start-end line and the boundary normal, covering one side of the
+        line. The segment cutter and degenerate point-knives share it."""
+        if normal is None:
+            normal = self._sdf_surface_normal(start)
+        normal = np.asarray(normal, dtype=np.float64)
         normal_length = float(np.linalg.norm(normal))
         if normal_length <= 1.0e-9:
-            raise ValueError(
-                "The selected BoundaryRegion has no planar normal for a segment cutter."
-            )
-        normal /= normal_length
+            raise ValueError("could not resolve a surface normal for the cutter")
+        normal = normal / normal_length
         start_array = np.asarray(start, dtype=np.float64)
         end_array = np.asarray(end, dtype=np.float64)
         line = end_array - start_array
@@ -1123,6 +1453,46 @@ class MainWindow(QMainWindow):
             axis_u=tuple(float(value) for value in line_axis),
             axis_v=tuple(float(value) for value in side_axis),
         )
+
+    def _sdf_surface_normal(
+        self,
+        point: tuple[float, float, float] | np.ndarray,
+    ) -> np.ndarray:
+        fluid = self.document.fluid_domain
+        if fluid is None:
+            raise ValueError("select a FluidDomain root first")
+        root = fluid.root
+        point_array = np.asarray(point, dtype=np.float64)
+        box = root.bounding_box()
+        diagonal = float(
+            np.linalg.norm(
+                (
+                    box.x_max - box.x_min,
+                    box.y_max - box.y_min,
+                    box.z_max - box.z_min,
+                )
+            )
+        )
+        step = max(diagonal * 1.0e-5, 1.0e-7)
+        gradient = np.empty(3, dtype=np.float64)
+        for axis in range(3):
+            offset = np.zeros(3, dtype=np.float64)
+            offset[axis] = step
+            positive = root.to_numpy(
+                np.asarray([point_array[0] + offset[0]], dtype=np.float64),
+                np.asarray([point_array[1] + offset[1]], dtype=np.float64),
+                np.asarray([point_array[2] + offset[2]], dtype=np.float64),
+            )[0]
+            negative = root.to_numpy(
+                np.asarray([point_array[0] - offset[0]], dtype=np.float64),
+                np.asarray([point_array[1] - offset[1]], dtype=np.float64),
+                np.asarray([point_array[2] - offset[2]], dtype=np.float64),
+            )[0]
+            gradient[axis] = float(positive - negative)
+        length = float(np.linalg.norm(gradient))
+        if length <= 1.0e-12:
+            raise ValueError("could not resolve a surface normal for the cutter")
+        return gradient / length
 
     def _start_viewport_move(self) -> None:
         handles = self.scene_tree.selected_handles()
@@ -1593,8 +1963,13 @@ class MainWindow(QMainWindow):
 
     _BOUNDARY_HIGHLIGHT_OBJECT_ID = 999_983
     _BOUNDARY_CUT_OUTSIDE_OBJECT_ID = 999_984
+    _BOUNDARY_CUTTER_VOLUME_OBJECT_ID = 999_985
     _BOUNDARY_HIGHLIGHT_COLOR = (0.25, 0.95, 1.0)
     _BOUNDARY_CUT_OUTSIDE_COLOR = (1.0, 0.62, 0.25)
+    _BOUNDARY_CUTTER_VOLUME_COLOR = (0.93, 0.38, 0.93)
+    # Debug aid, rebuilt per preview update: coarse keeps knife drags fluid.
+    _KNIFE_VOLUME_RESOLUTION = 28
+    _KNIFE_VOLUME_REBUILD_SECONDS = 0.25
 
     def _hovered_boundary_region(
         self, hit: BoundaryPatchHit

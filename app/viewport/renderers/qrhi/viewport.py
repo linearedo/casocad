@@ -35,6 +35,7 @@ from app.viewport.performance_governor import (
     ViewportPerformanceGovernor,
     ViewportRenderBudget,
 )
+from core.boundary_region import boundary_region_mask
 
 from .boundary_tool import BoundaryTool
 from .create_tool import CreateTool
@@ -269,6 +270,7 @@ class QRhiViewportWidget(QRhiWidget):
         self._revolve_last_preview_deg = None
         self._revolve_deg = 0.0
         self._boundary_region_selected = False
+        self._boundary_cutter_regions = ()
         self._committed_surface_scene = None   # last committed scene (restore target)
         self._committed_scene_payload = None
         self._preview_kind = None
@@ -1285,23 +1287,76 @@ class QRhiViewportWidget(QRhiWidget):
         """main_window passes (selectors, normals, regions); we only need to know
         whether a BoundaryRegion is selected so the cutter buttons enable."""
         regions = a[2] if len(a) >= 3 else ()
+        if regions or self._create_tool.boundary_cutter is None:
+            self._boundary_cutter_regions = tuple(regions)
         self._boundary_region_selected = bool(regions)
         self._update_cutter_buttons_enabled()
 
-    # One cutter, any knife shape: lines/profiles extrude through the scene,
-    # 3D shapes cut by their own volume (boundary_region_v2 §3).
+    # One cutter, planar knives extrude through the scene; the smooth
+    # polyline follows the boundary itself (shortest on-surface path through
+    # the clicked points), which covers every curved-region case the removed
+    # 3D-primitive knives were for (boundary_region_v2 §3).
     _CUTTER_KINDS = (
         ("Segment", "segment"),
         ("Polyline", "polyline"),
         ("Quadratic Bezier Polycurve", "quadratic_bezier_polycurve"),
-        ("Sphere", "sphere"),
-        ("Box", "box"),
-        ("Cylinder", "cylinder"),
-        ("Cone", "cone"),
+        ("Smooth Polyline", "smooth_polyline"),
     )
 
     def begin_boundary_cutter_tool(self, shape_kind: str) -> None:
         self._create_tool.begin_boundary_cutter(shape_kind)
+
+    def _boundary_cutter_point(self, pos):
+        if self._create_tool.boundary_cutter is None:
+            return None
+        root = getattr(self._tree, "root", None)
+        if root is None:
+            return None
+        hit = self._boundary_tool.pick(pos, root=root)
+        if hit is None:
+            return None
+        point = np.asarray(hit.point, dtype=np.float64)
+        regions = tuple(getattr(self, "_boundary_cutter_regions", ()) or ())
+        if regions:
+            sample = point.reshape(1, 3)
+            inside = False
+            for region in regions:
+                try:
+                    inside = bool(boundary_region_mask(root, region, sample)[0])
+                except (ValueError, NotImplementedError):
+                    continue
+                if inside:
+                    break
+            if not inside:
+                return None
+        return (float(point[0]), float(point[1]), float(point[2]))
+
+    def _create_point_from_cursor(self, pos, modifiers):
+        if self._create_tool.boundary_cutter is not None:
+            return self._boundary_cutter_point(pos)
+        return self._snap_world(self._screen_to_grid(pos), modifiers)
+
+    def _missing_create_point_message(self) -> str:
+        if self._create_tool.boundary_cutter is not None:
+            return "No selected BoundaryRegion under the cursor."
+        return "The camera ray does not reach the reference grid plane."
+
+    def _preview_boundary_point_cutter(self) -> None:
+        if (
+            self._create_tool.boundary_cutter is None
+            or self._create_tool.points is None
+            or self._create_tool.kind is None
+        ):
+            return
+        points = list(self._create_tool.points)
+        hover = self._create_tool.point_hover
+        if hover is not None and (not points or hover != points[-1]):
+            points.append(hover)
+        signals.viewport_point_shape_preview_requested.emit(
+            self._create_tool.kind,
+            tuple(points),
+            self._plane_id(),
+        )
 
     # --- boundary region hover/select tool (real; boundary_region_v2 §7) ---
 
@@ -1733,18 +1788,18 @@ class QRhiViewportWidget(QRhiWidget):
             self._press_pos = None
             return
         if self._create_tool.kind is not None and e.button() == Qt.MouseButton.LeftButton:
-            point = self._snap_world(
-                self._screen_to_grid(e.position()), e.modifiers())
+            point = self._create_point_from_cursor(e.position(), e.modifiers())
             if point is None:
                 signals.log_message.emit(
                     "warning",
-                    "The camera ray does not reach the reference grid plane.",
+                    self._missing_create_point_message(),
                 )
             elif self._create_tool.points is not None:  # point-shape: collect clicks
                 self._create_tool.points.append(point)
                 self._create_tool.point_hover = point
                 self._update_readout(point)
                 self._dirty = True
+                self._preview_boundary_point_cutter()
             elif self._create_tool.anchor is not None:  # anchored: this click is the end
                 self._create_tool.emit_drag_shape(self._create_tool.anchor, point)
             else:  # drag-shape: record the drag start
@@ -1777,7 +1832,7 @@ class QRhiViewportWidget(QRhiWidget):
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
         # Live coordinate readout (also fires on hover via mouse tracking).
-        hover = self._snap_world(self._screen_to_grid(e.position()), e.modifiers())
+        hover = self._create_point_from_cursor(e.position(), e.modifiers())
         self._update_readout(hover)
         if self._boundary_tool.active and not (
             e.buttons() & Qt.MouseButton.LeftButton
@@ -1786,6 +1841,7 @@ class QRhiViewportWidget(QRhiWidget):
         if self._create_tool.points is not None:  # live point-shape preview follows cursor
             self._create_tool.point_hover = hover
             self._dirty = True
+            self._preview_boundary_point_cutter()
         if self._create_tool.anchor is not None:  # rubber-band to the locked anchor
             self._create_tool.hover = hover
             self._dirty = True
@@ -1800,8 +1856,7 @@ class QRhiViewportWidget(QRhiWidget):
         if self._create_tool.kind is not None:
             self._last_pos = e.position()
             if self._create_tool.points is None and self._create_tool.start_world is not None:
-                cur = self._snap_world(
-                    self._screen_to_grid(e.position()), e.modifiers())
+                cur = self._create_point_from_cursor(e.position(), e.modifiers())
                 if cur is not None and cur != self._create_tool.hover:
                     self._create_tool.hover = cur
                     self._dirty = True
@@ -1979,6 +2034,7 @@ class QRhiViewportWidget(QRhiWidget):
             if self._create_tool.points:
                 self._create_tool.points.pop()
                 self._dirty = True
+                self._preview_boundary_point_cutter()
             return
         # Typed dimensions while an anchored drag-create is pending.
         if self._create_tool.anchor is not None:

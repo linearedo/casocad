@@ -22,6 +22,7 @@ from .sdf import (
     EllipseProfile,
     Extrude,
     Intersection,
+    NormalCurtain,
     OffsetProfile,
     OffsetProfile1D,
     PlacedPolyline1D,
@@ -459,6 +460,12 @@ def _node_to_record(node: SDFNode, names: _SceneNames) -> dict[str, Any]:
             inner_radius=node.inner_radius,
             caps=node.caps,
         )
+    elif isinstance(node, NormalCurtain):
+        data.update(
+            points=[list(point) for point in node.points],
+            normals=[list(normal) for normal in node.normals],
+            extent=node.extent,
+        )
     else:
         raise TypeError(f"cannot serialize {type(node).__name__}")
     return data
@@ -488,6 +495,7 @@ def _node_type(node: SDFNode) -> str:
         Revolve: "revolve",
         PolylineTube: "polyline_tube",
         QuadraticBezierTube: "quadratic_bezier_tube",
+        NormalCurtain: "normal_curtain",
     }
     return names[type(node)]
 
@@ -670,6 +678,13 @@ def _node_from_record(
             radius=float(data["radius"]),
             inner_radius=float(data.get("inner_radius", 0.0)),
             caps=str(data.get("caps", "round")),
+        )
+    if node_type == "normal_curtain":
+        return NormalCurtain(
+            **common,
+            points=_points3(data["points"]),
+            normals=_points3(data["normals"]),
+            extent=float(data.get("extent", 4.0)),
         )
     raise ValueError(f"unknown SDF node type: {node_type}")
 

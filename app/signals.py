@@ -36,6 +36,7 @@ class AppSignals(QObject):
     viewport_create_requested = Signal(str)
     viewport_shape_drawn = Signal(str, object, object, object)
     viewport_shape_preview_requested = Signal(str, object, object, object)
+    viewport_point_shape_preview_requested = Signal(str, object, str)
     viewport_point_shape_drawn = Signal(str, object, str)
 
     # -- viewport transform tools (move / rotate / extrude / revolve) ------------

@@ -42,9 +42,10 @@ class BoundaryTool:
     def active(self) -> bool:
         return self.root is not None
 
-    def _scene_extent(self) -> float:
+    def _scene_extent(self, root=None) -> float:
+        root = self.root if root is None else root
         try:
-            box = self.root.bounding_box()
+            box = root.bounding_box()
         except (ValueError, NotImplementedError):
             return 1.0
         return max(
@@ -86,19 +87,25 @@ class BoundaryTool:
     def update_hover(self, pos) -> None:
         if not self.active:
             return
-        origin, direction = self._viewport._screen_ray(pos)
-        extent = self._scene_extent()
-        hit = pick_boundary_patch(
-            self.root,
-            np.asarray(origin, dtype=np.float64),
-            np.asarray(direction, dtype=np.float64),
-            selector_objects=self.selectors,
-            hit_tolerance=_RELATIVE_HIT_TOLERANCE * extent,
-            maximum_travel=_RELATIVE_MAX_TRAVEL * extent,
-        )
+        hit = self.pick(pos)
         if not _same_hit(hit, self.hover):
             self.hover = hit
             signals.viewport_boundary_hovered.emit(hit)
+
+    def pick(self, pos, *, root=None, selectors=()) -> BoundaryPatchHit | None:
+        root = self.root if root is None else root
+        if root is None:
+            return None
+        origin, direction = self._viewport._screen_ray(pos)
+        extent = self._scene_extent(root)
+        return pick_boundary_patch(
+            root,
+            np.asarray(origin, dtype=np.float64),
+            np.asarray(direction, dtype=np.float64),
+            selector_objects=self.selectors if root is self.root else tuple(selectors),
+            hit_tolerance=_RELATIVE_HIT_TOLERANCE * extent,
+            maximum_travel=_RELATIVE_MAX_TRAVEL * extent,
+        )
 
     def commit(self) -> bool:
         """Left click while armed: tag the hovered patch. Returns True when
