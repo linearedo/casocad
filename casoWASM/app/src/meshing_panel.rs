@@ -117,8 +117,8 @@ impl MeshingPanel {
         }
     }
 
-    /// The emitted elements as viewport preview surfaces: triangles filled,
-    /// segments/points as wire markers, colored stably per tag.
+    /// The emitted elements as wire-only viewport preview surfaces (face
+    /// outlines, segments, point markers), colored stably per tag.
     pub fn preview_surfaces(&self) -> Vec<ViewportSurface> {
         if !self.show_preview || self.elements.is_empty() {
             return Vec::new();
@@ -135,7 +135,6 @@ impl MeshingPanel {
         for (tag_index, tag) in tags.iter().enumerate() {
             let mut vertices: Vec<[f32; 3]> = Vec::new();
             let mut normals: Vec<[f32; 3]> = Vec::new();
-            let mut indices: Vec<u32> = Vec::new();
             let mut wire_indices: Vec<u32> = Vec::new();
             let color = object_color(tag_color_id(tag));
             for element in self
@@ -177,15 +176,13 @@ impl MeshingPanel {
                         wire_indices.extend([base, base + 1]);
                     }
                     _ => {
-                        // Fan-triangulate (triangles pass through unchanged).
-                        let normal = element_normal(&element.vertices);
+                        // Face elements: wire outline only (no filled
+                        // triangles by design — see design_docs/
+                        // mesh_preview_opacity_independence.md).
                         for point in &element.vertices {
                             vertices
                                 .push([point[0] as f32, point[1] as f32, point[2] as f32]);
-                            normals.push(normal);
-                        }
-                        for index in 1..(element.vertices.len() as u32 - 1) {
-                            indices.extend([base, base + index, base + index + 1]);
+                            normals.push([0.0, 0.0, 1.0]);
                         }
                         for index in 0..element.vertices.len() as u32 {
                             wire_indices.extend([
@@ -214,7 +211,7 @@ impl MeshingPanel {
                 status: SurfaceStatus::Ready,
                 vertices,
                 normals,
-                indices,
+                indices: Vec::new(),
                 wire_indices,
                 color,
                 bounds_min,
@@ -236,26 +233,3 @@ fn tag_color_id(tag: &str) -> u32 {
     (hash % 60_000).max(1)
 }
 
-fn element_normal(vertices: &[[f64; 3]]) -> [f32; 3] {
-    if vertices.len() < 3 {
-        return [0.0, 0.0, 1.0];
-    }
-    let a = vertices[0];
-    let b = vertices[1];
-    let c = vertices[2];
-    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    let normal = [
-        u[1] * v[2] - u[2] * v[1],
-        u[2] * v[0] - u[0] * v[2],
-        u[0] * v[1] - u[1] * v[0],
-    ];
-    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
-        .sqrt()
-        .max(1.0e-12);
-    [
-        (normal[0] / length) as f32,
-        (normal[1] / length) as f32,
-        (normal[2] / length) as f32,
-    ]
-}

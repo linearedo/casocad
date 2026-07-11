@@ -41,25 +41,32 @@ The invariant falls out of the renderer's pipeline split
    surfaces. It never sees the opacity uniform.
 
 Mesh preview elements (`app/src/meshing_panel.rs::preview_surfaces`) are
-emitted as `ViewportSurface` chunks with `object_kind = "mesh_preview"`:
-point elements become tiny crosses, 1D elements become segments, and 2D/3D
-element faces get both fan triangles and wire outlines. Wire-only chunks go
-through the line pipeline — hence the opacity immunity the user observed.
+emitted as **wire-only** `ViewportSurface` chunks with
+`object_kind = "mesh_preview"`: point elements become tiny crosses, 1D
+elements become segments, and 2D/3D element faces become their edge
+outlines. Because these chunks never contain triangles, every mesh preview
+element goes through the line pipeline, so the invariant holds structurally
+— no renderer changes, no chunk tagging, no special-case uniform.
 
-## Known gap (to fix, not to relitigate)
+## Filled mesh faces were dropped deliberately (2026-07-11)
 
-The immunity is currently complete only for **wire/point** content. A
-per-tag preview chunk that contains any face element has triangles, so it is
-drawn through the surface pipeline and **does** inherit the global opacity —
-a violation of this rule. The renderer cannot tell chunks apart today
-(`SurfaceChunk` drops `object_kind` in `set_scene`).
+Earlier versions (a carry-over from the Python casoCAD port) also
+fan-triangulated face elements into shaded fills. That was removed on
+purpose, for two reasons:
 
-When mesh-face shading is worked on, the fix must respect the invariant:
+1. Wireframe-only is the useful default for FEA/CFD mesh inspection — the
+   element structure is the information; shaded fills hide it.
+2. Filled faces rode the surface pipeline and inherited the geometry
+   opacity slider, violating this invariant; and a per-tag chunk containing
+   any face element caused the renderer to drop the chunk's wire segments
+   entirely (`set_scene` uses `wire_indices` only when a chunk has no
+   triangles), hiding 1D bars sharing the tag.
 
-- Tag chunks originating from `object_kind == "mesh_preview"` through
-  `set_scene`, and
-- draw their triangles with **opacity pinned to 1.0** (dedicated pipeline or
-  a second uniform slot), independent of the slider.
+Do not reintroduce filled mesh faces casually. If shaded faces ever come
+back, they must be drawn with **opacity pinned to 1.0** (dedicated pipeline
+or a second uniform slot, keyed off `object_kind == "mesh_preview"` in
+`set_scene`), independent of the slider — and wire outlines must still be
+emitted alongside them.
 
 ## Rules for future work
 
