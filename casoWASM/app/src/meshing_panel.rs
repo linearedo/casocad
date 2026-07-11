@@ -117,8 +117,27 @@ impl MeshingPanel {
         }
     }
 
+    /// The emitted point elements as flat instance data (xyz + rgb per
+    /// point) for the renderer's sphere-impostor markers.
+    pub fn preview_points(&self) -> Vec<f32> {
+        if !self.show_preview {
+            return Vec::new();
+        }
+        let mut points = Vec::new();
+        for element in &self.elements {
+            if element.vertices.len() != 1 {
+                continue;
+            }
+            let point = element.vertices[0];
+            let color = object_color(tag_color_id(&element.tag_name));
+            points.extend([point[0] as f32, point[1] as f32, point[2] as f32]);
+            points.extend(color);
+        }
+        points
+    }
+
     /// The emitted elements as wire-only viewport preview surfaces (face
-    /// outlines, segments, point markers), colored stably per tag.
+    /// outlines and segments), colored stably per tag.
     pub fn preview_surfaces(&self) -> Vec<ViewportSurface> {
         if !self.show_preview || self.elements.is_empty() {
             return Vec::new();
@@ -144,29 +163,9 @@ impl MeshingPanel {
             {
                 let base = vertices.len() as u32;
                 match element.vertices.len() {
-                    0 => continue,
-                    1 => {
-                        // Point marker: a tiny screen-independent cross.
-                        let point = element.vertices[0];
-                        let d = 0.01;
-                        for offset in [
-                            [-d, 0.0, 0.0],
-                            [d, 0.0, 0.0],
-                            [0.0, -d, 0.0],
-                            [0.0, d, 0.0],
-                            [0.0, 0.0, -d],
-                            [0.0, 0.0, d],
-                        ] {
-                            vertices.push([
-                                (point[0] + offset[0]) as f32,
-                                (point[1] + offset[1]) as f32,
-                                (point[2] + offset[2]) as f32,
-                            ]);
-                            normals.push([0.0, 0.0, 1.0]);
-                        }
-                        wire_indices
-                            .extend([base, base + 1, base + 2, base + 3, base + 4, base + 5]);
-                    }
+                    // Points are drawn separately as sphere impostors
+                    // (`preview_points`), not as wire geometry.
+                    0 | 1 => continue,
                     2 => {
                         for point in &element.vertices {
                             vertices

@@ -129,9 +129,10 @@ design — this crate never touches wgpu.
 
 Orbit camera with `screen_ray` / `project_to_screen` as exact CPU/GPU
 inverses (`camera.rs`); offscreen renderer (Rgba8Unorm + Depth32Float) with
-grid → surface → line passes (`renderer.rs`); three WGSL shaders
+grid → surface → line → point passes (`renderer.rs`); four WGSL shaders
 (`surface.wgsl` per-vertex Lambert, `grid_axes.wgsl` fullscreen analytic
-grid/axes, `line.wgsl` screen-space thick lines).
+grid/axes, `line.wgsl` screen-space thick lines, `point_marker.wgsl`
+instanced sphere impostors at constant pixel size).
 
 Design invariant: the geometry opacity slider affects display surfaces
 only — the Meshing-workspace preview overlay never fades with it, so

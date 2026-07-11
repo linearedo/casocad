@@ -651,8 +651,9 @@ impl eframe::App for CasoApp {
         self.viewport.set_selection(self.state.selected_single());
         if self.viewport.mesh_preview_revision() != self.meshing_panel.preview_revision {
             let surfaces = self.meshing_panel.preview_surfaces();
+            let points = self.meshing_panel.preview_points();
             self.viewport
-                .set_mesh_preview(self.meshing_panel.preview_revision, surfaces);
+                .set_mesh_preview(self.meshing_panel.preview_revision, surfaces, points);
         }
         self.viewport
             .ui(ui, &mut self.state, &mut self.tools, &render_state);

@@ -42,11 +42,17 @@ The invariant falls out of the renderer's pipeline split
 
 Mesh preview elements (`app/src/meshing_panel.rs::preview_surfaces`) are
 emitted as **wire-only** `ViewportSurface` chunks with
-`object_kind = "mesh_preview"`: point elements become tiny crosses, 1D
-elements become segments, and 2D/3D element faces become their edge
-outlines. Because these chunks never contain triangles, every mesh preview
-element goes through the line pipeline, so the invariant holds structurally
-— no renderer changes, no chunk tagging, no special-case uniform.
+`object_kind = "mesh_preview"`: 1D elements become segments and 2D/3D
+element faces become their edge outlines. Because these chunks never
+contain triangles, every mesh preview element goes through the line
+pipeline, so the invariant holds structurally — no renderer changes, no
+chunk tagging, no special-case uniform.
+
+Point elements take a separate channel (`preview_points()` →
+`ViewportRenderer::set_points`) and render as **sphere impostors**
+(`shaders/point_marker.wgsl`): one instanced camera-facing quad per point,
+shaded as a little ball at constant pixel radius, with **alpha pinned to
+1.0** and no depth test — same immunity as the lines.
 
 ## Filled mesh faces were dropped deliberately (2026-07-11)
 

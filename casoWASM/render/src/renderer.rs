@@ -9,6 +9,8 @@ use crate::camera::OrbitCamera;
 pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const LINE_HALF_PX: f32 = 3.0;
+/// Screen-space radius of point markers (sphere impostors).
+const POINT_RADIUS_PX: f32 = 4.0;
 /// Default viewport background (#241f32).
 pub const DEFAULT_BACKGROUND: [f32; 3] = [0.141, 0.122, 0.196];
 
@@ -46,6 +48,7 @@ pub struct ViewportRenderer {
     surface_pipeline: wgpu::RenderPipeline,
     surface_blend_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    point_pipeline: wgpu::RenderPipeline,
     grid_bind_group: wgpu::BindGroup,
     surface_bind_group: wgpu::BindGroup,
     line_bind_group: wgpu::BindGroup,
@@ -55,6 +58,8 @@ pub struct ViewportRenderer {
     chunks: Vec<SurfaceChunk>,
     line_buffer: Option<wgpu::Buffer>,
     line_vertex_count: u32,
+    point_buffer: Option<wgpu::Buffer>,
+    point_count: u32,
     color_texture: Option<wgpu::Texture>,
     depth_texture: Option<wgpu::Texture>,
     size: (u32, u32),
@@ -116,6 +121,10 @@ impl ViewportRenderer {
         let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("line"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/line.wgsl").into()),
+        });
+        let point_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("point_marker"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/point_marker.wgsl").into()),
         });
 
         let color_target = [Some(wgpu::ColorTargetState {
@@ -259,6 +268,48 @@ impl ViewportRenderer {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(depth_disabled.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Point instance: pos(3) color(3) = 24 bytes, one quad per instance.
+        let point_instance_layout = wgpu::VertexBufferLayout {
+            array_stride: 24,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 12,
+                    shader_location: 1,
+                },
+            ],
+        };
+        let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("point pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &point_shader,
+                entry_point: Some("vs_main"),
+                buffers: std::slice::from_ref(&point_instance_layout),
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &point_shader,
+                entry_point: Some("fs_main"),
+                targets: &color_target,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
             depth_stencil: Some(depth_disabled),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
@@ -302,6 +353,7 @@ impl ViewportRenderer {
             surface_pipeline,
             surface_blend_pipeline,
             line_pipeline,
+            point_pipeline,
             grid_bind_group,
             surface_bind_group,
             line_bind_group,
@@ -311,6 +363,8 @@ impl ViewportRenderer {
             chunks: Vec::new(),
             line_buffer: None,
             line_vertex_count: 0,
+            point_buffer: None,
+            point_count: 0,
             color_texture: None,
             depth_texture: None,
             size: (0, 0),
@@ -425,6 +479,23 @@ impl ViewportRenderer {
         };
     }
 
+    /// Replace the point-marker instances (6 floats per point: xyz + rgb),
+    /// drawn as constant-pixel-size sphere impostors.
+    pub fn set_points(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) {
+        self.point_count = (data.len() / 6) as u32;
+        self.point_buffer = if data.is_empty() {
+            None
+        } else {
+            Some(upload_buffer(
+                device,
+                queue,
+                "point instances",
+                bytemuck::cast_slice(data),
+                wgpu::BufferUsages::VERTEX,
+            ))
+        };
+    }
+
     /// Render one frame into the offscreen target.
     pub fn render(
         &mut self,
@@ -496,7 +567,7 @@ impl ViewportRenderer {
             -1.0,
             width as f32,
             height as f32,
-            0.0,
+            POINT_RADIUS_PX,
             0.0,
         ];
         queue.write_buffer(&self.line_uniforms, 0, bytemuck::cast_slice(&line_data));
@@ -572,6 +643,14 @@ impl ViewportRenderer {
                 pass.set_bind_group(0, &self.line_bind_group, &[]);
                 pass.set_vertex_buffer(0, line_buffer.slice(..));
                 pass.draw(0..self.line_vertex_count, 0..1);
+            }
+
+            // 4. Point markers (instanced sphere impostors, no depth).
+            if let Some(point_buffer) = &self.point_buffer {
+                pass.set_pipeline(&self.point_pipeline);
+                pass.set_bind_group(0, &self.line_bind_group, &[]);
+                pass.set_vertex_buffer(0, point_buffer.slice(..));
+                pass.draw(0..4, 0..self.point_count);
             }
         }
         queue.submit([encoder.finish()]);

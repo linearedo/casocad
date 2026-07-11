@@ -36,6 +36,9 @@ pub struct ViewportPanel {
     overlay_signature: (u64, u64, Option<u32>),
     /// Meshing-workspace preview surfaces (per-tag lattice/mesh elements).
     mesh_overlays: Vec<caso_surfaces::ViewportSurface>,
+    /// Meshing-workspace point elements (xyz + rgb per point), drawn as
+    /// sphere-impostor markers.
+    mesh_points: Vec<f32>,
     mesh_preview_revision: u64,
     upload_pending: bool,
 }
@@ -60,6 +63,7 @@ impl Default for ViewportPanel {
             overlays: Vec::new(),
             overlay_signature: (u64::MAX, u64::MAX, None),
             mesh_overlays: Vec::new(),
+            mesh_points: Vec::new(),
             mesh_preview_revision: u64::MAX,
             upload_pending: false,
         }
@@ -92,9 +96,11 @@ impl ViewportPanel {
         &mut self,
         revision: u64,
         surfaces: Vec<caso_surfaces::ViewportSurface>,
+        points: Vec<f32>,
     ) {
         self.mesh_preview_revision = revision;
         self.mesh_overlays = surfaces;
+        self.mesh_points = points;
         self.upload_pending = true;
     }
 
@@ -120,6 +126,7 @@ impl ViewportPanel {
         scene.surfaces.extend(self.overlays.iter().cloned());
         scene.surfaces.extend(self.mesh_overlays.iter().cloned());
         renderer.set_scene(&render_state.device, &render_state.queue, &scene);
+        renderer.set_points(&render_state.device, &render_state.queue, &self.mesh_points);
         self.applied_selection = self.selection;
         self.upload_pending = false;
     }
