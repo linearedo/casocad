@@ -3,13 +3,17 @@
 //! orbit / pan / zoom / reference-view input matching casoCAD.
 
 use caso_kernel::scene::SceneDocument;
+use caso_kernel::vec3::{vec3, Vec3};
 use caso_render::{OrbitCamera, RenderOptions, ViewportRenderer};
 use caso_surfaces::ViewportSurfaceCache;
 use eframe::egui;
 use eframe::egui_wgpu::{wgpu, RenderState};
 
 use crate::state::AppState;
-use crate::tools::ToolState;
+use crate::tools::{ToolKind, ToolState};
+
+/// Wire objects (1D) are picked in screen space within this radius (points).
+const WIRE_PICK_RADIUS: f32 = 8.0;
 
 /// Progressive refinement ladder (coarse first paint, then quality tiers).
 const REFINEMENT_TIERS: [u32; 3] = [12, 64, 96];
@@ -205,6 +209,102 @@ impl ViewportPanel {
         self.upload_scene(render_state);
     }
 
+    /// The scene object under the screen position: nearest ray/triangle hit
+    /// on the built display surfaces, else the nearest wire segment (1D
+    /// objects) within a small screen-space radius.
+    fn pick_object(
+        &self,
+        pos: egui::Pos2,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+    ) -> Option<u32> {
+        let base = self.base_scene.as_ref()?;
+        let (origin, direction) = crate::tools::screen_ray(&self.camera, pos, rect, pixels_per_point);
+        let mut nearest: Option<(f64, u32)> = None;
+        for surface in &base.surfaces {
+            for triangle in surface.indices.chunks_exact(3) {
+                let a = vertex_point(surface, triangle[0]);
+                let b = vertex_point(surface, triangle[1]);
+                let c = vertex_point(surface, triangle[2]);
+                if let Some(t) = ray_triangle_hit(origin, direction, a, b, c) {
+                    if nearest.is_none_or(|(best, _)| t < best) {
+                        nearest = Some((t, surface.key.object_id));
+                    }
+                }
+            }
+        }
+        if let Some((_, object_id)) = nearest {
+            return Some(object_id);
+        }
+        // Wire fallback: 1D objects have no triangles, only line segments.
+        let mut nearest_wire: Option<(f32, u32)> = None;
+        for surface in &base.surfaces {
+            if !surface.indices.is_empty() {
+                continue;
+            }
+            for segment in surface.wire_indices.chunks_exact(2) {
+                let a = crate::tools::project_to_screen(
+                    &self.camera,
+                    vertex_point(surface, segment[0]),
+                    rect,
+                    pixels_per_point,
+                );
+                let b = crate::tools::project_to_screen(
+                    &self.camera,
+                    vertex_point(surface, segment[1]),
+                    rect,
+                    pixels_per_point,
+                );
+                let (Some(a), Some(b)) = (a, b) else {
+                    continue;
+                };
+                let distance = point_segment_distance(pos, a, b);
+                if distance <= WIRE_PICK_RADIUS
+                    && nearest_wire.is_none_or(|(best, _)| distance < best)
+                {
+                    nearest_wire = Some((distance, surface.key.object_id));
+                }
+            }
+        }
+        nearest_wire.map(|(_, object_id)| object_id)
+    }
+
+    /// Select-tool click: pick under the cursor (ctrl toggles, empty clears).
+    fn handle_select_click(
+        &mut self,
+        response: &egui::Response,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) {
+        if !response.clicked() {
+            return;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return;
+        };
+        let toggle = ui.ctx().input(|input| input.modifiers.command);
+        match self.pick_object(pos, rect, pixels_per_point) {
+            Some(object_id) => {
+                if toggle {
+                    state.toggle_select(object_id);
+                } else {
+                    state.select_only(object_id);
+                }
+                if let Ok(object) = state.document.object(object_id) {
+                    state.status = format!("Selected {}", object.name);
+                }
+            }
+            None => {
+                if !toggle && !state.selection.is_empty() {
+                    state.selection.clear();
+                    state.status = "Selection cleared".to_string();
+                }
+            }
+        }
+    }
+
     /// Build the next pending refinement tier and upload it.
     fn refresh_surfaces(&mut self, document: &SceneDocument, render_state: &RenderState) {
         if document.version != self.scene_version {
@@ -360,10 +460,90 @@ impl ViewportPanel {
         }
         // Tool input + ghost overlays go on top of the rendered image.
         tools.handle_viewport(&response, ui, &self.camera, rect, pixels_per_point, state);
+        if tools.kind == ToolKind::Select {
+            self.handle_select_click(&response, ui, rect, pixels_per_point, state);
+        }
         self.refresh_boundary_overlays(state, tools, render_state);
         // Keep painting while refinement tiers are pending.
         if !self.pending_tiers.is_empty() {
             ui.ctx().request_repaint();
         }
+    }
+}
+
+fn vertex_point(surface: &caso_surfaces::ViewportSurface, index: u32) -> Vec3 {
+    let vertex = surface.vertices[index as usize];
+    vec3(vertex[0] as f64, vertex[1] as f64, vertex[2] as f64)
+}
+
+/// Möller–Trumbore ray/triangle intersection; returns the ray parameter of
+/// a front hit (either winding — display surfaces are viewed from both sides).
+fn ray_triangle_hit(origin: Vec3, direction: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f64> {
+    const EPSILON: f64 = 1e-12;
+    let edge_ab = b - a;
+    let edge_ac = c - a;
+    let p = direction.cross(edge_ac);
+    let determinant = edge_ab.dot(p);
+    if determinant.abs() < EPSILON {
+        return None;
+    }
+    let inverse = 1.0 / determinant;
+    let s = origin - a;
+    let u = s.dot(p) * inverse;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(edge_ab);
+    let v = direction.dot(q) * inverse;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = edge_ac.dot(q) * inverse;
+    (t > EPSILON).then_some(t)
+}
+
+/// Distance from a point to a screen-space segment (egui points).
+fn point_segment_distance(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let segment = b - a;
+    let length_squared = segment.length_sq();
+    if length_squared <= f32::EPSILON {
+        return (point - a).length();
+    }
+    let t = ((point - a).dot(segment) / length_squared).clamp(0.0, 1.0);
+    (point - (a + segment * t)).length()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Clicking the framed default scene picks its root object; clicking
+    /// empty space picks nothing.
+    #[test]
+    fn pick_object_hits_scene_surface() {
+        let document = SceneDocument::default_scene().expect("default scene");
+        let root = document.roots[0];
+        let node = document.build_node(root).expect("root node");
+        let bounds = node.bounding_box().expect("bounds");
+
+        let mut panel = ViewportPanel::default();
+        let mut cache = ViewportSurfaceCache::new(24);
+        panel.base_scene = Some(caso_surfaces::build_viewport_surface_scene(
+            &[node],
+            document.version,
+            &mut cache,
+        ));
+        panel.camera.frame_box(&bounds);
+
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let center = vec3(
+            (bounds.x_min + bounds.x_max) * 0.5,
+            (bounds.y_min + bounds.y_max) * 0.5,
+            (bounds.z_min + bounds.z_max) * 0.5,
+        );
+        let on_object = crate::tools::project_to_screen(&panel.camera, center, rect, 1.0)
+            .expect("center projects");
+        assert_eq!(panel.pick_object(on_object, rect, 1.0), Some(root));
+        assert_eq!(panel.pick_object(egui::pos2(2.0, 2.0), rect, 1.0), None);
     }
 }
