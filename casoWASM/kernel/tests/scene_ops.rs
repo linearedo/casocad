@@ -112,16 +112,65 @@ fn duplicate_offsets_and_renames_a_deep_copy() {
     assert_eq!(pasted.len(), 1);
     let copy = document.object(pasted[0]).expect("copy");
     assert!(copy.name.ends_with(" copy"));
-    // The Difference root cannot translate in place, so the paste gains a
-    // Translate wrapper on top of the deep copy (same as Python).
-    assert_eq!(document.live_ids().len(), before * 2 + 1);
-    assert!(matches!(copy.payload, ScenePayload::Translate { .. }));
+    // The Difference root translates in place (leaf placements shift), so
+    // the paste stays a plain deep copy with no Translate wrapper.
+    assert_eq!(document.live_ids().len(), before * 2);
+    assert!(matches!(copy.payload, ScenePayload::Operator { .. }));
     // Selecting both original + a nested child only copies the root once.
     let child = document.object(root).expect("root").payload.children()[0];
     let pasted = document
         .duplicate_nodes(&[root, child], vec3(0.1, 0.1, 0.0))
         .expect("duplicate with descendant");
     assert_eq!(pasted.len(), 1);
+}
+
+/// Moving a boolean result mutates the leaf placements — it must never turn
+/// the object into a Translate node in the scene graph (Python parity).
+#[test]
+fn move_operator_translates_leaves_in_place() {
+    let mut document = SceneDocument::default_scene().expect("default scene");
+    let root = document.roots[0];
+    let children = document.object(root).expect("root").payload.children();
+    let center_of = |document: &SceneDocument, id| {
+        match &document.object(id).expect("child").payload {
+            ScenePayload::Box3(shape) => shape.center,
+            ScenePayload::Cylinder(shape) => shape.center,
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    };
+    let before: Vec<_> = children
+        .iter()
+        .map(|id| center_of(&document, *id))
+        .collect();
+    let live = document.live_ids().len();
+    let delta = vec3(0.3, -0.2, 0.1);
+    let moved = document.move_object(root, delta).expect("move");
+    assert_eq!(moved, root);
+    assert_eq!(document.roots, vec![root]);
+    assert_eq!(document.live_ids().len(), live);
+    assert!(matches!(
+        document.object(root).expect("root").payload,
+        ScenePayload::Operator { .. }
+    ));
+    for (id, previous) in children.iter().zip(before) {
+        let shifted = previous + delta;
+        assert!((center_of(&document, *id) - shifted).length() < 1e-12);
+    }
+}
+
+/// A Rotate/Scale wrapper in the subtree is the one case that still falls
+/// back to a Translate wrapper (same as Python).
+#[test]
+fn move_rotate_wrapped_subtree_still_wraps() {
+    let mut document = SceneDocument::default_scene().expect("default scene");
+    let root = document.roots[0];
+    let rotated = document.wrap_transform(root, "rotate").expect("wrap rotate");
+    let moved = document.move_object(rotated, vec3(1.0, 0.0, 0.0)).expect("move");
+    assert_ne!(moved, rotated);
+    assert!(matches!(
+        document.object(moved).expect("moved").payload,
+        ScenePayload::Translate { .. }
+    ));
 }
 
 #[test]
@@ -133,8 +182,8 @@ fn clipboard_import_copies_across_documents() {
         .import_subtree(&source, root, vec3(0.2, 0.0, 0.0))
         .expect("import");
     assert!(target.object(imported).expect("imported").name.ends_with(" copy"));
-    // Translate wrapper on top of the imported Difference subtree.
-    assert_eq!(target.live_ids().len(), source.live_ids().len() + 1);
+    // The imported Difference subtree is offset in place — no wrapper.
+    assert_eq!(target.live_ids().len(), source.live_ids().len());
     target.build_node(imported).expect("imported subtree builds");
 }
 

@@ -951,7 +951,18 @@ impl SceneDocument {
                 let section = *section;
                 self.translate_in_place(section, delta)
             }
-            ScenePayload::NormalCurtain(_) | ScenePayload::Operator { .. } => Ok(false),
+            ScenePayload::NormalCurtain(_) | ScenePayload::Operator { .. } => {
+                // Translate the subtree by translating every leaf placement
+                // (Python `_translate_copy_in_place`); only a Rotate/Scale in
+                // the subtree refuses and falls back to a Translate wrapper.
+                let children = payload.children();
+                for child in children {
+                    if !self.translate_in_place(child, delta)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
         }
     }
 
