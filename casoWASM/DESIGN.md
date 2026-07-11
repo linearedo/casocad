@@ -133,6 +133,11 @@ grid → surface → line passes (`renderer.rs`); three WGSL shaders
 (`surface.wgsl` per-vertex Lambert, `grid_axes.wgsl` fullscreen analytic
 grid/axes, `line.wgsl` screen-space thick lines).
 
+Design invariant: the geometry opacity slider affects display surfaces
+only — the Meshing-workspace preview overlay never fades with it, so
+opacity ~0 doubles as an x-ray mesh-inspection mode. See
+`design_docs/mesh_preview_opacity_independence.md`.
+
 ### 4.4 `meshing` — FEA/CFD mesh artifacts
 
 Arrow IPC mesh artifact writer matching the Python
