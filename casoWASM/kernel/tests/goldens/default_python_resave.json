@@ -1,0 +1,59 @@
+{
+  "format": "casocad",
+  "version": 1,
+  "unit": "m",
+  "root_objects": [
+    "von_karman_fluid"
+  ],
+  "objects": {
+    "von_karman_fluid": {
+      "type": "difference",
+      "left": "flow_volume",
+      "right": "cylinder_obstacle"
+    },
+    "flow_volume": {
+      "type": "box",
+      "center": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": [
+        3.2,
+        1.4,
+        0.9
+      ]
+    },
+    "cylinder_obstacle": {
+      "type": "cylinder",
+      "center": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "radius": 0.24,
+      "height": 1.1
+    }
+  },
+  "boundary_regions": {
+    "inlet": {
+      "owner": "flow_volume",
+      "outside_direction": 0
+    },
+    "outlet": {
+      "owner": "flow_volume",
+      "outside_direction": 1
+    }
+  },
+  "domains": {
+    "von_karman_fluid": {
+      "type": "fluid",
+      "root": "von_karman_fluid",
+      "tags": [
+        "inlet",
+        "outlet"
+      ],
+      "selectors": []
+    }
+  }
+}

@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["kernel", "surfaces", "render", "meshing", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+opt-level = 3

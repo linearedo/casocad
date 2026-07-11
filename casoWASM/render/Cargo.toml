@@ -1,0 +1,15 @@
+[package]
+name = "caso-render"
+description = "wgpu renderer for casoWASM: surface/grid/line passes, orbit camera, WGSL shaders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck = "1.25.0"
+caso-kernel = { path = "../kernel" }
+caso-surfaces = { path = "../surfaces" }
+wgpu = "29"

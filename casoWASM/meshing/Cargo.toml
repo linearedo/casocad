@@ -1,0 +1,17 @@
+[package]
+name = "caso-meshing"
+description = "casoWASM FEA/CFD meshing artifacts: Arrow IPC mesh export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+caso-kernel = { path = "../kernel" }
+arrow-array = "56"
+arrow-schema = "56"
+arrow-ipc = "56"
+arrow-buffer = "56"
+serde_json = "1"

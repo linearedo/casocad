@@ -1,0 +1,726 @@
+//! Viewport tools: draw-on-grid creation (drag-sized and point-placed
+//! kinds), Move, and Rotate — the port of casoCAD's grid interaction tools.
+//! All tools act on the `Z = 0` XY reference grid, like the Python app.
+
+use caso_kernel::boundary_ops::BoundaryPatchHit;
+use caso_kernel::sdf::node::{Node, RotationAxis};
+use caso_kernel::vec3::{vec3, Vec3};
+use caso_render::OrbitCamera;
+use eframe::egui;
+
+use crate::boundary_tool;
+use crate::dimensions::parse_dimension_entry;
+use crate::state::AppState;
+
+/// Drag-sized creation kinds (one drag fully defines the object).
+pub const DRAG_KINDS_3D: [(&str, &str); 8] = [
+    ("Box", "box"),
+    ("Sphere", "sphere"),
+    ("Cylinder", "cylinder"),
+    ("Cone", "cone"),
+    ("Capped Cone", "capped_cone"),
+    ("Pyramid", "pyramid"),
+    ("Box Frame", "box_frame"),
+    ("Torus", "torus"),
+];
+
+pub const DRAG_KINDS_2D: [(&str, &str); 7] = [
+    ("Rectangle", "rectangle"),
+    ("Circle", "circle"),
+    ("Square", "square"),
+    ("Rounded Rectangle", "rounded_rectangle"),
+    ("Ellipse", "ellipse"),
+    ("Regular Polygon", "regular_polygon"),
+    ("Polygon", "polygon"),
+];
+
+pub const DRAG_KINDS_1D: [(&str, &str); 2] = [
+    ("Segment 1D", "segment"),
+    ("Bezier Curve", "quadratic_bezier_curve"),
+];
+
+/// Point-placed kinds (click points, Enter commits).
+pub const POINT_KINDS: [(&str, &str); 4] = [
+    ("Polyline", "polyline"),
+    ("Polygon (points)", "polygon"),
+    ("Polyline Tube", "polyline_tube"),
+    ("Bezier Tube", "quadratic_bezier_tube"),
+];
+
+/// Cutter knife kinds: (menu label, kind key).
+pub const KNIFE_KINDS: [(&str, &str); 4] = [
+    ("Segment (drag)", "segment"),
+    ("Polygon (points)", "polygon"),
+    ("Bezier Surface (points)", "quadratic_bezier_surface"),
+    ("Smooth Polyline (on-surface)", "smooth_polyline"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    Select,
+    CreateDrag(&'static str),
+    CreatePoints(&'static str),
+    Move,
+    Rotate,
+    /// Hover the fluid boundary, click to create/select a region.
+    BoundaryRegion,
+    /// Split the selected region with a knife of the given kind.
+    BoundaryCutter(&'static str),
+}
+
+pub struct ToolState {
+    pub kind: ToolKind,
+    /// World-space start of the active drag on the grid plane.
+    drag_start: Option<Vec3>,
+    drag_current: Option<Vec3>,
+    /// Screen anchor of the active drag (for overlay + rotate deltas).
+    screen_start: Option<egui::Pos2>,
+    /// Committed points of an active point tool.
+    pub points: Vec<Vec3>,
+    /// Typed-dimension buffer, filled from keystrokes during a create drag.
+    pub dimension_text: String,
+    move_last: Option<Vec3>,
+    rotate_last_x: Option<f32>,
+    undo_pushed: bool,
+    /// Boundary tool: the candidate patch under the cursor.
+    pub hover_hit: Option<BoundaryPatchHit>,
+    /// Cutter: the knife ghost built from the current gesture.
+    pub preview_ghost: Option<Node>,
+    /// Bumped whenever hover/preview overlays must be rebuilt.
+    pub overlay_revision: u64,
+    /// Dense on-surface points from the display mesh (set by the viewport,
+    /// used to validate splits).
+    pub validation_points: Vec<Vec3>,
+}
+
+impl Default for ToolState {
+    fn default() -> Self {
+        Self {
+            kind: ToolKind::Select,
+            drag_start: None,
+            drag_current: None,
+            screen_start: None,
+            points: Vec::new(),
+            dimension_text: String::new(),
+            move_last: None,
+            rotate_last_x: None,
+            undo_pushed: false,
+            hover_hit: None,
+            preview_ghost: None,
+            overlay_revision: 0,
+            validation_points: Vec::new(),
+        }
+    }
+}
+
+/// World-space ray under a screen position.
+pub fn screen_ray(
+    camera: &OrbitCamera,
+    pos: egui::Pos2,
+    rect: egui::Rect,
+    pixels_per_point: f32,
+) -> (Vec3, Vec3) {
+    let scale = pixels_per_point as f64;
+    camera.screen_ray(
+        (pos.x - rect.min.x) as f64 * scale,
+        (pos.y - rect.min.y) as f64 * scale,
+        rect.width() as f64 * scale,
+        rect.height() as f64 * scale,
+    )
+}
+
+/// Intersect the screen ray with the `Z = 0` grid plane.
+pub fn grid_point(
+    camera: &OrbitCamera,
+    pos: egui::Pos2,
+    rect: egui::Rect,
+    pixels_per_point: f32,
+) -> Option<Vec3> {
+    let scale = pixels_per_point as f64;
+    let (origin, direction) = camera.screen_ray(
+        (pos.x - rect.min.x) as f64 * scale,
+        (pos.y - rect.min.y) as f64 * scale,
+        rect.width() as f64 * scale,
+        rect.height() as f64 * scale,
+    );
+    if direction.z.abs() < 1e-12 {
+        return None;
+    }
+    let t = -origin.z / direction.z;
+    if t <= 0.0 {
+        return None;
+    }
+    Some(origin + direction * t)
+}
+
+impl ToolState {
+    pub fn set_tool(&mut self, kind: ToolKind, state: &mut AppState) {
+        self.cancel(state);
+        self.kind = kind;
+        state.status = match kind {
+            ToolKind::Select => "Select: click objects, drag orbits".to_string(),
+            ToolKind::CreateDrag(create) => {
+                format!("Draw {create}: drag on the grid (type dimensions, Enter applies)")
+            }
+            ToolKind::CreatePoints(create) => {
+                format!("Place {create}: click points on the grid, Enter commits, Esc cancels")
+            }
+            ToolKind::Move => "Move: drag the selection on the grid".to_string(),
+            ToolKind::Rotate => "Rotate: drag horizontally to spin about Z".to_string(),
+            ToolKind::BoundaryRegion => {
+                "Boundary Region: hover the Fluid Domain surface, click to tag it".to_string()
+            }
+            ToolKind::BoundaryCutter(knife) => format!(
+                "Cutter ({knife}): select a region, place the knife, Enter splits"
+            ),
+        };
+    }
+
+    pub fn cancel(&mut self, state: &mut AppState) {
+        if !self.points.is_empty() || self.drag_start.is_some() {
+            state.status = "Tool cancelled".to_string();
+        }
+        self.drag_start = None;
+        self.drag_current = None;
+        self.screen_start = None;
+        self.points.clear();
+        self.dimension_text.clear();
+        self.move_last = None;
+        self.rotate_last_x = None;
+        self.undo_pushed = false;
+        if self.hover_hit.is_some() || self.preview_ghost.is_some() {
+            self.overlay_revision += 1;
+        }
+        self.hover_hit = None;
+        self.preview_ghost = None;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.kind != ToolKind::Select
+    }
+
+    /// Whether the active tool owns the primary mouse button (the Boundary
+    /// Region hover tool keeps camera navigation available, like Python).
+    pub fn blocks_camera(&self) -> bool {
+        !matches!(self.kind, ToolKind::Select | ToolKind::BoundaryRegion)
+    }
+
+    /// Handle viewport input for the active tool. Returns true when the tool
+    /// consumed the primary-button interaction (so the caller must not orbit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_viewport(
+        &mut self,
+        response: &egui::Response,
+        ui: &egui::Ui,
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) -> bool {
+        match self.kind {
+            ToolKind::Select => false,
+            ToolKind::CreateDrag(kind) => {
+                self.handle_create_drag(kind, response, ui, camera, rect, pixels_per_point, state)
+            }
+            ToolKind::CreatePoints(kind) => {
+                self.handle_create_points(kind, response, ui, camera, rect, pixels_per_point, state)
+            }
+            ToolKind::Move => {
+                self.handle_move(response, ui, camera, rect, pixels_per_point, state)
+            }
+            ToolKind::Rotate => self.handle_rotate(response, state),
+            ToolKind::BoundaryRegion => {
+                self.handle_boundary_region(response, ui, camera, rect, pixels_per_point, state)
+            }
+            ToolKind::BoundaryCutter(knife) => self.handle_boundary_cutter(
+                knife,
+                response,
+                ui,
+                camera,
+                rect,
+                pixels_per_point,
+                state,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_boundary_region(
+        &mut self,
+        response: &egui::Response,
+        ui: &egui::Ui,
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) -> bool {
+        let Some(root) = boundary_tool::fluid_root_node(&state.document) else {
+            state.status = "Boundary Region: set a Fluid Domain first".to_string();
+            self.set_hover(None);
+            // Camera stays usable while the tool cannot act.
+            return false;
+        };
+        let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        let hit = pointer.filter(|pos| rect.contains(*pos)).and_then(|pos| {
+            let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
+            boundary_tool::pick_patch(&root, origin, direction)
+        });
+        self.set_hover(hit);
+        if response.clicked() {
+            if let Some(hit) = self.hover_hit.clone() {
+                // Click selects an existing matching region, else creates one.
+                let existing = state.document.boundary_regions.iter().find(|region| {
+                    region.owner_object_id == hit.owner_object_id
+                        && region.patch_id.as_deref() == Some(hit.patch_id.as_str())
+                        && region.cuts.is_empty()
+                });
+                if let Some(region) = existing {
+                    state.selected_region = Some(region.object_id);
+                    state.status = format!("Selected region {}", region.name);
+                } else {
+                    state.push_undo();
+                    let result = state.document.add_boundary_region(
+                        hit.owner_object_id,
+                        hit.outside_direction,
+                        Some(&hit.patch_id),
+                        Some(&hit.patch_type),
+                    );
+                    if let Some(id) = state.report(result, "Boundary region created") {
+                        state.selected_region = Some(id);
+                    }
+                }
+            }
+        }
+        // Left-drag still orbits while hovering (Python keeps navigation).
+        false
+    }
+
+    fn set_hover(&mut self, hit: Option<BoundaryPatchHit>) {
+        let signature = |candidate: &BoundaryPatchHit| {
+            (candidate.owner_object_id, candidate.patch_id.clone())
+        };
+        if self.hover_hit.as_ref().map(&signature) != hit.as_ref().map(&signature) {
+            self.overlay_revision += 1;
+        }
+        self.hover_hit = hit;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_boundary_cutter(
+        &mut self,
+        knife: &'static str,
+        response: &egui::Response,
+        ui: &egui::Ui,
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) -> bool {
+        let Some(root) = boundary_tool::fluid_root_node(&state.document) else {
+            state.status = "Cutter: set a Fluid Domain first".to_string();
+            return false;
+        };
+        if state.selected_region.is_none() {
+            state.status = "Cutter: select a boundary region first (Boundary Region tool)"
+                .to_string();
+            return false;
+        }
+        let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        let pick = |pos: egui::Pos2| -> Option<Vec3> {
+            let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
+            boundary_tool::pick_surface_point(&root, origin, direction)
+                .or_else(|| grid_point(camera, pos, rect, pixels_per_point))
+        };
+        let mut points_changed = false;
+        if knife == "segment" {
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(point) = pointer.and_then(pick) {
+                    self.points = vec![point];
+                    points_changed = true;
+                }
+            } else if response.dragged_by(egui::PointerButton::Primary) {
+                if let Some(point) = pointer.and_then(pick) {
+                    if self.points.len() == 1 {
+                        self.points.push(point);
+                    } else if let Some(last) = self.points.last_mut() {
+                        *last = point;
+                    }
+                    points_changed = true;
+                }
+            }
+        } else if response.clicked() {
+            if let Some(point) = pointer.and_then(pick) {
+                self.points.push(point);
+                points_changed = true;
+                state.status = format!("{} knife point(s) — Enter splits", self.points.len());
+            }
+        }
+        let (enter, escape, backspace) = ui.ctx().input(|input| {
+            (
+                input.key_pressed(egui::Key::Enter),
+                input.key_pressed(egui::Key::Escape),
+                input.key_pressed(egui::Key::Backspace),
+            )
+        });
+        if backspace && !self.points.is_empty() {
+            self.points.pop();
+            points_changed = true;
+        }
+        if escape {
+            self.cancel(state);
+            return true;
+        }
+        // Rebuild the knife ghost (drives the cyan/orange split preview).
+        let minimum = match knife {
+            "segment" | "smooth_polyline" => 2,
+            _ => 3,
+        };
+        if points_changed {
+            self.preview_ghost = if self.points.len() >= minimum {
+                boundary_tool::cutter_ghost(&root, knife, &self.points).ok()
+            } else {
+                None
+            };
+            self.overlay_revision += 1;
+        }
+        if enter {
+            let ghost = if self.points.len() >= minimum {
+                boundary_tool::cutter_ghost(&root, knife, &self.points)
+            } else {
+                Err(format!("{knife} knife needs at least {minimum} points"))
+            };
+            match ghost {
+                Ok(ghost) => {
+                    let region_id = state.selected_region.expect("checked");
+                    state.push_undo();
+                    let validation = std::mem::take(&mut self.validation_points);
+                    let result = state.document.split_boundary_region(
+                        region_id,
+                        &ghost,
+                        Some(&validation),
+                    );
+                    self.validation_points = validation;
+                    match result {
+                        Ok((inside_id, _outside_id)) => {
+                            state.selected_region = Some(inside_id);
+                            state.status = "Region split".to_string();
+                            self.points.clear();
+                            self.preview_ghost = None;
+                            self.overlay_revision += 1;
+                        }
+                        Err(error) => {
+                            // Empty-cut refusal: undo snapshot rolls back.
+                            state.undo();
+                            state.status = error.to_string();
+                        }
+                    }
+                }
+                Err(error) => state.status = error,
+            }
+        }
+        // Overlay: knife points + rubber band.
+        let painter = ui.painter_at(rect);
+        let accent = egui::Color32::from_rgb(255, 80, 200); // magenta knife
+        let to_screen = |world: Vec3| project_to_screen(camera, world, rect, pixels_per_point);
+        let mut screen_points = Vec::new();
+        for point in &self.points {
+            if let Some(pos) = to_screen(*point) {
+                painter.circle_filled(pos, 3.0, accent);
+                screen_points.push(pos);
+            }
+        }
+        for pair in screen_points.windows(2) {
+            painter.line_segment([pair[0], pair[1]], egui::Stroke::new(1.5, accent));
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_create_drag(
+        &mut self,
+        kind: &'static str,
+        response: &egui::Response,
+        ui: &egui::Ui,
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) -> bool {
+        let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        self.collect_dimension_keys(ui);
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(pos) = pointer {
+                self.drag_start = grid_point(camera, pos, rect, pixels_per_point);
+                self.drag_current = self.drag_start;
+                self.screen_start = Some(pos);
+            }
+        } else if response.dragged_by(egui::PointerButton::Primary) {
+            if let Some(pos) = pointer {
+                if let Some(point) = grid_point(camera, pos, rect, pixels_per_point) {
+                    self.drag_current = Some(point);
+                }
+            }
+        } else if response.drag_stopped_by(egui::PointerButton::Primary) {
+            if let (Some(start), Some(mut end)) = (self.drag_start, self.drag_current) {
+                // Typed dimensions override the drag extents (full sizes, in
+                // the working unit, e.g. "1 x 2").
+                if !self.dimension_text.is_empty() {
+                    if let Ok(values) =
+                        parse_dimension_entry(&self.dimension_text, state.unit.factor)
+                    {
+                        let center = (start + end) * 0.5;
+                        let size_a = values.first().copied().unwrap_or(0.1) * state.unit.factor;
+                        let size_b =
+                            values.get(1).copied().unwrap_or(size_a / state.unit.factor)
+                                * state.unit.factor;
+                        let half = vec3(size_a * 0.5, size_b * 0.5, 0.0);
+                        let new_start = center - half;
+                        end = center + half;
+                        self.drag_start = Some(new_start);
+                    }
+                }
+                let start = self.drag_start.unwrap_or(start);
+                state.push_undo();
+                let result =
+                    state
+                        .document
+                        .add_primitive_from_drag(kind, start, end, state.unit.factor);
+                if let Some(id) = state.report(result, &format!("Created {kind}")) {
+                    state.select_only(id);
+                }
+            }
+            self.drag_start = None;
+            self.drag_current = None;
+            self.screen_start = None;
+            self.dimension_text.clear();
+        }
+        // Ghost preview: screen-space rectangle from press to cursor.
+        if let (Some(anchor), Some(pos)) = (self.screen_start, pointer) {
+            let painter = ui.painter_at(rect);
+            let ghost = egui::Rect::from_two_pos(anchor, pos);
+            painter.rect_stroke(
+                ghost,
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(74, 168, 255)),
+                egui::StrokeKind::Middle,
+            );
+            if !self.dimension_text.is_empty() {
+                painter.text(
+                    ghost.max + egui::vec2(6.0, 6.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{} {}", self.dimension_text, state.unit.key),
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::from_rgb(74, 168, 255),
+                );
+            }
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_create_points(
+        &mut self,
+        kind: &'static str,
+        response: &egui::Response,
+        ui: &egui::Ui,
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) -> bool {
+        let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        if response.clicked() {
+            if let Some(pos) = pointer {
+                if let Some(point) = grid_point(camera, pos, rect, pixels_per_point) {
+                    self.points.push(point);
+                    state.status = format!("{} point(s) — Enter commits", self.points.len());
+                }
+            }
+        }
+        let (enter, escape, backspace) = ui.ctx().input(|input| {
+            (
+                input.key_pressed(egui::Key::Enter),
+                input.key_pressed(egui::Key::Escape),
+                input.key_pressed(egui::Key::Backspace),
+            )
+        });
+        if backspace {
+            self.points.pop();
+        }
+        if escape {
+            self.cancel(state);
+        }
+        if enter && !self.points.is_empty() {
+            let points = std::mem::take(&mut self.points);
+            state.push_undo();
+            let result = state
+                .document
+                .add_point_shape_from_world_points(kind, &points, "xy");
+            if let Some(id) = state.report(result, &format!("Created {kind}")) {
+                state.select_only(id);
+            } else {
+                state.undo();
+            }
+        }
+        // Overlay: committed points + rubber band to the cursor.
+        let painter = ui.painter_at(rect);
+        let accent = egui::Color32::from_rgb(74, 168, 255);
+        let to_screen = |world: Vec3| project_to_screen(camera, world, rect, pixels_per_point);
+        let mut screen_points = Vec::new();
+        for point in &self.points {
+            if let Some(pos) = to_screen(*point) {
+                painter.circle_filled(pos, 3.0, accent);
+                screen_points.push(pos);
+            }
+        }
+        for pair in screen_points.windows(2) {
+            painter.line_segment([pair[0], pair[1]], egui::Stroke::new(1.5, accent));
+        }
+        if let (Some(last), Some(cursor)) = (screen_points.last(), pointer) {
+            if rect.contains(cursor) {
+                painter.line_segment(
+                    [*last, cursor],
+                    egui::Stroke::new(1.0, accent.gamma_multiply(0.6)),
+                );
+            }
+        }
+        true
+    }
+
+    fn handle_move(
+        &mut self,
+        response: &egui::Response,
+        ui: &egui::Ui,
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) -> bool {
+        let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(pos) = pointer {
+                self.move_last = grid_point(camera, pos, rect, pixels_per_point);
+                self.undo_pushed = false;
+            }
+        } else if response.dragged_by(egui::PointerButton::Primary) {
+            if let (Some(last), Some(pos)) = (self.move_last, pointer) {
+                if let Some(current) = grid_point(camera, pos, rect, pixels_per_point) {
+                    let delta = current - last;
+                    if delta.length() > 0.0 && !state.selection.is_empty() {
+                        if !self.undo_pushed {
+                            state.push_undo();
+                            self.undo_pushed = true;
+                        }
+                        let ids = state.selection.clone();
+                        let mut new_selection = Vec::new();
+                        for id in ids {
+                            match state.document.move_object(id, delta) {
+                                Ok(moved) => new_selection.push(moved),
+                                Err(error) => state.status = error.to_string(),
+                            }
+                        }
+                        state.selection = new_selection;
+                        self.move_last = Some(current);
+                    }
+                }
+            }
+        } else if response.drag_stopped_by(egui::PointerButton::Primary) {
+            self.move_last = None;
+            self.undo_pushed = false;
+        }
+        true
+    }
+
+    fn handle_rotate(&mut self, response: &egui::Response, state: &mut AppState) -> bool {
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            self.rotate_last_x = Some(0.0);
+            self.undo_pushed = false;
+        } else if response.dragged_by(egui::PointerButton::Primary) {
+            let delta_x = response.drag_delta().x;
+            if delta_x.abs() > 0.0 && !state.selection.is_empty() {
+                if !self.undo_pushed {
+                    state.push_undo();
+                    self.undo_pushed = true;
+                }
+                // Half a degree per pixel, about the world Z axis.
+                let angle = (delta_x as f64) * 0.5;
+                let ids = state.selection.clone();
+                for id in ids {
+                    if let Err(error) =
+                        state
+                            .document
+                            .rotate_object(id, RotationAxis::Z, angle, None)
+                    {
+                        state.status = error.to_string();
+                    }
+                }
+            }
+        } else if response.drag_stopped_by(egui::PointerButton::Primary) {
+            self.rotate_last_x = None;
+            self.undo_pushed = false;
+        }
+        true
+    }
+
+    /// Route digit/unit keystrokes into the typed-dimension buffer while a
+    /// create drag is armed.
+    fn collect_dimension_keys(&mut self, ui: &egui::Ui) {
+        ui.ctx().input(|input| {
+            for event in &input.events {
+                match event {
+                    egui::Event::Text(text) => {
+                        for character in text.chars() {
+                            if character.is_ascii_digit()
+                                || ".,xX;mkcft'\" +-*/()".contains(character)
+                            {
+                                self.dimension_text.push(character);
+                            }
+                        }
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } => {
+                        self.dimension_text.pop();
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    } => {
+                        self.dimension_text.clear();
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+}
+
+/// World → screen projection matching the WGSL vertex path.
+pub fn project_to_screen(
+    camera: &OrbitCamera,
+    world: Vec3,
+    rect: egui::Rect,
+    pixels_per_point: f32,
+) -> Option<egui::Pos2> {
+    let basis = camera.basis();
+    let relative = world - basis.position;
+    let depth = relative.dot(basis.forward);
+    if depth <= 1e-9 {
+        return None;
+    }
+    // Exact inverse of `OrbitCamera::screen_ray`: suvx = r·focal/(2·depth).
+    let scale = pixels_per_point as f64;
+    let width = rect.width() as f64 * scale;
+    let height = rect.height() as f64 * scale;
+    let px =
+        0.5 * width + height * relative.dot(basis.right) * camera.focal / (2.0 * depth);
+    let py =
+        0.5 * height - height * relative.dot(basis.up) * camera.focal / (2.0 * depth);
+    Some(egui::pos2(
+        rect.min.x + (px / scale) as f32,
+        rect.min.y + (py / scale) as f32,
+    ))
+}

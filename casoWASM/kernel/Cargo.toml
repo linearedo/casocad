@@ -1,0 +1,13 @@
+[package]
+name = "caso-kernel"
+description = "Exact-SDF geometry kernel for casoWASM (no GPU/UI dependencies)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The kernel's single external dependency: scene.json parsing/writing.
+serde_json = "1"

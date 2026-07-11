@@ -8,3 +8,7 @@
 *.serena/
 lbm_frames/
 perf_logs/
+
+# casoWASM build artifacts (regenerable via cargo build / wasm-pack build)
+casoWASM/target/
+casoWASM/web/pkg/

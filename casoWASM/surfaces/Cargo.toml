@@ -1,0 +1,12 @@
+[package]
+name = "caso-surfaces"
+description = "CPU display-surface builders for casoWASM (tessellation, exact clipping, dual contouring) — never called meshing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+caso-kernel = { path = "../kernel" }
