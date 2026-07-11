@@ -10,6 +10,7 @@ use eframe::egui;
 
 use crate::boundary_tool;
 use crate::dimensions::parse_dimension_entry;
+use crate::gizmo::{self, GizmoKind};
 use crate::state::AppState;
 
 /// Drag-sized creation kinds (one drag fully defines the object).
@@ -82,6 +83,14 @@ pub struct ToolState {
     move_last: Option<Vec3>,
     rotate_last_x: Option<f32>,
     undo_pushed: bool,
+    /// Gizmo handle being dragged (Move arrows / Rotate rings).
+    gizmo_axis: Option<RotationAxis>,
+    /// Gizmo handle under the cursor (highlight only).
+    gizmo_hover: Option<RotationAxis>,
+    /// Previous drag parameter: axis t (Move) or ring angle (Rotate).
+    gizmo_last: Option<f64>,
+    /// Pivot frozen at gizmo drag start (the axis line / rotation center).
+    gizmo_pivot: Option<Vec3>,
     /// Boundary tool: the candidate patch under the cursor.
     pub hover_hit: Option<BoundaryPatchHit>,
     /// Cutter: the knife ghost built from the current gesture.
@@ -105,6 +114,10 @@ impl Default for ToolState {
             move_last: None,
             rotate_last_x: None,
             undo_pushed: false,
+            gizmo_axis: None,
+            gizmo_hover: None,
+            gizmo_last: None,
+            gizmo_pivot: None,
             hover_hit: None,
             preview_ghost: None,
             overlay_revision: 0,
@@ -188,6 +201,10 @@ impl ToolState {
         self.move_last = None;
         self.rotate_last_x = None;
         self.undo_pushed = false;
+        self.gizmo_axis = None;
+        self.gizmo_hover = None;
+        self.gizmo_last = None;
+        self.gizmo_pivot = None;
         if self.hover_hit.is_some() || self.preview_ghost.is_some() {
             self.overlay_revision += 1;
         }
@@ -228,7 +245,9 @@ impl ToolState {
             ToolKind::Move => {
                 self.handle_move(response, ui, camera, rect, pixels_per_point, state)
             }
-            ToolKind::Rotate => self.handle_rotate(response, state),
+            ToolKind::Rotate => {
+                self.handle_rotate(response, ui, camera, rect, pixels_per_point, state)
+            }
             ToolKind::BoundaryRegion => {
                 self.handle_boundary_region(response, ui, camera, rect, pixels_per_point, state)
             }
@@ -587,6 +606,7 @@ impl ToolState {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_move(
         &mut self,
         response: &egui::Response,
@@ -597,69 +617,191 @@ impl ToolState {
         state: &mut AppState,
     ) -> bool {
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        self.update_gizmo_hover(GizmoKind::Move, response, pointer, camera, rect, pixels_per_point, state);
         if response.drag_started_by(egui::PointerButton::Primary) {
-            if let Some(pos) = pointer {
+            self.undo_pushed = false;
+            let pivot = selection_pivot(state);
+            if let (Some(axis), Some(pivot), Some(pos)) = (self.gizmo_hover, pivot, pointer) {
+                // Constrained drag along the picked arrow's axis.
+                let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
+                self.gizmo_axis = Some(axis);
+                self.gizmo_pivot = Some(pivot);
+                self.gizmo_last = gizmo::axis_drag_parameter(
+                    origin,
+                    direction,
+                    pivot,
+                    gizmo::axis_direction(axis),
+                );
+            } else if let Some(pos) = pointer {
                 self.move_last = grid_point(camera, pos, rect, pixels_per_point);
-                self.undo_pushed = false;
             }
         } else if response.dragged_by(egui::PointerButton::Primary) {
-            if let (Some(last), Some(pos)) = (self.move_last, pointer) {
-                if let Some(current) = grid_point(camera, pos, rect, pixels_per_point) {
-                    let delta = current - last;
-                    if delta.length() > 0.0 && !state.selection.is_empty() {
-                        if !self.undo_pushed {
-                            state.push_undo();
-                            self.undo_pushed = true;
-                        }
-                        let ids = state.selection.clone();
-                        let mut new_selection = Vec::new();
-                        for id in ids {
-                            match state.document.move_object(id, delta) {
-                                Ok(moved) => new_selection.push(moved),
-                                Err(error) => state.status = error.to_string(),
-                            }
-                        }
-                        state.selection = new_selection;
-                        self.move_last = Some(current);
+            if let (Some(axis), Some(pivot), Some(pos)) =
+                (self.gizmo_axis, self.gizmo_pivot, pointer)
+            {
+                let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
+                let along = gizmo::axis_direction(axis);
+                if let Some(t) = gizmo::axis_drag_parameter(origin, direction, pivot, along) {
+                    if let Some(last) = self.gizmo_last {
+                        self.apply_move_delta(along * (t - last), state);
                     }
+                    self.gizmo_last = Some(t);
+                }
+            } else if let (Some(last), Some(pos)) = (self.move_last, pointer) {
+                if let Some(current) = grid_point(camera, pos, rect, pixels_per_point) {
+                    self.apply_move_delta(current - last, state);
+                    self.move_last = Some(current);
                 }
             }
         } else if response.drag_stopped_by(egui::PointerButton::Primary) {
             self.move_last = None;
+            self.gizmo_axis = None;
+            self.gizmo_last = None;
+            self.gizmo_pivot = None;
             self.undo_pushed = false;
+        }
+        // The gizmo follows the moved selection.
+        if let Some(pivot) = selection_pivot(state) {
+            gizmo::paint(
+                GizmoKind::Move,
+                &ui.painter_at(rect),
+                camera,
+                pivot,
+                rect,
+                pixels_per_point,
+                self.gizmo_axis.or(self.gizmo_hover),
+            );
         }
         true
     }
 
-    fn handle_rotate(&mut self, response: &egui::Response, state: &mut AppState) -> bool {
+    fn apply_move_delta(&mut self, delta: Vec3, state: &mut AppState) {
+        if delta.length() <= 0.0 || state.selection.is_empty() {
+            return;
+        }
+        if !self.undo_pushed {
+            state.push_undo();
+            self.undo_pushed = true;
+        }
+        let ids = state.selection.clone();
+        let mut new_selection = Vec::new();
+        for id in ids {
+            match state.document.move_object(id, delta) {
+                Ok(moved) => new_selection.push(moved),
+                Err(error) => state.status = error.to_string(),
+            }
+        }
+        state.selection = new_selection;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_rotate(
+        &mut self,
+        response: &egui::Response,
+        ui: &egui::Ui,
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) -> bool {
+        let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        self.update_gizmo_hover(GizmoKind::Rotate, response, pointer, camera, rect, pixels_per_point, state);
         if response.drag_started_by(egui::PointerButton::Primary) {
-            self.rotate_last_x = Some(0.0);
             self.undo_pushed = false;
+            let pivot = selection_pivot(state);
+            if let (Some(axis), Some(pivot), Some(pos)) = (self.gizmo_hover, pivot, pointer) {
+                // Constrained rotation about the picked ring's axis; the
+                // pivot freezes for the whole gesture.
+                let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
+                self.gizmo_axis = Some(axis);
+                self.gizmo_pivot = Some(pivot);
+                self.gizmo_last = gizmo::ring_drag_angle(origin, direction, pivot, axis);
+            } else {
+                self.rotate_last_x = Some(0.0);
+            }
         } else if response.dragged_by(egui::PointerButton::Primary) {
-            let delta_x = response.drag_delta().x;
-            if delta_x.abs() > 0.0 && !state.selection.is_empty() {
-                if !self.undo_pushed {
-                    state.push_undo();
-                    self.undo_pushed = true;
-                }
-                // Half a degree per pixel, about the world Z axis.
-                let angle = (delta_x as f64) * 0.5;
-                let ids = state.selection.clone();
-                for id in ids {
-                    if let Err(error) =
-                        state
-                            .document
-                            .rotate_object(id, RotationAxis::Z, angle, None)
-                    {
-                        state.status = error.to_string();
+            if let (Some(axis), Some(pivot), Some(pos)) =
+                (self.gizmo_axis, self.gizmo_pivot, pointer)
+            {
+                let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
+                if let Some(angle) = gizmo::ring_drag_angle(origin, direction, pivot, axis) {
+                    if let Some(last) = self.gizmo_last {
+                        let degrees = gizmo::wrap_angle(angle - last).to_degrees();
+                        self.apply_rotation(axis, degrees, Some(pivot), state);
                     }
+                    self.gizmo_last = Some(angle);
                 }
+            } else if self.rotate_last_x.is_some() {
+                // Fallback: half a degree per pixel, about the world Z axis.
+                let angle = (response.drag_delta().x as f64) * 0.5;
+                self.apply_rotation(RotationAxis::Z, angle, None, state);
             }
         } else if response.drag_stopped_by(egui::PointerButton::Primary) {
             self.rotate_last_x = None;
+            self.gizmo_axis = None;
+            self.gizmo_last = None;
+            self.gizmo_pivot = None;
             self.undo_pushed = false;
         }
+        // Paint at the frozen pivot while dragging (stable rings).
+        if let Some(pivot) = self.gizmo_pivot.or_else(|| selection_pivot(state)) {
+            gizmo::paint(
+                GizmoKind::Rotate,
+                &ui.painter_at(rect),
+                camera,
+                pivot,
+                rect,
+                pixels_per_point,
+                self.gizmo_axis.or(self.gizmo_hover),
+            );
+        }
         true
+    }
+
+    fn apply_rotation(
+        &mut self,
+        axis: RotationAxis,
+        angle_degrees: f64,
+        pivot: Option<Vec3>,
+        state: &mut AppState,
+    ) {
+        if angle_degrees.abs() <= 0.0 || state.selection.is_empty() {
+            return;
+        }
+        if !self.undo_pushed {
+            state.push_undo();
+            self.undo_pushed = true;
+        }
+        let ids = state.selection.clone();
+        for id in ids {
+            if let Err(error) = state.document.rotate_object(id, axis, angle_degrees, pivot) {
+                state.status = error.to_string();
+            }
+        }
+    }
+
+    /// Refresh the hovered gizmo handle (skipped mid-drag so the armed
+    /// handle stays highlighted).
+    #[allow(clippy::too_many_arguments)]
+    fn update_gizmo_hover(
+        &mut self,
+        kind: GizmoKind,
+        response: &egui::Response,
+        pointer: Option<egui::Pos2>,
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &AppState,
+    ) {
+        if self.gizmo_axis.is_some() || response.dragged_by(egui::PointerButton::Primary) {
+            return;
+        }
+        self.gizmo_hover = match (selection_pivot(state), pointer) {
+            (Some(pivot), Some(pos)) if rect.contains(pos) => {
+                gizmo::hit_test(kind, pos, camera, pivot, rect, pixels_per_point)
+            }
+            _ => None,
+        };
     }
 
     /// Route digit/unit keystrokes into the typed-dimension buffer while a
@@ -696,6 +838,34 @@ impl ToolState {
             }
         });
     }
+}
+
+/// Center of the combined bounding boxes of the selection (gizmo pivot).
+fn selection_pivot(state: &AppState) -> Option<Vec3> {
+    let mut low = vec3(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut high = vec3(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for id in &state.selection {
+        let Ok(node) = state.document.build_node(*id) else {
+            continue;
+        };
+        let Ok(bounds) = node.bounding_box() else {
+            continue;
+        };
+        low = vec3(
+            low.x.min(bounds.x_min),
+            low.y.min(bounds.y_min),
+            low.z.min(bounds.z_min),
+        );
+        high = vec3(
+            high.x.max(bounds.x_max),
+            high.y.max(bounds.y_max),
+            high.z.max(bounds.z_max),
+        );
+    }
+    if low.x > high.x {
+        return None;
+    }
+    Some((low + high) * 0.5)
 }
 
 /// World → screen projection matching the WGSL vertex path.

@@ -258,7 +258,7 @@ impl ViewportPanel {
                 let (Some(a), Some(b)) = (a, b) else {
                     continue;
                 };
-                let distance = point_segment_distance(pos, a, b);
+                let distance = crate::gizmo::point_segment_distance(pos, a, b);
                 if distance <= WIRE_PICK_RADIUS
                     && nearest_wire.is_none_or(|(best, _)| distance < best)
                 {
@@ -500,17 +500,6 @@ fn ray_triangle_hit(origin: Vec3, direction: Vec3, a: Vec3, b: Vec3, c: Vec3) ->
     }
     let t = edge_ac.dot(q) * inverse;
     (t > EPSILON).then_some(t)
-}
-
-/// Distance from a point to a screen-space segment (egui points).
-fn point_segment_distance(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
-    let segment = b - a;
-    let length_squared = segment.length_sq();
-    if length_squared <= f32::EPSILON {
-        return (point - a).length();
-    }
-    let t = ((point - a).dot(segment) / length_squared).clamp(0.0, 1.0);
-    (point - (a + segment * t)).length()
 }
 
 #[cfg(test)]

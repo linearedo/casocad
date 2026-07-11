@@ -5,6 +5,7 @@
 
 mod boundary_tool;
 mod dimensions;
+mod gizmo;
 mod meshing_panel;
 mod properties_panel;
 mod scene_panel;
