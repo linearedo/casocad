@@ -37,11 +37,8 @@ impl Default for RenderOptions {
 
 struct SurfaceChunk {
     vertex_buffer: wgpu::Buffer,
-    index_buffer: Option<wgpu::Buffer>,
+    index_buffer: wgpu::Buffer,
     index_count: u32,
-    /// Thick-line vertex data for wire-only chunks (1D objects, outlines).
-    line_vertices: Vec<f32>,
-    has_triangles: bool,
 }
 
 pub struct ViewportRenderer {
@@ -373,21 +370,19 @@ impl ViewportRenderer {
         scene: &ViewportSurfaceScene,
     ) {
         self.chunks.clear();
+        // Thick-line vertex data for wire-only surfaces (1D objects,
+        // outlines), concatenated into one static buffer per scene.
+        let mut line_vertices: Vec<f32> = Vec::new();
         for surface in &scene.surfaces {
             if surface.status == SurfaceStatus::Failed {
                 continue;
             }
-            let has_triangles = !surface.indices.is_empty();
-            let mut line_vertices: Vec<f32> = Vec::new();
-            if !has_triangles && !surface.wire_indices.is_empty() {
-                // Wire-only chunk (1D objects / outlines): thick-line segments.
+            if surface.indices.is_empty() {
                 for pair in surface.wire_indices.chunks_exact(2) {
                     let a = surface.vertices[pair[0] as usize];
                     let b = surface.vertices[pair[1] as usize];
                     push_line_segment(&mut line_vertices, a, b, surface.color);
                 }
-            }
-            if !has_triangles && line_vertices.is_empty() {
                 continue;
             }
             let mut interleaved: Vec<f32> = Vec::with_capacity(surface.vertices.len() * 9);
@@ -403,25 +398,31 @@ impl ViewportRenderer {
                 bytemuck::cast_slice(&interleaved),
                 wgpu::BufferUsages::VERTEX,
             );
-            let index_buffer = if has_triangles {
-                Some(upload_buffer(
-                    device,
-                    queue,
-                    "chunk indices",
-                    bytemuck::cast_slice(&surface.indices),
-                    wgpu::BufferUsages::INDEX,
-                ))
-            } else {
-                None
-            };
+            let index_buffer = upload_buffer(
+                device,
+                queue,
+                "chunk indices",
+                bytemuck::cast_slice(&surface.indices),
+                wgpu::BufferUsages::INDEX,
+            );
             self.chunks.push(SurfaceChunk {
                 vertex_buffer,
                 index_buffer,
                 index_count: surface.indices.len() as u32,
-                line_vertices,
-                has_triangles,
             });
         }
+        self.line_vertex_count = (line_vertices.len() / 11) as u32;
+        self.line_buffer = if line_vertices.is_empty() {
+            None
+        } else {
+            Some(upload_buffer(
+                device,
+                queue,
+                "line vertices",
+                bytemuck::cast_slice(&line_vertices),
+                wgpu::BufferUsages::VERTEX,
+            ))
+        };
     }
 
     /// Render one frame into the offscreen target.
@@ -431,7 +432,6 @@ impl ViewportRenderer {
         queue: &wgpu::Queue,
         camera: &OrbitCamera,
         options: &RenderOptions,
-        overlay_lines: &[f32],
     ) {
         let (width, height) = self.size;
         if width == 0 || height == 0 {
@@ -500,25 +500,8 @@ impl ViewportRenderer {
             0.0,
         ];
         queue.write_buffer(&self.line_uniforms, 0, bytemuck::cast_slice(&line_data));
-
-        // Collect thick-line vertex data: chunk wires + overlay gizmos.
-        let mut line_vertices: Vec<f32> = Vec::new();
-        for chunk in &self.chunks {
-            line_vertices.extend_from_slice(&chunk.line_vertices);
-        }
-        line_vertices.extend_from_slice(overlay_lines);
-        self.line_vertex_count = (line_vertices.len() / 11) as u32;
-        self.line_buffer = if line_vertices.is_empty() {
-            None
-        } else {
-            Some(upload_buffer(
-                device,
-                queue,
-                "line vertices",
-                bytemuck::cast_slice(&line_vertices),
-                wgpu::BufferUsages::VERTEX,
-            ))
-        };
+        // Line vertices are uploaded once in set_scene; if per-frame overlay
+        // lines are ever needed, give them their own small buffer here.
 
         let color_view = self
             .color_texture
@@ -578,14 +561,9 @@ impl ViewportRenderer {
             pass.set_pipeline(surface_pipeline);
             pass.set_bind_group(0, &self.surface_bind_group, &[]);
             for chunk in &self.chunks {
-                if !chunk.has_triangles {
-                    continue;
-                }
                 pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
-                if let Some(index_buffer) = &chunk.index_buffer {
-                    pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..chunk.index_count, 0, 0..1);
-                }
+                pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..chunk.index_count, 0, 0..1);
             }
 
             // 3. Thick lines (wire chunks + overlays, no depth).
@@ -601,7 +579,7 @@ impl ViewportRenderer {
 }
 
 /// Append the six vertices of one thick-line segment (a -> b).
-pub fn push_line_segment(out: &mut Vec<f32>, a: [f32; 3], b: [f32; 3], color: [f32; 3]) {
+fn push_line_segment(out: &mut Vec<f32>, a: [f32; 3], b: [f32; 3], color: [f32; 3]) {
     // (endpoint_sel, side) for the two triangles of the segment quad.
     const PARAMS: [[f32; 2]; 6] = [
         [0.0, -1.0],

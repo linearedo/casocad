@@ -437,7 +437,6 @@ impl ViewportPanel {
             &render_state.queue,
             &self.camera,
             &self.options,
-            &[],
         );
         if resized || self.texture_id.is_none() {
             let mut egui_renderer = render_state.renderer.write();

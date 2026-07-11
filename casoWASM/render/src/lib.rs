@@ -11,6 +11,4 @@ pub mod camera;
 pub mod renderer;
 
 pub use camera::{OrbitCamera, DEFAULT_VIEW_DISTANCE};
-pub use renderer::{
-    push_line_segment, RenderOptions, ViewportRenderer, DEFAULT_BACKGROUND, TARGET_FORMAT,
-};
+pub use renderer::{RenderOptions, ViewportRenderer, DEFAULT_BACKGROUND, TARGET_FORMAT};
