@@ -163,7 +163,15 @@ and Properties panels tabified left, Log panel, central viewport shown as an
 offscreen texture. `state.rs` (selection, 50-snapshot undo/redo, LengthUnit
 registry), `dimensions.rs` (full measurement-entry parser: units incl.
 in/ft/"/', arithmetic expressions, multi-value entry), `tools.rs`
-(Select / drag-create / point-create / Move / Rotate on the grid),
+(Select / drag-create / point-create / Move / Rotate on the grid; all 1D
+kinds — segment, polyline, bezier curve, tubes — are point tools; while
+drawing, a live geometry ghost is built by the *same* kernel builder that
+commits (`add_primitive_from_drag` / `add_point_shape_from_world_points`
+on a throwaway `SceneDocument`), tessellated through the regular surface
+router and shown as an overlay — dimension category styles it only
+(3D translucent fill via per-surface `ViewportSurface::alpha` + the
+renderer's blended-chunk pass, 2D outline, 1D wires), so preview can never
+drift from the committed result and new kinds need zero preview code),
 `boundary_tool.rs` (BoundaryRegion hover tool + BoundaryCutter with three
 knife kinds — segment, polygon, bezier surface — and split preview; region
 highlights filter whole display

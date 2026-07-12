@@ -1509,13 +1509,21 @@ impl SceneDocument {
         reference_plane: &str,
     ) -> GeometryResult<ObjectId> {
         let (axis_u, axis_v) = reference_plane_axes(reference_plane)?;
-        let minimum_points = if matches!(kind, "polyline" | "polyline_tube") { 2 } else { 3 };
+        let minimum_points = if matches!(kind, "segment" | "interval" | "polyline" | "polyline_tube")
+        {
+            2
+        } else {
+            3
+        };
         if points.len() < minimum_points {
             return Err(GeometryError::new(if minimum_points == 2 {
-                "polyline requires at least two points".to_string()
+                format!("{kind} requires at least two points")
             } else {
                 format!("{kind} requires at least three points")
             }));
+        }
+        if matches!(kind, "segment" | "interval") && points.len() != 2 {
+            return Err(GeometryError::new("segment requires exactly two points"));
         }
         if kind == "quadratic_bezier_curve" && points.len() != 3 {
             return Err(GeometryError::new(
@@ -1540,6 +1548,22 @@ impl SceneDocument {
             })
             .collect();
         let payload = match kind {
+            // Same Placed1D as the drag path: origin at the midpoint, the
+            // profile spans half the point distance along axis_u.
+            "segment" | "interval" => {
+                let direction = points[1] - points[0];
+                let length = direction.length();
+                ScenePayload::Placed1D {
+                    profile: Profile1D::segment(0.0, 0.5 * length)?,
+                    origin: (points[0] + points[1]) * 0.5,
+                    axis_u: if length > 1e-12 {
+                        direction * (1.0 / length)
+                    } else {
+                        vec3(1.0, 0.0, 0.0)
+                    },
+                    sources: Vec::new(),
+                }
+            }
             "polyline" => ScenePayload::PlacedPolyline1D {
                 profile: Profile2D::polyline(local)?,
                 origin,

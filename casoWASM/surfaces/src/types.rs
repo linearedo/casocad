@@ -33,6 +33,9 @@ pub struct ViewportSurface {
     pub indices: Vec<u32>,
     pub wire_indices: Vec<u32>,
     pub color: [f32; 3],
+    /// 1.0 = opaque; below 1.0 the renderer draws the surface blended
+    /// (ghost previews). Wire-only surfaces ignore it (lines stay opaque).
+    pub alpha: f32,
     pub bounds_min: [f64; 3],
     pub bounds_max: [f64; 3],
     pub message: String,
@@ -183,6 +186,7 @@ pub fn empty_surface(
         indices: Vec::new(),
         wire_indices: Vec::new(),
         color,
+        alpha: 1.0,
         bounds_min,
         bounds_max,
         message: message.into(),

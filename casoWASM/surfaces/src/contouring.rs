@@ -410,6 +410,7 @@ fn finish_surface(
         indices: index_array,
         wire_indices: wire,
         color,
+        alpha: 1.0,
         bounds_min: [mins.x, mins.y, mins.z],
         bounds_max: [maxs.x, maxs.y, maxs.z],
         message,

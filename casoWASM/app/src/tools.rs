@@ -3,6 +3,7 @@
 //! All tools act on the `Z = 0` XY reference grid, like the Python app.
 
 use caso_kernel::boundary_ops::BoundaryPatchHit;
+use caso_kernel::scene::SceneDocument;
 use caso_kernel::sdf::node::{Node, RotationAxis};
 use caso_kernel::vec3::{vec3, Vec3};
 use caso_render::OrbitCamera;
@@ -35,17 +36,15 @@ pub const DRAG_KINDS_2D: [(&str, &str); 7] = [
     ("Polygon", "polygon"),
 ];
 
-pub const DRAG_KINDS_1D: [(&str, &str); 2] = [
+/// Point-placed kinds (click points, Enter commits). All 1D objects are
+/// point tools — segments and bezier curves included.
+pub const POINT_KINDS: [(&str, &str); 6] = [
     ("Segment 1D", "segment"),
-    ("Bezier Curve", "quadratic_bezier_curve"),
-];
-
-/// Point-placed kinds (click points, Enter commits).
-pub const POINT_KINDS: [(&str, &str); 4] = [
     ("Polyline", "polyline"),
-    ("Polygon (points)", "polygon"),
+    ("Bezier Curve", "quadratic_bezier_curve"),
     ("Polyline Tube", "polyline_tube"),
     ("Bezier Tube", "quadratic_bezier_tube"),
+    ("Polygon (points)", "polygon"),
 ];
 
 /// Cutter knife kinds: (menu label, kind key). A smooth on-surface polyline
@@ -96,6 +95,12 @@ pub struct ToolState {
     pub hover_hit: Option<BoundaryPatchHit>,
     /// Cutter: the knife ghost built from the current gesture.
     pub preview_ghost: Option<Node>,
+    /// Create tools: real-geometry ghost of the object that would commit
+    /// now, built by the same kernel builder as the commit path.
+    pub create_ghost: Option<Node>,
+    /// Change detector for the ghost inputs (start, end/last, point count,
+    /// typed dimensions) so the ghost only rebuilds when the gesture moves.
+    create_ghost_sig: Option<(Vec3, Vec3, usize, String)>,
     /// Bumped whenever hover/preview overlays must be rebuilt.
     pub overlay_revision: u64,
     /// Dense on-surface points from the display mesh (set by the viewport,
@@ -121,6 +126,8 @@ impl Default for ToolState {
             gizmo_pivot: None,
             hover_hit: None,
             preview_ghost: None,
+            create_ghost: None,
+            create_ghost_sig: None,
             overlay_revision: 0,
             validation_points: Vec::new(),
         }
@@ -206,11 +213,14 @@ impl ToolState {
         self.gizmo_hover = None;
         self.gizmo_last = None;
         self.gizmo_pivot = None;
-        if self.hover_hit.is_some() || self.preview_ghost.is_some() {
+        if self.hover_hit.is_some() || self.preview_ghost.is_some() || self.create_ghost.is_some()
+        {
             self.overlay_revision += 1;
         }
         self.hover_hit = None;
         self.preview_ghost = None;
+        self.create_ghost = None;
+        self.create_ghost_sig = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -313,6 +323,21 @@ impl ToolState {
         }
         // Left-drag still orbits while hovering (Python keeps navigation).
         false
+    }
+
+    /// Swap the create ghost, bumping the overlay revision only when the
+    /// gesture signature actually changed (mirrors `set_hover`).
+    fn set_create_ghost(
+        &mut self,
+        ghost: Option<Node>,
+        sig: Option<(Vec3, Vec3, usize, String)>,
+    ) {
+        if self.create_ghost_sig == sig && self.create_ghost.is_some() == ghost.is_some() {
+            return;
+        }
+        self.overlay_revision += 1;
+        self.create_ghost = ghost;
+        self.create_ghost_sig = sig;
     }
 
     fn set_hover(&mut self, hit: Option<BoundaryPatchHit>) {
@@ -500,25 +525,11 @@ impl ToolState {
                 }
             }
         } else if response.drag_stopped_by(egui::PointerButton::Primary) {
-            if let (Some(start), Some(mut end)) = (self.drag_start, self.drag_current) {
+            if let (Some(start), Some(end)) = (self.drag_start, self.drag_current) {
                 // Typed dimensions override the drag extents (full sizes, in
                 // the working unit, e.g. "1 x 2").
-                if !self.dimension_text.is_empty() {
-                    if let Ok(values) =
-                        parse_dimension_entry(&self.dimension_text, state.unit.factor)
-                    {
-                        let center = (start + end) * 0.5;
-                        let size_a = values.first().copied().unwrap_or(0.1) * state.unit.factor;
-                        let size_b =
-                            values.get(1).copied().unwrap_or(size_a / state.unit.factor)
-                                * state.unit.factor;
-                        let half = vec3(size_a * 0.5, size_b * 0.5, 0.0);
-                        let new_start = center - half;
-                        end = center + half;
-                        self.drag_start = Some(new_start);
-                    }
-                }
-                let start = self.drag_start.unwrap_or(start);
+                let (start, end) =
+                    apply_typed_dimensions(start, end, &self.dimension_text, state.unit.factor);
                 state.push_undo();
                 let result =
                     state
@@ -533,23 +544,38 @@ impl ToolState {
             self.screen_start = None;
             self.dimension_text.clear();
         }
-        // Ghost preview: screen-space rectangle from press to cursor.
+        // Live geometry ghost: rebuild only when the gesture moved.
+        if let (Some(start), Some(current)) = (self.drag_start, self.drag_current) {
+            let (ghost_start, ghost_end) =
+                apply_typed_dimensions(start, current, &self.dimension_text, state.unit.factor);
+            let sig = (ghost_start, ghost_end, 0usize, self.dimension_text.clone());
+            if self.create_ghost_sig.as_ref() != Some(&sig) {
+                let ghost = ghost_from_drag(kind, ghost_start, ghost_end, state.unit.factor);
+                self.set_create_ghost(ghost, Some(sig));
+            }
+        } else {
+            self.set_create_ghost(None, None);
+        }
         if let (Some(anchor), Some(pos)) = (self.screen_start, pointer) {
             let painter = ui.painter_at(rect);
-            let ghost = egui::Rect::from_two_pos(anchor, pos);
-            painter.rect_stroke(
-                ghost,
-                0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(74, 168, 255)),
-                egui::StrokeKind::Middle,
-            );
+            let accent = egui::Color32::from_rgb(74, 168, 255);
+            // Screen-space rectangle only as fallback when no geometry
+            // ghost could be built.
+            if self.create_ghost.is_none() {
+                painter.rect_stroke(
+                    egui::Rect::from_two_pos(anchor, pos),
+                    0.0,
+                    egui::Stroke::new(1.0, accent),
+                    egui::StrokeKind::Middle,
+                );
+            }
             if !self.dimension_text.is_empty() {
                 painter.text(
-                    ghost.max + egui::vec2(6.0, 6.0),
+                    pos + egui::vec2(6.0, 6.0),
                     egui::Align2::LEFT_TOP,
                     format!("{} {}", self.dimension_text, state.unit.key),
                     egui::FontId::monospace(12.0),
-                    egui::Color32::from_rgb(74, 168, 255),
+                    accent,
                 );
             }
         }
@@ -599,6 +625,35 @@ impl ToolState {
                 state.select_only(id);
             } else {
                 state.undo();
+            }
+        }
+        // Live geometry ghost from the committed points plus the cursor as
+        // a tentative point, so the ghost rubber-bands while placing.
+        let cursor_point = pointer
+            .filter(|pos| rect.contains(*pos))
+            .and_then(|pos| grid_point(camera, pos, rect, pixels_per_point));
+        let mut tentative = self.points.clone();
+        if let Some(point) = cursor_point {
+            tentative.push(point);
+        }
+        if tentative.is_empty() {
+            self.set_create_ghost(None, None);
+        } else {
+            let sig = (
+                tentative.first().copied().unwrap_or_default(),
+                tentative.last().copied().unwrap_or_default(),
+                tentative.len(),
+                String::new(),
+            );
+            if self.create_ghost_sig.as_ref() != Some(&sig) {
+                // Below the kind's minimum point count the builder errs and
+                // the ghost stays off (the dot painter still shows). For
+                // exact-count kinds (segment, bezier curve) the tentative
+                // cursor point can overshoot — fall back to the committed
+                // points so the ghost survives until Enter.
+                let ghost = ghost_from_points(kind, &tentative)
+                    .or_else(|| ghost_from_points(kind, &self.points));
+                self.set_create_ghost(ghost, Some(sig));
             }
         }
         // Overlay: committed points + rubber band to the cursor.
@@ -860,6 +915,41 @@ impl ToolState {
     }
 }
 
+/// Ghost of a drag-created primitive: run the drag through the SAME kernel
+/// builder that commits on mouse-up, on a throwaway document, so the preview
+/// can never drift from the committed result (any kind, 1D/2D/3D).
+fn ghost_from_drag(kind: &str, start: Vec3, end: Vec3, scale: f64) -> Option<Node> {
+    let mut scratch = SceneDocument::new();
+    let id = scratch.add_primitive_from_drag(kind, start, end, scale).ok()?;
+    scratch.build_node(id).ok()
+}
+
+/// Ghost of a point-placed shape (same throwaway-document invariant).
+fn ghost_from_points(kind: &str, points: &[Vec3]) -> Option<Node> {
+    let mut scratch = SceneDocument::new();
+    let id = scratch
+        .add_point_shape_from_world_points(kind, points, "xy")
+        .ok()?;
+    scratch.build_node(id).ok()
+}
+
+/// Typed-dimension override for a create drag: full sizes in the working
+/// unit (e.g. "1 x 2") replace the drag extents about the drag center.
+/// Shared by the commit branch and the live ghost.
+fn apply_typed_dimensions(start: Vec3, end: Vec3, text: &str, unit_factor: f64) -> (Vec3, Vec3) {
+    if text.is_empty() {
+        return (start, end);
+    }
+    let Ok(values) = parse_dimension_entry(text, unit_factor) else {
+        return (start, end);
+    };
+    let center = (start + end) * 0.5;
+    let size_a = values.first().copied().unwrap_or(0.1) * unit_factor;
+    let size_b = values.get(1).copied().unwrap_or(size_a / unit_factor) * unit_factor;
+    let half = vec3(size_a * 0.5, size_b * 0.5, 0.0);
+    (center - half, center + half)
+}
+
 /// Center of the combined bounding boxes of the selection (gizmo pivot).
 fn selection_pivot(state: &AppState) -> Option<Vec3> {
     let mut low = vec3(f64::INFINITY, f64::INFINITY, f64::INFINITY);
@@ -913,4 +1003,64 @@ pub fn project_to_screen(
         rect.min.x + (px / scale) as f32,
         rect.min.y + (py / scale) as f32,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ghost invariant: the preview node is byte-for-byte the node the
+    /// commit path would produce, for every dimension category.
+    #[test]
+    fn ghost_matches_committed_node() {
+        let start = vec3(-1.0, -0.5, 0.0);
+        let end = vec3(2.0, 1.5, 0.0);
+        for kind in ["box", "sphere", "torus", "circle", "rectangle", "segment"] {
+            let ghost = ghost_from_drag(kind, start, end, 1.0)
+                .unwrap_or_else(|| panic!("no ghost for {kind}"));
+            let mut document = SceneDocument::new();
+            let id = document
+                .add_primitive_from_drag(kind, start, end, 1.0)
+                .expect(kind);
+            let committed = document.build_node(id).expect(kind);
+            assert_eq!(
+                format!("{ghost:?}"),
+                format!("{committed:?}"),
+                "ghost drifted from commit for {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn ghost_from_points_matches_committed_node() {
+        let points = [
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(1.0, 1.0, 0.0),
+        ];
+        let ghost = ghost_from_points("polygon", &points).expect("polygon ghost");
+        let mut document = SceneDocument::new();
+        let id = document
+            .add_point_shape_from_world_points("polygon", &points, "xy")
+            .expect("polygon");
+        let committed = document.build_node(id).expect("polygon");
+        assert_eq!(format!("{ghost:?}"), format!("{committed:?}"));
+    }
+
+    #[test]
+    fn ghost_below_minimum_points_is_none() {
+        assert!(ghost_from_points("polygon", &[vec3(0.0, 0.0, 0.0)]).is_none());
+    }
+
+    /// Point-placed segment builds the same node as the drag path did.
+    #[test]
+    fn point_placed_segment_matches_drag_segment() {
+        let start = vec3(0.0, 0.0, 0.0);
+        let end = vec3(3.0, 4.0, 0.0);
+        let from_points = ghost_from_points("segment", &[start, end]).expect("segment");
+        let from_drag = ghost_from_drag("segment", start, end, 1.0).expect("segment");
+        assert_eq!(format!("{from_points:?}"), format!("{from_drag:?}"));
+        // Exactly two points: a third must refuse.
+        assert!(ghost_from_points("segment", &[start, end, vec3(1.0, 1.0, 0.0)]).is_none());
+    }
 }

@@ -242,6 +242,7 @@ pub fn region_highlight_surface(
         indices,
         wire_indices: Vec::new(),
         color,
+        alpha: 1.0,
         bounds_min,
         bounds_max,
         message: String::new(),

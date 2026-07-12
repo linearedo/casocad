@@ -213,6 +213,7 @@ impl MeshingPanel {
                 indices: Vec::new(),
                 wire_indices,
                 color,
+                alpha: 1.0,
                 bounds_min,
                 bounds_max,
                 message: String::new(),

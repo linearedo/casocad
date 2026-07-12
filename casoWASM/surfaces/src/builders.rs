@@ -89,6 +89,7 @@ fn surface_from_accum(
         indices: accum.indices,
         wire_indices: wire,
         color,
+        alpha: 1.0,
         bounds_min,
         bounds_max,
         message: String::new(),

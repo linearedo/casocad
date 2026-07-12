@@ -15,6 +15,9 @@ use crate::tools::{ToolKind, ToolState};
 /// Wire objects (1D) are picked in screen space within this radius (points).
 const WIRE_PICK_RADIUS: f32 = 8.0;
 
+/// Tint of the create-tool geometry ghost (the accent blue 74,168,255).
+const CREATE_GHOST_COLOR: [f32; 3] = [0.29, 0.66, 1.0];
+
 /// Progressive refinement ladder (coarse first paint, then quality tiers).
 const REFINEMENT_TIERS: [u32; 3] = [12, 64, 96];
 
@@ -294,6 +297,25 @@ impl ViewportPanel {
         }
         self.overlay_signature = signature;
         self.overlays.clear();
+        // Create-tool ghost: tessellate the live-preview node through the
+        // regular surface router (3D fill / 2D outline / 1D wires) — works
+        // with or without a fluid domain. Only the translucency is
+        // dimension-gated; construction is kind-agnostic.
+        if let Some(ghost) = &tools.create_ghost {
+            let key = caso_surfaces::ViewportSurfaceKey {
+                object_id: u32::MAX - 6,
+                scene_revision: tools.overlay_revision,
+                resolution: caso_surfaces::types::DEFAULT_RESOLUTION,
+            };
+            let mut surface = caso_surfaces::build_viewport_surface(ghost, key);
+            surface.color = CREATE_GHOST_COLOR;
+            if ghost.dimension() == 3 {
+                surface.alpha = 0.35;
+            }
+            if surface.has_geometry() {
+                self.overlays.push(surface);
+            }
+        }
         let Some(base) = self.base_scene.clone() else {
             self.upload_scene(render_state);
             return;

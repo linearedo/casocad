@@ -41,6 +41,9 @@ struct SurfaceChunk {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    /// Surface alpha < 1 (ghost previews): drawn after the opaque chunks
+    /// with the blend pipeline, regardless of the global opacity slider.
+    blended: bool,
 }
 
 pub struct ViewportRenderer {
@@ -176,9 +179,9 @@ impl ViewportRenderer {
             cache: None,
         });
 
-        // Interleaved surface vertex: pos(3) normal(3) color(3) = 36 bytes.
+        // Interleaved surface vertex: pos(3) normal(3) color(4) = 40 bytes.
         let surface_vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: 36,
+            array_stride: 40,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
@@ -192,7 +195,7 @@ impl ViewportRenderer {
                     shader_location: 1,
                 },
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
+                    format: wgpu::VertexFormat::Float32x4,
                     offset: 24,
                     shader_location: 2,
                 },
@@ -439,11 +442,13 @@ impl ViewportRenderer {
                 }
                 continue;
             }
-            let mut interleaved: Vec<f32> = Vec::with_capacity(surface.vertices.len() * 9);
+            let alpha = surface.alpha.clamp(0.0, 1.0);
+            let mut interleaved: Vec<f32> = Vec::with_capacity(surface.vertices.len() * 10);
             for (vertex, normal) in surface.vertices.iter().zip(surface.normals.iter()) {
                 interleaved.extend_from_slice(vertex);
                 interleaved.extend_from_slice(normal);
                 interleaved.extend_from_slice(&surface.color);
+                interleaved.push(alpha);
             }
             let vertex_buffer = upload_buffer(
                 device,
@@ -463,6 +468,7 @@ impl ViewportRenderer {
                 vertex_buffer,
                 index_buffer,
                 index_count: surface.indices.len() as u32,
+                blended: alpha < 0.999,
             });
         }
         self.line_vertex_count = (line_vertices.len() / 11) as u32;
@@ -623,7 +629,8 @@ impl ViewportRenderer {
             pass.set_bind_group(0, &self.grid_bind_group, &[]);
             pass.draw(0..3, 0..1);
 
-            // 2. Surface chunks (opaque or blended per the opacity slider).
+            // 2. Surface chunks (opaque or blended per the opacity slider),
+            // then per-surface translucent chunks (ghost previews) on top.
             let surface_pipeline = if options.opacity >= 0.999 {
                 &self.surface_pipeline
             } else {
@@ -631,10 +638,18 @@ impl ViewportRenderer {
             };
             pass.set_pipeline(surface_pipeline);
             pass.set_bind_group(0, &self.surface_bind_group, &[]);
-            for chunk in &self.chunks {
+            for chunk in self.chunks.iter().filter(|chunk| !chunk.blended) {
                 pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
                 pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..chunk.index_count, 0, 0..1);
+            }
+            if self.chunks.iter().any(|chunk| chunk.blended) {
+                pass.set_pipeline(&self.surface_blend_pipeline);
+                for chunk in self.chunks.iter().filter(|chunk| chunk.blended) {
+                    pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
+                    pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..chunk.index_count, 0, 0..1);
+                }
             }
 
             // 3. Thick lines (wire chunks + overlays, no depth).

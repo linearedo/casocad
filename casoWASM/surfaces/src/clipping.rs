@@ -530,6 +530,7 @@ pub fn clip_surface(
         indices,
         wire_indices: wire,
         color,
+        alpha: 1.0,
         bounds_min,
         bounds_max,
         message: "boolean rendered as SDF-clipped analytic meshes".to_string(),

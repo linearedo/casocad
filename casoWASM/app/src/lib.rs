@@ -28,7 +28,7 @@ use properties_panel::PropertiesPanel;
 use scene_panel::ScenePanel;
 use state::{AppState, LENGTH_UNITS};
 use tools::{
-    ToolKind, ToolState, DRAG_KINDS_1D, DRAG_KINDS_2D, DRAG_KINDS_3D, KNIFE_KINDS, POINT_KINDS,
+    ToolKind, ToolState, DRAG_KINDS_2D, DRAG_KINDS_3D, KNIFE_KINDS, POINT_KINDS,
 };
 use viewport_panel::ViewportPanel;
 
@@ -258,16 +258,7 @@ impl CasoApp {
                     }
                 }
                 ui.separator();
-                ui.label(egui::RichText::new("1D").weak());
-                for (label, kind) in DRAG_KINDS_1D {
-                    if sdf_menu_button(ui, label, kind).clicked() {
-                        self.tools
-                            .set_tool(ToolKind::CreateDrag(kind), &mut self.state);
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                ui.label(egui::RichText::new("Point tools (Enter commits)").weak());
+                ui.label(egui::RichText::new("1D & point tools (Enter commits)").weak());
                 for (label, kind) in POINT_KINDS {
                     if sdf_menu_button(ui, label, kind).clicked() {
                         self.tools
