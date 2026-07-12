@@ -1,9 +1,10 @@
-//! Scene.json round-trip parity with the Python serializer.
+//! Scene.json round-trip goldens.
 //!
-//! `tools/export_scene_goldens.py` (archived at the `python-final` tag) loads scenes through the Python
-//! load/save path and writes the resaved JSON; the Rust loader/saver must
-//! produce semantically identical JSON (same records — key order free) from
-//! the same inputs, including the legacy boundary-selector migration.
+//! The legacy fixtures (`scene_python_resave.json`, from
+//! `tools/export_scene_goldens.py` archived at the `python-final` tag) pin the
+//! legacy boundary-selector migration; `default_scene_resave.json` pins the
+//! Rust saver's output for the built-in default scene. The loader/saver must
+//! produce semantically identical JSON (same records — key order free).
 
 use caso_kernel::scene::{ScenePayload, SceneDocument, TagRef};
 use caso_kernel::serialization::{load_scene_from_str, save_scene_to_string, scene_to_value};
@@ -34,11 +35,11 @@ fn legacy_scene_resave_matches_python() {
 }
 
 #[test]
-fn default_scene_save_matches_python() {
+fn default_scene_save_matches_golden() {
     let document = SceneDocument::default_scene().expect("default scene");
     let saved = scene_to_value(&document).expect("save default scene");
-    let golden = load_json(&manifest_path("tests/goldens/default_python_resave.json"));
-    assert_eq!(saved, golden, "default scene differs from Python");
+    let golden = load_json(&manifest_path("tests/goldens/default_scene_resave.json"));
+    assert_eq!(saved, golden, "default scene differs from its saved golden");
 }
 
 #[test]
@@ -140,7 +141,7 @@ fn document_operations_smoke() {
 }
 
 #[test]
-fn default_scene_matches_python_default() {
+fn default_scene_has_expected_structure() {
     let document = SceneDocument::default_scene().expect("default");
     assert_eq!(document.roots.len(), 1);
     let fluid = document.fluid_domain.as_ref().expect("fluid domain");

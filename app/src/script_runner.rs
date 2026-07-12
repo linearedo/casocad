@@ -202,12 +202,13 @@ let fluid = domains.get("fluid");
 let b = fluid.bounds();
 let dx = 0.16;
 let regions = fluid.regions();
+let z = (b[4] + b[5]) / 2.0;
 let x = b[0] + dx/2.0;
 while x < b[1] {
     let y = b[2] + dx/2.0;
     while y < b[3] {
-        if fluid.sdf(x, y, 0.0) < 0.0 {
-            emit("point", [[x, y, 0.0]], "fluid_internal");
+        if fluid.sdf(x, y, z) < 0.0 {
+            emit("point", [[x, y, z]], "fluid_internal");
         }
         y += dx;
     }
@@ -260,10 +261,10 @@ mod tests {
                     r = candidate;
                 }
             }
-            if r.contains(-1.6, 0.0, 0.0) {
-                emit("point", [[-1.6, 0.0, 0.0]], r.name);
+            if r.contains(0.0, 0.0, 0.5) {
+                emit("point", [[0.0, 0.0, 0.5]], r.name);
             }
-            if !r.contains(1.6, 0.0, 0.0) {
+            if !r.contains(4.5, 0.0, 0.5) {
                 emit("point", [[9.0, 9.0, 9.0]], "not_in_region");
             }
         "#;

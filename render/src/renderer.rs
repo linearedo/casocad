@@ -31,7 +31,9 @@ impl Default for RenderOptions {
             show_grid: true,
             grid_spacing: 1.0,
             grid_plane: 0,
-            opacity: 1.0,
+            // Semi-transparent so interior features (e.g. the default
+            // scene's cylinder obstacle) are visible on first launch.
+            opacity: 0.35,
             wireframe: false,
         }
     }

@@ -2,7 +2,8 @@
 //! point stencils (polygon, quadratic bezier surface) sit on the plane fitted
 //! to the clicks and extrude one-sidedly, so closed surfaces never grow an
 //! antipodal phantom cut. Fixtures: a unit sphere Domain and the default von
-//! Kármán scene (box 1.6×0.7×0.45 half-size minus cylinder r=0.24).
+//! Kármán scene (box half-size 2.25×1.5×0.5 at (2.25, 0, 0.5) minus a
+//! Y-axis cylinder r=0.15 at (1.8, 0, 0.5)).
 
 use caso_kernel::boundary_paths::stencil_knife;
 use caso_kernel::scene::{SceneDocument, ScenePayload};
@@ -115,19 +116,19 @@ fn bezier_stencil_on_a_sphere_has_no_antipodal_mirror() {
 fn flat_face_stencil_matches_the_drawn_polygon() {
     let root = default_box_root();
     let clicks = [
-        vec3(-1.6, -0.2, -0.2),
-        vec3(-1.6, 0.2, -0.2),
-        vec3(-1.6, 0.0, 0.2),
+        vec3(0.0, -0.2, 0.3),
+        vec3(0.0, 0.2, 0.3),
+        vec3(0.0, 0.0, 0.7),
     ];
 
     let (ghost, curved) = stencil_knife(&root, "polygon", &clicks).expect("stencil");
 
     assert!(!curved, "a flat face must not raise the curvature flag");
     // In-plane probes on the -X face: triangle interior vs exterior.
-    assert!(ghost.eval_point(vec3(-1.6, 0.0, -0.1)) < 0.0);
-    assert!(ghost.eval_point(vec3(-1.6, 0.3, 0.3)) > 0.0);
+    assert!(ghost.eval_point(vec3(0.0, 0.0, 0.4)) < 0.0);
+    assert!(ghost.eval_point(vec3(0.0, 0.3, 0.8)) > 0.0);
     // The opposite (+X) face lies far below the one-sided extrusion.
-    assert!(ghost.eval_point(vec3(1.6, 0.0, -0.1)) > 0.0);
+    assert!(ghost.eval_point(vec3(4.5, 0.0, 0.4)) > 0.0);
 }
 
 #[test]

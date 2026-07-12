@@ -194,16 +194,29 @@ impl SceneDocument {
         }
     }
 
-    /// The built-in von Kármán demo scene (Python `SceneDocument.default`).
+    /// The built-in von Kármán demo scene: a channel spanning x ∈ [0, 4.5]
+    /// minus a crossflow cylinder (axis along +Y) at (1.8, 0, 0.5); the −X
+    /// face is the inlet and the +X face the outlet.
     pub fn default_scene() -> GeometryResult<Self> {
         let mut document = Self::new();
         let outer = document.insert_object(
             "flow_volume",
-            ScenePayload::Box3(Box3::new(Vec3::ZERO, vec3(1.6, 0.7, 0.45), IDENTITY_FRAME)?),
+            ScenePayload::Box3(Box3::new(
+                vec3(2.25, 0.0, 0.5),
+                vec3(2.25, 1.5, 0.5),
+                IDENTITY_FRAME,
+            )?),
+        )?;
+        // Cylinder axis is the frame's w: point it along +Y so the obstacle
+        // lies across the flow, parallel to the xy plane.
+        let obstacle_frame = Frame::orthonormal(
+            vec3(0.0, 0.0, 1.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
         )?;
         let obstacle = document.insert_object(
             "cylinder_obstacle",
-            ScenePayload::Cylinder(Cylinder::new(Vec3::ZERO, 0.24, 0.55, IDENTITY_FRAME)?),
+            ScenePayload::Cylinder(Cylinder::new(vec3(1.8, 0.0, 0.5), 0.15, 0.7, obstacle_frame)?),
         )?;
         let root = document.insert_object(
             "von_karman_fluid",

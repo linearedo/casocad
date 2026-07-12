@@ -355,8 +355,9 @@ mod tests {
     use caso_kernel::sdf::primitives_3d::Sphere;
     use caso_surfaces::{build_viewport_surface_scene, ViewportSurfaceCache};
 
-    /// Default von Kármán scene: Difference(flow box 1.6×0.7×0.45 half-size,
-    /// cylinder r=0.24 through Z) — the -X face is flat and uncut.
+    /// Default von Kármán scene: Difference(flow box half-size 2.25×1.5×0.5
+    /// at (2.25, 0, 0.5), Y-axis cylinder r=0.15 at (1.8, 0, 0.5)) — the -X
+    /// face (x = 0) is flat and uncut.
     fn fixture() -> (Node, ViewportSurfaceScene) {
         let document = SceneDocument::default_scene().expect("default scene");
         let root = fluid_root_node(&document).expect("fluid root");
@@ -366,9 +367,9 @@ mod tests {
     }
 
     fn minus_x_face_region(root: &Node) -> BoundaryRegion {
-        // The ray must miss the cylinder obstacle (r=0.24): its cut-surface
-        // patch would win the pick outright.
-        let hit = pick_patch(root, vec3(-5.0, 0.5, 0.02), vec3(1.0, 0.0, 0.0))
+        // The ray must miss the cylinder obstacle (y span ±0.7): its
+        // cut-surface patch would win the pick outright.
+        let hit = pick_patch(root, vec3(-5.0, 1.0, 0.5), vec3(1.0, 0.0, 0.0))
             .expect("-X face hit");
         assert!(hit.patch_id.ends_with("-X"), "unexpected patch {}", hit.patch_id);
         candidate_region(&hit)
@@ -380,7 +381,7 @@ mod tests {
         cutter_ghost(
             root,
             "segment",
-            &[vec3(-1.6, 0.0, -0.4), vec3(-1.6, 0.0, 0.4)],
+            &[vec3(0.0, 0.0, 0.1), vec3(0.0, 0.0, 0.9)],
         )
         .expect("segment ghost")
         .node
@@ -492,8 +493,8 @@ mod tests {
     #[test]
     fn segment_knife_is_click_order_independent() {
         let (root, _scene) = fixture();
-        let first = vec3(-1.6, 0.0, -0.4);
-        let second = vec3(-1.6, 0.0, 0.4);
+        let first = vec3(0.0, 0.0, 0.1);
+        let second = vec3(0.0, 0.0, 0.9);
         let forward = cutter_ghost(
             &root,
             "segment", &[first, second])
@@ -514,10 +515,10 @@ mod tests {
         // (the Inside/Outside labels of the two children may swap, but the
         // partition itself is identical).
         let probes = [
-            vec3(-1.6, 0.3, 0.1),
-            vec3(-1.6, -0.3, 0.1),
-            vec3(-1.6, 0.5, -0.3),
-            vec3(-1.6, -0.5, -0.3),
+            vec3(0.0, 0.3, 0.6),
+            vec3(0.0, -0.3, 0.6),
+            vec3(0.0, 0.5, 0.2),
+            vec3(0.0, -0.5, 0.2),
         ];
         let signs: Vec<(bool, bool)> = probes
             .iter()
@@ -577,7 +578,7 @@ mod tests {
         let ghost = cutter_ghost(
             &root,
             "segment",
-            &[vec3(-1.6, 0.0, -0.4), vec3(-1.6, 0.0, 0.4)],
+            &[vec3(0.0, 0.0, 0.1), vec3(0.0, 0.0, 0.9)],
         )
         .expect("ghost");
         assert!(ghost.warnings.is_empty());

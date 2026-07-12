@@ -122,7 +122,7 @@ fn boundary_regions_are_callable_from_mesher_scripts() {
     let ghost = caso_kernel::Node::new(
         "knife",
         caso_kernel::Shape::Sphere(
-            caso_kernel::sdf::primitives_3d::Sphere::new(vec3(-1.6, 0.0, 0.0), 0.5)
+            caso_kernel::sdf::primitives_3d::Sphere::new(vec3(0.0, 0.0, 0.5), 0.5)
                 .expect("sphere"),
         ),
     );
@@ -163,14 +163,14 @@ fn boundary_regions_are_callable_from_mesher_scripts() {
         .find(|region| region.tag.as_deref() == Some("inlet"))
         .expect("tagged region");
     let face_points = [
-        vec3(-1.6, 0.0, 0.0), // centre of the -X face: inside the knife
-        vec3(-1.6, 0.6, 0.3), // far corner of the -X face: outside the knife
-        vec3(1.6, 0.0, 0.0),  // +X face: wrong side of the box entirely
+        vec3(0.0, 0.0, 0.5), // centre of the -X face: inside the knife
+        vec3(0.0, 1.3, 0.9), // far corner of the -X face: outside the knife
+        vec3(4.5, 0.0, 0.5), // +X face: wrong side of the box entirely
     ];
     let mask = jet.contains(&face_points).expect("contains");
     assert_eq!(mask, vec![true, false, false]);
     // owner_sdf is the exact field of the generating surface
-    assert!(jet.owner_sdf(&[vec3(-1.6, 0.0, 0.0)])[0].abs() < 1e-9);
+    assert!(jet.owner_sdf(&[vec3(0.0, 0.0, 0.5)])[0].abs() < 1e-9);
     // selector_sdf is negative inside the kept knife-half
     let selector = jet.selector_sdf(&face_points).expect("selector field");
     assert!(selector[0] < 0.0);

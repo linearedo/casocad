@@ -1,7 +1,8 @@
 //! Ports of `tests/test_boundary_region_classifier.py` and
 //! `tests/test_boundary_split.py`. Fixture: the default von Kármán scene —
-//! root = Difference(flow box, cylinder obstacle), box half_size
-//! (1.6, 0.7, 0.45), cylinder radius 0.24 through Z.
+//! root = Difference(flow box, cylinder obstacle), box center (2.25, 0, 0.5)
+//! half_size (2.25, 1.5, 0.5), cylinder r 0.15 half-height 0.7 at
+//! (1.8, 0, 0.5) with its axis along +Y.
 
 use caso_kernel::boundary::{BoundaryCut, BoundaryRegion, CutSide};
 use caso_kernel::boundary_ops::{
@@ -46,23 +47,29 @@ fn default_scene() -> Fixture {
 fn face_points(x: f64, count: usize) -> Vec<Vec3> {
     let mut points = Vec::new();
     for i in 0..count {
-        let y = -0.6 + 1.2 * (i as f64) / ((count - 1) as f64);
+        let y = -1.3 + 2.6 * (i as f64) / ((count - 1) as f64);
         for j in 0..count {
-            let z = -0.35 + 0.7 * (j as f64) / ((count - 1) as f64);
+            let z = 0.1 + 0.8 * (j as f64) / ((count - 1) as f64);
             points.push(vec3(x, y, z));
         }
     }
     points
 }
 
+/// Points on the obstacle's lateral wall: the cylinder axis runs along +Y at
+/// (1.8, 0, 0.5), so the circular section lives in the xz plane.
 fn cylinder_wall_points() -> Vec<Vec3> {
-    let radius = 0.24;
+    let radius = 0.15;
     let mut points = Vec::new();
     for a in 0..24 {
         let angle = 2.0 * std::f64::consts::PI * (a as f64) / 24.0;
         for k in 0..5 {
-            let z = -0.3 + 0.6 * (k as f64) / 4.0;
-            points.push(vec3(radius * angle.cos(), radius * angle.sin(), z));
+            let y = -0.6 + 1.2 * (k as f64) / 4.0;
+            points.push(vec3(
+                1.8 + radius * angle.cos(),
+                y,
+                0.5 + radius * angle.sin(),
+            ));
         }
     }
     points
@@ -120,8 +127,8 @@ fn direction_region_selects_one_face() {
     let fixture = default_scene();
     let mut inlet = region(fixture.box_id);
     inlet.outside_direction = Some(0); // -X face
-    let minus_x = face_points(-1.6, 7);
-    let plus_x = face_points(1.6, 7);
+    let minus_x = face_points(0.0, 7);
+    let plus_x = face_points(4.5, 7);
     let wall = cylinder_wall_points();
 
     assert!(all(
@@ -138,11 +145,11 @@ fn direction_region_selects_one_face() {
 #[test]
 fn one_cut_partitions_the_parent_exactly() {
     let fixture = default_scene();
-    let mut samples = face_points(-1.6, 7);
-    samples.extend(face_points(1.6, 7));
+    let mut samples = face_points(0.0, 7);
+    samples.extend(face_points(4.5, 7));
     samples.extend(cylinder_wall_points());
     let parent = region(fixture.box_id);
-    let ghost = ghost_sphere(vec3(-1.6, 0.0, 0.0), 0.5);
+    let ghost = ghost_sphere(vec3(0.0, 0.0, 0.5), 0.5);
     let mut inside = region(fixture.box_id);
     inside.cuts = vec![BoundaryCut {
         side: CutSide::Inside,
@@ -166,7 +173,7 @@ fn one_cut_partitions_the_parent_exactly() {
     }
     for (i, point) in samples.iter().enumerate() {
         if inside_mask[i] {
-            assert!((*point - vec3(-1.6, 0.0, 0.0)).length() < 0.55);
+            assert!((*point - vec3(0.0, 0.0, 0.5)).length() < 0.55);
         }
     }
 }
@@ -174,9 +181,9 @@ fn one_cut_partitions_the_parent_exactly() {
 #[test]
 fn cut_chain_is_a_conjunction() {
     let fixture = default_scene();
-    let samples = face_points(-1.6, 13);
-    let sphere = ghost_sphere(vec3(-1.6, 0.0, 0.0), 0.4);
-    let upper = ghost_box(vec3(-1.6, 1.0, 0.0), vec3(1.0, 1.0, 1.0));
+    let samples = face_points(0.0, 13);
+    let sphere = ghost_sphere(vec3(0.0, 0.0, 0.5), 0.4);
+    let upper = ghost_box(vec3(0.0, 1.0, 0.5), vec3(1.0, 1.0, 1.0));
     let mut chained = region(fixture.box_id);
     chained.cuts = vec![
         BoundaryCut {
@@ -219,8 +226,8 @@ fn lower_dimensional_ghost_extrudes_through_the_scene() {
         .document
         .add_primitive_from_drag(
             "segment",
-            vec3(-1.6, -0.2, 0.0),
-            vec3(-1.6, 0.2, 0.0),
+            vec3(0.0, -0.2, 0.5),
+            vec3(0.0, 0.2, 0.5),
             1.0,
         )
         .expect("segment");
@@ -230,7 +237,7 @@ fn lower_dimensional_ghost_extrudes_through_the_scene() {
         side: CutSide::Inside,
         ghost: segment,
     }];
-    let samples = face_points(-1.6, 13);
+    let samples = face_points(0.0, 13);
 
     let mask = boundary_region_mask(&fixture.root, &region, &samples, None).expect("mask");
 
@@ -250,7 +257,7 @@ fn mask_composes_base_mask_and_cut_chain() {
     // Pins the base/full split: full mask == base mask (criteria 1-3)
     // ∧ every cut's tol-banded sign test (criterion 4).
     let fixture = default_scene();
-    let mut samples = face_points(-1.6, 9);
+    let mut samples = face_points(0.0, 9);
     samples.extend(cylinder_wall_points());
 
     let plain = region(fixture.box_id);
@@ -262,7 +269,7 @@ fn mask_composes_base_mask_and_cut_chain() {
     let mut with_cut = region(fixture.box_id);
     with_cut.cuts = vec![BoundaryCut {
         side: CutSide::Inside,
-        ghost: ghost_sphere(vec3(-1.6, 0.0, 0.0), 0.5),
+        ghost: ghost_sphere(vec3(0.0, 0.0, 0.5), 0.5),
     }];
     let tol = region_tolerance(&fixture.root, &with_cut);
     let volume = cut_volume(&fixture.root, &with_cut.cuts[0]).expect("volume");
@@ -354,7 +361,7 @@ fn scene_with_whole_surface_region() -> (SceneDocument, ObjectId, u32) {
 fn split_replaces_parent_and_keeps_ghost_out_of_scene() {
     let (mut document, _box_id, region_id) = scene_with_whole_surface_region();
     let objects_before = document.live_ids();
-    let ghost = ghost_sphere(vec3(-1.6, 0.0, 0.0), 0.5);
+    let ghost = ghost_sphere(vec3(0.0, 0.0, 0.5), 0.5);
 
     let (inside_id, outside_id) = document
         .split_boundary_region(region_id, &ghost, None)
@@ -394,12 +401,12 @@ fn nested_split_composes_chains_and_partitions() {
     let (mut document, _box_id, region_id) = scene_with_whole_surface_region();
     let root_id = document.fluid_domain.as_ref().expect("fluid").root;
     let root = document.build_node(root_id).expect("root");
-    let sphere = ghost_sphere(vec3(-1.6, 0.0, 0.0), 0.5);
+    let sphere = ghost_sphere(vec3(0.0, 0.0, 0.5), 0.5);
     let (inside_id, outside_id) = document
         .split_boundary_region(region_id, &sphere, None)
         .expect("split 1");
 
-    let upper = ghost_box(vec3(0.0, 1.0, 0.0), vec3(4.0, 1.0, 1.0));
+    let upper = ghost_box(vec3(2.25, 1.0, 0.5), vec3(6.0, 1.0, 1.0));
     let (top_id, bottom_id) = document
         .split_boundary_region(outside_id, &upper, None)
         .expect("split 2");
@@ -413,7 +420,7 @@ fn nested_split_composes_chains_and_partitions() {
     };
     assert_eq!(find(top_id).cuts.len(), 2);
     assert_eq!(find(bottom_id).cuts.len(), 2);
-    let samples = face_points(-1.6, 9);
+    let samples = face_points(0.0, 9);
     let inside_mask =
         boundary_region_mask(&root, find(inside_id), &samples, None).expect("mask");
     let top_mask = boundary_region_mask(&root, find(top_id), &samples, None).expect("mask");
@@ -449,7 +456,7 @@ fn legacy_selector_region_converts_into_chain() {
         .expect("selector object")
         .payload
     {
-        sphere.center = vec3(-1.6, 0.0, 0.0);
+        sphere.center = vec3(0.0, 0.0, 0.5);
     }
     let legacy_object_id = document.allocate_object_id().expect("id");
     let mut legacy = BoundaryRegion::new("legacy", legacy_object_id, box_id);
@@ -463,7 +470,7 @@ fn legacy_selector_region_converts_into_chain() {
         fluid.selectors.push(selector_id);
     }
 
-    let knife = ghost_box(vec3(0.0, 1.0, 0.0), vec3(4.0, 1.0, 1.0));
+    let knife = ghost_box(vec3(2.25, 1.0, 0.5), vec3(6.0, 1.0, 1.0));
     let (top_id, _bottom_id) = document
         .split_boundary_region(legacy_object_id, &knife, None)
         .expect("split legacy");
