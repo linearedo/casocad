@@ -58,7 +58,7 @@ Per crate, the complete allowed set:
 | `surfaces` | **zero** |
 | `render` | `wgpu 29`, `bytemuck` |
 | `meshing` | `arrow-array` / `arrow-schema` / `arrow-ipc` / `arrow-buffer` (v56), `serde_json` |
-| `app` | `eframe 0.35` (with the `wgpu` feature), `egui_dock 0.20`, `rhai 1`, `serde_json` |
+| `app` | `eframe 0.35` (with the `wgpu` feature), `egui_dock 0.20`, `egui_extras 0.35` (`svg` only, for the vector wordmark), `rhai 1`, `serde_json` |
 | `app` (wasm32 only) | `wasm-bindgen`, `wasm-bindgen-futures`, `web-sys`, `js-sys`, `getrandom` (`wasm_js` backend), `log` |
 
 Constraints and deliberate rejections:
@@ -155,7 +155,10 @@ uncompressed IPC).
 
 ### 4.5 `app` — the application
 
-eframe + egui_dock shell (theme ported from `app/assets/theme.qss`): Scene
+eframe + egui_dock shell (theme ported from `app/assets/theme.qss`; the
+toolbar shows the casoCAD wordmark from the vector
+`app/assets/casocad-wordmark.svg`, rasterized by the `egui_extras` SVG
+loader at the on-screen pixel size so it stays crisp at any DPI): Scene
 and Properties panels tabified left, Log panel, central viewport shown as an
 offscreen texture. `state.rs` (selection, 50-snapshot undo/redo, LengthUnit
 registry), `dimensions.rs` (full measurement-entry parser: units incl.

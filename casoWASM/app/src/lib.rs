@@ -55,6 +55,12 @@ const SDF_OPERATORS: [(&str, &str); 3] = [
 
 const DISJOINTNESS_RESOLUTION: usize = 32;
 
+/// The casoCAD wordmark (vector version of the Python app's title-bar logo),
+/// rasterized by the SVG loader at the on-screen pixel size — crisp at any
+/// DPI. Displayed at this height; width follows the SVG's 1572:216 aspect.
+const WORDMARK_HEIGHT_POINTS: f32 = 22.0;
+const WORDMARK_ASPECT: f32 = 1572.0 / 216.0;
+
 /// Browser entry point: attaches the app to the `casowasm_canvas` element.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
@@ -104,6 +110,7 @@ pub struct CasoApp {
 
 impl CasoApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&creation_context.egui_ctx);
         theme::apply(&creation_context.egui_ctx);
         let document = SceneDocument::default_scene().expect("default scene");
         let mut state = AppState::new(document);
@@ -152,8 +159,13 @@ impl CasoApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("caso").strong().color(theme::TEXT_COLOR));
-            ui.label(egui::RichText::new("WASM").strong().color(theme::ACCENT));
+            ui.add(
+                egui::Image::new(egui::include_image!("../assets/casocad-wordmark.svg"))
+                    .fit_to_exact_size(egui::vec2(
+                        WORDMARK_HEIGHT_POINTS * WORDMARK_ASPECT,
+                        WORDMARK_HEIGHT_POINTS,
+                    )),
+            );
             ui.separator();
 
             ui.menu_button("Add", |ui| {
