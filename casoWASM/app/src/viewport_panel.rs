@@ -18,6 +18,34 @@ const WIRE_PICK_RADIUS: f32 = 8.0;
 /// Progressive refinement ladder (coarse first paint, then quality tiers).
 const REFINEMENT_TIERS: [u32; 3] = [12, 64, 96];
 
+/// Reference views, matching the Python view panel: label, shortcut key,
+/// grid plane (0=XY, 1=XZ, 2=YZ) and camera yaw/pitch in degrees.
+const REFERENCE_VIEWS: [(&str, egui::Key, u32, f64, f64); 4] = [
+    ("3D", egui::Key::Num1, 0, 35.0, 28.0),
+    ("{x,y}", egui::Key::Num2, 0, 90.0, 89.5),
+    ("{x,z}", egui::Key::Num3, 1, -90.0, 0.0),
+    ("{y,z}", egui::Key::Num4, 2, 0.0, 0.0),
+];
+
+/// Duration of the camera flight to a reference view, in seconds.
+const VIEW_FLIGHT_SECONDS: f64 = 0.26;
+
+/// Axis triad overlay (bottom-left): world axes with their colors.
+const TRIAD_AXES: [(&str, Vec3, egui::Color32); 3] = [
+    ("X", vec3(1.0, 0.0, 0.0), egui::Color32::from_rgb(255, 86, 65)),
+    ("Y", vec3(0.0, 1.0, 0.0), egui::Color32::from_rgb(85, 235, 105)),
+    ("Z", vec3(0.0, 0.0, 1.0), egui::Color32::from_rgb(92, 145, 255)),
+];
+
+/// In-flight smoothstep camera flight to a reference view.
+struct ViewFlight {
+    start_time: f64,
+    start_yaw: f64,
+    start_pitch: f64,
+    delta_yaw: f64,
+    delta_pitch: f64,
+}
+
 pub struct ViewportPanel {
     pub camera: OrbitCamera,
     pub options: RenderOptions,
@@ -41,6 +69,7 @@ pub struct ViewportPanel {
     mesh_points: Vec<f32>,
     mesh_preview_revision: u64,
     upload_pending: bool,
+    view_flight: Option<ViewFlight>,
 }
 
 impl Default for ViewportPanel {
@@ -66,6 +95,7 @@ impl Default for ViewportPanel {
             mesh_points: Vec::new(),
             mesh_preview_revision: u64::MAX,
             upload_pending: false,
+            view_flight: None,
         }
     }
 }
@@ -110,6 +140,120 @@ impl ViewportPanel {
         self.camera.view_scale = factor;
         self.options.grid_spacing = factor as f32;
         self.request_frame_all();
+    }
+
+    /// Switch the visualization grid plane and fly the camera to the view
+    /// (matching the Python `set_reference_view`). Drawing tools stay on XY.
+    fn fly_to_reference_view(&mut self, plane: u32, yaw_deg: f64, pitch_deg: f64, now: f64) {
+        self.options.grid_plane = plane;
+        let tau = std::f64::consts::TAU;
+        let delta_yaw = (yaw_deg.to_radians() - self.camera.yaw + tau / 2.0).rem_euclid(tau)
+            - tau / 2.0;
+        let delta_pitch = pitch_deg.to_radians() - self.camera.pitch;
+        if delta_yaw.abs().max(delta_pitch.abs()) <= 1.0e-6 {
+            return;
+        }
+        self.view_flight = Some(ViewFlight {
+            start_time: now,
+            start_yaw: self.camera.yaw,
+            start_pitch: self.camera.pitch,
+            delta_yaw,
+            delta_pitch,
+        });
+    }
+
+    /// Advance the in-flight reference-view animation (smoothstep easing).
+    fn advance_view_flight(&mut self, ctx: &egui::Context, now: f64) {
+        let Some(flight) = &self.view_flight else {
+            return;
+        };
+        let t = ((now - flight.start_time) / VIEW_FLIGHT_SECONDS).clamp(0.0, 1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        self.camera.yaw = flight.start_yaw + flight.delta_yaw * eased;
+        self.camera.pitch = flight.start_pitch + flight.delta_pitch * eased;
+        if t >= 1.0 {
+            self.view_flight = None;
+        } else {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Bottom-left axis triad: world X/Y/Z projected with the camera basis,
+    /// back-to-front with depth-dimmed alpha (ported from `_OrientationWidget`).
+    fn paint_orientation_triad(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let painter = ui.painter_at(rect);
+        let size = 96.0;
+        let widget_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 10.0, rect.max.y - 10.0 - size),
+            egui::vec2(size, size),
+        );
+        painter.rect_filled(
+            widget_rect,
+            egui::CornerRadius::same(6),
+            egui::Color32::from_rgba_unmultiplied(6, 10, 16, 145),
+        );
+        let basis = self.camera.basis();
+        let origin = widget_rect.min + egui::vec2(38.0, 58.0);
+        let mut axes: Vec<(&str, f32, f32, f64, egui::Color32)> = TRIAD_AXES
+            .into_iter()
+            .map(|(label, axis, color)| {
+                (
+                    label,
+                    axis.dot(basis.right) as f32,
+                    -(axis.dot(basis.up)) as f32,
+                    axis.dot(basis.forward),
+                    color,
+                )
+            })
+            .collect();
+        axes.sort_by(|a, b| a.3.total_cmp(&b.3));
+        for (label, dx, dy, depth, color) in axes {
+            let alpha = if depth > 0.0 { 115 } else { 235 };
+            let color =
+                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+            let end = origin + egui::vec2(dx * 30.0, dy * 30.0);
+            painter.line_segment([origin, end], egui::Stroke::new(4.0, color));
+            painter.circle_filled(end, 4.5, color);
+            painter.text(
+                end + egui::vec2(6.0, -5.0),
+                egui::Align2::LEFT_BOTTOM,
+                label,
+                egui::FontId::proportional(12.0),
+                color,
+            );
+        }
+    }
+
+    /// Bottom-center reference-view buttons: 3D / {x,y} / {x,z} / {y,z}.
+    fn view_panel_ui(&mut self, ctx: &egui::Context, rect: egui::Rect, now: f64) {
+        egui::Area::new(egui::Id::new("viewport_view_panel"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(egui::pos2(rect.center().x, rect.max.y - 10.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(6, 10, 16, 170))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(120, 210, 255, 110),
+                    ))
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (index, (label, _, plane, yaw, pitch)) in
+                                REFERENCE_VIEWS.iter().enumerate()
+                            {
+                                let button = ui
+                                    .button(*label)
+                                    .on_hover_text(format!("{label} view (key {})", index + 1));
+                                if button.clicked() {
+                                    self.fly_to_reference_view(*plane, *yaw, *pitch, now);
+                                }
+                            }
+                        });
+                    });
+            });
     }
 
     fn upload_scene(&mut self, render_state: &RenderState) {
@@ -381,6 +525,7 @@ impl ViewportPanel {
         // Input: left-drag orbit, right/middle-drag pan, wheel zoom.
         let drag = response.drag_delta();
         if !tool_consumed && response.dragged_by(egui::PointerButton::Primary) {
+            self.view_flight = None; // manual orbit overrides a view flight
             self.camera
                 .orbit(drag.x as f64 * pixels_per_point as f64, drag.y as f64 * pixels_per_point as f64);
         } else if response.dragged_by(egui::PointerButton::Secondary)
@@ -398,21 +543,16 @@ impl ViewportPanel {
                 self.camera.zoom_by(scroll as f64);
             }
         }
+        let now = ui.ctx().input(|input| input.time);
         // View keys stay off while a tool consumes typed input (digits are
         // dimensions during a create drag, not view shortcuts).
         if response.hovered() && !tool_consumed {
-            ui.ctx().input(|input| {
-                for (key, yaw, pitch) in [
-                    (egui::Key::Num1, 35.0_f64, 28.0_f64),
-                    (egui::Key::Num2, 90.0, 89.5),
-                    (egui::Key::Num3, -90.0, 0.0),
-                    (egui::Key::Num4, 0.0, 0.0),
-                ] {
-                    if input.key_pressed(key) {
-                        self.camera.yaw = yaw.to_radians();
-                        self.camera.pitch = pitch.to_radians();
-                    }
+            for (_, key, plane, yaw, pitch) in REFERENCE_VIEWS {
+                if ui.ctx().input(|input| input.key_pressed(key)) {
+                    self.fly_to_reference_view(plane, yaw, pitch, now);
                 }
+            }
+            ui.ctx().input(|input| {
                 if input.key_pressed(egui::Key::Home) {
                     self.framed_once = false;
                     self.mark_scene_changed();
@@ -433,6 +573,8 @@ impl ViewportPanel {
                 }
             });
         }
+
+        self.advance_view_flight(ui.ctx(), now);
 
         let renderer = self
             .renderer
@@ -464,6 +606,10 @@ impl ViewportPanel {
                 egui::Color32::WHITE,
             );
         }
+        // Navigation overlays: axis triad (bottom-left) + view buttons
+        // (bottom-center).
+        self.paint_orientation_triad(ui, rect);
+        self.view_panel_ui(ui.ctx(), rect, now);
         // Tool input + ghost overlays go on top of the rendered image.
         tools.handle_viewport(&response, ui, &self.camera, rect, pixels_per_point, state);
         if tools.kind == ToolKind::Select {
@@ -511,6 +657,28 @@ fn ray_triangle_hit(origin: Vec3, direction: Vec3, a: Vec3, b: Vec3, c: Vec3) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reference-view switch sets the visualization grid plane and flies
+    /// the camera onto the target yaw/pitch by the end of the flight.
+    #[test]
+    fn reference_view_switch_sets_plane_and_lands_on_view() {
+        let mut panel = ViewportPanel::default();
+        let (_, _, plane, yaw, pitch) = REFERENCE_VIEWS[2]; // {x,z}
+        panel.fly_to_reference_view(plane, yaw, pitch, 10.0);
+        assert_eq!(panel.options.grid_plane, 1);
+        assert!(panel.view_flight.is_some());
+
+        let ctx = egui::Context::default();
+        panel.advance_view_flight(&ctx, 10.0 + 2.0 * VIEW_FLIGHT_SECONDS);
+        assert!(panel.view_flight.is_none());
+        assert!((panel.camera.yaw - yaw.to_radians()).abs() < 1e-9);
+        assert!((panel.camera.pitch - pitch.to_radians()).abs() < 1e-9);
+
+        // Returning to 3D restores the XY grid plane.
+        let (_, _, plane, yaw, pitch) = REFERENCE_VIEWS[0];
+        panel.fly_to_reference_view(plane, yaw, pitch, 20.0);
+        assert_eq!(panel.options.grid_plane, 0);
+    }
 
     /// Clicking the framed default scene picks its root object; clicking
     /// empty space picks nothing.

@@ -175,6 +175,16 @@ sheet so closed surfaces never show an antipodal phantom cut; see
 (Rhai scripting: `domains`, per-domain SDF/region queries, `emit(...)`;
 preview overlay; `.arrow` export — browser export is a Blob download).
 
+Viewport navigation overlays (`viewport_panel.rs`, ported from the Python
+`_OrientationWidget` / `_build_view_panel`): a bottom-left axis triad
+(world X/Y/Z projected with the camera basis, back-to-front with
+depth-dimmed alpha) and bottom-center reference-view buttons
+`3D / {x,y} / {x,z} / {y,z}` (keys 1–4). Each button sets the rendered
+grid plane (`RenderOptions::grid_plane`) and flies the camera to the view
+with a 260 ms smoothstep; manual orbit cancels the flight. Unlike the
+Python app, the drawing tools still work on the `Z = 0` XY plane — the
+plane switch is visualization-only for now.
+
 ### 4.6 `web`
 
 `index.html` hosting the wasm-pack output (`pkg/`), canvas id
