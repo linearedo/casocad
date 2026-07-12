@@ -1,5 +1,9 @@
 # Exact SDF for CFD — v2: casoCAD as a Safe Geometry Compiler
 
+> Moved from the Python tree's `design_old_docs/` on 2026-07-12 (Rust/WASM is
+> the only codebase now). Links to `progress/…` build logs and to the v1 spec
+> refer to the retired Python tree — recover them from git history if needed.
+
 > **Status:** design / migration spec (no code yet).
 > **Builds on:** [`exact_signed_distance_field_cfd_migration.md`](./exact_signed_distance_field_cfd_migration.md) (*v1*).
 >

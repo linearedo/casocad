@@ -1,5 +1,9 @@
 # Boundary Region v2 — one identity, one cutter
 
+> Moved from the Python tree's `design_old_docs/` on 2026-07-12 (Rust/WASM is
+> the only codebase now). Links to `progress/…` build logs and to the v1 spec
+> refer to the retired Python tree — recover them from git history if needed.
+
 > **Status:** IMPLEMENTED 2026-07-02 (all 7 phases; deviations + follow-ups in
 > `progress/boundary_region_v2_progress.md`).
 > **Builds on:** `exact_signed_distance_field_cfd_migration_v2.md` §4 (surface

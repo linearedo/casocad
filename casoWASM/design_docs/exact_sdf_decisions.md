@@ -1,5 +1,9 @@
 # Exact-SDF Migration — Decision Log
 
+> Moved from the Python tree's `design_old_docs/` on 2026-07-12 (Rust/WASM is
+> the only codebase now). Links to `progress/…` build logs and to the v1 spec
+> refer to the retired Python tree — recover them from git history if needed.
+
 > One entry per significant design choice: **what** we decided, the **alternatives**
 > we weighed, and **why** we rejected them. This exists so the *reasoning* isn't
 > trapped in chat history. Companion to the spec
