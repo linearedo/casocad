@@ -1,6 +1,6 @@
 //! Scene.json round-trip parity with the Python serializer.
 //!
-//! `casoWASM/tools/export_scene_goldens.py` loads scenes through the Python
+//! `tools/export_scene_goldens.py` (archived at the `python-final` tag) loads scenes through the Python
 //! load/save path and writes the resaved JSON; the Rust loader/saver must
 //! produce semantically identical JSON (same records — key order free) from
 //! the same inputs, including the legacy boundary-selector migration.
@@ -22,7 +22,7 @@ fn load_json(path: &str) -> Value {
 
 #[test]
 fn legacy_scene_resave_matches_python() {
-    let source = std::fs::read_to_string(manifest_path("../../scene.json"))
+    let source = std::fs::read_to_string(manifest_path("../scene.json"))
         .expect("repo-root scene.json fixture");
     let document = load_scene_from_str(&source).expect("load legacy scene");
     let resaved = scene_to_value(&document).expect("save scene");
@@ -43,7 +43,7 @@ fn default_scene_save_matches_python() {
 
 #[test]
 fn save_load_save_is_idempotent() {
-    let source = std::fs::read_to_string(manifest_path("../../scene.json"))
+    let source = std::fs::read_to_string(manifest_path("../scene.json"))
         .expect("repo-root scene.json fixture");
     let document = load_scene_from_str(&source).expect("load");
     let first = save_scene_to_string(&document).expect("first save");
@@ -54,7 +54,7 @@ fn save_load_save_is_idempotent() {
 
 #[test]
 fn loaded_scene_evaluates_like_the_kernel() {
-    let source = std::fs::read_to_string(manifest_path("../../scene.json"))
+    let source = std::fs::read_to_string(manifest_path("../scene.json"))
         .expect("repo-root scene.json fixture");
     let document = load_scene_from_str(&source).expect("load");
     let root_id = document.roots[0];
@@ -71,7 +71,7 @@ fn loaded_scene_evaluates_like_the_kernel() {
 
 #[test]
 fn legacy_selector_migrates_into_cut_chain() {
-    let source = std::fs::read_to_string(manifest_path("../../scene.json"))
+    let source = std::fs::read_to_string(manifest_path("../scene.json"))
         .expect("repo-root scene.json fixture");
     let document = load_scene_from_str(&source).expect("load");
     // The two split regions carry the migrated ghost as their first cut.

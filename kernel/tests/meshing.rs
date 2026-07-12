@@ -9,7 +9,7 @@ use caso_kernel::serialization::save_scene_to_string;
 use caso_kernel::vec3::vec3;
 
 fn root_scene_json() -> String {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scene.json");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../scene.json");
     std::fs::read_to_string(path).expect("repo-root scene.json")
 }
 

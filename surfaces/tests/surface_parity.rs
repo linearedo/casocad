@@ -1,6 +1,6 @@
 //! Surface-builder parity with the Python viewport builders.
 //!
-//! `casoWASM/tools/export_surface_goldens.py` runs the Python
+//! `tools/export_surface_goldens.py` (archived at the `python-final` tag) runs the Python
 //! `build_viewport_surface` on a fixture subset at resolutions 12 (dense) and
 //! 96 (narrow band / clip) and records status + vertex/triangle/wire counts +
 //! max |sdf| at the produced vertices. This test rebuilds identical fixtures
@@ -291,8 +291,8 @@ fn surface_metrics_match_python() {
         "/tests/goldens/surface_goldens.txt"
     );
     let text = std::fs::read_to_string(path).expect(
-        "golden file missing — run `.venv/bin/python \
-         casoWASM/tools/export_surface_goldens.py` from the casoCAD repo root",
+        "golden file missing — regenerate with `tools/export_surface_goldens.py` \
+         at the `python-final` tag (needs the archived Python codebase)",
     );
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;

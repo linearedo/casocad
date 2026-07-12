@@ -1,14 +1,13 @@
-*.venv/
-*.egg-info/
-*__pycache__/
-*.py[cod]
+# Rust build artifacts (regenerable via cargo build / wasm-pack build)
+/target/
+web/pkg/
+
+# analysis / sample outputs
 *.arrow
 *outbin/
 *.mp4
-*.serena/
 lbm_frames/
 perf_logs/
 
-# casoWASM build artifacts (regenerable via cargo build / wasm-pack build)
-casoWASM/target/
-casoWASM/web/pkg/
+# tooling
+*.serena/

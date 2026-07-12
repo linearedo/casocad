@@ -1,6 +1,6 @@
 //! Golden parity against the Python casoCAD kernel.
 //!
-//! `casoWASM/tools/export_goldens.py` samples every fixture below through the
+//! `tools/export_goldens.py` (archived at the `python-final` tag) samples every fixture below through the
 //! Python `to_numpy()` path and writes `tests/goldens/kernel_goldens.txt`;
 //! this test rebuilds the identical fixtures in Rust and requires agreement
 //! at f64 round-off level. Fixture definitions must stay in sync with the
@@ -539,8 +539,8 @@ struct GoldenFixture {
 fn load_goldens() -> Vec<GoldenFixture> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goldens/kernel_goldens.txt");
     let text = std::fs::read_to_string(path).expect(
-        "golden file missing — run `.venv/bin/python casoWASM/tools/export_goldens.py` \
-         from the casoCAD repo root",
+        "golden file missing — regenerate with `tools/export_goldens.py` \
+         at the `python-final` tag (needs the archived Python codebase)",
     );
     let mut fixtures = Vec::new();
     let mut current: Option<GoldenFixture> = None;

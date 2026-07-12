@@ -14,7 +14,7 @@ Status: agreed direction, nothing implemented yet.*
   signed-distance functions plus boundary regions — the analysis API, for
   writing external meshers/tools.
 - Key fact about the kernel: the SDF of a domain is **data, not code** — a
-  Rust `Shape` enum tree (`casoWASM/kernel/src/sdf/node.rs`) evaluated by
+  Rust `Shape` enum tree (`kernel/src/sdf/node.rs`) evaluated by
   one fixed interpreter (`Node::eval_point`): operators are `min`/`max`/
   `max(a,−b)`, transforms inverse-map the point, primitives bottom out in
   closed-form distance formulas (parity-tested 1e-12 vs Python). Any
@@ -42,7 +42,7 @@ never new Rust.
 ## 3. Scope discipline (what the ABI exposes)
 
 Only the **analysis contract**, mirroring `MeshableDomain`
-(`casoWASM/kernel/src/meshing.rs`). Scene *editing* stays out — it's the
+(`kernel/src/meshing.rs`). Scene *editing* stays out — it's the
 app's job and the churny part of the API. Roughly a dozen functions:
 
 ```c
@@ -80,7 +80,7 @@ uint32_t     caso_abi_version(void);
 
 ```
 casoCAD/
-├── casoWASM/
+├── <repo root>/
 │   └── ffi/                      # caso-ffi crate (cdylib + staticlib)
 │       ├── src/lib.rs            # the ~dozen extern "C" functions
 │       ├── cbindgen.toml
@@ -95,7 +95,7 @@ casoCAD/
 └── .github/workflows/bindings.yml  # wheel matrix + C smoke + julia test
 ```
 
-- `ffi/` lives in the casoWASM workspace: versions/builds/tests with the
+- `ffi/` lives in the Rust workspace: versions/builds/tests with the
   kernel it wraps.
 - Wrappers live outside the workspace, each shaped for its ecosystem's
   tooling (pip/maturin, Julia registrator subdir packages, CMake).
