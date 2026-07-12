@@ -346,8 +346,12 @@ pub fn sample_boundary_points(root: &Node, resolution: usize) -> GeometryResult<
     Ok((kept, band))
 }
 
-/// Exact membership of `points` in `region` (`boundary_region_mask`).
-pub fn boundary_region_mask(
+/// Membership under criteria 1-3 only (on the Domain boundary, owner
+/// provenance, analytic patch/direction scope) — the mesh-aligned part of the
+/// classifier, ignoring the region's cut chain. Highlight overlays filter
+/// whole display triangles with this mask and then clip the survivors
+/// exactly against each cut volume.
+pub fn boundary_region_base_mask(
     root: &Node,
     region: &BoundaryRegion,
     points: &[Vec3],
@@ -387,6 +391,19 @@ pub fn boundary_region_mask(
             }
         }
     }
+    Ok(mask)
+}
+
+/// Exact membership of `points` in `region` (`boundary_region_mask`):
+/// criteria 1-3 (`boundary_region_base_mask`) ∧ the cut chain (criterion 4).
+pub fn boundary_region_mask(
+    root: &Node,
+    region: &BoundaryRegion,
+    points: &[Vec3],
+    tolerance: Option<f64>,
+) -> GeometryResult<Vec<bool>> {
+    let tol = tolerance.unwrap_or_else(|| region_tolerance(root, region));
+    let mut mask = boundary_region_base_mask(root, region, points, Some(tol))?;
 
     // 4. the cut chain (conjunction)
     for cut in &region.cuts {

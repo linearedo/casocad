@@ -48,12 +48,13 @@ pub const POINT_KINDS: [(&str, &str); 4] = [
     ("Bezier Tube", "quadratic_bezier_tube"),
 ];
 
-/// Cutter knife kinds: (menu label, kind key).
-pub const KNIFE_KINDS: [(&str, &str); 4] = [
+/// Cutter knife kinds: (menu label, kind key). A smooth on-surface polyline
+/// knife existed until 2026-07-12 and was removed as unproven — see
+/// design_docs/boundary_cutter_exactness.md for its archived design record.
+pub const KNIFE_KINDS: [(&str, &str); 3] = [
     ("Segment (drag)", "segment"),
     ("Polygon (points)", "polygon"),
     ("Bezier Surface (points)", "quadratic_bezier_surface"),
-    ("Smooth Polyline (on-surface)", "smooth_polyline"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,13 +391,27 @@ impl ToolState {
             return true;
         }
         // Rebuild the knife ghost (drives the cyan/orange split preview).
+        let region_id = state.selected_region.expect("checked");
         let minimum = match knife {
-            "segment" | "smooth_polyline" => 2,
+            "segment" => 2,
             _ => 3,
         };
         if points_changed {
             self.preview_ghost = if self.points.len() >= minimum {
-                boundary_tool::cutter_ghost(&root, knife, &self.points).ok()
+                match boundary_tool::cutter_ghost(&root, knife, &self.points) {
+                    Ok(ghost) => {
+                        // Warnings (planar slice on a curved boundary)
+                        // surface at preview time.
+                        if !ghost.warnings.is_empty() {
+                            state.status = ghost.warnings.join("; ");
+                        }
+                        Some(ghost.node)
+                    }
+                    Err(error) => {
+                        state.status = error;
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -410,19 +425,24 @@ impl ToolState {
             };
             match ghost {
                 Ok(ghost) => {
-                    let region_id = state.selected_region.expect("checked");
                     state.push_undo();
                     let validation = std::mem::take(&mut self.validation_points);
                     let result = state.document.split_boundary_region(
                         region_id,
-                        &ghost,
+                        &ghost.node,
                         Some(&validation),
                     );
                     self.validation_points = validation;
                     match result {
                         Ok((inside_id, _outside_id)) => {
                             state.selected_region = Some(inside_id);
-                            state.status = "Region split".to_string();
+                            // Repeat the ghost warnings at commit so the user
+                            // knows exactly what was stored.
+                            state.status = if ghost.warnings.is_empty() {
+                                "Region split".to_string()
+                            } else {
+                                format!("Region split — {}", ghost.warnings.join("; "))
+                            };
                             self.points.clear();
                             self.preview_ghost = None;
                             self.overlay_revision += 1;

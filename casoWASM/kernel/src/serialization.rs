@@ -24,7 +24,7 @@ use crate::sdf::primitives_2d::{Point2, Profile2D};
 use crate::sdf::primitives_3d::{
     Box3, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Sphere, Torus,
 };
-use crate::sdf::solid_from_2d::RevolveAxis;
+use crate::sdf::solid_from_2d::{Extrude, RevolveAxis};
 use crate::sdf::tubes::{CapStyle, PolylineTube, QuadraticBezierTube};
 use crate::vec3::{vec3, Vec3};
 
@@ -433,10 +433,19 @@ fn tube_record(
     record.insert("caps".into(), caps.as_str().into());
 }
 
-/// Serialize a ghost (self-contained leaf `Node`) — always carries "name".
+/// Serialize a ghost (self-contained `Node`) — always carries "name".
+/// Leaf shapes plus the recursive `extrude` composite record (casoWASM
+/// format extension for one-sided stencil knives — see
+/// design_docs/boundary_cutter_exactness.md); never scene references.
 pub fn ghost_to_json(node: &Node) -> GeometryResult<Value> {
     let mut record = Map::new();
     match &node.shape {
+        Shape::Extrude(extrude) => {
+            record.insert("type".into(), "extrude".into());
+            record.insert("section".into(), ghost_to_json(&extrude.section)?);
+            record.insert("height".into(), json!(extrude.height));
+            record.insert("center_offset".into(), json!(extrude.center_offset));
+        }
         Shape::Sphere(shape) => {
             record.insert("type".into(), "sphere".into());
             record.insert("center".into(), vec3_json(shape.center));
@@ -556,15 +565,32 @@ pub fn ghost_to_json(node: &Node) -> GeometryResult<Value> {
     Ok(Value::Object(record))
 }
 
-/// Parse a ghost record into a self-contained leaf `Node` (object_id 0).
+/// Parse a ghost record into a self-contained `Node` (object_id 0): a leaf
+/// shape or the recursive `extrude` composite.
 pub fn ghost_from_json(value: &Value) -> GeometryResult<Node> {
     let record = value
         .as_object()
         .ok_or_else(|| err("ghost record must be a JSON object"))?;
     let name = get_str(record, "name").unwrap_or("ghost").to_string();
     let node_type = get_str(record, "type").ok_or_else(|| err("ghost requires a type"))?;
-    let shape = leaf_shape_from_record(node_type, record)?
-        .ok_or_else(|| err(format!("boundary cut ghosts cannot reference scene objects: {node_type}")))?;
+    // The `extrude` ghost record nests a further ghost record — unlike the
+    // scene payload "extrude", which references scene objects by id.
+    let shape = match node_type {
+        "extrude" => Shape::Extrude(Extrude::new(
+            ghost_from_json(
+                record
+                    .get("section")
+                    .ok_or_else(|| err("extrude ghost requires a section"))?,
+            )?,
+            require_f64(record, "height")?,
+            optional_f64(record, "center_offset", 0.0)?,
+        )?),
+        _ => leaf_shape_from_record(node_type, record)?.ok_or_else(|| {
+            err(format!(
+                "boundary cut ghosts cannot reference scene objects: {node_type}"
+            ))
+        })?,
+    };
     Ok(Node::new(name, shape))
 }
 

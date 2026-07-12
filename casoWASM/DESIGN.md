@@ -107,10 +107,17 @@ Port of `core/`. Modules:
   domains/duplicate/import-subtree; snapshot = Clone for undo).
 - `boundary.rs` / `boundary_ops.rs` / `boundary_paths.rs` — Boundary Region
   v2: the classifier (owner-active + patch scope + cut-chain sign
-  conjunction), analytic surface patches, sphere-trace picking with owner
-  attribution, knife path construction (Newton projection, geodesics).
+  conjunction; `boundary_region_base_mask` is the criteria-1-3 half,
+  `boundary_region_mask` composes it with the cut chain), analytic surface
+  patches, sphere-trace picking with owner attribution, knife construction
+  (segment = planar slice oriented by the mean endpoint normal;
+  polygon/bezier point stencils sit on the mean-click-normal plane and
+  extrude one-sidedly so closed surfaces never grow an antipodal phantom
+  cut; a smooth on-surface polyline knife was removed 2026-07-12 as unproven
+  — see `design_docs/boundary_cutter_exactness.md` for the archived record).
 - `serialization.rs` — scene.json v1 read/write, including boundary-region
-  records, ghost knives, and legacy selector→cut-chain migration.
+  records, ghost knives (leaf shapes plus the recursive `extrude` composite
+  record for one-sided stencils), and legacy selector→cut-chain migration.
 - `meshing.rs` — the `MeshableDomain` / `MeshableBoundaryRegion` API loaded
   from a saved scene (the FEA/CFD-facing view of the document).
 
@@ -154,8 +161,17 @@ offscreen texture. `state.rs` (selection, 50-snapshot undo/redo, LengthUnit
 registry), `dimensions.rs` (full measurement-entry parser: units incl.
 in/ft/"/', arithmetic expressions, multi-value entry), `tools.rs`
 (Select / drag-create / point-create / Move / Rotate on the grid),
-`boundary_tool.rs` (BoundaryRegion hover tool + BoundaryCutter with four
-knife kinds and split preview), `meshing_panel.rs` + `script_runner.rs`
+`boundary_tool.rs` (BoundaryRegion hover tool + BoundaryCutter with three
+knife kinds — segment, polygon, bezier surface — and split preview; region
+highlights filter whole display
+triangles by classifier criteria 1-3, then clip the survivors exactly
+against each cut volume with root-found seam vertices via
+`surfaces::clipping` — the highlight seam lies on the knife's true zero set
+regardless of display tessellation, the cyan/orange split previews share
+a bitwise-identical seam, and every area knife is bounded to the clicked
+sheet so closed surfaces never show an antipodal phantom cut; see
+`design_docs/boundary_cutter_exactness.md`),
+`meshing_panel.rs` + `script_runner.rs`
 (Rhai scripting: `domains`, per-domain SDF/region queries, `emit(...)`;
 preview overlay; `.arrow` export — browser export is a Blob download).
 

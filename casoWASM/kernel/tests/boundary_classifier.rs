@@ -5,8 +5,8 @@
 
 use caso_kernel::boundary::{BoundaryCut, BoundaryRegion, CutSide};
 use caso_kernel::boundary_ops::{
-    boundary_region_mask, owner_active_mask, pick_boundary_patch, region_tolerance,
-    surface_patches_for_root,
+    boundary_region_base_mask, boundary_region_mask, cut_volume, owner_active_mask,
+    pick_boundary_patch, region_tolerance, surface_patches_for_root,
 };
 use caso_kernel::scene::{ObjectId, SceneDocument, ScenePayload};
 use caso_kernel::sdf::node::{Node, Shape};
@@ -242,6 +242,37 @@ fn lower_dimensional_ghost_extrudes_through_the_scene() {
         if point.y.abs() > 0.3 {
             assert!(!mask[i]);
         }
+    }
+}
+
+#[test]
+fn mask_composes_base_mask_and_cut_chain() {
+    // Pins the base/full split: full mask == base mask (criteria 1-3)
+    // ∧ every cut's tol-banded sign test (criterion 4).
+    let fixture = default_scene();
+    let mut samples = face_points(-1.6, 9);
+    samples.extend(cylinder_wall_points());
+
+    let plain = region(fixture.box_id);
+    let full = boundary_region_mask(&fixture.root, &plain, &samples, None).expect("mask");
+    let base =
+        boundary_region_base_mask(&fixture.root, &plain, &samples, None).expect("mask");
+    assert_eq!(full, base, "cut-free regions: full == base");
+
+    let mut with_cut = region(fixture.box_id);
+    with_cut.cuts = vec![BoundaryCut {
+        side: CutSide::Inside,
+        ghost: ghost_sphere(vec3(-1.6, 0.0, 0.0), 0.5),
+    }];
+    let tol = region_tolerance(&fixture.root, &with_cut);
+    let volume = cut_volume(&fixture.root, &with_cut.cuts[0]).expect("volume");
+    let full =
+        boundary_region_mask(&fixture.root, &with_cut, &samples, None).expect("mask");
+    let base =
+        boundary_region_base_mask(&fixture.root, &with_cut, &samples, None).expect("mask");
+    for (i, point) in samples.iter().enumerate() {
+        let expected = base[i] && volume.eval_point(*point) <= tol;
+        assert_eq!(full[i], expected, "composition mismatch at {point:?}");
     }
 }
 

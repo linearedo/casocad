@@ -1,10 +1,11 @@
-//! Side-of-curtain classification field for on-surface knife paths.
+//! Side-of-curtain classification field for on-surface paths.
 //!
-//! The smooth-polyline boundary knife stores a dense path lying ON a Domain
-//! boundary plus the unit surface normals there. Its classification field is
-//! the signed distance to the ruled "curtain" swept from the path along the
-//! normals; the sign is which side of the curtain a query point falls on.
-//! Classification-only ghost geometry — never a scene object, never rendered.
+//! Stores a dense path lying ON a Domain boundary plus the unit surface
+//! normals there. Its classification field is the signed distance to the
+//! ruled "curtain" swept from the path along the normals; the sign is which
+//! side of the curtain a query point falls on. Used as a scene payload;
+//! its former use as the smooth-polyline boundary knife was removed
+//! 2026-07-12 (design_docs/boundary_cutter_exactness.md §6).
 //! Ported from `core/sdf/curtain.py`.
 
 use crate::bbox::BoundingBox3D;

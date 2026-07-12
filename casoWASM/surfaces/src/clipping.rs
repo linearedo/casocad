@@ -64,7 +64,21 @@ fn node_extent(node: &Node) -> f64 {
 
 /// Clip a triangle mesh against an SDF half-space (marching triangles); cut
 /// vertices are root-found exactly onto the clip's zero isosurface.
-fn clip_mesh_to_sdf(mesh: &OperandMesh, clip: &Node, keep_inside: bool, eps: Vec3) -> OperandMesh {
+///
+/// Contract (boundary-highlight overlays depend on it):
+/// - the kept side is `value <= 0` (`keep_inside`) or `value >= 0`; the exact
+///   zero set belongs to both sides;
+/// - crossing-edge vertices are Hermite-root-found onto the clip's zero set
+///   (`eps` is the gradient finite-difference step);
+/// - output is deterministic in its inputs — the same mesh and clip with
+///   opposite `keep_inside` produce bitwise-identical seam vertices, which is
+///   what makes complementary inside/outside previews crack-free.
+pub fn clip_mesh_to_sdf(
+    mesh: &OperandMesh,
+    clip: &Node,
+    keep_inside: bool,
+    eps: Vec3,
+) -> OperandMesh {
     let sv = clip.eval(&mesh.vertices);
     let keep: Vec<bool> = sv
         .iter()
@@ -236,7 +250,11 @@ fn seed_operand_mesh(node: &Node, mesh: OperandMesh) -> OperandMesh {
 }
 
 /// Refine mesh edges that are long AND near the `clip` cut (crack-free).
-fn tessellate_for_clip(
+///
+/// Only edges longer than `target_edge` and within `2·target_edge` of the
+/// clip zero set are split, so cost is proportional to seam length; passes
+/// are bounded by `max_passes`.
+pub fn tessellate_for_clip(
     mesh: OperandMesh,
     clip: &Node,
     target_edge: f64,
