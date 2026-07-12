@@ -12,7 +12,6 @@
   "domains": {
     "von_karman_fluid": {
       "root": "von_karman_fluid",
-      "selectors": [],
       "tags": [
         "inlet",
         "outlet"

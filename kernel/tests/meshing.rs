@@ -8,14 +8,14 @@ use caso_kernel::scene::{SceneDocument, ScenePayload};
 use caso_kernel::serialization::save_scene_to_string;
 use caso_kernel::vec3::vec3;
 
-fn root_scene_json() -> String {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../scene.json");
-    std::fs::read_to_string(path).expect("repo-root scene.json")
+fn default_scene_json() -> String {
+    let document = SceneDocument::default_scene().expect("default scene");
+    save_scene_to_string(&document).expect("save default scene")
 }
 
 #[test]
 fn load_meshable_domains_from_scene_json() {
-    let domains = load_meshable_domains_from_str(&root_scene_json()).expect("domains");
+    let domains = load_meshable_domains_from_str(&default_scene_json()).expect("domains");
 
     assert_eq!(domains.len(), 1);
     let domain = domains.get("von_karman_fluid").expect("by name");
@@ -26,12 +26,15 @@ fn load_meshable_domains_from_scene_json() {
         vec!["von_karman_fluid".to_string(), "fluid".to_string()]
     );
     assert_eq!(domain.dimension, 3);
-    assert_eq!(domain.boundary_tags.len(), 2);
+    // inlet + outlet are direction-only regions: addressable as regions,
+    // with no cut-chain tag fields.
+    assert_eq!(domain.boundary_regions.len(), 2);
+    assert!(domain.boundary_tags.is_empty());
 
     let values = domain.domain_sdf(&[
-        vec3(0.0, 0.0, 0.0),
-        vec3(1.4, 0.0, 0.0),
-        vec3(4.0, 4.0, 4.0),
+        vec3(1.8, 0.0, 0.5),
+        vec3(0.5, 0.0, 0.5),
+        vec3(6.0, 4.0, 4.0),
     ]);
     assert!(values[0] > 0.0, "cylinder obstacle is carved out of the fluid");
     assert!(values[1] < 0.0);

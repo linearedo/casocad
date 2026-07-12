@@ -29,7 +29,6 @@ use crate::vec3::{vec3, Vec3};
 pub type ObjectId = u32;
 
 pub const MAX_OBJECT_ID: ObjectId = 65_535;
-pub const INTERNAL_BOUNDARY_SELECTOR_PREFIX: &str = "__boundary_selector_";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperatorKind {
@@ -170,7 +169,6 @@ pub enum TagRef {
 pub struct FluidDomainRecord {
     pub root: ObjectId,
     pub tags: Vec<TagRef>,
-    pub selectors: Vec<ObjectId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -237,7 +235,6 @@ impl SceneDocument {
         document.fluid_domain = Some(FluidDomainRecord {
             root,
             tags: vec![TagRef::Region(inlet_id), TagRef::Region(outlet_id)],
-            selectors: Vec::new(),
         });
         document.domain_kinds.insert(root, DomainKind::Fluid);
         Ok(document)
@@ -316,10 +313,6 @@ impl SceneDocument {
         self.objects
             .get_mut(&id)
             .ok_or_else(|| GeometryError::new(format!("unknown scene object {id}")))
-    }
-
-    pub fn is_internal_scene_node(name: &str) -> bool {
-        name.starts_with(INTERNAL_BOUNDARY_SELECTOR_PREFIX)
     }
 
     /// (id, parent id) pairs: roots depth-first with DAG dedupe, then regions
@@ -875,10 +868,6 @@ impl SceneDocument {
             self.fluid_domain = Some(FluidDomainRecord {
                 root: id,
                 tags: previous.as_ref().map(|fluid| fluid.tags.clone()).unwrap_or_default(),
-                selectors: previous
-                    .as_ref()
-                    .map(|fluid| fluid.selectors.clone())
-                    .unwrap_or_default(),
             });
         }
         self.mark_changed();
@@ -1283,16 +1272,10 @@ impl SceneDocument {
                         TagRef::Node(id) => live.contains(id),
                     })
                     .collect();
-                let selectors = fluid
-                    .selectors
-                    .into_iter()
-                    .filter(|id| live.contains(id))
-                    .collect();
                 self.domain_kinds.insert(fluid.root, DomainKind::Fluid);
                 self.fluid_domain = Some(FluidDomainRecord {
                     root: fluid.root,
                     tags,
-                    selectors,
                 });
             }
         }
@@ -1740,20 +1723,7 @@ impl SceneDocument {
             .ok_or_else(|| {
                 GeometryError::new("base boundary region is not part of this document")
             })?;
-        if base.selector_start.is_some() {
-            return Err(GeometryError::new(
-                "interval-selector regions cannot be split; recreate them with the boundary cutter",
-            ));
-        }
-        let mut base_cuts = base.cuts.clone();
-        if base.selector_id.is_some() {
-            let legacy = self.legacy_selector_cut(&base)?.ok_or_else(|| {
-                GeometryError::new(
-                    "this region references a selector that is no longer available",
-                )
-            })?;
-            base_cuts.insert(0, legacy);
-        }
+        let base_cuts = base.cuts.clone();
         let root = self.build_node(fluid.root)?;
         let cut_index = base_cuts.len() + 1;
         let mut children = Vec::new();
@@ -1814,36 +1784,6 @@ impl SceneDocument {
         }
         self.mark_changed();
         Ok(child_ids)
-    }
-
-    /// Convert a legacy single-selector reference into a cut-chain entry
-    /// (Python `_legacy_selector_cut`).
-    fn legacy_selector_cut(&self, region: &BoundaryRegion) -> GeometryResult<Option<BoundaryCut>> {
-        let Some(selector_id) = region.selector_id.as_deref() else {
-            return Ok(None);
-        };
-        let Some(id_text) = selector_id.strip_prefix("selector:") else {
-            return Ok(None);
-        };
-        let Ok(selector_object_id) = id_text.parse::<ObjectId>() else {
-            return Ok(None);
-        };
-        let Some(fluid) = &self.fluid_domain else {
-            return Ok(None);
-        };
-        if !fluid.selectors.contains(&selector_object_id)
-            && self.object(selector_object_id).is_err()
-        {
-            return Ok(None);
-        }
-        let Ok(mut knife) = self.build_node(selector_object_id) else {
-            return Ok(None);
-        };
-        knife.object_id = 0;
-        Ok(Some(BoundaryCut {
-            side: region.selector_side,
-            ghost: knife,
-        }))
     }
 
     /// Copy a subtree from another document into this one with fresh ids,

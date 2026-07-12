@@ -115,8 +115,8 @@ Port of `core/`. Modules:
   cut; a smooth on-surface polyline knife was removed 2026-07-12 as unproven
   — see `design_docs/boundary_cutter_exactness.md` for the archived record).
 - `serialization.rs` — scene.json v1 read/write, including boundary-region
-  records, ghost knives (leaf shapes plus the recursive `extrude` composite
-  record for one-sided stencils), and legacy selector→cut-chain migration.
+  records and ghost knives (leaf shapes plus the recursive `extrude` composite
+  record for one-sided stencils).
 - `meshing.rs` — the `MeshableDomain` / `MeshableBoundaryRegion` API loaded
   from a saved scene (the FEA/CFD-facing view of the document).
 
@@ -208,9 +208,8 @@ casoCAD `.venv`) and replayed by Rust tests:
 - `tools/export_goldens.py` → `kernel/tests/parity.rs`: **52 fixtures /
   ~11.5k sampled SDF values, ≤1e-12 relative tolerance** against
   `to_numpy()`.
-- `tools/export_scene_goldens.py` → `kernel/tests/roundtrip.rs`: Rust resave
-  of scene.json equals Python resave (JSON Value equality); save/load/save is
-  a fixed point; Python loads Rust-saved files and resaves them identically.
+- `kernel/tests/roundtrip.rs`: the default-scene resave matches its golden
+  (JSON Value equality); save/load/save is a fixed point.
 - `tools/export_surface_goldens.py` → `surfaces/tests/surface_parity.rs`:
   **44 golden metric rows** (status / vertex / triangle / wire counts + max
   surface error, at res 12 and 96) match Python exactly.

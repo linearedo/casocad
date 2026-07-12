@@ -1,10 +1,6 @@
-//! Scene.json round-trip goldens.
-//!
-//! The legacy fixtures (`scene_python_resave.json`, from
-//! `tools/export_scene_goldens.py` archived at the `python-final` tag) pin the
-//! legacy boundary-selector migration; `default_scene_resave.json` pins the
-//! Rust saver's output for the built-in default scene. The loader/saver must
-//! produce semantically identical JSON (same records — key order free).
+//! Scene.json round-trip goldens: `default_scene_resave.json` pins the saver's
+//! output for the built-in default scene (same records — key order free), and
+//! save/load/save must be a fixed point.
 
 use caso_kernel::scene::{ScenePayload, SceneDocument, TagRef};
 use caso_kernel::serialization::{load_scene_from_str, save_scene_to_string, scene_to_value};
@@ -22,19 +18,6 @@ fn load_json(path: &str) -> Value {
 }
 
 #[test]
-fn legacy_scene_resave_matches_python() {
-    let source = std::fs::read_to_string(manifest_path("../scene.json"))
-        .expect("repo-root scene.json fixture");
-    let document = load_scene_from_str(&source).expect("load legacy scene");
-    let resaved = scene_to_value(&document).expect("save scene");
-    let golden = load_json(&manifest_path("tests/goldens/scene_python_resave.json"));
-    assert_eq!(
-        resaved, golden,
-        "Rust resave differs from Python resave of scene.json"
-    );
-}
-
-#[test]
 fn default_scene_save_matches_golden() {
     let document = SceneDocument::default_scene().expect("default scene");
     let saved = scene_to_value(&document).expect("save default scene");
@@ -44,9 +27,7 @@ fn default_scene_save_matches_golden() {
 
 #[test]
 fn save_load_save_is_idempotent() {
-    let source = std::fs::read_to_string(manifest_path("../scene.json"))
-        .expect("repo-root scene.json fixture");
-    let document = load_scene_from_str(&source).expect("load");
+    let document = SceneDocument::default_scene().expect("default scene");
     let first = save_scene_to_string(&document).expect("first save");
     let reloaded = load_scene_from_str(&first).expect("reload own output");
     let second = save_scene_to_string(&reloaded).expect("second save");
@@ -55,45 +36,20 @@ fn save_load_save_is_idempotent() {
 
 #[test]
 fn loaded_scene_evaluates_like_the_kernel() {
-    let source = std::fs::read_to_string(manifest_path("../scene.json"))
-        .expect("repo-root scene.json fixture");
+    let source =
+        save_scene_to_string(&SceneDocument::default_scene().expect("default scene"))
+            .expect("save default scene");
     let document = load_scene_from_str(&source).expect("load");
     let root_id = document.roots[0];
     let root = document.build_node(root_id).expect("build root node");
     assert_eq!(root.kind(), "difference");
-    // von Kármán: box(3.2, 1.4, 0.9) minus cylinder(r 0.24, h 1.1) at origin.
-    // At the origin we are inside the cylinder -> outside the difference.
-    assert!(root.eval_point(vec3(0.0, 0.0, 0.0)) > 0.0);
-    // Near the box corner interior, far from the cylinder -> inside.
-    assert!(root.eval_point(vec3(1.2, 0.5, 0.0)) < 0.0);
+    // von Kármán: channel x ∈ [0, 4.5] minus Y-axis cylinder at (1.8, 0, 0.5).
+    // On the cylinder axis we are inside the obstacle -> outside the fluid.
+    assert!(root.eval_point(vec3(1.8, 0.0, 0.5)) > 0.0);
+    // Upstream of the obstacle, inside the channel -> inside.
+    assert!(root.eval_point(vec3(0.5, 0.0, 0.5)) < 0.0);
     // Outside the box -> positive.
-    assert!(root.eval_point(vec3(5.0, 0.0, 0.0)) > 0.0);
-}
-
-#[test]
-fn legacy_selector_migrates_into_cut_chain() {
-    let source = std::fs::read_to_string(manifest_path("../scene.json"))
-        .expect("repo-root scene.json fixture");
-    let document = load_scene_from_str(&source).expect("load");
-    // The two split regions carry the migrated ghost as their first cut.
-    let with_cuts: Vec<_> = document
-        .boundary_regions
-        .iter()
-        .filter(|region| !region.cuts.is_empty())
-        .collect();
-    assert_eq!(with_cuts.len(), 2);
-    for region in with_cuts {
-        assert_eq!(region.cuts[0].ghost.kind(), "placed_sdf_2d");
-        assert_eq!(region.cuts[0].ghost.object_id, 0);
-        assert!(region.selector_id.is_none(), "volume selector must migrate");
-    }
-    // The hidden selector node is dropped from the scene graph.
-    assert!(document
-        .live_ids()
-        .iter()
-        .all(|id| !SceneDocument::is_internal_scene_node(
-            &document.object(*id).expect("live object").name
-        )));
+    assert!(root.eval_point(vec3(5.0, 0.0, 0.5)) > 0.0);
 }
 
 #[test]

@@ -488,16 +488,11 @@ impl ViewportPanel {
             return;
         };
         self.pending_tiers.remove(0);
-        // Visible top-level components (never internal selector nodes).
+        // Visible top-level components.
         let mut components = Vec::new();
         for root in &document.roots {
-            if let Ok(object) = document.object(*root) {
-                if SceneDocument::is_internal_scene_node(&object.name) {
-                    continue;
-                }
-                if let Ok(node) = document.build_node(*root) {
-                    components.push(node);
-                }
+            if let Ok(node) = document.build_node(*root) {
+                components.push(node);
             }
         }
         let cache = self

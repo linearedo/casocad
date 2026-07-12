@@ -8,7 +8,7 @@
 
 use crate::boundary::{BoundaryRegion, CutSide};
 use crate::boundary_ops::{
-    boundary_region_mask, cut_volume, find_node_by_object_id, surface_selector_volume,
+    boundary_region_mask, cut_volume, find_node_by_object_id,
 };
 use crate::error::{GeometryError, GeometryResult};
 use crate::model::{compile_model, Model};
@@ -224,26 +224,6 @@ fn cut_chain_field(root: &Node, region: &BoundaryRegion) -> GeometryResult<Optio
     Ok(Some(SelectorField { parts }))
 }
 
-/// Legacy single-selector field (`_boundary_region_callable`).
-fn legacy_selector_field(
-    document: &SceneDocument,
-    root: &Node,
-    region: &BoundaryRegion,
-) -> Option<SelectorField> {
-    let selector_id = region.selector_id.as_deref()?.strip_prefix("selector:")?;
-    let selector_object_id: u32 = selector_id.parse().ok()?;
-    let selector = document.build_node(selector_object_id).ok()?;
-    let volume = surface_selector_volume(root, &selector).ok()??;
-    let sign = if region.selector_side == CutSide::Outside {
-        -1.0
-    } else {
-        1.0
-    };
-    Some(SelectorField {
-        parts: vec![(sign, volume)],
-    })
-}
-
 fn fluid_boundary_entries(
     document: &SceneDocument,
     root: &Node,
@@ -266,10 +246,7 @@ fn fluid_boundary_entries(
                 let Some(owner) = find_node_by_object_id(root, region.owner_object_id) else {
                     continue;
                 };
-                let selector = cut_chain_field(root, region)
-                    .ok()
-                    .flatten()
-                    .or_else(|| legacy_selector_field(document, root, region));
+                let selector = cut_chain_field(root, region).ok().flatten();
                 if let Some(field) = &selector {
                     tags.push(MeshableBoundaryTag {
                         name: region.name.clone(),

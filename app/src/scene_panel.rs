@@ -3,7 +3,7 @@
 //! actions — the port of the Qt Scene dock's tree.
 
 use caso_kernel::roles::DomainKind;
-use caso_kernel::scene::{ObjectId, SceneDocument, ScenePayload, TagRef};
+use caso_kernel::scene::{ObjectId, ScenePayload, TagRef};
 use eframe::egui;
 
 use crate::state::AppState;
@@ -55,13 +55,7 @@ impl ScenePanel {
                     .roots
                     .iter()
                     .copied()
-                    .filter(|id| {
-                        state
-                            .document
-                            .object(*id)
-                            .map(|object| !SceneDocument::is_internal_scene_node(&object.name))
-                            .unwrap_or(false)
-                    })
+                    .filter(|id| state.document.object(*id).is_ok())
                     .collect();
                 for root in roots {
                     self.node_ui(ui, state, root, true);

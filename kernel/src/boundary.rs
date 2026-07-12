@@ -44,9 +44,7 @@ pub struct BoundaryCut {
 ///
 /// Identity = owner surface (provenance) + optional analytic patch scope +
 /// the ordered chain of cuts that carved it. `tag` is an opaque physics label
-/// the kernel never interprets. The `selector_*`/`outside_direction` fields
-/// are the legacy single-selector schema, kept readable until every
-/// creation/load path emits cut chains.
+/// the kernel never interprets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundaryRegion {
     pub name: String,
@@ -55,11 +53,6 @@ pub struct BoundaryRegion {
     pub outside_direction: Option<u8>,
     pub patch_id: Option<String>,
     pub patch_type: Option<String>,
-    pub selector_id: Option<String>,
-    pub selector_type: Option<String>,
-    pub selector_side: CutSide,
-    pub selector_start: Option<f64>,
-    pub selector_end: Option<f64>,
     pub cuts: Vec<BoundaryCut>,
     pub tag: Option<String>,
 }
@@ -73,11 +66,6 @@ impl BoundaryRegion {
             outside_direction: None,
             patch_id: None,
             patch_type: None,
-            selector_id: None,
-            selector_type: None,
-            selector_side: CutSide::Inside,
-            selector_start: None,
-            selector_end: None,
             cuts: Vec::new(),
             tag: None,
         }
@@ -90,11 +78,6 @@ impl BoundaryRegion {
                     "outside_direction must be in the range 0..5",
                 ));
             }
-        }
-        if self.selector_start.is_some() != self.selector_end.is_some() {
-            return Err(GeometryError::new(
-                "selector_start and selector_end must be set together",
-            ));
         }
         Ok(())
     }

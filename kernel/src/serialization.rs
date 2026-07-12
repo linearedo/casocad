@@ -1,10 +1,8 @@
 //! Versioned scene.json read/write, ported from `core/serialization.py`.
 //!
 //! The format is `{"format": "casocad", "version": 1, "unit": "m", ...}` with
-//! name-keyed object records referencing each other by key. Loading migrates
-//! the legacy boundary-selector schema (volume selectors are inlined into cut
-//! chains; interval selectors keep the legacy fields until 2D parity), and
-//! saving always emits the new self-contained format.
+//! name-keyed object records referencing each other by key. Boundary regions
+//! carry their knives inline as cut chains; there are no selector nodes.
 
 use std::collections::BTreeMap;
 
@@ -957,25 +955,6 @@ fn region_to_json(
     if let Some(tag) = &region.tag {
         record.insert("tag".into(), tag.clone().into());
     }
-    // Interval selectors (2D curve params) remain in the legacy fields until
-    // 2D parity; volume selectors were already migrated into cuts at load.
-    if let (Some(selector_id), Some(start)) = (&region.selector_id, region.selector_start) {
-        record.insert(
-            "selector".into(),
-            selector_key(selector_id, names)?.into(),
-        );
-        if let Some(selector_type) = &region.selector_type {
-            record.insert("selector_type".into(), selector_type.clone().into());
-        }
-        if region.selector_side != CutSide::Inside {
-            record.insert("selector_side".into(), region.selector_side.as_str().into());
-        }
-        record.insert("selector_start".into(), json!(start));
-        record.insert(
-            "selector_end".into(),
-            json!(region.selector_end.unwrap_or(start)),
-        );
-    }
     if !region.cuts.is_empty() {
         let cuts: GeometryResult<Vec<Value>> = region
             .cuts
@@ -992,22 +971,7 @@ fn region_to_json(
     Ok(Value::Object(record))
 }
 
-fn selector_key(selector_id: &str, names: &SaveNames) -> GeometryResult<String> {
-    let Some(rest) = selector_id.strip_prefix("selector:") else {
-        return Ok(selector_id.to_string());
-    };
-    let object_id: ObjectId = rest
-        .parse()
-        .map_err(|_| err(format!("invalid selector id: {selector_id}")))?;
-    names
-        .node_keys
-        .get(&object_id)
-        .cloned()
-        .ok_or_else(|| err(format!("unknown selector object id: {object_id}")))
-}
-
-/// Serialize the document to the scene.json v1 `Value` (semantically equal to
-/// the Python writer's output).
+/// Serialize the document to the scene.json v1 `Value`.
 pub fn scene_to_value(document: &SceneDocument) -> GeometryResult<Value> {
     let names = scene_names(document);
     let mut payload = Map::new();
@@ -1076,18 +1040,6 @@ pub fn scene_to_value(document: &SceneDocument) -> GeometryResult<Value> {
                     })
                     .collect();
                 record.insert("tags".into(), Value::Array(tags?));
-                let selectors: GeometryResult<Vec<Value>> = fluid
-                    .selectors
-                    .iter()
-                    .map(|id| {
-                        names
-                            .node_keys
-                            .get(id)
-                            .map(|key| Value::String(key.clone()))
-                            .ok_or_else(|| err(format!("unknown selector {id}")))
-                    })
-                    .collect();
-                record.insert("selectors".into(), Value::Array(selectors?));
             }
         }
         domains.insert(root_key.clone(), Value::Object(record));
@@ -1248,8 +1200,7 @@ impl<'a> Loader<'a> {
     }
 }
 
-/// Load a scene.json v1 payload, migrating the legacy boundary-selector
-/// schema exactly like the Python loader.
+/// Load a scene.json v1 payload.
 pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
     let payload: Value = serde_json::from_str(text)
         .map_err(|error| err(format!("invalid scene JSON: {error}")))?;
@@ -1292,7 +1243,7 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
     }
     loader.document.roots = roots;
 
-    // Boundary regions (with legacy selector migration).
+    // Boundary regions.
     let mut regions_by_name: BTreeMap<String, usize> = BTreeMap::new();
     if let Some(raw_regions) = payload.get("boundary_regions") {
         let raw_regions = raw_regions
@@ -1360,28 +1311,14 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
                     }
                 }
             }
-            let mut selectors = Vec::new();
-            if let Some(Value::Array(raw_selectors)) = record.get("selectors") {
-                for selector_name in raw_selectors {
-                    let key = selector_name
-                        .as_str()
-                        .ok_or_else(|| err("fluid selectors must be names"))?;
-                    selectors.push(loader.build(key)?);
-                }
-            }
             if loader.document.fluid_domain.is_none() {
-                loader.document.fluid_domain = Some(FluidDomainRecord {
-                    root,
-                    tags,
-                    selectors,
-                });
+                loader.document.fluid_domain = Some(FluidDomainRecord { root, tags });
             }
         }
     }
 
     let mut document = loader.document;
     document.bump_next_object_id(loader.next_object_id.saturating_sub(1));
-    drop_orphaned_internal_selectors(&mut document);
     Ok(document)
 }
 
@@ -1396,25 +1333,6 @@ fn region_from_record(
         .to_string();
     let owner = loader.build(&owner_name)?;
     let mut cuts = Vec::new();
-    let mut selector_id = None;
-    let is_interval = record
-        .get("selector_start")
-        .is_some_and(|value| !value.is_null());
-    if let Some(selector_name) = get_str(record, "selector") {
-        let selector_name = selector_name.to_string();
-        let selector = loader.build(&selector_name)?;
-        if is_interval {
-            // 2D interval selectors stay legacy until 2D parity (v2 §9).
-            selector_id = Some(format!("selector:{selector}"));
-        } else {
-            // One-way migration: a legacy volume selector becomes the first
-            // entry of the cut chain; the hidden node is dropped afterwards.
-            let mut knife = loader.document.build_node(selector)?;
-            knife.object_id = 0;
-            let side = CutSide::parse(get_str(record, "selector_side").unwrap_or("inside"))?;
-            cuts.push(BoundaryCut { side, ghost: knife });
-        }
-    }
     if let Some(raw_cuts) = record.get("cuts") {
         let raw_cuts = raw_cuts
             .as_array()
@@ -1444,60 +1362,9 @@ fn region_from_record(
             .map(|value| value as u8),
         patch_id: get_str(record, "patch").map(str::to_string),
         patch_type: get_str(record, "patch_type").map(str::to_string),
-        selector_id,
-        selector_type: if is_interval {
-            get_str(record, "selector_type").map(str::to_string)
-        } else {
-            None
-        },
-        selector_side: CutSide::parse(get_str(record, "selector_side").unwrap_or("inside"))?,
-        selector_start: match record.get("selector_start") {
-            Some(Value::Null) | None => None,
-            Some(value) => Some(parse_f64(value)?),
-        },
-        selector_end: match record.get("selector_end") {
-            Some(Value::Null) | None => None,
-            Some(value) => Some(parse_f64(value)?),
-        },
         cuts,
         tag: get_str(record, "tag").map(str::to_string),
     };
     region.validate()?;
     Ok(region)
-}
-
-/// Remove hidden `__boundary_selector_*` nodes once no region references
-/// them (Python `_drop_orphaned_internal_selectors`).
-fn drop_orphaned_internal_selectors(document: &mut SceneDocument) {
-    let mut referenced: Vec<ObjectId> = Vec::new();
-    for region in &document.boundary_regions {
-        if let Some(selector_id) = &region.selector_id {
-            if let Some(rest) = selector_id.strip_prefix("selector:") {
-                if let Ok(id) = rest.parse::<ObjectId>() {
-                    referenced.push(id);
-                }
-            }
-        }
-    }
-    let doomed: Vec<ObjectId> = document
-        .roots
-        .iter()
-        .copied()
-        .filter(|id| {
-            document
-                .object(*id)
-                .map(|object| {
-                    SceneDocument::is_internal_scene_node(&object.name)
-                        && !referenced.contains(id)
-                })
-                .unwrap_or(false)
-        })
-        .collect();
-    document.roots.retain(|id| !doomed.contains(id));
-    if let Some(fluid) = document.fluid_domain.as_mut() {
-        fluid
-            .selectors
-            .retain(|id| referenced.contains(id) || !doomed.contains(id));
-    }
-    document.refresh_fluid_domain();
 }
