@@ -61,6 +61,64 @@ const DISJOINTNESS_RESOLUTION: usize = 32;
 const WORDMARK_HEIGHT_POINTS: f32 = 22.0;
 const WORDMARK_ASPECT: f32 = 1572.0 / 216.0;
 
+/// Menu icon edge, in points.
+const SDF_ICON_SIZE_POINTS: f32 = 16.0;
+
+/// The `sdf_<kind>.svg` icon for an SDF kind — the same icon set the Python
+/// app shows in its Add/Draw menus (`include_image!` needs literal paths,
+/// hence the match).
+fn sdf_icon(kind: &str) -> Option<egui::ImageSource<'static>> {
+    Some(match kind {
+        "segment" => egui::include_image!("../assets/icons/sdf_segment.svg"),
+        "polyline" => egui::include_image!("../assets/icons/sdf_polyline.svg"),
+        "quadratic_bezier_curve" => {
+            egui::include_image!("../assets/icons/sdf_quadratic_bezier_curve.svg")
+        }
+        "quadratic_bezier_polycurve" => {
+            egui::include_image!("../assets/icons/sdf_quadratic_bezier_polycurve.svg")
+        }
+        "circle" => egui::include_image!("../assets/icons/sdf_circle.svg"),
+        "rectangle" => egui::include_image!("../assets/icons/sdf_rectangle.svg"),
+        "square" => egui::include_image!("../assets/icons/sdf_square.svg"),
+        "rounded_rectangle" => {
+            egui::include_image!("../assets/icons/sdf_rounded_rectangle.svg")
+        }
+        "ellipse" => egui::include_image!("../assets/icons/sdf_ellipse.svg"),
+        "regular_polygon" => egui::include_image!("../assets/icons/sdf_regular_polygon.svg"),
+        "polygon" => egui::include_image!("../assets/icons/sdf_polygon.svg"),
+        "quadratic_bezier_surface" => {
+            egui::include_image!("../assets/icons/sdf_quadratic_bezier_surface.svg")
+        }
+        "sphere" => egui::include_image!("../assets/icons/sdf_sphere.svg"),
+        "box" => egui::include_image!("../assets/icons/sdf_box.svg"),
+        "box_frame" => egui::include_image!("../assets/icons/sdf_box_frame.svg"),
+        "cylinder" => egui::include_image!("../assets/icons/sdf_cylinder.svg"),
+        "capped_cone" => egui::include_image!("../assets/icons/sdf_capped_cone.svg"),
+        "cone" => egui::include_image!("../assets/icons/sdf_cone.svg"),
+        "pyramid" => egui::include_image!("../assets/icons/sdf_pyramid.svg"),
+        "torus" => egui::include_image!("../assets/icons/sdf_torus.svg"),
+        "polyline_tube" => egui::include_image!("../assets/icons/sdf_polyline_tube.svg"),
+        "quadratic_bezier_tube" => {
+            egui::include_image!("../assets/icons/sdf_quadratic_bezier_tube.svg")
+        }
+        _ => return None,
+    })
+}
+
+/// Menu entry with the kind's SVG icon before the label (plain button when
+/// no icon exists) — the egui counterpart of the Python `QAction(sdf_icon(
+/// kind), label)` menus.
+fn sdf_menu_button(ui: &mut egui::Ui, label: &str, kind: &str) -> egui::Response {
+    match sdf_icon(kind) {
+        Some(source) => ui.add(egui::Button::image_and_text(
+            egui::Image::new(source)
+                .fit_to_exact_size(egui::vec2(SDF_ICON_SIZE_POINTS, SDF_ICON_SIZE_POINTS)),
+            label,
+        )),
+        None => ui.button(label),
+    }
+}
+
 /// Browser entry point: attaches the app to the `casowasm_canvas` element.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
@@ -170,7 +228,7 @@ impl CasoApp {
 
             ui.menu_button("Add", |ui| {
                 for (label, kind) in PRIMITIVE_KINDS {
-                    if ui.button(label).clicked() {
+                    if sdf_menu_button(ui, label, kind).clicked() {
                         self.state.push_undo();
                         let scale = self.state.unit.factor;
                         let result = self.state.document.add_primitive(kind, scale);
@@ -184,7 +242,7 @@ impl CasoApp {
             ui.menu_button("Draw", |ui| {
                 ui.label(egui::RichText::new("3D (drag on grid)").weak());
                 for (label, kind) in DRAG_KINDS_3D {
-                    if ui.button(label).clicked() {
+                    if sdf_menu_button(ui, label, kind).clicked() {
                         self.tools
                             .set_tool(ToolKind::CreateDrag(kind), &mut self.state);
                         ui.close();
@@ -193,7 +251,7 @@ impl CasoApp {
                 ui.separator();
                 ui.label(egui::RichText::new("2D sections").weak());
                 for (label, kind) in DRAG_KINDS_2D {
-                    if ui.button(label).clicked() {
+                    if sdf_menu_button(ui, label, kind).clicked() {
                         self.tools
                             .set_tool(ToolKind::CreateDrag(kind), &mut self.state);
                         ui.close();
@@ -202,7 +260,7 @@ impl CasoApp {
                 ui.separator();
                 ui.label(egui::RichText::new("1D").weak());
                 for (label, kind) in DRAG_KINDS_1D {
-                    if ui.button(label).clicked() {
+                    if sdf_menu_button(ui, label, kind).clicked() {
                         self.tools
                             .set_tool(ToolKind::CreateDrag(kind), &mut self.state);
                         ui.close();
@@ -211,7 +269,7 @@ impl CasoApp {
                 ui.separator();
                 ui.label(egui::RichText::new("Point tools (Enter commits)").weak());
                 for (label, kind) in POINT_KINDS {
-                    if ui.button(label).clicked() {
+                    if sdf_menu_button(ui, label, kind).clicked() {
                         self.tools
                             .set_tool(ToolKind::CreatePoints(kind), &mut self.state);
                         ui.close();
@@ -228,7 +286,7 @@ impl CasoApp {
                     ui.weak("Select a boundary region first.");
                 }
                 for (label, kind) in KNIFE_KINDS {
-                    if ui.button(label).clicked() {
+                    if sdf_menu_button(ui, label, kind).clicked() {
                         self.tools
                             .set_tool(ToolKind::BoundaryCutter(kind), &mut self.state);
                         ui.close();
