@@ -5,6 +5,7 @@
 
 mod boundary_tool;
 mod dimensions;
+mod file_menu;
 mod gizmo;
 mod meshing_panel;
 mod properties_panel;
@@ -23,6 +24,7 @@ use caso_kernel::vec3::vec3;
 use eframe::egui;
 
 use dimensions::{parse_dimension_entry, parse_scalar_entry};
+use file_menu::{FileEvent, FileMenu};
 use meshing_panel::MeshingPanel;
 use properties_panel::PropertiesPanel;
 use scene_panel::ScenePanel;
@@ -162,8 +164,7 @@ pub struct CasoApp {
     clipboard: Option<(SceneDocument, Vec<caso_kernel::scene::ObjectId>)>,
     extrude_height_text: String,
     revolve_angle_text: String,
-    #[cfg(not(target_arch = "wasm32"))]
-    scene_path: String,
+    file_menu: FileMenu,
 }
 
 impl CasoApp {
@@ -186,8 +187,7 @@ impl CasoApp {
             clipboard: None,
             extrude_height_text: "1".to_string(),
             revolve_angle_text: "360".to_string(),
-            #[cfg(not(target_arch = "wasm32"))]
-            scene_path: "scene.json".to_string(),
+            file_menu: FileMenu::default(),
         }
     }
 
@@ -224,6 +224,9 @@ impl CasoApp {
                         WORDMARK_HEIGHT_POINTS,
                     )),
             );
+            ui.separator();
+
+            self.show_file_menu(ui);
             ui.separator();
 
             ui.menu_button("Add", |ui| {
@@ -349,13 +352,24 @@ impl CasoApp {
                 self.validate_domains();
             }
             ui.toggle_value(&mut self.show_log, "Log");
-            ui.separator();
-
-            #[cfg(not(target_arch = "wasm32"))]
-            self.file_controls(ui);
-            #[cfg(target_arch = "wasm32")]
-            self.file_controls_web(ui);
         });
+    }
+
+    /// The File menu, plus applying whatever it produced: a status message,
+    /// or a freshly loaded scene replacing the current document (undoable).
+    fn show_file_menu(&mut self, ui: &mut egui::Ui) {
+        match self.file_menu.ui(ui, &self.state.document) {
+            Some(FileEvent::Loaded { name, document }) => {
+                self.state.push_undo();
+                self.state.document = document;
+                self.state.document.mark_changed();
+                self.state.retain_live_selection();
+                self.viewport.request_frame_all();
+                self.state.status = format!("Loaded {name}");
+            }
+            Some(FileEvent::Status(status)) => self.state.status = status,
+            None => {}
+        }
     }
 
     /// Extrude / Revolve from a selected placed 2D section.
@@ -489,62 +503,6 @@ impl CasoApp {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn file_controls(&mut self, ui: &mut egui::Ui) {
-        ui.add(
-            egui::TextEdit::singleline(&mut self.scene_path)
-                .desired_width(160.0)
-                .hint_text("scene.json"),
-        );
-        if ui.button("Save").clicked() {
-            match caso_kernel::serialization::save_scene_to_string(&self.state.document)
-                .map_err(|error| error.to_string())
-                .and_then(|text| {
-                    std::fs::write(&self.scene_path, text).map_err(|error| error.to_string())
-                }) {
-                Ok(()) => self.state.status = format!("Saved {}", self.scene_path),
-                Err(error) => self.state.status = error,
-            }
-        }
-        if ui.button("Load").clicked() {
-            match std::fs::read_to_string(&self.scene_path)
-                .map_err(|error| error.to_string())
-                .and_then(|text| {
-                    caso_kernel::serialization::load_scene_from_str(&text)
-                        .map_err(|error| error.to_string())
-                }) {
-                Ok(document) => {
-                    self.state.push_undo();
-                    self.state.document = document;
-                    self.state.document.mark_changed();
-                    self.state.retain_live_selection();
-                    self.viewport.request_frame_all();
-                    self.state.status = format!("Loaded {}", self.scene_path);
-                }
-                Err(error) => self.state.status = error,
-            }
-        }
-        ui.separator();
-    }
-
-    /// Web save/load: download the scene.json / open a picked file.
-    #[cfg(target_arch = "wasm32")]
-    fn file_controls_web(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Save").clicked() {
-            match caso_kernel::serialization::save_scene_to_string(&self.state.document) {
-                Ok(text) => {
-                    if let Err(error) = web_download("scene.json", &text) {
-                        self.state.status = format!("Download failed: {error:?}");
-                    } else {
-                        self.state.status = "Downloaded scene.json".to_string();
-                    }
-                }
-                Err(error) => self.state.status = error.to_string(),
-            }
-        }
-        ui.separator();
-    }
-
     fn shortcuts(&mut self, ui: &egui::Ui) {
         // Skip document shortcuts while a text field owns the keyboard or a
         // create tool is collecting typed dimensions/points.
@@ -646,23 +604,6 @@ pub(crate) fn web_download_bytes(
     anchor.set_download(filename);
     anchor.click();
     let _ = web_sys::Url::revoke_object_url(&url);
-    Ok(())
-}
-
-/// Trigger a browser download of `contents` as `filename`.
-#[cfg(target_arch = "wasm32")]
-fn web_download(filename: &str, contents: &str) -> Result<(), wasm_bindgen::JsValue> {
-    use eframe::wasm_bindgen::JsCast;
-    let document = web_sys::window()
-        .ok_or("no window")?
-        .document()
-        .ok_or("no document")?;
-    let anchor: web_sys::HtmlAnchorElement =
-        document.create_element("a")?.dyn_into()?;
-    let encoded = js_sys::encode_uri_component(contents);
-    anchor.set_href(&format!("data:application/json;charset=utf-8,{encoded}"));
-    anchor.set_download(filename);
-    anchor.click();
     Ok(())
 }
 

@@ -16,6 +16,7 @@ caso-meshing = { path = "../meshing" }
 rhai = "1"
 serde_json = "1"
 eframe = { version = "0.35.0", features = ["wgpu"] }
+rfd = "0.15"
 egui_dock = "0.20.1"
 egui_extras = { version = "0.35.0", default-features = false, features = ["svg"] }
 
