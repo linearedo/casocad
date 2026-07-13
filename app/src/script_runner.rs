@@ -195,25 +195,40 @@ pub fn run_mesher_script(
 }
 
 /// The example script preloaded in the Meshing workspace.
-pub const EXAMPLE_SCRIPT: &str = r#"// casoWASM mesher script (Rhai).
+pub const EXAMPLE_SCRIPT: &str = r#"// casoCAD example 2D slice mesher script (Rhai).
 // `domains` exposes the declared Fluid/Solid Domains;
-// `emit(element_type, vertices, tag_name)` streams mesh elements.
-let fluid = domains.get("fluid");
-let b = fluid.bounds();
-let dx = 0.16;
-let regions = fluid.regions();
-let z = (b[4] + b[5]) / 2.0;
-let x = b[0] + dx/2.0;
-while x < b[1] {
-    let y = b[2] + dx/2.0;
-    while y < b[3] {
-        if fluid.sdf(x, y, z) < 0.0 {
-            emit("point", [[x, y, z]], "fluid_internal");
-        }
-        y += dx;
-    }
-    x += dx;
-}
+// `emit(element_type, vertices, tag_name)`
+//streams mesh elements.
+  let fluid = domains.get("fluid");
+  let b = fluid.bounds();
+  let dx = 0.15;
+  let x = b[0];
+  while x + dx <= b[1] {
+    let y = b[2];
+    while y + dx <= b[3] {
+      // Cell corners on the z=0.5 plane.
+      let p00 = [x,      y,      0.5];
+      let p10 = [x + dx, y,      0.5];
+      let p01 = [x,      y + dx, 0.5];
+      let p11 = [x + dx, y + dx, 0.5];
+        // Emit only if the whole cell is inside the fluid.
+        if fluid.sdf(p00[0], p00[1], 0.5) < 0.0
+           && fluid.sdf(p10[0], p10[1], 0.5) < 0.0
+           && fluid.sdf(p01[0], p01[1], 0.5) < 0.0
+           && fluid.sdf(p11[0], p11[1], 0.5) < 0.0 {
+              emit("triangle",
+                    [p00, p10, p11],
+                    "fluid_internal"
+                    );
+              emit("triangle",
+                    [p00, p11, p01],
+                    "fluid_internal"
+                    );
+          }
+          y += dx;
+      }
+      x += dx;
+  }
 "#;
 
 #[cfg(test)]
@@ -221,19 +236,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn example_script_emits_interior_lattice_points() {
+    fn example_script_emits_interior_slice_triangles() {
         let document = SceneDocument::default_scene().expect("default scene");
         let elements = run_mesher_script(&document, EXAMPLE_SCRIPT).expect("script runs");
         assert!(!elements.is_empty());
-        // Every emitted point is strictly inside the fluid (not in the
-        // cylinder obstacle, not outside the flow box).
+        // Every emitted triangle lies on the z=0.5 slice, strictly inside
+        // the fluid (not in the cylinder obstacle, not outside the box).
         let domains = meshable_domains_from_document(&document).expect("domains");
         let fluid = domains.get("fluid").expect("fluid");
         for element in &elements {
-            assert_eq!(element.element_type, "point");
+            assert_eq!(element.element_type, "triangle");
             assert_eq!(element.tag_name, "fluid_internal");
-            let point = element.vertices[0];
-            assert!(fluid.domain_sdf(&[vec3(point[0], point[1], point[2])])[0] < 0.0);
+            assert_eq!(element.vertices.len(), 3);
+            for point in &element.vertices {
+                assert_eq!(point[2], 0.5);
+                assert!(fluid.domain_sdf(&[vec3(point[0], point[1], point[2])])[0] < 0.0);
+            }
         }
     }
 
