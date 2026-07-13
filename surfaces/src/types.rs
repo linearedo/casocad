@@ -135,6 +135,15 @@ pub fn object_color(object_id: u32) -> [f32; 3] {
     hsv_to_rgb(hue, 0.48, 0.92)
 }
 
+/// Stable color for a mesh-preview tag: same hue hashing as
+/// [`object_color`] but saturated and dark, so mesh wires and markers stand
+/// out against the pastel object surfaces they overlay.
+pub fn mesh_tag_color(tag_id: u32) -> [f32; 3] {
+    let value = (tag_id as u64).wrapping_mul(2_654_435_761) & 0xFFFF_FFFF;
+    let hue = (value % 360) as f64 / 360.0;
+    hsv_to_rgb(hue, 0.95, 0.65)
+}
+
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> [f32; 3] {
     let h = (hue % 1.0) * 6.0;
     let c = value * saturation;

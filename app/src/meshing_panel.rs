@@ -2,8 +2,11 @@
 //! artifact export — the port of casoCAD's Meshing workspace page (with Rhai
 //! replacing the Python subprocess, so it also runs in the browser).
 
+use caso_kernel::meshing::meshable_domains_from_document;
+use caso_kernel::scene::SceneDocument;
+use caso_kernel::vec3::{vec3, Vec3};
 use caso_meshing::{write_mesh_artifact, MeshElement};
-use caso_surfaces::types::object_color;
+use caso_surfaces::types::mesh_tag_color;
 use caso_surfaces::{SurfaceStatus, ViewportSurface, ViewportSurfaceKey};
 use eframe::egui;
 
@@ -16,6 +19,16 @@ pub struct MeshingPanel {
     pub show_preview: bool,
     /// Bumped when `elements` change (viewport rebuilds the preview overlay).
     pub preview_revision: u64,
+    /// Per-element distance to the nearest Domain boundary (min |sdf| over
+    /// the element's vertices, across all declared Domains). Parallel to
+    /// `elements`; computed once per script run.
+    boundary_distances: Vec<f64>,
+    /// Largest value in `boundary_distances` — the boundary-distance
+    /// slider's upper bound.
+    max_boundary_distance: f64,
+    /// Preview only elements within this distance of a boundary (the
+    /// slider); at `max_boundary_distance` the whole mesh shows.
+    boundary_range: f64,
     #[cfg(not(target_arch = "wasm32"))]
     export_path: String,
 }
@@ -27,6 +40,9 @@ impl Default for MeshingPanel {
             elements: Vec::new(),
             show_preview: true,
             preview_revision: 0,
+            boundary_distances: Vec::new(),
+            max_boundary_distance: 0.0,
+            boundary_range: 0.0,
             #[cfg(not(target_arch = "wasm32"))]
             export_path: "mesh.arrow".to_string(),
         }
@@ -41,6 +57,7 @@ impl MeshingPanel {
                     Ok(elements) => {
                         state.status = format!("Mesher script: {} element(s)", elements.len());
                         self.elements = elements;
+                        self.update_boundary_distances(&state.document);
                         self.preview_revision += 1;
                     }
                     Err(error) => state.status = format!("Mesher script error: {error}"),
@@ -54,9 +71,29 @@ impl MeshingPanel {
                 self.preview_revision += 1;
             }
             if !self.elements.is_empty() {
-                ui.weak(format!("{} element(s)", self.elements.len()));
+                let shown = (0..self.elements.len())
+                    .filter(|index| self.is_shown(*index))
+                    .count();
+                if shown == self.elements.len() {
+                    ui.weak(format!("{shown} element(s)"));
+                } else {
+                    ui.weak(format!("{shown}/{} element(s)", self.elements.len()));
+                }
             }
         });
+        if !self.elements.is_empty() && self.max_boundary_distance > 0.0 {
+            let slider = ui
+                .add(
+                    egui::Slider::new(&mut self.boundary_range, 0.0..=self.max_boundary_distance)
+                        .text("Boundary distance"),
+                )
+                .on_hover_text(
+                    "Preview only elements within this distance of a Domain boundary",
+                );
+            if slider.changed() {
+                self.preview_revision += 1;
+            }
+        }
         ui.horizontal(|ui| {
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -87,6 +124,60 @@ impl MeshingPanel {
                         .desired_rows(24),
                 );
             });
+    }
+
+    /// Caches each element's distance to the nearest Domain boundary: the
+    /// domain SDF is a signed distance, so min |sdf| over the element's
+    /// vertices (across all Domains) is that distance. One batched SDF pass
+    /// per Domain here keeps the slider free of per-frame SDF work.
+    fn update_boundary_distances(&mut self, document: &SceneDocument) {
+        self.boundary_distances.clear();
+        self.max_boundary_distance = 0.0;
+        let Ok(domains) = meshable_domains_from_document(document) else {
+            // No compilable Domains: treat everything as on-boundary so the
+            // q filter never hides elements.
+            self.boundary_distances = vec![0.0; self.elements.len()];
+            self.boundary_range = 0.0;
+            return;
+        };
+        let points: Vec<Vec3> = self
+            .elements
+            .iter()
+            .flat_map(|element| element.vertices.iter())
+            .map(|point| vec3(point[0], point[1], point[2]))
+            .collect();
+        let mut nearest = vec![f64::INFINITY; points.len()];
+        for key in domains.keys() {
+            let Ok(domain) = domains.get(&key) else {
+                continue;
+            };
+            for (slot, sdf) in nearest.iter_mut().zip(domain.domain_sdf(&points)) {
+                *slot = slot.min(sdf.abs());
+            }
+        }
+        let mut cursor = 0;
+        for element in &self.elements {
+            let distance = nearest[cursor..cursor + element.vertices.len()]
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min);
+            let distance = if distance.is_finite() { distance } else { 0.0 };
+            self.boundary_distances.push(distance);
+            self.max_boundary_distance = self.max_boundary_distance.max(distance);
+            cursor += element.vertices.len();
+        }
+        // Keep the user's range across reruns; unset or stale values show all.
+        if self.boundary_range <= 0.0 || self.boundary_range > self.max_boundary_distance {
+            self.boundary_range = self.max_boundary_distance;
+        }
+    }
+
+    /// Whether the boundary-distance filter keeps the element visible
+    /// (elements without a cached distance always show).
+    fn is_shown(&self, index: usize) -> bool {
+        self.boundary_distances
+            .get(index)
+            .is_none_or(|distance| *distance <= self.boundary_range)
     }
 
     fn export(&mut self, state: &mut AppState) {
@@ -124,12 +215,12 @@ impl MeshingPanel {
             return Vec::new();
         }
         let mut points = Vec::new();
-        for element in &self.elements {
-            if element.vertices.len() != 1 {
+        for (index, element) in self.elements.iter().enumerate() {
+            if element.vertices.len() != 1 || !self.is_shown(index) {
                 continue;
             }
             let point = element.vertices[0];
-            let color = object_color(tag_color_id(&element.tag_name));
+            let color = mesh_tag_color(tag_color_id(&element.tag_name));
             points.extend([point[0] as f32, point[1] as f32, point[2] as f32]);
             points.extend(color);
         }
@@ -155,11 +246,13 @@ impl MeshingPanel {
             let mut vertices: Vec<[f32; 3]> = Vec::new();
             let mut normals: Vec<[f32; 3]> = Vec::new();
             let mut wire_indices: Vec<u32> = Vec::new();
-            let color = object_color(tag_color_id(tag));
+            let color = mesh_tag_color(tag_color_id(tag));
             for element in self
                 .elements
                 .iter()
-                .filter(|element| element.tag_name == **tag)
+                .enumerate()
+                .filter(|(index, element)| element.tag_name == **tag && self.is_shown(*index))
+                .map(|(_, element)| element)
             {
                 let base = vertices.len() as u32;
                 match element.vertices.len() {

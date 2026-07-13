@@ -9,11 +9,11 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 860.0])
-            .with_title("casoWASM - Programmable SDF CAD"),
+            .with_title("casoCAD"),
         ..Default::default()
     };
     eframe::run_native(
-        "casoWASM",
+        "casoCAD",
         options,
         Box::new(|creation_context| Ok(Box::new(caso_app::CasoApp::new(creation_context)))),
     )
