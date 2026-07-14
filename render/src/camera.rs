@@ -9,7 +9,6 @@ use caso_kernel::vec3::{vec3, Vec3};
 /// The familiar startup framing: 6 m away from a 1 m grid.
 pub const DEFAULT_VIEW_DISTANCE: f64 = 6.0;
 const WORLD_UP: Vec3 = vec3(0.0, 0.0, 1.0);
-const FALLBACK_UP: Vec3 = vec3(0.0, 1.0, 0.0);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OrbitCamera {
@@ -58,12 +57,10 @@ impl OrbitCamera {
         let position = self.position();
         let mut forward = self.target - position;
         forward = forward / forward.length().max(1.0e-9);
-        let world_up = if forward.dot(WORLD_UP).abs() > 0.99 {
-            FALLBACK_UP
-        } else {
-            WORLD_UP
-        };
-        let mut right = forward.cross(world_up);
+        // The orbit pitch clamp (±1.5 rad) keeps forward away from ±Z, so
+        // forward × WORLD_UP never degenerates; a fallback up would snap the
+        // basis discontinuously near the poles.
+        let mut right = forward.cross(WORLD_UP);
         right = right / right.length().max(1.0e-9);
         let up = right.cross(forward);
         CameraBasis {
@@ -165,5 +162,36 @@ impl OrbitCamera {
             row0.z as f32, row1.z as f32, row2.z as f32, row3.z as f32,
             t0 as f32, t1 as f32, t2 as f32, t3 as f32,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sweeping pitch through the whole clamped range must never snap the
+    /// basis (regression: the old fallback-up switch at |sin(pitch)| > 0.99
+    /// rolled the view instantly near the poles).
+    #[test]
+    fn basis_is_continuous_across_pitch_range() {
+        let mut camera = OrbitCamera::default();
+        let steps = 4000;
+        let mut previous: Option<CameraBasis> = None;
+        for i in 0..=steps {
+            camera.pitch = -1.5 + 3.0 * (i as f64) / (steps as f64);
+            let basis = camera.basis();
+            if let Some(prev) = previous {
+                let max_delta = (basis.right - prev.right)
+                    .length()
+                    .max((basis.up - prev.up).length())
+                    .max((basis.forward - prev.forward).length());
+                assert!(
+                    max_delta < 0.01,
+                    "basis jumped by {max_delta} at pitch {}",
+                    camera.pitch
+                );
+            }
+            previous = Some(basis);
+        }
     }
 }
