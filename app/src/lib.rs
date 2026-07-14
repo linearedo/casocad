@@ -216,6 +216,13 @@ impl CasoApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        self.toolbar_row_app(ui);
+        ui.separator();
+        self.toolbar_row_tools(ui);
+    }
+
+    /// Toolbar row 1: wordmark, File, and the app/view controls.
+    fn toolbar_row_app(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add(
                 egui::Image::new(egui::include_image!("../assets/casocad-wordmark.svg"))
@@ -229,6 +236,44 @@ impl CasoApp {
             self.show_file_menu(ui);
             ui.separator();
 
+            ui.checkbox(&mut self.viewport.options.show_grid, "Grid");
+            if ui.button("Validate").on_hover_text("Compile the Model: exactness grammar, preconditions, Domain disjointness").clicked() {
+                self.validate_domains();
+            }
+
+            // Working unit: display-only — rescales camera and grid, never
+            // the committed geometry (model stays in meters).
+            let current = self.state.unit;
+            egui::ComboBox::from_id_salt("working_unit")
+                .selected_text(current.key)
+                .width(52.0)
+                .show_ui(ui, |ui| {
+                    for unit in LENGTH_UNITS {
+                        if ui
+                            .selectable_label(unit.key == current.key, unit.label)
+                            .clicked()
+                            && unit.key != current.key
+                        {
+                            self.state.unit = unit;
+                            self.viewport.set_working_unit(unit.factor);
+                            self.state.status = format!("Working unit: {}", unit.label);
+                        }
+                    }
+                });
+
+            ui.label("Opacity");
+            ui.add(egui::Slider::new(&mut self.viewport.options.opacity, 0.05..=1.0));
+            ui.checkbox(&mut self.viewport.show_bounds, "Bounds")
+                .on_hover_text("Show the selection's bounding extents in the viewport");
+            ui.separator();
+
+            ui.toggle_value(&mut self.show_log, "Log");
+        });
+    }
+
+    /// Toolbar row 2: the modeling tools.
+    fn toolbar_row_tools(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
             ui.menu_button("Add", |ui| {
                 for (label, kind) in PRIMITIVE_KINDS {
                     if sdf_menu_button(ui, label, kind).clicked() {
@@ -321,40 +366,6 @@ impl CasoApp {
             if redo {
                 self.state.redo();
             }
-            ui.separator();
-
-            // Working unit: display-only — rescales camera and grid, never
-            // the committed geometry (model stays in meters).
-            let current = self.state.unit;
-            egui::ComboBox::from_id_salt("working_unit")
-                .selected_text(current.key)
-                .width(52.0)
-                .show_ui(ui, |ui| {
-                    for unit in LENGTH_UNITS {
-                        if ui
-                            .selectable_label(unit.key == current.key, unit.label)
-                            .clicked()
-                            && unit.key != current.key
-                        {
-                            self.state.unit = unit;
-                            self.viewport.set_working_unit(unit.factor);
-                            self.state.status = format!("Working unit: {}", unit.label);
-                        }
-                    }
-                });
-
-            ui.checkbox(&mut self.viewport.options.show_grid, "Grid");
-            ui.checkbox(&mut self.viewport.show_bounds, "Bounds")
-                .on_hover_text("Show the selection's bounding extents in the viewport");
-            ui.add(
-                egui::Slider::new(&mut self.viewport.options.opacity, 0.05..=1.0).text("Opacity"),
-            );
-            ui.separator();
-
-            if ui.button("Validate").on_hover_text("Compile the Model: exactness grammar, preconditions, Domain disjointness").clicked() {
-                self.validate_domains();
-            }
-            ui.toggle_value(&mut self.show_log, "Log");
         });
     }
 
