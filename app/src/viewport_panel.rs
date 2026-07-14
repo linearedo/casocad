@@ -18,6 +18,9 @@ const WIRE_PICK_RADIUS: f32 = 8.0;
 /// Tint of the create-tool geometry ghost (the accent blue 74,168,255).
 const CREATE_GHOST_COLOR: [f32; 3] = [0.29, 0.66, 1.0];
 
+/// Measure-annotation amber, distinct from the accent blue and axis colors.
+const MEASURE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 200, 80);
+
 /// Progressive refinement ladder (coarse first paint, then quality tiers).
 const REFINEMENT_TIERS: [u32; 3] = [12, 64, 96];
 
@@ -73,6 +76,13 @@ pub struct ViewportPanel {
     mesh_preview_revision: u64,
     upload_pending: bool,
     view_flight: Option<ViewFlight>,
+    /// Draw the bounding-extent tripod on each selected object.
+    pub show_bounds: bool,
+    /// Committed measure annotations (world points, meters). Session-only —
+    /// never part of the scene document.
+    measurements: Vec<(Vec3, Vec3)>,
+    /// First point of the measure pair being placed.
+    measure_pending: Option<Vec3>,
 }
 
 impl Default for ViewportPanel {
@@ -99,6 +109,9 @@ impl Default for ViewportPanel {
             mesh_preview_revision: u64::MAX,
             upload_pending: false,
             view_flight: None,
+            show_bounds: false,
+            measurements: Vec::new(),
+            measure_pending: None,
         }
     }
 }
@@ -224,6 +237,63 @@ impl ViewportPanel {
                 egui::FontId::proportional(12.0),
                 color,
             );
+        }
+    }
+
+    /// Bounding-extent tripod for each selected object: one edge per axis of
+    /// the world AABB, anchored at the minimum corner, labeled with its
+    /// extent in the working unit. Informational overlay only — bounding
+    /// boxes are never treated as geometry.
+    fn paint_bounds_tripods(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &AppState,
+    ) {
+        let painter = ui.painter_at(rect);
+        for id in &state.selection {
+            let Ok(node) = state.document.build_node(*id) else {
+                continue;
+            };
+            let Ok(bounds) = node.bounding_box() else {
+                continue;
+            };
+            let corner = vec3(bounds.x_min, bounds.y_min, bounds.z_min);
+            let Some(anchor) =
+                crate::tools::project_to_screen(&self.camera, corner, rect, pixels_per_point)
+            else {
+                continue;
+            };
+            let edges = [
+                (vec3(bounds.x_max, bounds.y_min, bounds.z_min), bounds.x_max - bounds.x_min),
+                (vec3(bounds.x_min, bounds.y_max, bounds.z_min), bounds.y_max - bounds.y_min),
+                (vec3(bounds.x_min, bounds.y_min, bounds.z_max), bounds.z_max - bounds.z_min),
+            ];
+            for (index, ((_, _, color), (end_world, extent))) in
+                TRIAD_AXES.into_iter().zip(edges).enumerate()
+            {
+                let text = crate::dimensions::format_length(extent, &state.unit);
+                // Degenerate axes (2D/1D objects) get the label only,
+                // stacked at the anchor so they never overlap each other.
+                if extent <= 1e-9 {
+                    let pos = anchor + egui::vec2(8.0, -6.0 - 14.0 * index as f32);
+                    label_with_backdrop(&painter, pos, &text, color);
+                    continue;
+                }
+                let Some(end) = crate::tools::project_to_screen(
+                    &self.camera,
+                    end_world,
+                    rect,
+                    pixels_per_point,
+                ) else {
+                    continue;
+                };
+                painter.line_segment([anchor, end], egui::Stroke::new(2.0, color));
+                painter.circle_filled(end, 3.0, color);
+                let mid = anchor + (end - anchor) * 0.5;
+                label_with_backdrop(&painter, mid + egui::vec2(6.0, -6.0), &text, color);
+            }
         }
     }
 
@@ -478,6 +548,158 @@ impl ViewportPanel {
         }
     }
 
+    /// Where a measure click lands: the nearest display-surface hit under
+    /// the cursor, falling back to the Z=0 grid plane.
+    fn measure_point(
+        &self,
+        pos: egui::Pos2,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+    ) -> Option<Vec3> {
+        if let Some(base) = self.base_scene.as_ref() {
+            let (origin, direction) =
+                crate::tools::screen_ray(&self.camera, pos, rect, pixels_per_point);
+            let mut nearest: Option<f64> = None;
+            for surface in &base.surfaces {
+                for triangle in surface.indices.chunks_exact(3) {
+                    let a = vertex_point(surface, triangle[0]);
+                    let b = vertex_point(surface, triangle[1]);
+                    let c = vertex_point(surface, triangle[2]);
+                    if let Some(t) = ray_triangle_hit(origin, direction, a, b, c) {
+                        if nearest.is_none_or(|best| t < best) {
+                            nearest = Some(t);
+                        }
+                    }
+                }
+            }
+            if let Some(t) = nearest {
+                return Some(origin + direction * t);
+            }
+        }
+        crate::tools::grid_point(&self.camera, pos, rect, pixels_per_point)
+    }
+
+    /// Measure-tool click: first click arms the pending point, the second
+    /// commits an annotation pair.
+    fn handle_measure_click(
+        &mut self,
+        response: &egui::Response,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) {
+        if !response.clicked() {
+            return;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return;
+        };
+        let Some(point) = self.measure_point(pos, rect, pixels_per_point) else {
+            return;
+        };
+        match self.measure_pending.take() {
+            None => {
+                self.measure_pending = Some(point);
+                state.status = "Measure: click the second point".to_string();
+            }
+            Some(start) => {
+                let distance = (point - start).length();
+                self.measurements.push((start, point));
+                state.status = format!(
+                    "Measured {}",
+                    crate::dimensions::format_length(distance, &state.unit)
+                );
+            }
+        }
+    }
+
+    /// Draw every committed measurement (they persist across tool switches)
+    /// plus, while the Measure tool is active, the pending point marker and
+    /// its live rubber band to the snapped cursor point.
+    fn paint_measurements(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &AppState,
+        measure_active: bool,
+    ) {
+        if self.measurements.is_empty() && self.measure_pending.is_none() {
+            return;
+        }
+        let painter = ui.painter_at(rect);
+        for (start, end) in &self.measurements {
+            self.paint_dimension_line(&painter, rect, pixels_per_point, state, *start, *end);
+        }
+        let Some(pending) = self.measure_pending else {
+            return;
+        };
+        if !measure_active {
+            return;
+        }
+        if let Some(anchor) =
+            crate::tools::project_to_screen(&self.camera, pending, rect, pixels_per_point)
+        {
+            painter.circle_filled(anchor, 3.5, MEASURE_COLOR);
+        }
+        let hover = ui
+            .ctx()
+            .input(|input| input.pointer.latest_pos())
+            .filter(|pos| rect.contains(*pos))
+            .and_then(|pos| self.measure_point(pos, rect, pixels_per_point));
+        // A zero-length rubber band (cursor still on the first click) would
+        // only paint a degenerate "0" label on top of the marker.
+        if let Some(current) = hover.filter(|point| (*point - pending).length() > 1e-12) {
+            self.paint_dimension_line(&painter, rect, pixels_per_point, state, pending, current);
+        }
+    }
+
+    /// One arrowed dimension line: segment, inward arrowheads at both ends,
+    /// distance label at the midpoint.
+    fn paint_dimension_line(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &AppState,
+        start: Vec3,
+        end: Vec3,
+    ) {
+        let a = crate::tools::project_to_screen(&self.camera, start, rect, pixels_per_point);
+        let b = crate::tools::project_to_screen(&self.camera, end, rect, pixels_per_point);
+        let (Some(a), Some(b)) = (a, b) else {
+            return;
+        };
+        let stroke = egui::Stroke::new(1.5, MEASURE_COLOR);
+        painter.line_segment([a, b], stroke);
+        let along = b - a;
+        if along.length() > 1e-3 {
+            let inward = along.normalized();
+            arrow_head(painter, a, inward, stroke);
+            arrow_head(painter, b, -inward, stroke);
+        }
+        let text = crate::dimensions::format_length((end - start).length(), &state.unit);
+        // Label offset perpendicular to the line so it never sits on it.
+        let normal = egui::vec2(-along.y, along.x).normalized();
+        let mid = a + along * 0.5 + normal * 10.0;
+        label_with_backdrop(painter, mid, &text, MEASURE_COLOR);
+    }
+
+    /// Drop all committed measurements (Delete while the Measure tool is
+    /// active).
+    pub fn clear_measurements(&mut self) -> usize {
+        self.measure_pending = None;
+        let count = self.measurements.len();
+        self.measurements.clear();
+        count
+    }
+
+    /// Cancel the pending first point; true when there was one (so Esc can
+    /// fall through to leaving the tool otherwise).
+    pub fn cancel_pending_measurement(&mut self) -> bool {
+        self.measure_pending.take().is_some()
+    }
+
     /// Build the next pending refinement tier and upload it.
     fn refresh_surfaces(&mut self, document: &SceneDocument, render_state: &RenderState) {
         if document.version != self.scene_version {
@@ -632,11 +854,64 @@ impl ViewportPanel {
         if tools.kind == ToolKind::Select {
             self.handle_select_click(&response, ui, rect, pixels_per_point, state);
         }
+        if tools.kind == ToolKind::Measure {
+            self.handle_measure_click(&response, rect, pixels_per_point, state);
+        }
+        // Annotation overlays: measurements persist across tool switches;
+        // the bounds tripod follows the selection while toggled on.
+        self.paint_measurements(
+            ui,
+            rect,
+            pixels_per_point,
+            state,
+            tools.kind == ToolKind::Measure,
+        );
+        if self.show_bounds {
+            self.paint_bounds_tripods(ui, rect, pixels_per_point, state);
+        }
         self.refresh_boundary_overlays(state, tools, render_state);
         // Keep painting while refinement tiers are pending.
         if !self.pending_tiers.is_empty() {
             ui.ctx().request_repaint();
         }
+    }
+}
+
+/// Monospace overlay label on a dark backdrop (the triad's palette) so the
+/// text stays readable over any geometry.
+fn label_with_backdrop(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    text: &str,
+    color: egui::Color32,
+) {
+    let galley = painter.layout_no_wrap(text.to_string(), egui::FontId::monospace(11.0), color);
+    let rect = egui::Rect::from_min_size(pos, galley.size()).expand(3.0);
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_rgba_unmultiplied(6, 10, 16, 190),
+    );
+    painter.galley(pos, galley, color);
+}
+
+/// Two wing strokes at a dimension-line tip; `direction` points inward along
+/// the line (unit length).
+fn arrow_head(
+    painter: &egui::Painter,
+    tip: egui::Pos2,
+    direction: egui::Vec2,
+    stroke: egui::Stroke,
+) {
+    const WING_LENGTH: f32 = 8.0;
+    const WING_ANGLE: f32 = 0.45;
+    for angle in [WING_ANGLE, -WING_ANGLE] {
+        let (sin, cos) = angle.sin_cos();
+        let wing = egui::vec2(
+            direction.x * cos - direction.y * sin,
+            direction.x * sin + direction.y * cos,
+        );
+        painter.line_segment([tip, tip + wing * WING_LENGTH], stroke);
     }
 }
 

@@ -63,6 +63,9 @@ pub enum ToolKind {
     CreatePoints(&'static str),
     Move,
     Rotate,
+    /// Two-click distance annotation, drawn as a viewport overlay (input and
+    /// state live in the viewport panel, like Select clicks).
+    Measure,
     /// Hover the fluid boundary, click to create/select a region.
     BoundaryRegion,
     /// Split the selected region with a knife of the given kind.
@@ -188,6 +191,9 @@ impl ToolState {
             }
             ToolKind::Move => "Move: drag the selection on the grid".to_string(),
             ToolKind::Rotate => "Rotate: drag horizontally to spin about Z".to_string(),
+            ToolKind::Measure => {
+                "Measure: click two points (surfaces snap, grid otherwise) — Esc cancels a point, Delete clears all".to_string()
+            }
             ToolKind::BoundaryRegion => {
                 "Boundary Region: hover the Fluid Domain surface, click to tag it".to_string()
             }
@@ -230,7 +236,10 @@ impl ToolState {
     /// Whether the active tool owns the primary mouse button (the Boundary
     /// Region hover tool keeps camera navigation available, like Python).
     pub fn blocks_camera(&self) -> bool {
-        !matches!(self.kind, ToolKind::Select | ToolKind::BoundaryRegion)
+        !matches!(
+            self.kind,
+            ToolKind::Select | ToolKind::Measure | ToolKind::BoundaryRegion
+        )
     }
 
     /// Handle viewport input for the active tool. Returns true when the tool
@@ -246,7 +255,9 @@ impl ToolState {
         state: &mut AppState,
     ) -> bool {
         match self.kind {
-            ToolKind::Select => false,
+            // Select and Measure clicks are handled by the viewport panel
+            // (they pick against its display surfaces).
+            ToolKind::Select | ToolKind::Measure => false,
             ToolKind::CreateDrag(kind) => {
                 self.handle_create_drag(kind, response, ui, camera, rect, pixels_per_point, state)
             }

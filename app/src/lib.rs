@@ -272,6 +272,7 @@ impl CasoApp {
             });
             self.tool_button(ui, "Move", ToolKind::Move);
             self.tool_button(ui, "Rotate", ToolKind::Rotate);
+            self.tool_button(ui, "Measure", ToolKind::Measure);
             ui.separator();
 
             self.tool_button(ui, "Boundary Region", ToolKind::BoundaryRegion);
@@ -343,6 +344,8 @@ impl CasoApp {
                 });
 
             ui.checkbox(&mut self.viewport.options.show_grid, "Grid");
+            ui.checkbox(&mut self.viewport.show_bounds, "Bounds")
+                .on_hover_text("Show the selection's bounding extents in the viewport");
             ui.add(
                 egui::Slider::new(&mut self.viewport.options.opacity, 0.05..=1.0).text("Opacity"),
             );
@@ -527,7 +530,13 @@ impl CasoApp {
             )
         });
         if escape && self.tools.is_active() && !create_tool_active {
-            self.tools.set_tool(ToolKind::Select, &mut self.state);
+            // Measure: the first Esc only cancels a pending point.
+            if self.tools.kind == ToolKind::Measure && self.viewport.cancel_pending_measurement()
+            {
+                self.state.status = "Measure point cancelled".to_string();
+            } else {
+                self.tools.set_tool(ToolKind::Select, &mut self.state);
+            }
         }
         if create_tool_active {
             // Esc inside create tools is handled by the tool itself; a second
@@ -543,7 +552,11 @@ impl CasoApp {
         if redo {
             self.state.redo();
         }
-        if delete && !self.state.selection.is_empty() {
+        if delete && self.tools.kind == ToolKind::Measure {
+            // Delete clears annotations while measuring, never scene objects.
+            let cleared = self.viewport.clear_measurements();
+            self.state.status = format!("Cleared {cleared} measurement(s)");
+        } else if delete && !self.state.selection.is_empty() {
             self.state.push_undo();
             let ids = self.state.selection.clone();
             let removed = self.state.document.delete_many(&ids);

@@ -6,6 +6,24 @@
 //! unit. Expressions support `+ - * /` and parentheses; multiple values are
 //! separated by `x`, `;` or `,` (or whitespace in the plain-number fallback).
 
+use crate::state::LengthUnit;
+
+/// Display counterpart of the entry parser: a length in meters rendered in
+/// the working unit, trimmed to at most 4 decimals (`2.5 m`, `120 mm`).
+pub fn format_length(meters: f64, unit: &LengthUnit) -> String {
+    let shown = meters / unit.factor;
+    let mut text = format!("{shown:.4}");
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
+    format!("{} {}", text, unit.key)
+}
+
 /// (spelling, meters per unit); longest spellings first so greedy unit
 /// matching picks "mm" before "m".
 const UNIT_SPELLINGS: [(&str, f64); 29] = [
@@ -416,6 +434,17 @@ mod tests {
         );
         assert!(parse_dimension_entry("-5", 1.0).is_err());
         assert!(parse_measurement_entry("nonsense", 1.0).is_err());
+    }
+
+    #[test]
+    fn format_length_trims_and_converts() {
+        let meters = crate::state::LENGTH_UNITS[1];
+        let millimeters = crate::state::LENGTH_UNITS[3];
+        assert_eq!(format_length(2.5, &meters), "2.5 m");
+        assert_eq!(format_length(2.0, &meters), "2 m");
+        assert_eq!(format_length(0.12, &millimeters), "120 mm");
+        assert_eq!(format_length(0.123456789, &meters), "0.1235 m");
+        assert_eq!(format_length(0.0, &meters), "0 m");
     }
 
     #[test]
