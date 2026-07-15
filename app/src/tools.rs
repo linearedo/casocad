@@ -38,10 +38,11 @@ pub const DRAG_KINDS_2D: [(&str, &str); 7] = [
 
 /// Point-placed kinds (click points, Enter commits). All 1D objects are
 /// point tools — segments and bezier curves included.
-pub const POINT_KINDS: [(&str, &str); 6] = [
+pub const POINT_KINDS: [(&str, &str); 7] = [
     ("Segment 1D", "segment"),
     ("Polyline", "polyline"),
     ("Bezier Curve", "quadratic_bezier_curve"),
+    ("Bezier Polycurve", "quadratic_bezier_polycurve"),
     ("Polyline Tube", "polyline_tube"),
     ("Bezier Tube", "quadratic_bezier_tube"),
     ("Polygon (points)", "polygon"),
@@ -64,6 +65,12 @@ fn point_capacity(kind: &str) -> Option<usize> {
         "quadratic_bezier_curve" => Some(3),
         _ => None,
     }
+}
+
+/// Kinds the kernel only accepts with an odd point count (chained
+/// anchor-control-anchor bezier spans).
+fn needs_odd_points(kind: &str) -> bool {
+    matches!(kind, "quadratic_bezier_polycurve" | "quadratic_bezier_tube")
 }
 
 /// Fewest points that define a knife of the given kind.
@@ -819,8 +826,16 @@ impl ToolState {
                         );
                     } else {
                         self.points.push(point);
-                        state.status =
-                            format!("{} point(s) — Enter commits", self.points.len());
+                        let count = self.points.len();
+                        // Odd-count kinds can't commit mid-span: say so
+                        // instead of promising Enter.
+                        state.status = if needs_odd_points(kind) && count.is_multiple_of(2) {
+                            format!(
+                                "{count} point(s) — click the span's anchor (odd count commits)"
+                            )
+                        } else {
+                            format!("{count} point(s) — Enter commits")
+                        };
                     }
                 }
             }
@@ -1271,6 +1286,35 @@ mod tests {
         }
         assert_eq!(point_capacity("polyline"), None);
         assert!(ghost_from_points("polyline", &square).is_some());
+    }
+
+    /// The polycurve point tool: unlimited clicks, valid ghost at odd
+    /// counts only, and Enter commits a multi-span curve.
+    #[test]
+    fn polycurve_ghost_and_capacity() {
+        assert_eq!(point_capacity("quadratic_bezier_polycurve"), None);
+        let points = [
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 1.0, 0.0),
+            vec3(2.0, 0.0, 0.0),
+            vec3(3.0, -1.0, 0.0),
+            vec3(4.0, 0.0, 0.0),
+        ];
+        assert!(ghost_from_points("quadratic_bezier_polycurve", &points).is_some());
+        assert!(
+            ghost_from_points("quadratic_bezier_polycurve", &points[..4]).is_none(),
+            "even count must refuse"
+        );
+        let mut state = AppState::new(SceneDocument::new());
+        let mut tools = ToolState::default();
+        tools.set_tool(
+            ToolKind::CreatePoints("quadratic_bezier_polycurve"),
+            &mut state,
+        );
+        tools.points = points.to_vec();
+        assert!(tools.confirm_pending(&mut state));
+        assert_eq!(state.document.roots.len(), 1);
+        assert_eq!(state.selection, state.document.roots);
     }
 
     /// The universal grammar on a point tool: Backspace pops, Enter commits
