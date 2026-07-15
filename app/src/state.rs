@@ -66,12 +66,22 @@ impl AppState {
         !self.redo_stack.is_empty()
     }
 
+    /// Replace the document, keeping `version` strictly monotonic for the
+    /// session: the viewport rebuild gate and the (object_id, revision)
+    /// surface-cache keys assume a revision number never denotes two
+    /// different scene states. Every wholesale document replacement
+    /// (undo/redo/gesture abort/scene load) must go through here.
+    pub(crate) fn install_document(&mut self, mut document: SceneDocument) {
+        document.version = document.version.max(self.document.version);
+        document.mark_changed();
+        self.document = document;
+        self.retain_live_selection();
+    }
+
     pub fn undo(&mut self) {
         if let Some(previous) = self.undo_stack.pop() {
             self.redo_stack.push(self.document.snapshot());
-            self.document = previous;
-            self.document.mark_changed();
-            self.retain_live_selection();
+            self.install_document(previous);
             self.status = "Undo".to_string();
         }
     }
@@ -83,18 +93,14 @@ impl AppState {
     /// history state.
     pub fn abort_to_last_snapshot(&mut self) {
         if let Some(previous) = self.undo_stack.pop() {
-            self.document = previous;
-            self.document.mark_changed();
-            self.retain_live_selection();
+            self.install_document(previous);
         }
     }
 
     pub fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
             self.undo_stack.push(self.document.snapshot());
-            self.document = next;
-            self.document.mark_changed();
-            self.retain_live_selection();
+            self.install_document(next);
             self.status = "Redo".to_string();
         }
     }
@@ -212,6 +218,45 @@ mod tests {
         // The pre-gesture history is intact: one more undo removes the box.
         state.undo();
         assert!(state.document.roots.is_empty());
+    }
+
+    /// The contract the viewport rebuild gate and the (object_id, revision)
+    /// surface-cache keys rely on: replacing the document via history
+    /// navigation must leave `version` STRICTLY greater than before the
+    /// call, even for ops that bumped the version exactly once (a restored
+    /// snapshot's version + 1 would otherwise collide with the pre-undo
+    /// version and freeze the viewport).
+    #[test]
+    fn history_navigation_bumps_version_strictly() {
+        let mut state = AppState::new(SceneDocument::new());
+
+        state.push_undo();
+        state.document.add_primitive("box", 1.0).unwrap(); // bumps exactly once
+        let before_undo = state.document.version;
+        state.undo();
+        assert!(state.document.version > before_undo, "undo must advance the version");
+
+        let before_redo = state.document.version;
+        state.redo();
+        assert!(state.document.version > before_redo, "redo must advance the version");
+
+        state.push_undo();
+        state.document.add_primitive("sphere", 1.0).unwrap();
+        let before_abort = state.document.version;
+        state.abort_to_last_snapshot();
+        assert!(
+            state.document.version > before_abort,
+            "gesture abort must advance the version"
+        );
+
+        // Scene load path: installing a fresh low-version document must not
+        // rewind the session's revision sequence.
+        let before_install = state.document.version;
+        state.install_document(SceneDocument::default_scene().unwrap());
+        assert!(
+            state.document.version > before_install,
+            "install_document must advance the version"
+        );
     }
 
     /// Deleting selected nodes (the Delete-key path) leaves no dangling ids.
