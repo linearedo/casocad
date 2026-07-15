@@ -1375,8 +1375,10 @@ impl SceneDocument {
                     CapStyle::Round,
                 )?)
             }
-            "circle" | "rectangle" | "square" | "rounded_rectangle" | "ellipse"
-            | "regular_polygon" | "polygon" => {
+            // Polygons are point-placed (`add_regular_polygon_from_world_points`
+            // / `add_point_shape_from_world_points`) — a drag cannot express
+            // their vertices.
+            "circle" | "rectangle" | "square" | "rounded_rectangle" | "ellipse" => {
                 let profile = match kind {
                     "circle" => Profile2D::circle([0.0, 0.0], radius)?,
                     "rectangle" => Profile2D::rectangle([0.0, 0.0], [extent_a, extent_b])?,
@@ -1386,14 +1388,7 @@ impl SceneDocument {
                         [extent_a, extent_b],
                         (0.01 * scale).max(extent_a.min(extent_b) * 0.2),
                     )?,
-                    "ellipse" => Profile2D::ellipse([0.0, 0.0], [extent_a, extent_b])?,
-                    "polygon" => Profile2D::polygon(vec![
-                        [-extent_a, -extent_b],
-                        [extent_a, -extent_b],
-                        [extent_a, extent_b],
-                        [-extent_a, extent_b],
-                    ])?,
-                    _ => Profile2D::regular_polygon([0.0, 0.0], radius, 6, 0.0)?,
+                    _ => Profile2D::ellipse([0.0, 0.0], [extent_a, extent_b])?,
                 };
                 ScenePayload::Placed2D {
                     profile,
@@ -1606,6 +1601,40 @@ impl SceneDocument {
             other => other,
         };
         let name = self.default_name(name_key);
+        let id = self.insert_object(name, payload)?;
+        self.roots.push(id);
+        self.mark_changed();
+        Ok(id)
+    }
+
+    /// Place a regular polygon from two world-space clicks on a reference
+    /// plane: the center, then one vertex. The vertex click sets both the
+    /// radius and the rotation, so the clicked point IS a vertex of the
+    /// committed profile (vertex 0 sits at angle `rotation`).
+    pub fn add_regular_polygon_from_world_points(
+        &mut self,
+        points: &[Vec3],
+        side_count: u32,
+        reference_plane: &str,
+    ) -> GeometryResult<ObjectId> {
+        let (axis_u, axis_v) = reference_plane_axes(reference_plane)?;
+        let [center, vertex] = points else {
+            return Err(GeometryError::new(
+                "regular polygon requires exactly two points: the center, then a vertex",
+            ));
+        };
+        let offset = *vertex - *center;
+        let (du, dv) = (offset.dot(axis_u), offset.dot(axis_v));
+        let radius = du.hypot(dv);
+        let rotation = dv.atan2(du);
+        let payload = ScenePayload::Placed2D {
+            profile: Profile2D::regular_polygon([0.0, 0.0], radius, side_count, rotation)?,
+            origin: *center,
+            axis_u,
+            axis_v,
+            sources: Vec::new(),
+        };
+        let name = self.default_name("regular_polygon");
         let id = self.insert_object(name, payload)?;
         self.roots.push(id);
         self.mark_changed();

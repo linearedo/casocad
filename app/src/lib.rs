@@ -30,7 +30,7 @@ use properties_panel::PropertiesPanel;
 use scene_panel::ScenePanel;
 use state::{AppState, LENGTH_UNITS};
 use tools::{
-    ToolKind, ToolState, DRAG_KINDS_2D, DRAG_KINDS_3D, KNIFE_KINDS, POINT_KINDS,
+    ToolKind, ToolState, DRAG_KINDS_2D, DRAG_KINDS_3D, KNIFE_KINDS, POINT_KINDS, POINT_KINDS_2D,
 };
 use viewport_panel::ViewportPanel;
 
@@ -320,6 +320,23 @@ impl CasoApp {
                 ui.label(egui::RichText::new("2D sections").weak());
                 for (label, kind) in DRAG_KINDS_2D {
                     self.tool_menu_entry(ui, label, kind, ToolKind::CreateDrag(kind));
+                }
+                // Point-placed 2D kinds live in the same section: Regular
+                // Polygon is two clicks (center, then a vertex) with its
+                // side count set here; Polygon is one click per corner.
+                for (label, kind) in POINT_KINDS_2D {
+                    if kind == "regular_polygon" {
+                        ui.horizontal(|ui| {
+                            self.tool_menu_entry(ui, label, kind, ToolKind::CreatePoints(kind));
+                            ui.label("Sides");
+                            ui.add(
+                                egui::DragValue::new(&mut self.tools.regular_polygon_sides)
+                                    .range(3..=64),
+                            );
+                        });
+                    } else {
+                        self.tool_menu_entry(ui, label, kind, ToolKind::CreatePoints(kind));
+                    }
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("1D & point tools (Enter commits)").weak());

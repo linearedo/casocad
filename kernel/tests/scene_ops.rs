@@ -101,6 +101,52 @@ fn point_shape_projects_world_points_to_plane_locals() {
         .is_err());
 }
 
+/// Two clicks — center, then a vertex — define a regular polygon: the
+/// second click sets radius AND rotation, so the clicked point is a vertex
+/// of the committed profile.
+#[test]
+fn regular_polygon_from_center_and_vertex_clicks() {
+    let mut document = SceneDocument::new();
+    let center = vec3(1.0, 1.0, 0.0);
+    let vertex = vec3(1.0 + 3.0, 1.0 + 4.0, 0.0);
+    let id = document
+        .add_regular_polygon_from_world_points(&[center, vertex], 5, "xy")
+        .expect("regular polygon from points");
+    match &document.object(id).expect("object").payload {
+        ScenePayload::Placed2D { profile, origin, .. } => {
+            assert_eq!(*origin, center);
+            match profile {
+                Profile2D::RegularPolygon {
+                    center,
+                    radius,
+                    side_count,
+                    rotation,
+                } => {
+                    assert_eq!(*center, [0.0, 0.0]);
+                    assert!((radius - 5.0).abs() < 1e-12);
+                    assert_eq!(*side_count, 5);
+                    assert!((rotation - (4.0f64).atan2(3.0)).abs() < 1e-12);
+                }
+                other => panic!("expected RegularPolygon, got {other:?}"),
+            }
+        }
+        other => panic!("expected Placed2D, got {other:?}"),
+    }
+    // One point, three points, coincident clicks, and <3 sides all refuse.
+    assert!(document
+        .add_regular_polygon_from_world_points(&[center], 5, "xy")
+        .is_err());
+    assert!(document
+        .add_regular_polygon_from_world_points(&[center, vertex, center], 5, "xy")
+        .is_err());
+    assert!(document
+        .add_regular_polygon_from_world_points(&[center, center], 5, "xy")
+        .is_err());
+    assert!(document
+        .add_regular_polygon_from_world_points(&[center, vertex], 2, "xy")
+        .is_err());
+}
+
 #[test]
 fn duplicate_offsets_and_renames_a_deep_copy() {
     let mut document = SceneDocument::default_scene().expect("default scene");

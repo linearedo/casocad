@@ -29,26 +29,31 @@ pub const DRAG_KINDS_3D: [(&str, &str); 8] = [
     ("Torus", "torus"),
 ];
 
-pub const DRAG_KINDS_2D: [(&str, &str); 7] = [
+pub const DRAG_KINDS_2D: [(&str, &str); 5] = [
     ("Rectangle", "rectangle"),
     ("Circle", "circle"),
     ("Square", "square"),
     ("Rounded Rectangle", "rounded_rectangle"),
     ("Ellipse", "ellipse"),
+];
+
+/// Point-placed 2D sections, shown alongside the drag kinds. Regular
+/// Polygon takes exactly two clicks (center, then a vertex — that click
+/// sets radius AND rotation); Polygon takes one click per corner.
+pub const POINT_KINDS_2D: [(&str, &str); 2] = [
     ("Regular Polygon", "regular_polygon"),
     ("Polygon", "polygon"),
 ];
 
 /// Point-placed kinds (click points, Enter commits). All 1D objects are
 /// point tools — segments and bezier curves included.
-pub const POINT_KINDS: [(&str, &str); 7] = [
+pub const POINT_KINDS: [(&str, &str); 6] = [
     ("Segment 1D", "segment"),
     ("Polyline", "polyline"),
     ("Bezier Curve", "quadratic_bezier_curve"),
     ("Bezier Polycurve", "quadratic_bezier_polycurve"),
     ("Polyline Tube", "polyline_tube"),
     ("Bezier Tube", "quadratic_bezier_tube"),
-    ("Polygon (points)", "polygon"),
 ];
 
 /// Cutter knife kinds: (menu label, kind key). A smooth on-surface polyline
@@ -65,6 +70,7 @@ pub const KNIFE_KINDS: [(&str, &str); 3] = [
 fn point_capacity(kind: &str) -> Option<usize> {
     match kind {
         "segment" => Some(2),
+        "regular_polygon" => Some(2),
         "quadratic_bezier_curve" => Some(3),
         _ => None,
     }
@@ -116,6 +122,9 @@ pub struct ToolState {
     /// Revolve angle in degrees, parsed from the toolbar at Revolve-tool
     /// activation and consumed by the commit.
     pub revolve_angle: f64,
+    /// Side count for the Regular Polygon point tool, set from the Draw
+    /// menu's Sides field and consumed by ghost + commit.
+    pub regular_polygon_sides: u32,
     /// Typed-dimension buffer, filled from keystrokes during a create drag.
     pub dimension_text: String,
     move_last: Option<Vec3>,
@@ -158,6 +167,7 @@ impl Default for ToolState {
             screen_start: None,
             points: Vec::new(),
             revolve_angle: 360.0,
+            regular_polygon_sides: 6,
             dimension_text: String::new(),
             move_last: None,
             rotate_last_x: None,
@@ -226,6 +236,9 @@ impl ToolState {
             ToolKind::CreateDrag(create) => format!(
                 "Draw {create}: drag on the grid — type dimensions (applied on release), Backspace edits, Esc cancels/exits"
             ),
+            ToolKind::CreatePoints("regular_polygon") => {
+                "Place regular polygon: click the center, then a vertex — Enter commits, Esc cancels/exits".to_string()
+            }
             ToolKind::CreatePoints(create) => format!(
                 "Place {create}: click points — Enter commits, Backspace removes last, Esc cancels/exits"
             ),
@@ -440,9 +453,8 @@ impl ToolState {
         }
         let points = std::mem::take(&mut self.points);
         state.push_undo();
-        let result = state
-            .document
-            .add_point_shape_from_world_points(kind, &points, "xy");
+        let result =
+            build_point_shape(&mut state.document, kind, &points, self.regular_polygon_sides);
         if let Some(id) = state.report(result, &format!("Created {kind}")) {
             state.select_only(id);
             self.set_create_ghost(None, None);
@@ -1051,7 +1063,10 @@ impl ToolState {
                         let count = self.points.len();
                         // Odd-count kinds can't commit mid-span: say so
                         // instead of promising Enter.
-                        state.status = if needs_odd_points(kind) && count.is_multiple_of(2) {
+                        state.status = if kind == "regular_polygon" && count == 1 {
+                            "Center placed — click a vertex (sets radius and rotation)"
+                                .to_string()
+                        } else if needs_odd_points(kind) && count.is_multiple_of(2) {
                             format!(
                                 "{count} point(s) — click the span's anchor (odd count commits)"
                             )
@@ -1077,11 +1092,18 @@ impl ToolState {
         if tentative.is_empty() {
             self.set_create_ghost(None, None);
         } else {
+            let sides = self.regular_polygon_sides;
             let sig = (
                 tentative.first().copied().unwrap_or_default(),
                 tentative.last().copied().unwrap_or_default(),
                 tentative.len(),
-                String::new(),
+                // The string slot carries the side count so changing it in
+                // the menu refreshes a live regular-polygon ghost.
+                if kind == "regular_polygon" {
+                    sides.to_string()
+                } else {
+                    String::new()
+                },
             );
             if self.create_ghost_sig.as_ref() != Some(&sig) {
                 // Below the kind's minimum point count the builder errs and
@@ -1089,8 +1111,8 @@ impl ToolState {
                 // odd-count kinds (bezier polycurve/tube) the tentative
                 // cursor point makes the count even — fall back to the
                 // committed points so a valid ghost survives while placing.
-                let ghost = ghost_from_points(kind, &tentative)
-                    .or_else(|| ghost_from_points(kind, &self.points));
+                let ghost = ghost_from_points(kind, &tentative, sides)
+                    .or_else(|| ghost_from_points(kind, &self.points, sides));
                 self.set_create_ghost(ghost, Some(sig));
             }
         }
@@ -1362,12 +1384,26 @@ fn ghost_from_drag(kind: &str, start: Vec3, end: Vec3, scale: f64) -> Option<Nod
     scratch.build_node(id).ok()
 }
 
+/// Point-shape builder shared by the commit and the ghost, so the preview
+/// can never drift from the committed result. Regular polygons take their
+/// side count from the tool state; every other kind ignores `sides`.
+fn build_point_shape(
+    document: &mut SceneDocument,
+    kind: &str,
+    points: &[Vec3],
+    sides: u32,
+) -> caso_kernel::GeometryResult<ObjectId> {
+    if kind == "regular_polygon" {
+        document.add_regular_polygon_from_world_points(points, sides, "xy")
+    } else {
+        document.add_point_shape_from_world_points(kind, points, "xy")
+    }
+}
+
 /// Ghost of a point-placed shape (same throwaway-document invariant).
-fn ghost_from_points(kind: &str, points: &[Vec3]) -> Option<Node> {
+fn ghost_from_points(kind: &str, points: &[Vec3], sides: u32) -> Option<Node> {
     let mut scratch = SceneDocument::new();
-    let id = scratch
-        .add_point_shape_from_world_points(kind, points, "xy")
-        .ok()?;
+    let id = build_point_shape(&mut scratch, kind, points, sides).ok()?;
     scratch.build_node(id).ok()
 }
 
@@ -1837,7 +1873,7 @@ mod tests {
             vec3(1.0, 0.0, 0.0),
             vec3(1.0, 1.0, 0.0),
         ];
-        let ghost = ghost_from_points("polygon", &points).expect("polygon ghost");
+        let ghost = ghost_from_points("polygon", &points, 6).expect("polygon ghost");
         let mut document = SceneDocument::new();
         let id = document
             .add_point_shape_from_world_points("polygon", &points, "xy")
@@ -1848,7 +1884,51 @@ mod tests {
 
     #[test]
     fn ghost_below_minimum_points_is_none() {
-        assert!(ghost_from_points("polygon", &[vec3(0.0, 0.0, 0.0)]).is_none());
+        assert!(ghost_from_points("polygon", &[vec3(0.0, 0.0, 0.0)], 6).is_none());
+    }
+
+    /// The Regular Polygon point tool: two clicks (center, vertex), the
+    /// side count comes from the tool state, and Enter commits a placed
+    /// profile whose vertex 0 is the clicked point.
+    #[test]
+    fn regular_polygon_two_click_commit() {
+        assert_eq!(point_capacity("regular_polygon"), Some(2));
+        let center = vec3(1.0, 2.0, 0.0);
+        let vertex = vec3(2.0, 2.0, 0.0);
+
+        let mut state = AppState::new(SceneDocument::new());
+        let mut tools = ToolState::default();
+        tools.set_tool(ToolKind::CreatePoints("regular_polygon"), &mut state);
+        tools.regular_polygon_sides = 8;
+        tools.points = vec![center, vertex];
+        let ghost =
+            ghost_from_points("regular_polygon", &tools.points, 8).expect("polygon ghost");
+        assert!(tools.confirm_pending(&mut state), "Enter must commit");
+        let id = state.selected_single().expect("committed shape selected");
+        match &state.document.object(id).expect("object").payload {
+            ScenePayload::Placed2D { profile, origin, .. } => {
+                assert_eq!(*origin, center);
+                match profile {
+                    Profile2D::RegularPolygon { radius, side_count, rotation, .. } => {
+                        assert!((radius - 1.0).abs() < 1e-12);
+                        assert_eq!(*side_count, 8);
+                        assert!(rotation.abs() < 1e-12);
+                    }
+                    other => panic!("expected RegularPolygon, got {other:?}"),
+                }
+            }
+            other => panic!("expected Placed2D, got {other:?}"),
+        }
+        // Ghost/commit parity (same builder on both paths).
+        let committed = state.document.build_node(id).expect("node");
+        assert_eq!(format!("{ghost:?}"), format!("{committed:?}"));
+        assert!(state.can_undo());
+
+        // Coincident clicks refuse at Enter: rollback keeps the points so
+        // the user can Backspace and re-click.
+        tools.points = vec![center, center];
+        assert!(tools.confirm_pending(&mut state), "refusal still consumes Enter");
+        assert_eq!(tools.points, vec![center, center], "points kept for retry");
     }
 
     /// The click cap mirrors the kernel's exact-count rules: capacity
@@ -1863,11 +1943,11 @@ mod tests {
         ];
         for (kind, capacity) in [("segment", 2), ("quadratic_bezier_curve", 3)] {
             assert_eq!(point_capacity(kind), Some(capacity));
-            assert!(ghost_from_points(kind, &square[..capacity]).is_some());
-            assert!(ghost_from_points(kind, &square[..capacity + 1]).is_none());
+            assert!(ghost_from_points(kind, &square[..capacity], 6).is_some());
+            assert!(ghost_from_points(kind, &square[..capacity + 1], 6).is_none());
         }
         assert_eq!(point_capacity("polyline"), None);
-        assert!(ghost_from_points("polyline", &square).is_some());
+        assert!(ghost_from_points("polyline", &square, 6).is_some());
     }
 
     /// The polycurve point tool: unlimited clicks, valid ghost at odd
@@ -1882,9 +1962,9 @@ mod tests {
             vec3(3.0, -1.0, 0.0),
             vec3(4.0, 0.0, 0.0),
         ];
-        assert!(ghost_from_points("quadratic_bezier_polycurve", &points).is_some());
+        assert!(ghost_from_points("quadratic_bezier_polycurve", &points, 6).is_some());
         assert!(
-            ghost_from_points("quadratic_bezier_polycurve", &points[..4]).is_none(),
+            ghost_from_points("quadratic_bezier_polycurve", &points[..4], 6).is_none(),
             "even count must refuse"
         );
         let mut state = AppState::new(SceneDocument::new());
@@ -2223,10 +2303,10 @@ mod tests {
     fn point_placed_segment_matches_drag_segment() {
         let start = vec3(0.0, 0.0, 0.0);
         let end = vec3(3.0, 4.0, 0.0);
-        let from_points = ghost_from_points("segment", &[start, end]).expect("segment");
+        let from_points = ghost_from_points("segment", &[start, end], 6).expect("segment");
         let from_drag = ghost_from_drag("segment", start, end, 1.0).expect("segment");
         assert_eq!(format!("{from_points:?}"), format!("{from_drag:?}"));
         // Exactly two points: a third must refuse.
-        assert!(ghost_from_points("segment", &[start, end, vec3(1.0, 1.0, 0.0)]).is_none());
+        assert!(ghost_from_points("segment", &[start, end, vec3(1.0, 1.0, 0.0)], 6).is_none());
     }
 }
