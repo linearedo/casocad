@@ -2,7 +2,8 @@
 //! texture (own render pass with depth) and shows it as an egui image, with
 //! orbit / pan / zoom / reference-view input matching casoCAD.
 
-use caso_kernel::scene::SceneDocument;
+use caso_kernel::scene::{SceneDocument, ScenePayload};
+use caso_kernel::sdf::node::Shape;
 use caso_kernel::vec3::{vec3, Vec3};
 use caso_render::{OrbitCamera, RenderOptions, ViewportRenderer};
 use caso_surfaces::ViewportSurfaceCache;
@@ -292,6 +293,55 @@ impl ViewportPanel {
                 let mid = anchor + (end - anchor) * 0.5;
                 label_with_backdrop(&painter, mid + egui::vec2(6.0, -6.0), &text, color);
             }
+        }
+    }
+
+    /// Dashed revolve-axis glyph for each selected revolved solid — the same
+    /// rendering the pick tool previews, so the axis stays inspectable after
+    /// commit (`Revolve::axis_frame` is the single source of truth).
+    fn paint_revolve_axes(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &AppState,
+    ) {
+        let painter = ui.painter_at(rect);
+        for id in &state.selection {
+            let Ok(object) = state.document.object(*id) else {
+                continue;
+            };
+            if !matches!(object.payload, ScenePayload::Revolve { .. }) {
+                continue;
+            }
+            let Ok(node) = state.document.build_node(*id) else {
+                continue;
+            };
+            let Shape::Revolve(revolve) = &node.shape else {
+                continue;
+            };
+            let Ok(frame) = revolve.axis_frame() else {
+                continue;
+            };
+            let section = revolve.section2d();
+            let half_length = crate::tools::axis_half_length(
+                section.origin,
+                section.axis_u,
+                section.axis_v,
+                section.profile.bounds(),
+                frame.origin,
+            );
+            crate::tools::paint_revolve_axis(
+                &painter,
+                &self.camera,
+                rect,
+                pixels_per_point,
+                frame.origin,
+                frame.axis,
+                frame.radial,
+                half_length,
+                crate::tools::REVOLVE_AXIS_COLOR,
+            );
         }
     }
 
@@ -673,8 +723,8 @@ impl ViewportPanel {
         let along = b - a;
         if along.length() > 1e-3 {
             let inward = along.normalized();
-            arrow_head(painter, a, inward, stroke);
-            arrow_head(painter, b, -inward, stroke);
+            crate::tools::arrow_head(painter, a, inward, stroke);
+            crate::tools::arrow_head(painter, b, -inward, stroke);
         }
         let text = crate::dimensions::format_length((end - start).length(), &state.unit);
         // Label offset perpendicular to the line so it never sits on it.
@@ -860,6 +910,7 @@ impl ViewportPanel {
         if self.show_bounds {
             self.paint_bounds_tripods(ui, rect, pixels_per_point, state);
         }
+        self.paint_revolve_axes(ui, rect, pixels_per_point, state);
         self.refresh_boundary_overlays(state, tools, render_state);
         // Keep painting while refinement tiers are pending.
         if !self.pending_tiers.is_empty() {
@@ -884,26 +935,6 @@ fn label_with_backdrop(
         egui::Color32::from_rgba_unmultiplied(6, 10, 16, 190),
     );
     painter.galley(pos, galley, color);
-}
-
-/// Two wing strokes at a dimension-line tip; `direction` points inward along
-/// the line (unit length).
-fn arrow_head(
-    painter: &egui::Painter,
-    tip: egui::Pos2,
-    direction: egui::Vec2,
-    stroke: egui::Stroke,
-) {
-    const WING_LENGTH: f32 = 8.0;
-    const WING_ANGLE: f32 = 0.45;
-    for angle in [WING_ANGLE, -WING_ANGLE] {
-        let (sin, cos) = angle.sin_cos();
-        let wing = egui::vec2(
-            direction.x * cos - direction.y * sin,
-            direction.x * sin + direction.y * cos,
-        );
-        painter.line_segment([tip, tip + wing * WING_LENGTH], stroke);
-    }
 }
 
 fn vertex_point(surface: &caso_surfaces::ViewportSurface, index: u32) -> Vec3 {

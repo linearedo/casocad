@@ -447,20 +447,12 @@ impl CasoApp {
                 if ui.button("Revolve").clicked() {
                     match parse_scalar_entry(&self.revolve_angle_text) {
                         Ok(angle) => {
-                            self.state.push_undo();
-                            let result = self.state.document.solid_from_2d(
-                                section,
-                                "revolve",
-                                None,
-                                RevolveAxis::V,
-                                None,
-                                None,
-                                None,
-                                angle,
-                            );
-                            if let Some(id) = self.state.report(result, "Revolved") {
-                                self.state.select_only(id);
-                            }
+                            // Arms the axis-pick tool: the viewport shows the
+                            // dashed default axis (Enter commits it) and two
+                            // clicks re-place it on the section plane.
+                            self.tools
+                                .set_tool(ToolKind::RevolveAxisPick(section), &mut self.state);
+                            self.tools.revolve_angle = angle;
                         }
                         Err(error) => self.state.status = error,
                     }

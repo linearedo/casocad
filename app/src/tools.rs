@@ -3,10 +3,13 @@
 //! All tools act on the `Z = 0` XY reference grid, like the Python app.
 
 use caso_kernel::boundary_ops::BoundaryPatchHit;
-use caso_kernel::scene::SceneDocument;
+use caso_kernel::scene::{ObjectId, SceneDocument, ScenePayload};
 use caso_kernel::sdf::node::{Node, RotationAxis};
+use caso_kernel::sdf::primitives_2d::Profile2D;
+use caso_kernel::sdf::solid_from_2d::RevolveAxis;
 use caso_kernel::vec3::{vec3, Vec3};
 use caso_render::OrbitCamera;
+use caso_surfaces::profiles2d::profile_outline;
 use eframe::egui;
 
 use crate::boundary_tool;
@@ -96,6 +99,9 @@ pub enum ToolKind {
     BoundaryRegion,
     /// Split the selected region with a knife of the given kind.
     BoundaryCutter(&'static str),
+    /// Place the revolve axis on the section's plane: Enter commits the
+    /// dashed default axis, or click origin then direction to re-place it.
+    RevolveAxisPick(ObjectId),
 }
 
 pub struct ToolState {
@@ -107,6 +113,9 @@ pub struct ToolState {
     screen_start: Option<egui::Pos2>,
     /// Committed points of an active point tool.
     pub points: Vec<Vec3>,
+    /// Revolve angle in degrees, parsed from the toolbar at Revolve-tool
+    /// activation and consumed by the commit.
+    pub revolve_angle: f64,
     /// Typed-dimension buffer, filled from keystrokes during a create drag.
     pub dimension_text: String,
     move_last: Option<Vec3>,
@@ -148,6 +157,7 @@ impl Default for ToolState {
             drag_current: None,
             screen_start: None,
             points: Vec::new(),
+            revolve_angle: 360.0,
             dimension_text: String::new(),
             move_last: None,
             rotate_last_x: None,
@@ -236,6 +246,9 @@ impl ToolState {
             ToolKind::BoundaryCutter(knife) => format!(
                 "Cutter ({knife}): place the knife — Enter splits, Backspace removes last, Esc cancels/exits"
             ),
+            ToolKind::RevolveAxisPick(_) => {
+                "Revolve: dashed line is the axis — Enter revolves now, or click the axis origin then its direction (Esc exits)".to_string()
+            }
         };
     }
 
@@ -279,9 +292,10 @@ impl ToolState {
             ToolKind::CreateDrag(_) => {
                 self.drag_start.is_some() || !self.dimension_text.is_empty()
             }
-            ToolKind::CreatePoints(_) | ToolKind::Measure | ToolKind::BoundaryCutter(_) => {
-                !self.points.is_empty()
-            }
+            ToolKind::CreatePoints(_)
+            | ToolKind::Measure
+            | ToolKind::BoundaryCutter(_)
+            | ToolKind::RevolveAxisPick(_) => !self.points.is_empty(),
             ToolKind::Move | ToolKind::Rotate => {
                 self.undo_pushed
                     || self.gizmo_axis.is_some()
@@ -347,6 +361,12 @@ impl ToolState {
                 state.status = "Knife cleared".to_string();
                 true
             }
+            ToolKind::RevolveAxisPick(_) => {
+                self.points.clear();
+                state.status =
+                    "Axis origin cleared — Enter revolves around the default axis".to_string();
+                true
+            }
         }
     }
 
@@ -357,6 +377,9 @@ impl ToolState {
         match self.kind {
             ToolKind::CreatePoints(_) => self.commit_point_shape(state),
             ToolKind::BoundaryCutter(_) => self.commit_cutter_split(state),
+            // Enter always commits a revolve: with no points it uses the
+            // default axis the dashed preview is showing.
+            ToolKind::RevolveAxisPick(section) => self.commit_revolve(section, None, state),
             _ => false,
         }
     }
@@ -387,6 +410,15 @@ impl ToolState {
                     state.status =
                         format!("{} knife point(s) — Enter splits", self.points.len());
                     self.refresh_cutter_ghost(knife, state);
+                    true
+                } else {
+                    false
+                }
+            }
+            ToolKind::RevolveAxisPick(_) => {
+                if self.points.pop().is_some() {
+                    state.status =
+                        "Axis origin removed — Enter revolves around the default axis".to_string();
                     true
                 } else {
                     false
@@ -514,7 +546,10 @@ impl ToolState {
     pub fn blocks_camera(&self) -> bool {
         !matches!(
             self.kind,
-            ToolKind::Select | ToolKind::Measure | ToolKind::BoundaryRegion
+            ToolKind::Select
+                | ToolKind::Measure
+                | ToolKind::BoundaryRegion
+                | ToolKind::RevolveAxisPick(_)
         )
     }
 
@@ -551,6 +586,15 @@ impl ToolState {
             }
             ToolKind::BoundaryCutter(knife) => self.handle_boundary_cutter(
                 knife,
+                response,
+                ui,
+                camera,
+                rect,
+                pixels_per_point,
+                state,
+            ),
+            ToolKind::RevolveAxisPick(section) => self.handle_revolve_axis(
+                section,
                 response,
                 ui,
                 camera,
@@ -705,6 +749,184 @@ impl ToolState {
         }
         for pair in screen_points.windows(2) {
             painter.line_segment([pair[0], pair[1]], egui::Stroke::new(1.5, accent));
+        }
+        true
+    }
+
+    /// Revolve axis pick: the dashed preview always shows the axis the
+    /// commit would use — default (section origin + V) with no points, the
+    /// picked origin toward the cursor with one. Clicks snap to the section
+    /// outline (vertices, edge midpoints, origin); the second click commits.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_revolve_axis(
+        &mut self,
+        section: ObjectId,
+        response: &egui::Response,
+        ui: &egui::Ui,
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        state: &mut AppState,
+    ) -> bool {
+        let Some(frame) = section_frame(&state.document, section) else {
+            state.status = "Revolve: the section is gone — tool exited".to_string();
+            self.points.clear();
+            self.kind = ToolKind::Select;
+            return false;
+        };
+        let pointer = ui
+            .ctx()
+            .input(|input| input.pointer.latest_pos())
+            .filter(|pos| rect.contains(*pos));
+        let candidates: Vec<(egui::Pos2, Vec3)> = revolve_snap_points(&frame)
+            .into_iter()
+            .filter_map(|world| {
+                project_to_screen(camera, world, rect, pixels_per_point)
+                    .map(|pos| (pos, world))
+            })
+            .collect();
+        let snap_hit = pointer.and_then(|pos| {
+            snap_to_candidates(pos, &candidates, REVOLVE_SNAP_THRESHOLD_PX)
+        });
+        let cursor_point = snap_hit.or_else(|| {
+            pointer.and_then(|pos| {
+                let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
+                ray_plane_point(origin, direction, frame.origin, frame.normal)
+            })
+        });
+        let mut consumed = false;
+        if response.clicked() {
+            if let Some(point) = cursor_point {
+                consumed = true;
+                if self.points.is_empty() {
+                    self.points.push(point);
+                    state.status =
+                        "Revolve: click the axis direction — Enter uses the V direction"
+                            .to_string();
+                } else {
+                    let start = self.points[0];
+                    let toward = point - start;
+                    if toward.length() <= 1e-9 {
+                        state.status =
+                            "Revolve: the direction point must differ from the origin"
+                                .to_string();
+                    } else {
+                        let unit = toward / toward.length();
+                        let direction = snap_axis_direction(
+                            unit,
+                            frame.axis_u,
+                            frame.axis_v,
+                            REVOLVE_DIRECTION_SNAP_DEGREES,
+                        );
+                        self.commit_revolve(section, Some(direction), state);
+                        return true;
+                    }
+                }
+            }
+        }
+        // Preview: exactly the axis a commit right now would use.
+        let (axis_origin, axis_direction) = match (self.points.first().copied(), cursor_point)
+        {
+            (Some(start), Some(cursor)) if (cursor - start).length() > 1e-9 => {
+                let unit = (cursor - start) / (cursor - start).length();
+                (
+                    start,
+                    snap_axis_direction(
+                        unit,
+                        frame.axis_u,
+                        frame.axis_v,
+                        REVOLVE_DIRECTION_SNAP_DEGREES,
+                    ),
+                )
+            }
+            (Some(start), _) => (start, frame.axis_v),
+            (None, _) => (frame.origin, frame.axis_v),
+        };
+        let radial = radial_toward_centroid(
+            axis_origin,
+            axis_direction,
+            frame.normal,
+            outline_centroid(&frame),
+        );
+        let half_length = axis_half_length(
+            frame.origin,
+            frame.axis_u,
+            frame.axis_v,
+            frame.profile.bounds(),
+            axis_origin,
+        );
+        let painter = ui.painter_at(rect);
+        paint_revolve_axis(
+            &painter,
+            camera,
+            rect,
+            pixels_per_point,
+            axis_origin,
+            axis_direction,
+            radial,
+            half_length,
+            REVOLVE_AXIS_COLOR,
+        );
+        // Cursor marker: filled when snapped to the outline, ring otherwise.
+        if let Some(point) = cursor_point {
+            if let Some(pos) = project_to_screen(camera, point, rect, pixels_per_point) {
+                if snap_hit.is_some() {
+                    painter.circle_filled(pos, 4.5, REVOLVE_AXIS_COLOR);
+                } else {
+                    painter.circle_stroke(
+                        pos,
+                        4.5,
+                        egui::Stroke::new(1.5, REVOLVE_AXIS_COLOR),
+                    );
+                }
+            }
+        }
+        consumed
+    }
+
+    /// Commit the revolve around the picked (or default) axis. The radial
+    /// direction always points from the axis toward the profile centroid so
+    /// the swept half-plane is the side holding the profile mass.
+    fn commit_revolve(
+        &mut self,
+        section: ObjectId,
+        direction: Option<Vec3>,
+        state: &mut AppState,
+    ) -> bool {
+        let Some(frame) = section_frame(&state.document, section) else {
+            state.status = "Revolve: the section is gone — tool exited".to_string();
+            self.points.clear();
+            self.kind = ToolKind::Select;
+            return true;
+        };
+        let axis_origin = self.points.first().copied().unwrap_or(frame.origin);
+        let axis_direction = direction.unwrap_or(frame.axis_v);
+        let radial = radial_toward_centroid(
+            axis_origin,
+            axis_direction,
+            frame.normal,
+            outline_centroid(&frame),
+        );
+        state.push_undo();
+        let result = state.document.solid_from_2d(
+            section,
+            "revolve",
+            None,
+            RevolveAxis::V,
+            Some(axis_origin),
+            Some(axis_direction),
+            Some(radial),
+            self.revolve_angle,
+        );
+        if let Some(id) = state.report(result, "Revolved") {
+            state.select_only(id);
+            self.points.clear();
+            // Not `set_tool`: its cancel() would overwrite the status.
+            self.kind = ToolKind::Select;
+        } else {
+            // Refused commit: roll back the snapshot, keep the picked point
+            // so the user can adjust and retry.
+            state.abort_to_last_snapshot();
         }
         true
     }
@@ -1221,6 +1443,366 @@ pub fn project_to_screen(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Revolve axis pick: plane picking, snapping, and axis rendering
+
+/// Revolve-axis orange, distinct from the accent blue, measure amber, and
+/// knife magenta.
+pub(crate) const REVOLVE_AXIS_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 140, 60);
+
+/// Screen-space snap radius to the section outline, in points.
+const REVOLVE_SNAP_THRESHOLD_PX: f32 = 12.0;
+
+/// Direction clicks within this angle of the workplane U/V axes snap onto
+/// them.
+const REVOLVE_DIRECTION_SNAP_DEGREES: f64 = 4.0;
+
+/// The section's workplane and profile, read fresh from the document every
+/// frame so undo/redo mid-tool can never leave the tool acting on a stale
+/// section.
+struct SectionFrame {
+    origin: Vec3,
+    axis_u: Vec3,
+    axis_v: Vec3,
+    normal: Vec3,
+    profile: Profile2D,
+}
+
+fn section_frame(document: &SceneDocument, id: ObjectId) -> Option<SectionFrame> {
+    let object = document.object(id).ok()?;
+    let ScenePayload::Placed2D {
+        profile,
+        origin,
+        axis_u,
+        axis_v,
+        ..
+    } = &object.payload
+    else {
+        return None;
+    };
+    let normal = axis_u.cross(*axis_v);
+    let length = normal.length();
+    if length <= 1e-12 {
+        return None;
+    }
+    Some(SectionFrame {
+        origin: *origin,
+        axis_u: *axis_u,
+        axis_v: *axis_v,
+        normal: normal / length,
+        profile: profile.clone(),
+    })
+}
+
+/// Intersect a world ray with an arbitrary plane (the general form of
+/// `grid_point`'s Z=0 case). Rejects near-parallel rays and hits behind the
+/// ray origin.
+pub fn ray_plane_point(
+    origin: Vec3,
+    direction: Vec3,
+    plane_origin: Vec3,
+    plane_normal: Vec3,
+) -> Option<Vec3> {
+    let denominator = direction.dot(plane_normal);
+    if denominator.abs() < 1e-12 {
+        return None;
+    }
+    let t = (plane_origin - origin).dot(plane_normal) / denominator;
+    if t <= 0.0 {
+        return None;
+    }
+    Some(origin + direction * t)
+}
+
+/// World-space snap targets on the section: outline vertices, outline edge
+/// midpoints, and the workplane origin.
+fn revolve_snap_points(frame: &SectionFrame) -> Vec<Vec3> {
+    let outline = profile_outline(&frame.profile, 64);
+    let lift = |u: f64, v: f64| frame.origin + frame.axis_u * u + frame.axis_v * v;
+    let mut points: Vec<Vec3> = outline.iter().map(|point| lift(point[0], point[1])).collect();
+    for index in 0..outline.len() {
+        let a = outline[index];
+        let b = outline[(index + 1) % outline.len()];
+        points.push(lift((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5));
+    }
+    points.push(frame.origin);
+    points
+}
+
+/// Nearest projected candidate within the pixel threshold.
+pub fn snap_to_candidates(
+    cursor: egui::Pos2,
+    candidates: &[(egui::Pos2, Vec3)],
+    threshold: f32,
+) -> Option<Vec3> {
+    let mut best: Option<(f32, Vec3)> = None;
+    for (pos, world) in candidates {
+        let distance = pos.distance(cursor);
+        if distance <= threshold && best.is_none_or(|(nearest, _)| distance < nearest) {
+            best = Some((distance, *world));
+        }
+    }
+    best.map(|(_, world)| world)
+}
+
+/// Snap a unit direction onto ±axis_u/±axis_v when within tolerance, else
+/// return it unchanged.
+pub fn snap_axis_direction(
+    direction: Vec3,
+    axis_u: Vec3,
+    axis_v: Vec3,
+    tolerance_degrees: f64,
+) -> Vec3 {
+    let cos_tolerance = tolerance_degrees.to_radians().cos();
+    for candidate in [axis_u, axis_v] {
+        let length = candidate.length();
+        if length <= 1e-12 {
+            continue;
+        }
+        let unit = candidate / length;
+        let alignment = direction.dot(unit);
+        if alignment.abs() >= cos_tolerance {
+            return unit * alignment.signum();
+        }
+    }
+    direction
+}
+
+/// World-space centroid of the section outline: signed-area centroid of the
+/// closed polygon, vertex mean when the area degenerates, workplane origin
+/// when the outline is empty.
+fn outline_centroid(frame: &SectionFrame) -> Vec3 {
+    let outline = profile_outline(&frame.profile, 64);
+    if outline.is_empty() {
+        return frame.origin;
+    }
+    let mut doubled_area = 0.0;
+    let mut weighted_u = 0.0;
+    let mut weighted_v = 0.0;
+    for index in 0..outline.len() {
+        let a = outline[index];
+        let b = outline[(index + 1) % outline.len()];
+        let cross = a[0] * b[1] - b[0] * a[1];
+        doubled_area += cross;
+        weighted_u += (a[0] + b[0]) * cross;
+        weighted_v += (a[1] + b[1]) * cross;
+    }
+    let (u, v) = if doubled_area.abs() > 1e-12 {
+        (
+            weighted_u / (3.0 * doubled_area),
+            weighted_v / (3.0 * doubled_area),
+        )
+    } else {
+        let count = outline.len() as f64;
+        (
+            outline.iter().map(|point| point[0]).sum::<f64>() / count,
+            outline.iter().map(|point| point[1]).sum::<f64>() / count,
+        )
+    };
+    frame.origin + frame.axis_u * u + frame.axis_v * v
+}
+
+/// In-plane unit perpendicular of the axis, oriented toward the profile
+/// centroid — so the revolve's kept half-plane is always the side holding
+/// the profile (a centroid exactly on the axis keeps the +perp side, where
+/// either choice sweeps the same solid).
+pub fn radial_toward_centroid(
+    axis_origin: Vec3,
+    axis_direction: Vec3,
+    plane_normal: Vec3,
+    centroid: Vec3,
+) -> Vec3 {
+    let perpendicular = plane_normal.cross(axis_direction);
+    let length = perpendicular.length();
+    if length <= 1e-12 {
+        return plane_normal;
+    }
+    let perpendicular = perpendicular / length;
+    if (centroid - axis_origin).dot(perpendicular) < 0.0 {
+        -perpendicular
+    } else {
+        perpendicular
+    }
+}
+
+/// Half-length of the drawn axis line: the farthest lifted profile-bounds
+/// corner from the axis origin with margin, floored for tiny profiles.
+pub fn axis_half_length(
+    section_origin: Vec3,
+    axis_u: Vec3,
+    axis_v: Vec3,
+    bounds: (f64, f64, f64, f64),
+    axis_origin: Vec3,
+) -> f64 {
+    let (u_min, u_max, v_min, v_max) = bounds;
+    let mut farthest: f64 = 0.0;
+    for (u, v) in [(u_min, v_min), (u_min, v_max), (u_max, v_min), (u_max, v_max)] {
+        let corner = section_origin + axis_u * u + axis_v * v;
+        farthest = farthest.max((corner - axis_origin).length());
+    }
+    (farthest * 1.5).max(0.5)
+}
+
+/// Liang–Barsky clip of a screen segment to a rect (keeps the dash count
+/// bounded when a projected endpoint lands far outside the viewport).
+fn clip_segment_to_rect(
+    a: egui::Pos2,
+    b: egui::Pos2,
+    rect: egui::Rect,
+) -> Option<(egui::Pos2, egui::Pos2)> {
+    let delta = b - a;
+    let mut enter = 0.0f32;
+    let mut exit = 1.0f32;
+    for (direction, distance_low, distance_high) in [
+        (delta.x, rect.min.x - a.x, rect.max.x - a.x),
+        (delta.y, rect.min.y - a.y, rect.max.y - a.y),
+    ] {
+        if direction.abs() < 1e-9 {
+            if distance_low > 0.0 || distance_high < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let (mut low, mut high) = (distance_low / direction, distance_high / direction);
+        if low > high {
+            std::mem::swap(&mut low, &mut high);
+        }
+        enter = enter.max(low);
+        exit = exit.min(high);
+        if enter > exit {
+            return None;
+        }
+    }
+    Some((a + delta * enter, a + delta * exit))
+}
+
+/// Dashed world-space segment: clipped to the camera-front half-space (so a
+/// long axis stays visible when one end is behind the camera), projected,
+/// clipped to the viewport rect, then dashed in screen space.
+pub fn paint_dashed_segment(
+    painter: &egui::Painter,
+    camera: &OrbitCamera,
+    rect: egui::Rect,
+    pixels_per_point: f32,
+    a: Vec3,
+    b: Vec3,
+    stroke: egui::Stroke,
+) {
+    const NEAR: f64 = 1e-3;
+    let basis = camera.basis();
+    let depth = |point: Vec3| (point - basis.position).dot(basis.forward);
+    let (depth_a, depth_b) = (depth(a), depth(b));
+    if depth_a <= NEAR && depth_b <= NEAR {
+        return;
+    }
+    let (mut a, mut b) = (a, b);
+    if depth_a <= NEAR {
+        a = a + (b - a) * ((NEAR - depth_a) / (depth_b - depth_a));
+    } else if depth_b <= NEAR {
+        b = b + (a - b) * ((NEAR - depth_b) / (depth_a - depth_b));
+    }
+    let (Some(a), Some(b)) = (
+        project_to_screen(camera, a, rect, pixels_per_point),
+        project_to_screen(camera, b, rect, pixels_per_point),
+    ) else {
+        return;
+    };
+    let Some((a, b)) = clip_segment_to_rect(a, b, rect) else {
+        return;
+    };
+    const DASH: f32 = 8.0;
+    const GAP: f32 = 5.0;
+    let along = b - a;
+    let length = along.length();
+    if length < 1e-3 {
+        return;
+    }
+    let unit = along / length;
+    let mut travelled = 0.0;
+    while travelled < length {
+        let end = (travelled + DASH).min(length);
+        painter.line_segment([a + unit * travelled, a + unit * end], stroke);
+        travelled = end + GAP;
+    }
+}
+
+/// The revolve-axis glyph, shared by the pick tool's live preview and the
+/// selection overlay on committed revolves: dashed axis line with an
+/// arrowhead at the +axis end, a solid "kept side" radial tick, and the
+/// origin dot.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_revolve_axis(
+    painter: &egui::Painter,
+    camera: &OrbitCamera,
+    rect: egui::Rect,
+    pixels_per_point: f32,
+    origin: Vec3,
+    axis: Vec3,
+    radial: Vec3,
+    half_length: f64,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.5, color);
+    paint_dashed_segment(
+        painter,
+        camera,
+        rect,
+        pixels_per_point,
+        origin - axis * half_length,
+        origin + axis * half_length,
+        stroke,
+    );
+    let anchor = project_to_screen(camera, origin, rect, pixels_per_point);
+    if let (Some(anchor), Some(tip)) = (
+        anchor,
+        project_to_screen(camera, origin + axis * half_length, rect, pixels_per_point),
+    ) {
+        let along = tip - anchor;
+        if along.length() > 1e-3 {
+            arrow_head(painter, tip, -along.normalized(), stroke);
+        }
+    }
+    if let (Some(anchor), Some(tick)) = (
+        anchor,
+        project_to_screen(
+            camera,
+            origin + radial * (half_length * 0.25),
+            rect,
+            pixels_per_point,
+        ),
+    ) {
+        painter.line_segment([anchor, tick], stroke);
+        let along = tick - anchor;
+        if along.length() > 1e-3 {
+            arrow_head(painter, tick, -along.normalized(), stroke);
+        }
+    }
+    if let Some(anchor) = anchor {
+        painter.circle_filled(anchor, 3.5, color);
+    }
+}
+
+/// Two wing strokes at a line tip; `direction` points inward along the line
+/// (unit length). Shared by the measure dimension lines and the revolve
+/// axis glyph.
+pub(crate) fn arrow_head(
+    painter: &egui::Painter,
+    tip: egui::Pos2,
+    direction: egui::Vec2,
+    stroke: egui::Stroke,
+) {
+    const WING_LENGTH: f32 = 8.0;
+    const WING_ANGLE: f32 = 0.45;
+    for angle in [WING_ANGLE, -WING_ANGLE] {
+        let (sin, cos) = angle.sin_cos();
+        let wing = egui::vec2(
+            direction.x * cos - direction.y * sin,
+            direction.x * sin + direction.y * cos,
+        );
+        painter.line_segment([tip, tip + wing * WING_LENGTH], stroke);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1430,6 +2012,210 @@ mod tests {
         assert!(tools.points.is_empty());
         assert!(!tools.pop_pending(&mut state));
         assert!(!tools.has_pending());
+    }
+
+    #[test]
+    fn ray_plane_point_hits_oblique_plane() {
+        let plane_origin = vec3(1.0, 0.0, 0.0);
+        let plane_normal = vec3(1.0, 1.0, 0.0);
+        let hit = ray_plane_point(vec3(3.0, 0.0, 0.0), vec3(-1.0, 0.0, 0.0), plane_origin, plane_normal)
+            .expect("hit");
+        assert!((hit - vec3(1.0, 0.0, 0.0)).length() < 1e-12);
+        // Parallel ray misses; a plane behind the ray origin misses.
+        assert!(ray_plane_point(
+            vec3(0.0, 0.0, 1.0),
+            vec3(1.0, -1.0, 0.0),
+            plane_origin,
+            plane_normal
+        )
+        .is_none());
+        assert!(ray_plane_point(
+            vec3(3.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            plane_origin,
+            plane_normal
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn snap_prefers_nearest_candidate_within_threshold() {
+        let candidates = [
+            (egui::pos2(20.0, 0.0), vec3(2.0, 0.0, 0.0)),
+            (egui::pos2(8.0, 0.0), vec3(1.0, 0.0, 0.0)),
+        ];
+        assert_eq!(
+            snap_to_candidates(egui::pos2(0.0, 0.0), &candidates, 12.0),
+            Some(vec3(1.0, 0.0, 0.0))
+        );
+        assert_eq!(
+            snap_to_candidates(egui::pos2(0.0, 40.0), &candidates, 12.0),
+            None
+        );
+    }
+
+    #[test]
+    fn direction_snaps_to_workplane_axes() {
+        let axis_u = vec3(1.0, 0.0, 0.0);
+        let axis_v = vec3(0.0, 1.0, 0.0);
+        let nearly_u = vec3(3.0f64.to_radians().cos(), 3.0f64.to_radians().sin(), 0.0);
+        assert_eq!(snap_axis_direction(nearly_u, axis_u, axis_v, 4.0), axis_u);
+        let off_u = vec3(10.0f64.to_radians().cos(), 10.0f64.to_radians().sin(), 0.0);
+        assert_eq!(snap_axis_direction(off_u, axis_u, axis_v, 4.0), off_u);
+        let nearly_negative_v =
+            vec3(2.0f64.to_radians().sin(), -2.0f64.to_radians().cos(), 0.0);
+        assert_eq!(
+            snap_axis_direction(nearly_negative_v, axis_u, axis_v, 4.0),
+            -axis_v
+        );
+    }
+
+    /// The kept half-plane always holds the profile: the radial flips with
+    /// the profile side and stays finite when the centroid sits on the axis.
+    #[test]
+    fn radial_points_toward_centroid() {
+        let normal = vec3(0.0, 0.0, 1.0);
+        let axis = vec3(0.0, 1.0, 0.0);
+        let origin = vec3(0.0, 0.0, 0.0);
+        let toward_positive_u =
+            radial_toward_centroid(origin, axis, normal, vec3(0.5, 0.0, 0.0));
+        assert!((toward_positive_u - vec3(1.0, 0.0, 0.0)).length() < 1e-12);
+        let toward_negative_u =
+            radial_toward_centroid(origin, axis, normal, vec3(-0.5, 0.2, 0.0));
+        assert!((toward_negative_u - vec3(-1.0, 0.0, 0.0)).length() < 1e-12);
+        let on_axis = radial_toward_centroid(origin, axis, normal, vec3(0.0, 3.0, 0.0));
+        assert!((on_axis.length() - 1.0).abs() < 1e-12);
+        assert!(on_axis.x.is_finite() && on_axis.y.is_finite() && on_axis.z.is_finite());
+    }
+
+    #[test]
+    fn axis_half_length_covers_profile() {
+        let mut state = AppState::new(SceneDocument::new());
+        let id = state
+            .document
+            .add_primitive_from_drag(
+                "rectangle",
+                vec3(-0.3, -0.5, 0.0),
+                vec3(0.3, 0.5, 0.0),
+                1.0,
+            )
+            .unwrap();
+        let frame = section_frame(&state.document, id).expect("section");
+        let axis_origin = frame.origin + frame.axis_u * 0.3;
+        let half = axis_half_length(
+            frame.origin,
+            frame.axis_u,
+            frame.axis_v,
+            frame.profile.bounds(),
+            axis_origin,
+        );
+        // Farthest corner from (0.3, 0) is (-0.3, ±0.5): distance ~0.781.
+        assert!(half >= (0.6f64.powi(2) + 0.5f64.powi(2)).sqrt());
+    }
+
+    /// Enter with no picked points commits the same revolve the old
+    /// one-click button produced, but with the axis stored explicitly.
+    #[test]
+    fn enter_with_no_points_commits_default_axis() {
+        let mut state = AppState::new(SceneDocument::new());
+        let id = state
+            .document
+            .add_primitive_from_drag(
+                "rectangle",
+                vec3(-0.3, -0.5, 0.0),
+                vec3(0.3, 0.5, 0.0),
+                1.0,
+            )
+            .unwrap();
+        let frame = section_frame(&state.document, id).expect("section");
+        let mut tools = ToolState::default();
+        tools.set_tool(ToolKind::RevolveAxisPick(id), &mut state);
+        tools.revolve_angle = 360.0;
+        assert!(tools.confirm_pending(&mut state));
+        assert_eq!(tools.kind, ToolKind::Select, "commit exits the tool");
+        assert_eq!(state.document.roots.len(), 1);
+        let root = state.document.roots[0];
+        assert_eq!(state.selection, vec![root]);
+        let object = state.document.object(root).unwrap();
+        let ScenePayload::Revolve {
+            axis_origin,
+            axis_direction,
+            radial_direction,
+            angle_degrees,
+            ..
+        } = &object.payload
+        else {
+            panic!("expected a revolve payload");
+        };
+        assert_eq!(*axis_origin, Some(frame.origin));
+        assert_eq!(*axis_direction, Some(frame.axis_v));
+        assert!(radial_direction.is_some());
+        assert_eq!(*angle_degrees, 360.0);
+        assert!(state.can_undo());
+    }
+
+    /// A picked origin + explicit direction land verbatim in the payload,
+    /// with the radial oriented at the profile.
+    #[test]
+    fn commit_with_explicit_origin_and_direction() {
+        let mut state = AppState::new(SceneDocument::new());
+        let id = state
+            .document
+            .add_primitive_from_drag(
+                "rectangle",
+                vec3(-0.3, -0.5, 0.0),
+                vec3(0.3, 0.5, 0.0),
+                1.0,
+            )
+            .unwrap();
+        let frame = section_frame(&state.document, id).expect("section");
+        // Axis along the rectangle's left edge: classic solid cylinder.
+        let picked_origin = frame.origin - frame.axis_u * 0.3;
+        let mut tools = ToolState::default();
+        tools.set_tool(ToolKind::RevolveAxisPick(id), &mut state);
+        tools.points.push(picked_origin);
+        assert!(tools.commit_revolve(id, Some(frame.axis_v), &mut state));
+        let root = state.document.roots[0];
+        let ScenePayload::Revolve {
+            axis_origin,
+            axis_direction,
+            radial_direction,
+            ..
+        } = &state.document.object(root).unwrap().payload
+        else {
+            panic!("expected a revolve payload");
+        };
+        assert_eq!(*axis_origin, Some(picked_origin));
+        assert_eq!(*axis_direction, Some(frame.axis_v));
+        let radial = radial_direction.expect("radial derived");
+        assert!(
+            radial.dot(frame.axis_u) > 0.99,
+            "radial must point from the axis toward the profile"
+        );
+        state.undo();
+        assert_eq!(state.document.roots, vec![id], "one undo restores the section");
+    }
+
+    /// Deleting the section mid-tool exits cleanly instead of committing
+    /// against a dead id.
+    #[test]
+    fn stale_section_exits_to_select() {
+        let mut state = AppState::new(SceneDocument::new());
+        let id = state
+            .document
+            .add_primitive_from_drag(
+                "circle",
+                vec3(0.2, -0.2, 0.0),
+                vec3(0.6, 0.2, 0.0),
+                1.0,
+            )
+            .unwrap();
+        let mut tools = ToolState::default();
+        tools.set_tool(ToolKind::RevolveAxisPick(id), &mut state);
+        state.document.delete_many(&[id]);
+        assert!(tools.confirm_pending(&mut state), "Enter is consumed");
+        assert_eq!(tools.kind, ToolKind::Select);
+        assert!(state.document.roots.is_empty(), "document unchanged");
     }
 
     /// Point-placed segment builds the same node as the drag path did.
