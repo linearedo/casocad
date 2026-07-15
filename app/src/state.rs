@@ -76,6 +76,19 @@ impl AppState {
         }
     }
 
+    /// Revert to the last undo snapshot WITHOUT creating a redo entry — for
+    /// aborting an in-flight gesture (or rolling back a refused commit)
+    /// whose `push_undo` already ran. That `push_undo` cleared the redo
+    /// stack, so popping without pushing restores the exact pre-gesture
+    /// history state.
+    pub fn abort_to_last_snapshot(&mut self) {
+        if let Some(previous) = self.undo_stack.pop() {
+            self.document = previous;
+            self.document.mark_changed();
+            self.retain_live_selection();
+        }
+    }
+
     pub fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
             self.undo_stack.push(self.document.snapshot());
@@ -181,6 +194,24 @@ mod tests {
             undone += 1;
         }
         assert_eq!(undone, UNDO_LIMIT);
+    }
+
+    /// Aborting a gesture reverts the document without leaving the
+    /// half-applied edit reachable through Ctrl+Y.
+    #[test]
+    fn abort_to_last_snapshot_leaves_no_redo() {
+        let mut state = AppState::new(SceneDocument::new());
+        state.push_undo();
+        let a = state.document.add_primitive("box", 1.0).unwrap();
+        // The gesture: snapshot, then a mutation the user aborts.
+        state.push_undo();
+        state.document.add_primitive("cylinder", 1.0).unwrap();
+        state.abort_to_last_snapshot();
+        assert_eq!(state.document.roots, vec![a]);
+        assert!(!state.can_redo(), "aborted gesture must not be redoable");
+        // The pre-gesture history is intact: one more undo removes the box.
+        state.undo();
+        assert!(state.document.roots.is_empty());
     }
 
     /// Deleting selected nodes (the Delete-key path) leaves no dangling ids.

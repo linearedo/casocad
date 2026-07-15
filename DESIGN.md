@@ -185,6 +185,32 @@ sheet so closed surfaces never show an antipodal phantom cut; see
 (Rhai scripting: `domains`, per-domain SDF/region queries, `emit(...)`;
 preview overlay; `.arrow` export — browser export is a Blob download).
 
+**Unified tool-interaction grammar.** Every viewport tool follows one
+lifecycle, enforced by a single dispatcher instead of per-tool key handling:
+
+- **Commit model is per input class**: drag-created kinds commit at gesture
+  end (typed dimensions are applied at mouse release); point-placed kinds
+  and the cutter commit on **Enter**; Measure commits on its second click;
+  Boundary Region commits on click. There is no draft/pending object state —
+  undo is the safety net.
+- **Tools stay armed** after a commit for repeated use; Esc (idle) or
+  re-clicking the active tool button/menu entry exits to Select.
+- **The key ladder**: **Esc** first clears pending input (typed dimensions,
+  placed points, the pending measure point, a live Move/Rotate gesture —
+  reverted via `AppState::abort_to_last_snapshot`, which leaves no redo
+  entry), and a second Esc exits to Select. **Enter** confirms whatever is
+  pending. **Backspace** pops the last placed point / typed character.
+- **One dispatcher**: `ToolState::{has_pending, clear_pending,
+  confirm_pending, pop_pending}` called once from the app `shortcuts()`
+  pass; tool handlers never read Esc/Enter/Backspace themselves. The
+  Measure pending point lives in `ToolState::points` like every point tool
+  (only committed annotations stay in the viewport panel).
+- **Documented exceptions**: Delete while measuring is annotation-scoped
+  (clears measurements, never scene objects); document edit shortcuts
+  (undo/redo/copy/paste/duplicate/delete) are suppressed only while input
+  is pending — an armed-but-idle tool no longer blocks them; a focused text
+  field owns all keys.
+
 Viewport navigation overlays (`viewport_panel.rs`, ported from the Python
 `_OrientationWidget` / `_build_view_panel`): a bottom-left axis triad
 (world X/Y/Z projected with the camera basis, back-to-front with

@@ -109,15 +109,20 @@ fn sdf_icon(kind: &str) -> Option<egui::ImageSource<'static>> {
 
 /// Menu entry with the kind's SVG icon before the label (plain button when
 /// no icon exists) — the egui counterpart of the Python `QAction(sdf_icon(
-/// kind), label)` menus.
-fn sdf_menu_button(ui: &mut egui::Ui, label: &str, kind: &str) -> egui::Response {
+/// kind), label)` menus. `selected` highlights the entry whose tool is
+/// active, so re-clicking it can toggle back to Select like the toolbar
+/// tool buttons.
+fn sdf_menu_button(ui: &mut egui::Ui, label: &str, kind: &str, selected: bool) -> egui::Response {
     match sdf_icon(kind) {
-        Some(source) => ui.add(egui::Button::image_and_text(
-            egui::Image::new(source)
-                .fit_to_exact_size(egui::vec2(SDF_ICON_SIZE_POINTS, SDF_ICON_SIZE_POINTS)),
-            label,
-        )),
-        None => ui.button(label),
+        Some(source) => ui.add(
+            egui::Button::image_and_text(
+                egui::Image::new(source)
+                    .fit_to_exact_size(egui::vec2(SDF_ICON_SIZE_POINTS, SDF_ICON_SIZE_POINTS)),
+                label,
+            )
+            .selected(selected),
+        ),
+        None => ui.add(egui::Button::new(label).selected(selected)),
     }
 }
 
@@ -215,6 +220,25 @@ impl CasoApp {
         }
     }
 
+    /// Menu entry that arms a tool — highlighted while active, and clicking
+    /// the active entry toggles back to Select, matching `tool_button`.
+    fn tool_menu_entry(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        icon_kind: &str,
+        tool: ToolKind,
+    ) {
+        if sdf_menu_button(ui, label, icon_kind, self.tools.kind == tool).clicked() {
+            if self.tools.kind == tool {
+                self.tools.set_tool(ToolKind::Select, &mut self.state);
+            } else {
+                self.tools.set_tool(tool, &mut self.state);
+            }
+            ui.close();
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         self.toolbar_row_app(ui);
         ui.separator();
@@ -276,7 +300,7 @@ impl CasoApp {
         ui.horizontal(|ui| {
             ui.menu_button("Add", |ui| {
                 for (label, kind) in PRIMITIVE_KINDS {
-                    if sdf_menu_button(ui, label, kind).clicked() {
+                    if sdf_menu_button(ui, label, kind, false).clicked() {
                         self.state.push_undo();
                         let scale = self.state.unit.factor;
                         let result = self.state.document.add_primitive(kind, scale);
@@ -290,29 +314,17 @@ impl CasoApp {
             ui.menu_button("Draw", |ui| {
                 ui.label(egui::RichText::new("3D (drag on grid)").weak());
                 for (label, kind) in DRAG_KINDS_3D {
-                    if sdf_menu_button(ui, label, kind).clicked() {
-                        self.tools
-                            .set_tool(ToolKind::CreateDrag(kind), &mut self.state);
-                        ui.close();
-                    }
+                    self.tool_menu_entry(ui, label, kind, ToolKind::CreateDrag(kind));
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("2D sections").weak());
                 for (label, kind) in DRAG_KINDS_2D {
-                    if sdf_menu_button(ui, label, kind).clicked() {
-                        self.tools
-                            .set_tool(ToolKind::CreateDrag(kind), &mut self.state);
-                        ui.close();
-                    }
+                    self.tool_menu_entry(ui, label, kind, ToolKind::CreateDrag(kind));
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("1D & point tools (Enter commits)").weak());
                 for (label, kind) in POINT_KINDS {
-                    if sdf_menu_button(ui, label, kind).clicked() {
-                        self.tools
-                            .set_tool(ToolKind::CreatePoints(kind), &mut self.state);
-                        ui.close();
-                    }
+                    self.tool_menu_entry(ui, label, kind, ToolKind::CreatePoints(kind));
                 }
             });
             self.tool_button(ui, "Move", ToolKind::Move);
@@ -326,11 +338,7 @@ impl CasoApp {
                     ui.weak("Select a boundary region first.");
                 }
                 for (label, kind) in KNIFE_KINDS {
-                    if sdf_menu_button(ui, label, kind).clicked() {
-                        self.tools
-                            .set_tool(ToolKind::BoundaryCutter(kind), &mut self.state);
-                        ui.close();
-                    }
+                    self.tool_menu_entry(ui, label, kind, ToolKind::BoundaryCutter(kind));
                 }
             });
             ui.separator();
@@ -518,43 +526,56 @@ impl CasoApp {
     }
 
     fn shortcuts(&mut self, ui: &egui::Ui) {
-        // Skip document shortcuts while a text field owns the keyboard or a
-        // create tool is collecting typed dimensions/points.
+        // A focused widget (rename field, property entry) owns ALL keys,
+        // grammar included.
         if ui.ctx().memory(|memory| memory.focused().is_some()) {
             return;
         }
-        let create_tool_active = matches!(
-            self.tools.kind,
-            ToolKind::CreateDrag(_) | ToolKind::CreatePoints(_)
-        );
-        let (undo, redo, delete, duplicate, copy, paste, escape) = ui.ctx().input(|input| {
-            (
-                input.modifiers.ctrl && input.key_pressed(egui::Key::Z) && !input.modifiers.shift,
-                input.modifiers.ctrl
-                    && (input.key_pressed(egui::Key::Y)
-                        || (input.modifiers.shift && input.key_pressed(egui::Key::Z))),
-                input.key_pressed(egui::Key::Delete),
-                input.modifiers.ctrl && input.key_pressed(egui::Key::D),
-                input.modifiers.ctrl && input.key_pressed(egui::Key::C),
-                input.modifiers.ctrl && input.key_pressed(egui::Key::V),
-                input.key_pressed(egui::Key::Escape),
-            )
-        });
-        if escape && self.tools.is_active() && !create_tool_active {
-            // Measure: the first Esc only cancels a pending point.
-            if self.tools.kind == ToolKind::Measure && self.viewport.cancel_pending_measurement()
-            {
-                self.state.status = "Measure point cancelled".to_string();
-            } else {
-                self.tools.set_tool(ToolKind::Select, &mut self.state);
-            }
+        let (undo, redo, delete, duplicate, copy, paste, escape, enter, backspace) =
+            ui.ctx().input(|input| {
+                (
+                    input.modifiers.ctrl
+                        && input.key_pressed(egui::Key::Z)
+                        && !input.modifiers.shift,
+                    input.modifiers.ctrl
+                        && (input.key_pressed(egui::Key::Y)
+                            || (input.modifiers.shift && input.key_pressed(egui::Key::Z))),
+                    input.key_pressed(egui::Key::Delete),
+                    input.modifiers.ctrl && input.key_pressed(egui::Key::D),
+                    input.modifiers.ctrl && input.key_pressed(egui::Key::C),
+                    input.modifiers.ctrl && input.key_pressed(egui::Key::V),
+                    input.key_pressed(egui::Key::Escape),
+                    input.key_pressed(egui::Key::Enter),
+                    input.key_pressed(egui::Key::Backspace),
+                )
+            });
+        // The unified tool grammar (one dispatcher for every tool): Esc
+        // clears pending input, a second Esc exits to Select; Enter commits
+        // whatever is pending; Backspace pops the last point / typed char.
+        if escape
+            && !self.tools.clear_pending(&mut self.state)
+            && self.tools.is_active()
+        {
+            self.tools.set_tool(ToolKind::Select, &mut self.state);
         }
-        if create_tool_active {
-            // Esc inside create tools is handled by the tool itself; a second
-            // Esc (nothing pending) leaves the tool.
-            if escape && self.tools.points.is_empty() && self.tools.dimension_text.is_empty() {
-                self.tools.set_tool(ToolKind::Select, &mut self.state);
-            }
+        if enter {
+            self.tools.confirm_pending(&mut self.state);
+        }
+        if backspace {
+            self.tools.pop_pending(&mut self.state);
+        }
+        if delete && self.tools.kind == ToolKind::Measure {
+            // Documented exception: Delete is annotation-scoped while
+            // measuring — clears every measurement (pending point included),
+            // never scene objects.
+            self.tools.clear_pending(&mut self.state);
+            let cleared = self.viewport.clear_measurements();
+            self.state.status = format!("Cleared {cleared} measurement(s)");
+            return;
+        }
+        // Document edit shortcuts stay suppressed only while a tool holds
+        // pending input (an armed-but-idle tool no longer blocks them).
+        if self.tools.has_pending() {
             return;
         }
         if undo {
@@ -563,11 +584,7 @@ impl CasoApp {
         if redo {
             self.state.redo();
         }
-        if delete && self.tools.kind == ToolKind::Measure {
-            // Delete clears annotations while measuring, never scene objects.
-            let cleared = self.viewport.clear_measurements();
-            self.state.status = format!("Cleared {cleared} measurement(s)");
-        } else if delete && !self.state.selection.is_empty() {
+        if delete && !self.state.selection.is_empty() {
             self.state.push_undo();
             let ids = self.state.selection.clone();
             let removed = self.state.document.delete_many(&ids);

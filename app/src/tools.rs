@@ -56,6 +56,25 @@ pub const KNIFE_KINDS: [(&str, &str); 3] = [
     ("Bezier Surface (points)", "quadratic_bezier_surface"),
 ];
 
+/// Most points a point-placed kind accepts (the kernel builder requires the
+/// exact count for these kinds); None is unlimited.
+fn point_capacity(kind: &str) -> Option<usize> {
+    match kind {
+        "segment" => Some(2),
+        "quadratic_bezier_curve" => Some(3),
+        _ => None,
+    }
+}
+
+/// Fewest points that define a knife of the given kind.
+fn knife_minimum_points(knife: &str) -> usize {
+    if knife == "segment" {
+        2
+    } else {
+        3
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
     Select,
@@ -86,6 +105,9 @@ pub struct ToolState {
     move_last: Option<Vec3>,
     rotate_last_x: Option<f32>,
     undo_pushed: bool,
+    /// Esc aborted a gesture while the mouse button is still held: drag
+    /// events are swallowed until the button is released.
+    gesture_aborted: bool,
     /// Gizmo handle being dragged (Move arrows / Rotate rings).
     gizmo_axis: Option<RotationAxis>,
     /// Gizmo handle under the cursor (highlight only).
@@ -123,6 +145,7 @@ impl Default for ToolState {
             move_last: None,
             rotate_last_x: None,
             undo_pushed: false,
+            gesture_aborted: false,
             gizmo_axis: None,
             gizmo_hover: None,
             gizmo_last: None,
@@ -183,22 +206,28 @@ impl ToolState {
         self.kind = kind;
         state.status = match kind {
             ToolKind::Select => "Select: click objects, drag orbits".to_string(),
-            ToolKind::CreateDrag(create) => {
-                format!("Draw {create}: drag on the grid (type dimensions, Enter applies)")
+            ToolKind::CreateDrag(create) => format!(
+                "Draw {create}: drag on the grid — type dimensions (applied on release), Backspace edits, Esc cancels/exits"
+            ),
+            ToolKind::CreatePoints(create) => format!(
+                "Place {create}: click points — Enter commits, Backspace removes last, Esc cancels/exits"
+            ),
+            ToolKind::Move => {
+                "Move: drag the selection (arrows constrain) — Esc aborts the drag, again exits"
+                    .to_string()
             }
-            ToolKind::CreatePoints(create) => {
-                format!("Place {create}: click points on the grid, Enter commits, Esc cancels")
+            ToolKind::Rotate => {
+                "Rotate: drag a ring or drag horizontally — Esc aborts the drag, again exits"
+                    .to_string()
             }
-            ToolKind::Move => "Move: drag the selection on the grid".to_string(),
-            ToolKind::Rotate => "Rotate: drag horizontally to spin about Z".to_string(),
             ToolKind::Measure => {
-                "Measure: click two points (surfaces snap, grid otherwise) — Esc cancels a point, Delete clears all".to_string()
+                "Measure: click two points (surfaces snap, grid otherwise) — Backspace/Esc removes the pending point, Delete clears all, Esc again exits".to_string()
             }
             ToolKind::BoundaryRegion => {
                 "Boundary Region: hover the Fluid Domain surface, click to tag it".to_string()
             }
             ToolKind::BoundaryCutter(knife) => format!(
-                "Cutter ({knife}): select a region, place the knife, Enter splits"
+                "Cutter ({knife}): place the knife — Enter splits, Backspace removes last, Esc cancels/exits"
             ),
         };
     }
@@ -215,6 +244,7 @@ impl ToolState {
         self.move_last = None;
         self.rotate_last_x = None;
         self.undo_pushed = false;
+        self.gesture_aborted = false;
         self.gizmo_axis = None;
         self.gizmo_hover = None;
         self.gizmo_last = None;
@@ -231,6 +261,245 @@ impl ToolState {
 
     pub fn is_active(&self) -> bool {
         self.kind != ToolKind::Select
+    }
+
+    /// Uncommitted input the active tool is holding: placed points, typed
+    /// dimensions, a live create drag, or a live Move/Rotate gesture. The
+    /// single source of truth for the key grammar's "pending" concept.
+    pub fn has_pending(&self) -> bool {
+        match self.kind {
+            ToolKind::Select | ToolKind::BoundaryRegion => false,
+            ToolKind::CreateDrag(_) => {
+                self.drag_start.is_some() || !self.dimension_text.is_empty()
+            }
+            ToolKind::CreatePoints(_) | ToolKind::Measure | ToolKind::BoundaryCutter(_) => {
+                !self.points.is_empty()
+            }
+            ToolKind::Move | ToolKind::Rotate => {
+                self.undo_pushed
+                    || self.gizmo_axis.is_some()
+                    || self.move_last.is_some()
+                    || self.rotate_last_x.is_some()
+            }
+        }
+    }
+
+    /// Esc rung 1: drop all pending input, keep the tool armed. A live
+    /// Move/Rotate gesture reverts through `AppState::abort_to_last_snapshot`
+    /// (no redo entry). Returns true when something was cleared, so the
+    /// caller's second rung (exit to Select) only fires on an idle tool.
+    pub fn clear_pending(&mut self, state: &mut AppState) -> bool {
+        if !self.has_pending() {
+            return false;
+        }
+        match self.kind {
+            ToolKind::Select | ToolKind::BoundaryRegion => false,
+            ToolKind::CreateDrag(_) => {
+                if self.drag_start.is_some() {
+                    // The button may still be held: swallow the rest of
+                    // the drag so releasing it cannot commit.
+                    self.gesture_aborted = true;
+                }
+                self.drag_start = None;
+                self.drag_current = None;
+                self.screen_start = None;
+                self.dimension_text.clear();
+                self.set_create_ghost(None, None);
+                state.status = "Draw cancelled".to_string();
+                true
+            }
+            ToolKind::CreatePoints(_) => {
+                self.points.clear();
+                self.set_create_ghost(None, None);
+                state.status = "Points cleared".to_string();
+                true
+            }
+            ToolKind::Move | ToolKind::Rotate => {
+                if self.undo_pushed {
+                    state.abort_to_last_snapshot();
+                }
+                self.move_last = None;
+                self.rotate_last_x = None;
+                self.gizmo_axis = None;
+                self.gizmo_last = None;
+                self.gizmo_pivot = None;
+                self.undo_pushed = false;
+                self.gesture_aborted = true;
+                state.status = "Gesture aborted".to_string();
+                true
+            }
+            ToolKind::Measure => {
+                self.points.clear();
+                state.status = "Measure point cancelled".to_string();
+                true
+            }
+            ToolKind::BoundaryCutter(_) => {
+                self.points.clear();
+                self.preview_ghost = None;
+                self.overlay_revision += 1;
+                state.status = "Knife cleared".to_string();
+                true
+            }
+        }
+    }
+
+    /// Enter rung: commit whatever is pending (point-shape commit, cutter
+    /// split). Returns true when the key was consumed — including a refused
+    /// commit that reported an error and kept the points for adjustment.
+    pub fn confirm_pending(&mut self, state: &mut AppState) -> bool {
+        match self.kind {
+            ToolKind::CreatePoints(_) => self.commit_point_shape(state),
+            ToolKind::BoundaryCutter(_) => self.commit_cutter_split(state),
+            _ => false,
+        }
+    }
+
+    /// Backspace rung: pop the last typed-dimension character (create
+    /// drags), else the last placed point. Returns true when consumed.
+    pub fn pop_pending(&mut self, state: &mut AppState) -> bool {
+        match self.kind {
+            ToolKind::CreateDrag(_) => self.dimension_text.pop().is_some(),
+            ToolKind::CreatePoints(_) => {
+                if self.points.pop().is_some() {
+                    state.status = format!("{} point(s) — Enter commits", self.points.len());
+                    true
+                } else {
+                    false
+                }
+            }
+            ToolKind::Measure => {
+                if self.points.pop().is_some() {
+                    state.status = "Measure point removed".to_string();
+                    true
+                } else {
+                    false
+                }
+            }
+            ToolKind::BoundaryCutter(knife) => {
+                if self.points.pop().is_some() {
+                    state.status =
+                        format!("{} knife point(s) — Enter splits", self.points.len());
+                    self.refresh_cutter_ghost(knife, state);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Enter commit for a point tool: build the shape from the placed
+    /// points. On failure the snapshot rolls back without a redo entry and
+    /// the points stay so the user can adjust and retry.
+    fn commit_point_shape(&mut self, state: &mut AppState) -> bool {
+        let ToolKind::CreatePoints(kind) = self.kind else {
+            return false;
+        };
+        if self.points.is_empty() {
+            return false;
+        }
+        let points = std::mem::take(&mut self.points);
+        state.push_undo();
+        let result = state
+            .document
+            .add_point_shape_from_world_points(kind, &points, "xy");
+        if let Some(id) = state.report(result, &format!("Created {kind}")) {
+            state.select_only(id);
+            self.set_create_ghost(None, None);
+        } else {
+            state.abort_to_last_snapshot();
+            self.points = points;
+        }
+        true
+    }
+
+    /// Enter commit for the cutter: split the selected region with the
+    /// knife built from the placed points. Refusals (missing fluid root or
+    /// region, below-minimum points, empty cut) report on the status line
+    /// and keep the points.
+    fn commit_cutter_split(&mut self, state: &mut AppState) -> bool {
+        let ToolKind::BoundaryCutter(knife) = self.kind else {
+            return false;
+        };
+        if self.points.is_empty() {
+            return false;
+        }
+        let Some(root) = boundary_tool::fluid_root_node(&state.document) else {
+            state.status = "Cutter: set a Fluid Domain first".to_string();
+            return true;
+        };
+        let Some(region_id) = state.selected_region else {
+            state.status =
+                "Cutter: select a boundary region first (Boundary Region tool)".to_string();
+            return true;
+        };
+        let minimum = knife_minimum_points(knife);
+        if self.points.len() < minimum {
+            state.status = format!("{knife} knife needs at least {minimum} points");
+            return true;
+        }
+        match boundary_tool::cutter_ghost(&root, knife, &self.points) {
+            Ok(ghost) => {
+                state.push_undo();
+                let validation = std::mem::take(&mut self.validation_points);
+                let result = state.document.split_boundary_region(
+                    region_id,
+                    &ghost.node,
+                    Some(&validation),
+                );
+                self.validation_points = validation;
+                match result {
+                    Ok((inside_id, _outside_id)) => {
+                        state.selected_region = Some(inside_id);
+                        // Repeat the ghost warnings at commit so the user
+                        // knows exactly what was stored.
+                        state.status = if ghost.warnings.is_empty() {
+                            "Region split".to_string()
+                        } else {
+                            format!("Region split — {}", ghost.warnings.join("; "))
+                        };
+                        self.points.clear();
+                        self.preview_ghost = None;
+                        self.overlay_revision += 1;
+                    }
+                    Err(error) => {
+                        // Empty-cut refusal: the snapshot rolls back.
+                        state.abort_to_last_snapshot();
+                        state.status = error.to_string();
+                    }
+                }
+            }
+            Err(error) => state.status = error,
+        }
+        true
+    }
+
+    /// Rebuild the cutter preview ghost from the current points (dropped
+    /// below the knife's minimum); builder warnings/errors reach the status
+    /// line at preview time.
+    fn refresh_cutter_ghost(&mut self, knife: &'static str, state: &mut AppState) {
+        let root = boundary_tool::fluid_root_node(&state.document);
+        self.preview_ghost = match root {
+            Some(root) if self.points.len() >= knife_minimum_points(knife) => {
+                match boundary_tool::cutter_ghost(&root, knife, &self.points) {
+                    Ok(ghost) => {
+                        // Warnings (planar slice on a curved boundary)
+                        // surface at preview time.
+                        if !ghost.warnings.is_empty() {
+                            state.status = ghost.warnings.join("; ");
+                        }
+                        Some(ghost.node)
+                    }
+                    Err(error) => {
+                        state.status = error;
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        self.overlay_revision += 1;
     }
 
     /// Whether the active tool owns the primary mouse button (the Boundary
@@ -411,87 +680,10 @@ impl ToolState {
                 state.status = format!("{} knife point(s) — Enter splits", self.points.len());
             }
         }
-        let (enter, escape, backspace) = ui.ctx().input(|input| {
-            (
-                input.key_pressed(egui::Key::Enter),
-                input.key_pressed(egui::Key::Escape),
-                input.key_pressed(egui::Key::Backspace),
-            )
-        });
-        if backspace && !self.points.is_empty() {
-            self.points.pop();
-            points_changed = true;
-        }
-        if escape {
-            self.cancel(state);
-            return true;
-        }
-        // Rebuild the knife ghost (drives the cyan/orange split preview).
-        let region_id = state.selected_region.expect("checked");
-        let minimum = match knife {
-            "segment" => 2,
-            _ => 3,
-        };
+        // Rebuild the knife ghost (drives the cyan/orange split preview);
+        // Enter/Esc/Backspace are handled by the grammar dispatcher.
         if points_changed {
-            self.preview_ghost = if self.points.len() >= minimum {
-                match boundary_tool::cutter_ghost(&root, knife, &self.points) {
-                    Ok(ghost) => {
-                        // Warnings (planar slice on a curved boundary)
-                        // surface at preview time.
-                        if !ghost.warnings.is_empty() {
-                            state.status = ghost.warnings.join("; ");
-                        }
-                        Some(ghost.node)
-                    }
-                    Err(error) => {
-                        state.status = error;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            self.overlay_revision += 1;
-        }
-        if enter {
-            let ghost = if self.points.len() >= minimum {
-                boundary_tool::cutter_ghost(&root, knife, &self.points)
-            } else {
-                Err(format!("{knife} knife needs at least {minimum} points"))
-            };
-            match ghost {
-                Ok(ghost) => {
-                    state.push_undo();
-                    let validation = std::mem::take(&mut self.validation_points);
-                    let result = state.document.split_boundary_region(
-                        region_id,
-                        &ghost.node,
-                        Some(&validation),
-                    );
-                    self.validation_points = validation;
-                    match result {
-                        Ok((inside_id, _outside_id)) => {
-                            state.selected_region = Some(inside_id);
-                            // Repeat the ghost warnings at commit so the user
-                            // knows exactly what was stored.
-                            state.status = if ghost.warnings.is_empty() {
-                                "Region split".to_string()
-                            } else {
-                                format!("Region split — {}", ghost.warnings.join("; "))
-                            };
-                            self.points.clear();
-                            self.preview_ghost = None;
-                            self.overlay_revision += 1;
-                        }
-                        Err(error) => {
-                            // Empty-cut refusal: undo snapshot rolls back.
-                            state.undo();
-                            state.status = error.to_string();
-                        }
-                    }
-                }
-                Err(error) => state.status = error,
-            }
+            self.refresh_cutter_ghost(knife, state);
         }
         // Overlay: knife points + rubber band.
         let painter = ui.painter_at(rect);
@@ -523,7 +715,14 @@ impl ToolState {
     ) -> bool {
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
         self.collect_dimension_keys(ui);
-        if response.drag_started_by(egui::PointerButton::Primary) {
+        if self.gesture_aborted {
+            // Esc aborted this drag: swallow events until the button lifts.
+            if response.drag_stopped_by(egui::PointerButton::Primary)
+                || !response.dragged_by(egui::PointerButton::Primary)
+            {
+                self.gesture_aborted = false;
+            }
+        } else if response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(pos) = pointer {
                 self.drag_start = grid_point(camera, pos, rect, pixels_per_point);
                 self.drag_current = self.drag_start;
@@ -605,42 +804,33 @@ impl ToolState {
         state: &mut AppState,
     ) -> bool {
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        // Exact-count kinds (segment, bezier curve) refuse extra clicks: the
+        // kernel builder demands the exact count, so a surplus point could
+        // only fail at Enter.
+        let at_capacity =
+            point_capacity(kind).is_some_and(|capacity| self.points.len() >= capacity);
         if response.clicked() {
             if let Some(pos) = pointer {
                 if let Some(point) = grid_point(camera, pos, rect, pixels_per_point) {
-                    self.points.push(point);
-                    state.status = format!("{} point(s) — Enter commits", self.points.len());
+                    if at_capacity {
+                        state.status = format!(
+                            "{kind} takes exactly {} points — Enter commits, Backspace edits",
+                            point_capacity(kind).expect("checked"),
+                        );
+                    } else {
+                        self.points.push(point);
+                        state.status =
+                            format!("{} point(s) — Enter commits", self.points.len());
+                    }
                 }
             }
         }
-        let (enter, escape, backspace) = ui.ctx().input(|input| {
-            (
-                input.key_pressed(egui::Key::Enter),
-                input.key_pressed(egui::Key::Escape),
-                input.key_pressed(egui::Key::Backspace),
-            )
-        });
-        if backspace {
-            self.points.pop();
-        }
-        if escape {
-            self.cancel(state);
-        }
-        if enter && !self.points.is_empty() {
-            let points = std::mem::take(&mut self.points);
-            state.push_undo();
-            let result = state
-                .document
-                .add_point_shape_from_world_points(kind, &points, "xy");
-            if let Some(id) = state.report(result, &format!("Created {kind}")) {
-                state.select_only(id);
-            } else {
-                state.undo();
-            }
-        }
+        // Enter/Esc/Backspace are handled by the grammar dispatcher.
         // Live geometry ghost from the committed points plus the cursor as
-        // a tentative point, so the ghost rubber-bands while placing.
+        // a tentative point, so the ghost rubber-bands while placing (the
+        // cursor stops counting once the kind's capacity is placed).
         let cursor_point = pointer
+            .filter(|_| !at_capacity)
             .filter(|pos| rect.contains(*pos))
             .and_then(|pos| grid_point(camera, pos, rect, pixels_per_point));
         let mut tentative = self.points.clone();
@@ -659,9 +849,9 @@ impl ToolState {
             if self.create_ghost_sig.as_ref() != Some(&sig) {
                 // Below the kind's minimum point count the builder errs and
                 // the ghost stays off (the dot painter still shows). For
-                // exact-count kinds (segment, bezier curve) the tentative
-                // cursor point can overshoot — fall back to the committed
-                // points so the ghost survives until Enter.
+                // odd-count kinds (bezier polycurve/tube) the tentative
+                // cursor point makes the count even — fall back to the
+                // committed points so a valid ghost survives while placing.
                 let ghost = ghost_from_points(kind, &tentative)
                     .or_else(|| ghost_from_points(kind, &self.points));
                 self.set_create_ghost(ghost, Some(sig));
@@ -681,8 +871,10 @@ impl ToolState {
         for pair in screen_points.windows(2) {
             painter.line_segment([pair[0], pair[1]], egui::Stroke::new(1.5, accent));
         }
+        // No rubber band to the cursor once the kind's capacity is placed —
+        // it would suggest another point can be added.
         if let (Some(last), Some(cursor)) = (screen_points.last(), pointer) {
-            if rect.contains(cursor) {
+            if rect.contains(cursor) && !at_capacity {
                 painter.line_segment(
                     [*last, cursor],
                     egui::Stroke::new(1.0, accent.gamma_multiply(0.6)),
@@ -704,7 +896,14 @@ impl ToolState {
     ) -> bool {
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
         self.update_gizmo_hover(GizmoKind::Move, response, pointer, camera, rect, pixels_per_point, state);
-        if response.drag_started_by(egui::PointerButton::Primary) {
+        if self.gesture_aborted {
+            // Esc aborted this drag: swallow events until the button lifts.
+            if response.drag_stopped_by(egui::PointerButton::Primary)
+                || !response.dragged_by(egui::PointerButton::Primary)
+            {
+                self.gesture_aborted = false;
+            }
+        } else if response.drag_started_by(egui::PointerButton::Primary) {
             self.undo_pushed = false;
             let pivot = selection_pivot(state);
             if let (Some(axis), Some(pivot), Some(pos)) = (self.gizmo_hover, pivot, pointer) {
@@ -792,7 +991,14 @@ impl ToolState {
     ) -> bool {
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
         self.update_gizmo_hover(GizmoKind::Rotate, response, pointer, camera, rect, pixels_per_point, state);
-        if response.drag_started_by(egui::PointerButton::Primary) {
+        if self.gesture_aborted {
+            // Esc aborted this drag: swallow events until the button lifts.
+            if response.drag_stopped_by(egui::PointerButton::Primary)
+                || !response.dragged_by(egui::PointerButton::Primary)
+            {
+                self.gesture_aborted = false;
+            }
+        } else if response.drag_started_by(egui::PointerButton::Primary) {
             self.undo_pushed = false;
             let pivot = selection_pivot(state);
             if let (Some(axis), Some(pivot), Some(pos)) = (self.gizmo_hover, pivot, pointer) {
@@ -891,35 +1097,19 @@ impl ToolState {
     }
 
     /// Route digit/unit keystrokes into the typed-dimension buffer while a
-    /// create drag is armed.
+    /// create drag is armed (Backspace/Esc editing lives in the grammar
+    /// dispatcher: `pop_pending` / `clear_pending`).
     fn collect_dimension_keys(&mut self, ui: &egui::Ui) {
         ui.ctx().input(|input| {
             for event in &input.events {
-                match event {
-                    egui::Event::Text(text) => {
-                        for character in text.chars() {
-                            if character.is_ascii_digit()
-                                || ".,xX;mkcft'\" +-*/()".contains(character)
-                            {
-                                self.dimension_text.push(character);
-                            }
+                if let egui::Event::Text(text) = event {
+                    for character in text.chars() {
+                        if character.is_ascii_digit()
+                            || ".,xX;mkcft'\" +-*/()".contains(character)
+                        {
+                            self.dimension_text.push(character);
                         }
                     }
-                    egui::Event::Key {
-                        key: egui::Key::Backspace,
-                        pressed: true,
-                        ..
-                    } => {
-                        self.dimension_text.pop();
-                    }
-                    egui::Event::Key {
-                        key: egui::Key::Escape,
-                        pressed: true,
-                        ..
-                    } => {
-                        self.dimension_text.clear();
-                    }
-                    _ => {}
                 }
             }
         });
@@ -1019,6 +1209,7 @@ pub fn project_to_screen(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caso_kernel::roles::DomainKind;
 
     /// The ghost invariant: the preview node is byte-for-byte the node the
     /// commit path would produce, for every dimension category.
@@ -1061,6 +1252,140 @@ mod tests {
     #[test]
     fn ghost_below_minimum_points_is_none() {
         assert!(ghost_from_points("polygon", &[vec3(0.0, 0.0, 0.0)]).is_none());
+    }
+
+    /// The click cap mirrors the kernel's exact-count rules: capacity
+    /// points build, one more refuses.
+    #[test]
+    fn point_capacity_matches_kernel_exact_counts() {
+        let square = [
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(1.0, 1.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+        ];
+        for (kind, capacity) in [("segment", 2), ("quadratic_bezier_curve", 3)] {
+            assert_eq!(point_capacity(kind), Some(capacity));
+            assert!(ghost_from_points(kind, &square[..capacity]).is_some());
+            assert!(ghost_from_points(kind, &square[..capacity + 1]).is_none());
+        }
+        assert_eq!(point_capacity("polyline"), None);
+        assert!(ghost_from_points("polyline", &square).is_some());
+    }
+
+    /// The universal grammar on a point tool: Backspace pops, Enter commits
+    /// (tool stays armed, object selected), Esc on an idle tool is not
+    /// consumed (so the caller's second rung exits to Select).
+    #[test]
+    fn point_tool_grammar_ladder() {
+        let mut state = AppState::new(SceneDocument::new());
+        let mut tools = ToolState::default();
+        tools.set_tool(ToolKind::CreatePoints("polyline"), &mut state);
+        tools.points = vec![
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(1.0, 1.0, 0.0),
+        ];
+        assert!(tools.pop_pending(&mut state));
+        assert_eq!(tools.points.len(), 2);
+        assert!(tools.confirm_pending(&mut state));
+        assert_eq!(state.document.roots.len(), 1);
+        assert_eq!(state.selection, state.document.roots);
+        assert!(tools.points.is_empty(), "commit consumes the points");
+        assert_eq!(tools.kind, ToolKind::CreatePoints("polyline"), "stays armed");
+        assert!(!tools.confirm_pending(&mut state), "nothing pending");
+        assert!(!tools.clear_pending(&mut state), "idle: Esc falls to rung 2");
+        // A refused commit (below the kind's minimum) keeps the points and
+        // leaves no redo entry.
+        tools.points = vec![vec3(0.0, 0.0, 0.0)];
+        assert!(tools.confirm_pending(&mut state), "refusal still consumes Enter");
+        assert_eq!(tools.points.len(), 1, "points kept for adjustment");
+        assert_eq!(state.document.roots.len(), 1, "document unchanged");
+        assert!(!state.can_redo());
+    }
+
+    /// Backspace edits the typed-dimension buffer; Esc clears it (rung 1)
+    /// and only an idle tool lets Esc fall through.
+    #[test]
+    fn create_drag_dimension_backspace_and_escape() {
+        let mut state = AppState::new(SceneDocument::new());
+        let mut tools = ToolState::default();
+        tools.set_tool(ToolKind::CreateDrag("box"), &mut state);
+        tools.dimension_text = "1x2".to_string();
+        assert!(tools.has_pending());
+        assert!(tools.pop_pending(&mut state));
+        assert_eq!(tools.dimension_text, "1x");
+        assert!(tools.clear_pending(&mut state));
+        assert!(tools.dimension_text.is_empty());
+        assert!(!tools.has_pending());
+        assert!(!tools.clear_pending(&mut state));
+    }
+
+    /// Esc during a live Move gesture reverts the document with no redo
+    /// entry and swallows the rest of the held drag.
+    #[test]
+    fn move_abort_reverts_document() {
+        let mut state = AppState::new(SceneDocument::new());
+        let id = state.document.add_primitive("box", 1.0).unwrap();
+        state.select_only(id);
+        let before = format!("{:?}", state.document.build_node(id).unwrap());
+        let mut tools = ToolState::default();
+        tools.set_tool(ToolKind::Move, &mut state);
+        tools.apply_move_delta(vec3(1.0, 0.0, 0.0), &mut state);
+        assert!(tools.has_pending(), "live gesture is pending input");
+        let moved = state.selection[0];
+        assert_ne!(
+            before,
+            format!("{:?}", state.document.build_node(moved).unwrap())
+        );
+        assert!(tools.clear_pending(&mut state));
+        assert!(tools.gesture_aborted, "held drag must be swallowed");
+        assert!(!state.can_redo(), "aborted gesture must not be redoable");
+        let root = state.document.roots[0];
+        assert_eq!(
+            before,
+            format!("{:?}", state.document.build_node(root).unwrap())
+        );
+        assert!(!tools.has_pending());
+    }
+
+    /// Enter on the cutter is consumed even when the split is refused, and
+    /// the knife points survive so the user can adjust and retry.
+    #[test]
+    fn cutter_enter_below_minimum_keeps_points() {
+        let mut state = AppState::new(SceneDocument::new());
+        let id = state.document.add_primitive("box", 1.0).unwrap();
+        state
+            .document
+            .set_domain_root(id, DomainKind::Fluid)
+            .unwrap();
+        let region = state.document.add_boundary_region(id, None, None, None).unwrap();
+        state.selected_region = Some(region);
+        let mut tools = ToolState::default();
+        tools.set_tool(ToolKind::BoundaryCutter("polygon"), &mut state);
+        tools.points = vec![vec3(0.5, 0.0, 0.0), vec3(0.0, 0.5, 0.0)];
+        assert!(tools.confirm_pending(&mut state), "refusal still consumes Enter");
+        assert_eq!(tools.points.len(), 2, "points kept");
+        assert_eq!(state.document.boundary_regions.len(), 1, "no split");
+        assert!(!state.can_undo(), "no snapshot for a refused split");
+        // Esc rung 1 clears the knife; rung 2 is then the caller's.
+        assert!(tools.clear_pending(&mut state));
+        assert!(tools.points.is_empty());
+        assert!(!tools.clear_pending(&mut state));
+    }
+
+    /// The Measure pending point lives in `points` and answers the grammar.
+    #[test]
+    fn measure_pending_pop() {
+        let mut state = AppState::new(SceneDocument::new());
+        let mut tools = ToolState::default();
+        tools.set_tool(ToolKind::Measure, &mut state);
+        tools.points.push(vec3(1.0, 2.0, 0.0));
+        assert!(tools.has_pending());
+        assert!(tools.pop_pending(&mut state));
+        assert!(tools.points.is_empty());
+        assert!(!tools.pop_pending(&mut state));
+        assert!(!tools.has_pending());
     }
 
     /// Point-placed segment builds the same node as the drag path did.

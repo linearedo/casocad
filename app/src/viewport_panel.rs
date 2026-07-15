@@ -79,10 +79,9 @@ pub struct ViewportPanel {
     /// Draw the bounding-extent tripod on each selected object.
     pub show_bounds: bool,
     /// Committed measure annotations (world points, meters). Session-only —
-    /// never part of the scene document.
+    /// never part of the scene document. The pending first point of a pair
+    /// lives in `ToolState::points` like every other point tool.
     measurements: Vec<(Vec3, Vec3)>,
-    /// First point of the measure pair being placed.
-    measure_pending: Option<Vec3>,
 }
 
 impl Default for ViewportPanel {
@@ -111,7 +110,6 @@ impl Default for ViewportPanel {
             view_flight: None,
             show_bounds: false,
             measurements: Vec::new(),
-            measure_pending: None,
         }
     }
 }
@@ -579,14 +577,16 @@ impl ViewportPanel {
         crate::tools::grid_point(&self.camera, pos, rect, pixels_per_point)
     }
 
-    /// Measure-tool click: first click arms the pending point, the second
-    /// commits an annotation pair.
+    /// Measure-tool click: first click arms the pending point (held in
+    /// `tools.points` like every point tool), the second commits an
+    /// annotation pair.
     fn handle_measure_click(
         &mut self,
         response: &egui::Response,
         rect: egui::Rect,
         pixels_per_point: f32,
         state: &mut AppState,
+        tools: &mut ToolState,
     ) {
         if !response.clicked() {
             return;
@@ -597,10 +597,11 @@ impl ViewportPanel {
         let Some(point) = self.measure_point(pos, rect, pixels_per_point) else {
             return;
         };
-        match self.measure_pending.take() {
+        match tools.points.pop() {
             None => {
-                self.measure_pending = Some(point);
-                state.status = "Measure: click the second point".to_string();
+                tools.points.push(point);
+                state.status =
+                    "Measure: click the second point — Backspace/Esc removes it".to_string();
             }
             Some(start) => {
                 let distance = (point - start).length();
@@ -622,21 +623,18 @@ impl ViewportPanel {
         rect: egui::Rect,
         pixels_per_point: f32,
         state: &AppState,
-        measure_active: bool,
+        pending: Option<Vec3>,
     ) {
-        if self.measurements.is_empty() && self.measure_pending.is_none() {
+        if self.measurements.is_empty() && pending.is_none() {
             return;
         }
         let painter = ui.painter_at(rect);
         for (start, end) in &self.measurements {
             self.paint_dimension_line(&painter, rect, pixels_per_point, state, *start, *end);
         }
-        let Some(pending) = self.measure_pending else {
+        let Some(pending) = pending else {
             return;
         };
-        if !measure_active {
-            return;
-        }
         if let Some(anchor) =
             crate::tools::project_to_screen(&self.camera, pending, rect, pixels_per_point)
         {
@@ -688,16 +686,9 @@ impl ViewportPanel {
     /// Drop all committed measurements (Delete while the Measure tool is
     /// active).
     pub fn clear_measurements(&mut self) -> usize {
-        self.measure_pending = None;
         let count = self.measurements.len();
         self.measurements.clear();
         count
-    }
-
-    /// Cancel the pending first point; true when there was one (so Esc can
-    /// fall through to leaving the tool otherwise).
-    pub fn cancel_pending_measurement(&mut self) -> bool {
-        self.measure_pending.take().is_some()
     }
 
     /// Build the next pending refinement tier and upload it.
@@ -855,17 +846,17 @@ impl ViewportPanel {
             self.handle_select_click(&response, ui, rect, pixels_per_point, state);
         }
         if tools.kind == ToolKind::Measure {
-            self.handle_measure_click(&response, rect, pixels_per_point, state);
+            self.handle_measure_click(&response, rect, pixels_per_point, state, tools);
         }
         // Annotation overlays: measurements persist across tool switches;
-        // the bounds tripod follows the selection while toggled on.
-        self.paint_measurements(
-            ui,
-            rect,
-            pixels_per_point,
-            state,
-            tools.kind == ToolKind::Measure,
-        );
+        // the bounds tripod follows the selection while toggled on. The
+        // pending point only shows while the Measure tool is active.
+        let measure_pending = if tools.kind == ToolKind::Measure {
+            tools.points.first().copied()
+        } else {
+            None
+        };
+        self.paint_measurements(ui, rect, pixels_per_point, state, measure_pending);
         if self.show_bounds {
             self.paint_bounds_tripods(ui, rect, pixels_per_point, state);
         }
