@@ -34,10 +34,13 @@ s op_nested 12 ready 5357 6983 0 0.0012023789711789745
 s op_nested 96 ready 26314 38209 0 0.0001338484692480768
 s placed2d_circle 12 ready 49 48 96 0.45
 s placed2d_circle 96 ready 385 384 768 0.45
-s placed2d_polygon 12 ready 6 5 10 0.15231546497394124
-s placed2d_polygon 96 ready 6 5 10 0.15231546497394124
-s placed2d_bezier_surface_open 12 ready 73 72 144 0.293300011794671
-s placed2d_bezier_surface_open 96 ready 577 576 1152 0.29342536470171676
+# Deliberate divergence from Python (2026-07-16): concave outlines are now
+# ear-clipped instead of center-fanned — the fan overdraws outside a concave
+# polygon (Python had the same bug). Convex fixtures still match Python.
+s placed2d_polygon 12 ready 5 3 10 2.336692e-8
+s placed2d_polygon 96 ready 5 3 10 2.336692e-8
+s placed2d_bezier_surface_open 12 ready 72 70 144 2.166684e-8
+s placed2d_bezier_surface_open 96 ready 576 574 1152 2.918725e-8
 s placed1d_segment 12 outline 2 0 2 0.0
 s placed1d_segment 96 outline 2 0 2 0.0
 s placed_polyline_1d 12 outline 3 0 4 0.0

@@ -237,7 +237,7 @@ fn point_in_triangle_2d(point: Point2, a: Point2, b: Point2, c: Point2) -> bool 
         && cross_2d(c, a, point) >= -1.0e-12
 }
 
-fn polygon_is_convex(points: &[Point2]) -> bool {
+pub(crate) fn polygon_is_convex(points: &[Point2]) -> bool {
     if points.len() <= 3 {
         return true;
     }
@@ -731,25 +731,41 @@ fn ordered_placed_2d_surface(
         .iter()
         .map(|point| placed.origin + placed.axis_u * point[0] + placed.axis_v * point[1])
         .collect();
-    let mut center = Vec3::ZERO;
-    for point in &world {
-        center += *point;
-    }
-    center = center / world.len() as f64;
     let mut vertices: Vec<[f32; 3]> = world
         .iter()
         .map(|v| [v.x as f32, v.y as f32, v.z as f32])
         .collect();
-    vertices.push([center.x as f32, center.y as f32, center.z as f32]);
+    let count = outline.len() as u32;
+    // Fill: a center fan is only valid for (CCW-)convex outlines — on a
+    // concave polygon its triangles spill outside the outline and overdraw.
+    // Concave outlines ear-clip instead; when even that fails (self-crossing
+    // click order) bail to the contoured SDF path, whose even-odd fill is
+    // what the profile's eval actually means.
+    let indices: Vec<u32> = if polygon_is_convex(&outline) {
+        let mut center = Vec3::ZERO;
+        for point in &world {
+            center += *point;
+        }
+        center = center / world.len() as f64;
+        vertices.push([center.x as f32, center.y as f32, center.z as f32]);
+        let center_index = count;
+        (0..count)
+            .flat_map(|current| [center_index, current, (current + 1) % count])
+            .collect()
+    } else {
+        let triangles = triangulate_simple_polygon(&outline);
+        if triangles.is_empty() {
+            return None;
+        }
+        triangles
+            .iter()
+            .flat_map(|triangle| triangle.map(|index| index as u32))
+            .collect()
+    };
     let normal_f32 = [normal.x as f32, normal.y as f32, normal.z as f32];
     let normals = vec![normal_f32; vertices.len()];
-    let count = outline.len() as u32;
     let wire: Vec<u32> = (0..count)
         .flat_map(|current| [current, (current + 1) % count])
-        .collect();
-    let center_index = count;
-    let indices: Vec<u32> = (0..count)
-        .flat_map(|current| [center_index, current, (current + 1) % count])
         .collect();
     let (bounds_min, bounds_max) = f32_bounds(&vertices);
     Some(ViewportSurface {

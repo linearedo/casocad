@@ -25,7 +25,8 @@ use crate::clipping::{clip_surface, OperandMesh};
 use crate::contouring::contour_surface;
 use crate::geomops::{mesh_normals, normalize_or_z, wire_indices_from_triangles};
 use crate::profiles2d::{
-    f32_bounds, placed_1d_line, placed_2d_outline, placed_polyline_1d, profile_outline,
+    f32_bounds, placed_1d_line, placed_2d_outline, placed_polyline_1d, polygon_is_convex,
+    profile_outline, triangulate_simple_polygon,
 };
 use crate::types::{
     empty_surface, failed_surface, object_color, SurfaceStatus, ViewportSurface,
@@ -667,24 +668,40 @@ fn extrude_profile_surface(
             count + index,
         ]);
     }
-    let mut bottom_mean = Vec3::ZERO;
-    for vertex in &bottom {
-        bottom_mean += *vertex;
-    }
-    bottom_mean = bottom_mean / bottom.len() as f64;
-    let mut top_mean = Vec3::ZERO;
-    for vertex in &top {
-        top_mean += *vertex;
-    }
-    top_mean = top_mean / top.len() as f64;
-    let bottom_center = accum.push(bottom_mean, Vec3::ZERO);
-    let top_center = accum.push(top_mean, Vec3::ZERO);
-    for index in 0..count {
-        let next_index = (index + 1) % count;
-        accum.indices.extend_from_slice(&[bottom_center, next_index, index]);
-        accum
-            .indices
-            .extend_from_slice(&[top_center, count + index, count + next_index]);
+    // Caps: center fan for (CCW-)convex outlines, ear clipping otherwise —
+    // fan triangles overdraw outside a concave outline. Bottom cap winding
+    // is the top's reversed, matching the fan convention.
+    if let Some(triangles) = planar_cap_triangles(&outline) {
+        for [a, b, c] in triangles {
+            accum
+                .indices
+                .extend_from_slice(&[a as u32, c as u32, b as u32]);
+            accum.indices.extend_from_slice(&[
+                count + a as u32,
+                count + b as u32,
+                count + c as u32,
+            ]);
+        }
+    } else {
+        let mut bottom_mean = Vec3::ZERO;
+        for vertex in &bottom {
+            bottom_mean += *vertex;
+        }
+        bottom_mean = bottom_mean / bottom.len() as f64;
+        let mut top_mean = Vec3::ZERO;
+        for vertex in &top {
+            top_mean += *vertex;
+        }
+        top_mean = top_mean / top.len() as f64;
+        let bottom_center = accum.push(bottom_mean, Vec3::ZERO);
+        let top_center = accum.push(top_mean, Vec3::ZERO);
+        for index in 0..count {
+            let next_index = (index + 1) % count;
+            accum.indices.extend_from_slice(&[bottom_center, next_index, index]);
+            accum
+                .indices
+                .extend_from_slice(&[top_center, count + index, count + next_index]);
+        }
     }
     Some(surface_from_accum(node, key, color, accum, false, true))
 }
@@ -761,11 +778,11 @@ fn revolve_profile_surface(
         }
     }
     if !closed {
-        append_revolve_cap(&mut indices, 0, outline_count, &mut vertices, false);
+        append_revolve_cap(&mut indices, 0, &outline, &mut vertices, false);
         append_revolve_cap(
             &mut indices,
             segments * outline_count,
-            outline_count,
+            &outline,
             &mut vertices,
             true,
         );
@@ -807,13 +824,51 @@ fn clip_outline_to_half_plane(
     clipped
 }
 
+/// Cap triangulation for a concave planar outline: `Some` ear-clip triangles
+/// (indices into the outline, oriented with its winding), `None` when the
+/// caller should keep its center fan (convex outline — fan is valid and
+/// preserves the Python-parity tessellation — or ear clipping failed on a
+/// self-crossing outline).
+fn planar_cap_triangles(outline: &[[f64; 2]]) -> Option<Vec<[usize; 3]>> {
+    if polygon_is_convex(outline) {
+        return None;
+    }
+    let triangles = triangulate_simple_polygon(outline);
+    if triangles.is_empty() {
+        None
+    } else {
+        Some(triangles)
+    }
+}
+
 fn append_revolve_cap(
     indices: &mut Vec<u32>,
     ring_start: usize,
-    outline_count: usize,
+    outline: &[[f64; 2]],
     vertices: &mut Vec<Vec3>,
     flip: bool,
 ) {
+    let outline_count = outline.len();
+    // Concave profiles ear-clip in section space (affine to the cap plane on
+    // the clipped non-negative-radial half, so the triangulation transfers).
+    if let Some(triangles) = planar_cap_triangles(outline) {
+        for [a, b, c] in triangles {
+            if flip {
+                indices.extend_from_slice(&[
+                    (ring_start + a) as u32,
+                    (ring_start + c) as u32,
+                    (ring_start + b) as u32,
+                ]);
+            } else {
+                indices.extend_from_slice(&[
+                    (ring_start + a) as u32,
+                    (ring_start + b) as u32,
+                    (ring_start + c) as u32,
+                ]);
+            }
+        }
+        return;
+    }
     let mut center = Vec3::ZERO;
     for vertex in &vertices[ring_start..ring_start + outline_count] {
         center += *vertex;
