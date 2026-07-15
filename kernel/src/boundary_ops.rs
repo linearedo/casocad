@@ -41,15 +41,22 @@ pub fn boundary_owner_ids(node: &Node) -> Vec<u32> {
 }
 
 fn collect_leaf_ids(node: &Node, ids: &mut Vec<u32>) {
-    let children = node.children();
-    if children.is_empty() {
-        if !ids.contains(&node.object_id) {
-            ids.push(node.object_id);
+    // Recurse only through operators and transforms: any other node is a
+    // provenance leaf that owns its whole surface, matching `walk_owner` and
+    // `evaluate_with_attribution` (generators keep their section internal).
+    match &node.shape {
+        Shape::Union(op) | Shape::Intersection(op) | Shape::Difference(op) | Shape::Xor(op) => {
+            collect_leaf_ids(&op.left, ids);
+            collect_leaf_ids(&op.right, ids);
         }
-        return;
-    }
-    for child in children {
-        collect_leaf_ids(child, ids);
+        Shape::Translate { child, .. }
+        | Shape::Scale { child, .. }
+        | Shape::Rotate { child, .. } => collect_leaf_ids(child, ids),
+        _ => {
+            if !ids.contains(&node.object_id) {
+                ids.push(node.object_id);
+            }
+        }
     }
 }
 

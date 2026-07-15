@@ -6,12 +6,14 @@
 
 use caso_kernel::boundary::{BoundaryCut, BoundaryRegion, CutSide};
 use caso_kernel::boundary_ops::{
-    boundary_region_base_mask, boundary_region_mask, cut_volume, owner_active_mask,
-    pick_boundary_patch, region_tolerance, surface_patches_for_root,
+    boundary_owner_ids, boundary_region_base_mask, boundary_region_mask, cut_volume,
+    owner_active_mask, pick_boundary_patch, region_tolerance, surface_patches_for_root,
 };
+use caso_kernel::roles::DomainKind;
 use caso_kernel::scene::{ObjectId, SceneDocument, ScenePayload};
 use caso_kernel::sdf::node::{Node, Shape};
 use caso_kernel::sdf::primitives_3d::{Box3, Pyramid, Sphere};
+use caso_kernel::sdf::solid_from_2d::RevolveAxis;
 use caso_kernel::frame::IDENTITY_FRAME;
 use caso_kernel::vec3::{vec3, Vec3};
 
@@ -335,6 +337,75 @@ fn generic_leaf_patches_make_pyramid_pickable() {
     .expect("hit");
     assert_eq!(hit.owner_object_id, 7);
     assert_eq!(hit.patch_id, "surface");
+}
+
+// --- boundary owners on generator solids (extrude / revolve) ---
+
+/// Rectangle section on the XY plane plus the generator solid built from it.
+fn document_with_generator(method: &str) -> (SceneDocument, ObjectId, ObjectId) {
+    let mut document = SceneDocument::new();
+    let section_id = document
+        .add_primitive_from_drag(
+            "rectangle",
+            vec3(-0.3, -0.5, 0.0),
+            vec3(0.3, 0.5, 0.0),
+            1.0,
+        )
+        .expect("rectangle");
+    let solid_id = document
+        .solid_from_2d(
+            section_id,
+            method,
+            Some(1.0),
+            RevolveAxis::U,
+            None,
+            None,
+            None,
+            360.0,
+        )
+        .expect(method);
+    (document, section_id, solid_id)
+}
+
+#[test]
+fn generators_are_boundary_owner_leaves() {
+    for method in ["extrude", "revolve"] {
+        let (document, section_id, solid_id) = document_with_generator(method);
+        let root = document.build_node(solid_id).expect("node");
+        let owners = boundary_owner_ids(&root);
+        assert_eq!(owners, vec![solid_id], "{method} owns its whole surface");
+        assert!(!owners.contains(&section_id), "{method} section stays internal");
+    }
+}
+
+#[test]
+fn boundary_region_on_generator_fluid_domain() {
+    for method in ["extrude", "revolve"] {
+        let (mut document, _section_id, solid_id) = document_with_generator(method);
+        document
+            .set_domain_root(solid_id, DomainKind::Fluid)
+            .expect("fluid domain");
+        let region_id = document
+            .add_boundary_region(solid_id, None, None, None)
+            .expect("whole-surface region on the generator solid");
+        assert!(document
+            .boundary_regions
+            .iter()
+            .any(|region| region.object_id == region_id
+                && region.owner_object_id == solid_id));
+    }
+}
+
+#[test]
+fn difference_owners_include_the_generator_obstacle() {
+    let (mut document, _section_id, extrude_id) = document_with_generator("extrude");
+    let box_id = document.add_primitive("box", 4.0).expect("box");
+    let combined = document
+        .combine(box_id, extrude_id, "difference")
+        .expect("difference");
+    let root = document.build_node(combined).expect("node");
+    let owners = boundary_owner_ids(&root);
+    assert_eq!(owners, vec![box_id, extrude_id]);
 }
 
 // --- split_boundary_region (test_boundary_split.py) ---

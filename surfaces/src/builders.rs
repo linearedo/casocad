@@ -702,6 +702,17 @@ fn revolve_profile_surface(
         return None;
     }
     let frame = revolve.axis_frame().ok()?;
+    // Outline edges crossing the revolution axis would be swept by unsigned
+    // radius and collapse (a rectangle straddling the axis loses its caps);
+    // keep only the non-negative signed-radial half of the profile.
+    let outline = clip_outline_to_half_plane(&outline, |point| {
+        (section.origin - frame.origin).dot(frame.radial)
+            + point[0] * section.axis_u.dot(frame.radial)
+            + point[1] * section.axis_v.dot(frame.radial)
+    });
+    if outline.len() < 3 {
+        return None;
+    }
     let outline_points: Vec<Vec3> = outline
         .iter()
         .map(|point| section.origin + section.axis_u * point[0] + section.axis_v * point[1])
@@ -766,6 +777,34 @@ fn revolve_profile_surface(
     }
     accum.indices = indices;
     Some(surface_from_accum(node, key, color, accum, false, false))
+}
+
+/// Sutherland–Hodgman clip of a closed outline against `distance(point) >= 0`,
+/// inserting the zero crossings. An outline fully on the kept side is
+/// returned unchanged (point-for-point), so profiles that do not straddle the
+/// revolution axis tessellate exactly as before.
+fn clip_outline_to_half_plane(
+    outline: &[[f64; 2]],
+    distance: impl Fn(&[f64; 2]) -> f64,
+) -> Vec<[f64; 2]> {
+    let mut clipped: Vec<[f64; 2]> = Vec::with_capacity(outline.len() + 2);
+    for index in 0..outline.len() {
+        let current = outline[index];
+        let next = outline[(index + 1) % outline.len()];
+        let current_distance = distance(&current);
+        let next_distance = distance(&next);
+        if current_distance >= 0.0 {
+            clipped.push(current);
+        }
+        if (current_distance >= 0.0) != (next_distance >= 0.0) {
+            let t = current_distance / (current_distance - next_distance);
+            clipped.push([
+                current[0] + (next[0] - current[0]) * t,
+                current[1] + (next[1] - current[1]) * t,
+            ]);
+        }
+    }
+    clipped
 }
 
 fn append_revolve_cap(
