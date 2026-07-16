@@ -3,6 +3,7 @@
 //! mutating action gets a history snapshot (Python keeps 50, we match it).
 
 use caso_kernel::scene::{ObjectId, SceneDocument};
+use caso_kernel::vec3::Vec3;
 
 pub const UNDO_LIMIT: usize = 50;
 
@@ -32,6 +33,9 @@ pub struct AppState {
     pub selected_region: Option<u32>,
     pub unit: LengthUnit,
     pub status: String,
+    /// World point under the mouse this frame; None when the cursor is
+    /// outside the viewport.
+    pub cursor_world: Option<Vec3>,
     undo_stack: Vec<SceneDocument>,
     redo_stack: Vec<SceneDocument>,
 }
@@ -44,6 +48,7 @@ impl AppState {
             selected_region: None,
             unit: DEFAULT_LENGTH_UNIT,
             status: String::new(),
+            cursor_world: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         }

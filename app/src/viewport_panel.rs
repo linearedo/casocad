@@ -886,6 +886,13 @@ impl ViewportPanel {
                 egui::Color32::WHITE,
             );
         }
+        // Live cursor readout for the status bar: the world point under the
+        // pointer (surface hit or grid plane), None off-viewport.
+        state.cursor_world = ui
+            .ctx()
+            .input(|input| input.pointer.latest_pos())
+            .filter(|pos| rect.contains(*pos))
+            .and_then(|pos| self.measure_point(pos, rect, pixels_per_point));
         // Navigation overlays: axis triad (bottom-left) + view buttons
         // (bottom-center).
         self.paint_orientation_triad(ui, rect);

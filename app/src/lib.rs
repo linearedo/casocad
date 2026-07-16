@@ -665,6 +665,11 @@ impl eframe::App for CasoApp {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.state.status);
+                if let Some(point) = self.state.cursor_world {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.monospace(crate::dimensions::format_cursor(point, &self.state.unit));
+                    });
+                }
             });
         });
         if self.show_log {

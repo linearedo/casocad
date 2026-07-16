@@ -8,11 +8,9 @@
 
 use crate::state::LengthUnit;
 
-/// Display counterpart of the entry parser: a length in meters rendered in
-/// the working unit, trimmed to at most 4 decimals (`2.5 m`, `120 mm`).
-pub fn format_length(meters: f64, unit: &LengthUnit) -> String {
-    let shown = meters / unit.factor;
-    let mut text = format!("{shown:.4}");
+/// At most 4 decimals, trailing zeros trimmed (`2.5`, `120`).
+fn format_number(value: f64) -> String {
+    let mut text = format!("{value:.4}");
     if text.contains('.') {
         while text.ends_with('0') {
             text.pop();
@@ -21,7 +19,25 @@ pub fn format_length(meters: f64, unit: &LengthUnit) -> String {
             text.pop();
         }
     }
-    format!("{} {}", text, unit.key)
+    text
+}
+
+/// Display counterpart of the entry parser: a length in meters rendered in
+/// the working unit, trimmed to at most 4 decimals (`2.5 m`, `120 mm`).
+pub fn format_length(meters: f64, unit: &LengthUnit) -> String {
+    format!("{} {}", format_number(meters / unit.factor), unit.key)
+}
+
+/// A world point rendered in the working unit for the status-bar cursor
+/// readout: `x 1.25  y 0  z 0.5 m`.
+pub fn format_cursor(point: caso_kernel::vec3::Vec3, unit: &LengthUnit) -> String {
+    format!(
+        "x {}  y {}  z {} {}",
+        format_number(point.x / unit.factor),
+        format_number(point.y / unit.factor),
+        format_number(point.z / unit.factor),
+        unit.key
+    )
 }
 
 /// (spelling, meters per unit); longest spellings first so greedy unit
@@ -445,6 +461,15 @@ mod tests {
         assert_eq!(format_length(0.12, &millimeters), "120 mm");
         assert_eq!(format_length(0.123456789, &meters), "0.1235 m");
         assert_eq!(format_length(0.0, &meters), "0 m");
+    }
+
+    #[test]
+    fn format_cursor_converts_all_axes() {
+        let meters = crate::state::LENGTH_UNITS[1];
+        let millimeters = crate::state::LENGTH_UNITS[3];
+        let point = caso_kernel::vec3::vec3(1.25, 0.0, 0.5);
+        assert_eq!(format_cursor(point, &meters), "x 1.25  y 0  z 0.5 m");
+        assert_eq!(format_cursor(point, &millimeters), "x 1250  y 0  z 500 mm");
     }
 
     #[test]
