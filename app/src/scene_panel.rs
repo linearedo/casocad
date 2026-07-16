@@ -13,6 +13,10 @@ use crate::theme;
 #[derive(Default)]
 pub struct ScenePanel {
     rename: Option<(ObjectId, String)>,
+    region_rename: Option<(u32, String)>,
+    /// Grab keyboard focus on the first frame the editor shows. Requesting
+    /// focus every frame would mask `lost_focus`, so Enter could never commit.
+    rename_focus: bool,
 }
 
 pub fn payload_label(payload: &ScenePayload) -> &'static str {
@@ -46,6 +50,30 @@ pub fn payload_label(payload: &ScenePayload) -> &'static str {
 }
 
 impl ScenePanel {
+    /// One frame of the inline rename editor. Returns `None` while editing,
+    /// `Some(None)` on cancel, `Some(Some(text))` on Enter.
+    fn rename_editor(
+        ui: &mut egui::Ui,
+        buffer: &mut String,
+        take_focus: &mut bool,
+    ) -> Option<Option<String>> {
+        let response = ui.text_edit_singleline(buffer);
+        if *take_focus {
+            response.request_focus();
+            *take_focus = false;
+        }
+        if response.lost_focus() {
+            if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                return Some(Some(buffer.trim().to_string()));
+            }
+            return Some(None);
+        }
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            return Some(None);
+        }
+        None
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -76,6 +104,30 @@ impl ScenePanel {
             .map(|region| (region.object_id, region.name.clone(), region.tag.clone()))
             .collect();
         for (region_id, name, tag) in regions {
+            // Inline rename takes over the row until Enter/Esc.
+            if let Some((rename_id, buffer)) = &mut self.region_rename {
+                if *rename_id == region_id {
+                    if let Some(outcome) =
+                        Self::rename_editor(ui, buffer, &mut self.rename_focus)
+                    {
+                        self.region_rename = None;
+                        if let Some(text) = outcome {
+                            if !text.is_empty() && text != name {
+                                state.push_undo();
+                                for region in state.document.boundary_regions.iter_mut() {
+                                    if region.object_id == region_id {
+                                        region.name = text.clone();
+                                    }
+                                }
+                                state.document.mark_changed();
+                                state.status = format!("Renamed region to {text}");
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
             let selected = state.selected_region == Some(region_id);
             let mut title = name.clone();
             if let Some(tag) = &tag {
@@ -85,7 +137,16 @@ impl ScenePanel {
             if response.clicked() {
                 state.selected_region = if selected { None } else { Some(region_id) };
             }
+            if response.double_clicked() {
+                self.region_rename = Some((region_id, name.clone()));
+                self.rename_focus = true;
+            }
             response.context_menu(|ui| {
+                if ui.button("Rename").clicked() {
+                    self.region_rename = Some((region_id, name.clone()));
+                    self.rename_focus = true;
+                    ui.close();
+                }
                 if ui.button("Delete region").clicked() {
                     state.push_undo();
                     state
@@ -124,21 +185,15 @@ impl ScenePanel {
         // Inline rename takes over the row until Enter/Esc.
         if let Some((rename_id, buffer)) = &mut self.rename {
             if *rename_id == id {
-                let response = ui.text_edit_singleline(buffer);
-                response.request_focus();
-                let commit = response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                let cancel = ui.input(|input| input.key_pressed(egui::Key::Escape));
-                if commit {
-                    let text = buffer.trim().to_string();
-                    let (_, _) = self.rename.take().expect("rename active");
-                    if !text.is_empty() && text != name {
-                        state.push_undo();
-                        let result = state.document.rename(id, text);
-                        state.report(result, "Renamed");
-                    }
-                } else if cancel || (response.lost_focus() && !commit) {
+                if let Some(outcome) = Self::rename_editor(ui, buffer, &mut self.rename_focus) {
                     self.rename = None;
+                    if let Some(text) = outcome {
+                        if !text.is_empty() && text != name {
+                            state.push_undo();
+                            let result = state.document.rename(id, text);
+                            state.report(result, "Renamed");
+                        }
+                    }
                 }
                 for child in children {
                     ui.indent(id, |ui| self.node_ui(ui, state, child, false));
@@ -168,10 +223,12 @@ impl ScenePanel {
         }
         if response.double_clicked() {
             self.rename = Some((id, name.clone()));
+            self.rename_focus = true;
         }
         response.context_menu(|ui| {
             if ui.button("Rename").clicked() {
                 self.rename = Some((id, name.clone()));
+                self.rename_focus = true;
                 ui.close();
             }
             if ui.button("Delete").clicked() {
