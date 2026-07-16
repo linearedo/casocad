@@ -2,6 +2,8 @@
 //! drag-sized creation, point-shape placement, duplicate/paste — plus the
 //! Phase 5 acceptance workflow (draw, subtract, set domain, save/reload).
 
+use caso_kernel::meshing::meshable_domains_from_document;
+use caso_kernel::roles::DomainKind;
 use caso_kernel::scene::{SceneDocument, ScenePayload};
 use caso_kernel::sdf::primitives_2d::Profile2D;
 use caso_kernel::serialization::{load_scene_from_str, save_scene_to_string};
@@ -273,4 +275,88 @@ fn acceptance_workflow_saves_and_reloads_identically() {
         reloaded.object(reloaded_root).expect("root").payload,
         ScenePayload::Operator { .. }
     ));
+}
+
+/// Subtracting from the fluid root must move the domain mark to the new
+/// root — not leave two nested fluid domains that meshing refuses.
+#[test]
+fn subtract_from_fluid_root_keeps_a_single_domain() {
+    let mut document = SceneDocument::default_scene().expect("default scene");
+    let fluid_root = document.fluid_domain.as_ref().expect("fluid").root;
+    let sphere = document
+        .add_primitive_from_drag("sphere", vec3(0.9, 0.0, 0.5), vec3(1.1, 0.0, 0.5), 1.0)
+        .expect("sphere");
+    let combined = document
+        .combine(fluid_root, sphere, "difference")
+        .expect("subtract");
+
+    assert_eq!(document.fluid_domain.as_ref().expect("fluid").root, combined);
+    let marks: Vec<_> = document
+        .domain_kinds
+        .iter()
+        .map(|(id, kind)| (*id, *kind))
+        .collect();
+    assert_eq!(marks, vec![(combined, DomainKind::Fluid)]);
+    let domains = meshable_domains_from_document(&document).expect("meshable");
+    assert_eq!(domains.len(), 1);
+}
+
+/// Wrapping the fluid root in a transform moves the mark to the wrapper.
+#[test]
+fn transform_of_fluid_root_moves_the_domain_mark() {
+    let mut document = SceneDocument::default_scene().expect("default scene");
+    let fluid_root = document.fluid_domain.as_ref().expect("fluid").root;
+    let wrapped = document
+        .wrap_transform(fluid_root, "translate")
+        .expect("wrap");
+    assert_eq!(document.fluid_domain.as_ref().expect("fluid").root, wrapped);
+    assert_eq!(document.domain_kinds.len(), 1);
+    assert_eq!(document.domain_kinds.get(&wrapped), Some(&DomainKind::Fluid));
+}
+
+/// Solid domains follow the same rule as fluid: booleans carry the mark.
+#[test]
+fn difference_inherits_a_solid_domain_mark() {
+    let mut document = SceneDocument::new();
+    let block = document.add_primitive("box", 1.0).expect("box");
+    let hole = document.add_primitive("sphere", 0.4).expect("sphere");
+    document
+        .set_domain_root(block, DomainKind::Solid)
+        .expect("solid domain");
+    let combined = document.combine(block, hole, "difference").expect("subtract");
+    assert_eq!(document.domain_kinds.len(), 1);
+    assert_eq!(document.domain_kinds.get(&combined), Some(&DomainKind::Solid));
+}
+
+/// Only top-level objects can be Domains.
+#[test]
+fn set_domain_root_rejects_nested_nodes() {
+    let mut document = SceneDocument::default_scene().expect("default scene");
+    let root = document.roots[0];
+    let nested = document.object(root).expect("root").payload.children()[0];
+    let error = document
+        .set_domain_root(nested, DomainKind::Fluid)
+        .expect_err("nested node must be refused");
+    assert!(error.to_string().contains("top-level"));
+}
+
+/// Files saved with a stale nested domain mark (the old bug) self-heal on
+/// load: the nested mark is dropped, the root domain and its tags survive.
+#[test]
+fn loading_drops_stale_nested_domain_marks() {
+    let document = SceneDocument::default_scene().expect("default scene");
+    let saved = save_scene_to_string(&document).expect("save");
+    let mut payload: serde_json::Value = serde_json::from_str(&saved).expect("json");
+    payload["domains"]["flow_volume"] =
+        serde_json::json!({ "root": "flow_volume", "type": "fluid" });
+    let corrupted = serde_json::to_string(&payload).expect("corrupted json");
+
+    let reloaded = load_scene_from_str(&corrupted).expect("load");
+    assert_eq!(reloaded.roots.len(), 1);
+    let root = reloaded.roots[0];
+    assert_eq!(reloaded.domain_kinds.len(), 1);
+    assert_eq!(reloaded.domain_kinds.get(&root), Some(&DomainKind::Fluid));
+    let fluid = reloaded.fluid_domain.as_ref().expect("fluid record");
+    assert_eq!(fluid.root, root);
+    assert_eq!(fluid.tags.len(), 2, "inlet/outlet tags survive the heal");
 }

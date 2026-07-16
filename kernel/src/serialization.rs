@@ -1273,6 +1273,12 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
                 .ok_or_else(|| err(format!("domain '{domain_key}' requires a root")))?
                 .to_string();
             let root = loader.build(&root_name)?;
+            // Domains are only valid on top-level objects; files saved with
+            // stale nested domain marks (an old root demoted to a child)
+            // self-heal by dropping those records.
+            if !loader.document.roots.contains(&root) {
+                continue;
+            }
             let kind = DomainKind::parse(get_str(record, "type").unwrap_or("fluid"))
                 .map_err(|_| {
                     err(format!(
@@ -1319,6 +1325,9 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
 
     let mut document = loader.document;
     document.bump_next_object_id(loader.next_object_id.saturating_sub(1));
+    // Domains are only valid on top-level objects; files saved with stale
+    // nested domain marks self-heal here.
+    document.refresh_domains();
     Ok(document)
 }
 

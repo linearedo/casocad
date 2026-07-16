@@ -627,6 +627,13 @@ impl SceneDocument {
             .fluid_domain
             .as_ref()
             .is_some_and(|fluid| fluid.root == first || fluid.root == second);
+        // The combined root inherits an operand's domain kind (the operands
+        // themselves stop being roots, so they lose their marks in refresh).
+        let inherited_kind = self
+            .domain_kinds
+            .get(&first)
+            .or_else(|| self.domain_kinds.get(&second))
+            .copied();
 
         let first_payload = self.object(first)?.payload.clone();
         let second_payload = self.object(second)?.payload.clone();
@@ -733,11 +740,11 @@ impl SceneDocument {
             if let Some(fluid) = self.fluid_domain.as_mut() {
                 fluid.root = combined;
             }
-            if let Some(fluid) = self.fluid_domain.clone() {
-                self.domain_kinds.insert(fluid.root, DomainKind::Fluid);
-            }
         }
-        self.refresh_fluid_domain();
+        if let Some(kind) = inherited_kind {
+            self.domain_kinds.insert(combined, kind);
+        }
+        self.refresh_domains();
         self.mark_changed();
         Ok(combined)
     }
@@ -770,6 +777,7 @@ impl SceneDocument {
             .fluid_domain
             .as_ref()
             .is_some_and(|fluid| fluid.root == id);
+        let inherited_kind = self.domain_kinds.get(&id).copied();
         let wrapped = self.insert_object(name, payload)?;
         let index = self.detach_root(id);
         let index = index.min(self.roots.len());
@@ -778,9 +786,11 @@ impl SceneDocument {
             if let Some(fluid) = self.fluid_domain.as_mut() {
                 fluid.root = wrapped;
             }
-            self.domain_kinds.insert(wrapped, DomainKind::Fluid);
         }
-        self.refresh_fluid_domain();
+        if let Some(kind) = inherited_kind {
+            self.domain_kinds.insert(wrapped, kind);
+        }
+        self.refresh_domains();
         self.mark_changed();
         Ok(wrapped)
     }
@@ -831,6 +841,7 @@ impl SceneDocument {
             .fluid_domain
             .as_ref()
             .is_some_and(|fluid| fluid.root == section);
+        let inherited_kind = self.domain_kinds.get(&section).copied();
         let result = self.insert_object(name, payload)?;
         if method == "revolve" {
             let built = self.build_node(result)?;
@@ -850,9 +861,11 @@ impl SceneDocument {
             if let Some(fluid) = self.fluid_domain.as_mut() {
                 fluid.root = result;
             }
-            self.domain_kinds.insert(result, DomainKind::Fluid);
         }
-        self.refresh_fluid_domain();
+        if let Some(kind) = inherited_kind {
+            self.domain_kinds.insert(result, kind);
+        }
+        self.refresh_domains();
         self.mark_changed();
         Ok(result)
     }
@@ -861,6 +874,11 @@ impl SceneDocument {
         let dimension = self.dimension_of(id)?;
         if dimension != 2 && dimension != 3 {
             return Err(GeometryError::new("Domain root must be a 2D or 3D SDF"));
+        }
+        if !self.roots.contains(&id) {
+            return Err(GeometryError::new(
+                "Domain root must be a top-level object",
+            ));
         }
         self.domain_kinds.insert(id, kind);
         if kind == DomainKind::Fluid {
@@ -1160,7 +1178,7 @@ impl SceneDocument {
         if deleted == 0 {
             return 0;
         }
-        self.refresh_fluid_domain();
+        self.refresh_domains();
         self.mark_changed();
         deleted
     }
@@ -1249,12 +1267,14 @@ impl SceneDocument {
         }
     }
 
-    /// Prune domain kinds, boundary regions, and the fluid record to nodes
-    /// still reachable from the roots (Python `_refresh_fluid_domain`), and
-    /// garbage-collect unreachable objects from the id map.
-    pub fn refresh_fluid_domain(&mut self) {
+    /// Prune boundary regions and objects to nodes still reachable from the
+    /// roots, and prune domain kinds and the fluid record to *top-level*
+    /// nodes: only a root object can be a Domain, so a root demoted to a
+    /// child (by combine/wrap/extrude) loses its domain mark here.
+    pub fn refresh_domains(&mut self) {
         let live = self.live_ids();
-        self.domain_kinds.retain(|id, _kind| live.contains(id));
+        let roots = self.roots.clone();
+        self.domain_kinds.retain(|id, _kind| roots.contains(id));
         self.boundary_regions
             .retain(|region| live.contains(&region.owner_object_id));
         let region_ids: Vec<ObjectId> = self
@@ -1263,7 +1283,7 @@ impl SceneDocument {
             .map(|region| region.object_id)
             .collect();
         if let Some(fluid) = self.fluid_domain.take() {
-            if live.contains(&fluid.root) {
+            if roots.contains(&fluid.root) {
                 let tags = fluid
                     .tags
                     .into_iter()
@@ -1671,7 +1691,7 @@ impl SceneDocument {
             }
             pasted.push(moved);
         }
-        self.refresh_fluid_domain();
+        self.refresh_domains();
         self.mark_changed();
         Ok(pasted)
     }
@@ -1832,7 +1852,7 @@ impl SceneDocument {
         if moved != imported {
             self.object_mut(moved)?.name = name;
         }
-        self.refresh_fluid_domain();
+        self.refresh_domains();
         self.mark_changed();
         Ok(moved)
     }
