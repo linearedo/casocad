@@ -350,6 +350,23 @@ impl SceneDocument {
         self.walk().into_iter().map(|(id, _parent)| id).collect()
     }
 
+    /// Roots that are not contained inside another root's chain — the true
+    /// top-level components. A domain exposed as a root while also nested in
+    /// another chain is omitted: its geometry already renders inside that
+    /// chain, so the viewport draws `primary_roots` to avoid duplicates.
+    pub fn primary_roots(&self) -> Vec<ObjectId> {
+        self.roots
+            .iter()
+            .copied()
+            .filter(|id| {
+                !self
+                    .roots
+                    .iter()
+                    .any(|other| other != id && self.contains(*other, *id))
+            })
+            .collect()
+    }
+
     pub fn default_name(&self, kind: &str) -> String {
         let used: Vec<&str> = self
             .live_ids()
@@ -496,6 +513,87 @@ impl SceneDocument {
         Ok(Node::with_id(object.name.clone(), object.id, shape))
     }
 
+    /// Build the node for `id` as it is *embedded* in the scene: ancestor
+    /// Translate/Rotate/Scale wrappers between the containing root and `id`
+    /// are re-applied, so the result occupies the same world region the
+    /// object occupies inside its root's tree. Boolean ancestors add no
+    /// wrapper (their children already live in world coordinates); an
+    /// extrude/revolve/placed ancestor is an error, because a profile
+    /// consumed by a generator is not a world region. For a root this is
+    /// exactly `build_node`.
+    pub fn embedded_node(&self, id: ObjectId) -> GeometryResult<Node> {
+        // Prefer a primary root: a domain exposed as a bare root while also
+        // nested in a chain occupies world space through that chain (its
+        // exposure carries no ancestor transforms).
+        let root = self
+            .primary_roots()
+            .into_iter()
+            .find(|root| self.contains(*root, id))
+            .or_else(|| {
+                self.roots
+                    .iter()
+                    .copied()
+                    .find(|root| self.contains(*root, id))
+            })
+            .ok_or_else(|| {
+                GeometryError::new(format!("object {id} is not reachable from the scene roots"))
+            })?;
+        let mut path = Vec::new();
+        if !self.path_to(root, id, &mut path) {
+            return Err(GeometryError::new(format!(
+                "object {id} is not reachable from the scene roots"
+            )));
+        }
+        let mut node = self.build_node(id)?;
+        // Apply ancestor wrappers innermost-first (path holds root..=id).
+        for ancestor in path.into_iter().rev().skip(1) {
+            let object = self.object(ancestor)?;
+            let shape = match &object.payload {
+                ScenePayload::Translate { offset, .. } => Shape::Translate {
+                    child: Box::new(node),
+                    offset: *offset,
+                },
+                ScenePayload::Rotate {
+                    axis,
+                    angle_degrees,
+                    ..
+                } => Shape::Rotate {
+                    child: Box::new(node),
+                    axis: *axis,
+                    angle_degrees: *angle_degrees,
+                },
+                ScenePayload::Scale { factor, .. } => Shape::scale(node, *factor)?,
+                ScenePayload::Operator { .. } => continue,
+                _ => {
+                    return Err(GeometryError::new(format!(
+                        "'{}' is consumed by generator '{}' and has no world region of its own",
+                        self.object(id)?.name,
+                        object.name
+                    )));
+                }
+            };
+            node = Node::new(object.name.clone(), shape);
+        }
+        Ok(node)
+    }
+
+    /// Append the ancestor chain `current..=target` to `path`; true if found.
+    fn path_to(&self, current: ObjectId, target: ObjectId, path: &mut Vec<ObjectId>) -> bool {
+        path.push(current);
+        if current == target {
+            return true;
+        }
+        if let Some(object) = self.objects.get(&current) {
+            for child in object.payload.children() {
+                if self.path_to(child, target, path) {
+                    return true;
+                }
+            }
+        }
+        path.pop();
+        false
+    }
+
     pub fn dimension_of(&self, id: ObjectId) -> GeometryResult<u8> {
         let object = self.object(id)?;
         Ok(match &object.payload {
@@ -574,7 +672,33 @@ impl SceneDocument {
         Ok(id)
     }
 
-    fn contains(&self, ancestor: ObjectId, descendant: ObjectId) -> bool {
+    /// True if `descendant` is reachable from `ancestor` following only
+    /// "base" links (Operator.left, transform child, extrude/revolve
+    /// section) — the chain along which domain marks evolve. Strict: an
+    /// object is not its own lineage descendant.
+    pub(crate) fn lineage_contains(&self, ancestor: ObjectId, descendant: ObjectId) -> bool {
+        let mut current = ancestor;
+        loop {
+            let Some(object) = self.objects.get(&current) else {
+                return false;
+            };
+            let next = match &object.payload {
+                ScenePayload::Operator { left, .. } => *left,
+                ScenePayload::Translate { child, .. }
+                | ScenePayload::Rotate { child, .. }
+                | ScenePayload::Scale { child, .. } => *child,
+                ScenePayload::Extrude { section, .. }
+                | ScenePayload::Revolve { section, .. } => *section,
+                _ => return false,
+            };
+            if next == descendant {
+                return true;
+            }
+            current = next;
+        }
+    }
+
+    pub(crate) fn contains(&self, ancestor: ObjectId, descendant: ObjectId) -> bool {
         if ancestor == descendant {
             return true;
         }
@@ -623,17 +747,15 @@ impl SceneDocument {
         }
         let kind = OperatorKind::parse(operation)?;
         let default_name = self.default_name(operation);
+        // The first operand is the base that evolves into the combined node:
+        // its domain mark (and the fluid record) MOVES to the result. The
+        // second operand keeps its own mark while nested — a subtracted solid
+        // domain stays a live domain inside the difference.
         let replaces_fluid_root = self
             .fluid_domain
             .as_ref()
-            .is_some_and(|fluid| fluid.root == first || fluid.root == second);
-        // The combined root inherits an operand's domain kind (the operands
-        // themselves stop being roots, so they lose their marks in refresh).
-        let inherited_kind = self
-            .domain_kinds
-            .get(&first)
-            .or_else(|| self.domain_kinds.get(&second))
-            .copied();
+            .is_some_and(|fluid| fluid.root == first);
+        let moved_kind = self.domain_kinds.remove(&first);
 
         let first_payload = self.object(first)?.payload.clone();
         let second_payload = self.object(second)?.payload.clone();
@@ -733,20 +855,73 @@ impl SceneDocument {
 
         let combined = self.insert_object(default_name, payload)?;
         let first_index = self.detach_root(first);
-        let second_index = self.detach_root(second);
-        let index = first_index.min(second_index).min(self.roots.len());
+        // A marked second operand keeps its top-level exposure (a domain is
+        // always visible as a root — the same object, shared with this
+        // chain); unmarked operands are consumed as before.
+        let index = if self.domain_kinds.contains_key(&second) {
+            first_index
+        } else {
+            first_index.min(self.detach_root(second))
+        };
+        let index = index.min(self.roots.len());
         self.roots.insert(index, combined);
         if replaces_fluid_root {
             if let Some(fluid) = self.fluid_domain.as_mut() {
                 fluid.root = combined;
             }
         }
-        if let Some(kind) = inherited_kind {
+        if let Some(kind) = moved_kind {
             self.domain_kinds.insert(combined, kind);
         }
+        self.replace_child_references(first, combined, combined);
         self.refresh_domains();
         self.mark_changed();
         Ok(combined)
+    }
+
+    /// Rewrite every payload child slot pointing at `old` to point at `new`,
+    /// except inside `skip` (the newly created node that legitimately keeps
+    /// `old` as its child). Used when an object evolves, so shared
+    /// references — a domain exposed as a root AND used in another chain —
+    /// follow the evolution instead of desynchronizing.
+    fn replace_child_references(&mut self, old: ObjectId, new: ObjectId, skip: ObjectId) {
+        for (id, object) in self.objects.iter_mut() {
+            if *id == skip {
+                continue;
+            }
+            match &mut object.payload {
+                ScenePayload::Operator { left, right, .. } => {
+                    if *left == old {
+                        *left = new;
+                    }
+                    if *right == old {
+                        *right = new;
+                    }
+                }
+                ScenePayload::Translate { child, .. }
+                | ScenePayload::Rotate { child, .. }
+                | ScenePayload::Scale { child, .. } => {
+                    if *child == old {
+                        *child = new;
+                    }
+                }
+                ScenePayload::Extrude { section, .. }
+                | ScenePayload::Revolve { section, .. } => {
+                    if *section == old {
+                        *section = new;
+                    }
+                }
+                ScenePayload::Placed1D { sources, .. }
+                | ScenePayload::Placed2D { sources, .. } => {
+                    for source in sources.iter_mut() {
+                        if *source == old {
+                            *source = new;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Wrap a 3D node in a default transform (Python `wrap_transform`).
@@ -777,7 +952,8 @@ impl SceneDocument {
             .fluid_domain
             .as_ref()
             .is_some_and(|fluid| fluid.root == id);
-        let inherited_kind = self.domain_kinds.get(&id).copied();
+        // The wrapped object evolves: its mark moves to the wrapper.
+        let moved_kind = self.domain_kinds.remove(&id);
         let wrapped = self.insert_object(name, payload)?;
         let index = self.detach_root(id);
         let index = index.min(self.roots.len());
@@ -787,9 +963,10 @@ impl SceneDocument {
                 fluid.root = wrapped;
             }
         }
-        if let Some(kind) = inherited_kind {
+        if let Some(kind) = moved_kind {
             self.domain_kinds.insert(wrapped, kind);
         }
+        self.replace_child_references(id, wrapped, wrapped);
         self.refresh_domains();
         self.mark_changed();
         Ok(wrapped)
@@ -841,7 +1018,8 @@ impl SceneDocument {
             .fluid_domain
             .as_ref()
             .is_some_and(|fluid| fluid.root == section);
-        let inherited_kind = self.domain_kinds.get(&section).copied();
+        // The section evolves into the solid: its mark moves to the result.
+        let moved_kind = self.domain_kinds.remove(&section);
         let result = self.insert_object(name, payload)?;
         if method == "revolve" {
             let built = self.build_node(result)?;
@@ -862,9 +1040,10 @@ impl SceneDocument {
                 fluid.root = result;
             }
         }
-        if let Some(kind) = inherited_kind {
+        if let Some(kind) = moved_kind {
             self.domain_kinds.insert(result, kind);
         }
+        self.replace_child_references(section, result, result);
         self.refresh_domains();
         self.mark_changed();
         Ok(result)
@@ -875,12 +1054,31 @@ impl SceneDocument {
         if dimension != 2 && dimension != 3 {
             return Err(GeometryError::new("Domain root must be a 2D or 3D SDF"));
         }
-        if !self.roots.contains(&id) {
-            return Err(GeometryError::new(
-                "Domain root must be a top-level object",
-            ));
+        // Two marks may never sit on the same evolution chain: the base a
+        // domain evolved from (and anything it will evolve into) is the same
+        // object as the domain itself.
+        for other in self.domain_kinds.keys() {
+            if *other == id {
+                continue;
+            }
+            if self.lineage_contains(*other, id) || self.lineage_contains(id, *other) {
+                let other_name = self
+                    .object(*other)
+                    .map(|object| object.name.clone())
+                    .unwrap_or_default();
+                return Err(GeometryError::new(format!(
+                    "this object is on the evolution chain of domain '{other_name}'; \
+                     unset that domain first"
+                )));
+            }
         }
         self.domain_kinds.insert(id, kind);
+        // A domain is always visible as a top-level object: the root entry
+        // and the occurrence inside another object's chain are the SAME
+        // object, kept in sync.
+        if !self.roots.contains(&id) {
+            self.roots.push(id);
+        }
         if kind == DomainKind::Fluid {
             let previous = self.fluid_domain.take();
             self.fluid_domain = Some(FluidDomainRecord {
@@ -900,6 +1098,16 @@ impl SceneDocument {
             .is_some_and(|fluid| fluid.root == id)
         {
             self.fluid_domain = None;
+        }
+        // Drop the domain's top-level exposure when the object also lives
+        // inside another root's chain (it stays alive there); a standalone
+        // marked root remains a root.
+        let shared = self
+            .roots
+            .iter()
+            .any(|root| *root != id && self.contains(*root, id));
+        if shared {
+            self.roots.retain(|root| *root != id);
         }
         self.mark_changed();
     }
@@ -1166,14 +1374,41 @@ impl SceneDocument {
         if !node_targets.is_empty() {
             let roots = std::mem::take(&mut self.roots);
             let mut remaining = Vec::new();
+            let mut collapses = Vec::new();
+            // A shared object (a domain exposed as a root AND nested in
+            // another chain) is visited once per occurrence: count distinct
+            // removals and dedupe the surviving roots.
+            let mut removed_ids = std::collections::BTreeSet::new();
             for root in roots {
-                let (replacement, removed) = self.remove_targets_from(root, &node_targets);
-                deleted += removed;
+                let (replacement, _removed) =
+                    self.remove_targets_from(root, &node_targets, &mut collapses, &mut removed_ids);
                 if let Some(id) = replacement {
-                    remaining.push(id);
+                    if !remaining.contains(&id) {
+                        remaining.push(id);
+                    }
                 }
             }
+            deleted += removed_ids.len();
             self.roots = remaining;
+            // A collapsed operator devolves its domain mark to the surviving
+            // operand (evolution in reverse), unless the survivor already
+            // carries its own mark.
+            for (dead, successor) in collapses {
+                let Some(kind) = self.domain_kinds.remove(&dead) else {
+                    continue;
+                };
+                if self.domain_kinds.contains_key(&successor) {
+                    continue;
+                }
+                self.domain_kinds.insert(successor, kind);
+                if kind == DomainKind::Fluid {
+                    if let Some(fluid) = self.fluid_domain.as_mut() {
+                        if fluid.root == dead {
+                            fluid.root = successor;
+                        }
+                    }
+                }
+            }
         }
         if deleted == 0 {
             return 0;
@@ -1191,8 +1426,11 @@ impl SceneDocument {
         &mut self,
         current: ObjectId,
         targets: &[ObjectId],
+        collapses: &mut Vec<(ObjectId, ObjectId)>,
+        removed_ids: &mut std::collections::BTreeSet<ObjectId>,
     ) -> (Option<ObjectId>, usize) {
         if targets.contains(&current) {
+            removed_ids.insert(current);
             return (None, 1);
         }
         let payload = match self.objects.get(&current) {
@@ -1203,7 +1441,8 @@ impl SceneDocument {
             ScenePayload::Translate { child, .. }
             | ScenePayload::Rotate { child, .. }
             | ScenePayload::Scale { child, .. } => {
-                let (replacement, removed) = self.remove_targets_from(child, targets);
+                let (replacement, removed) =
+                    self.remove_targets_from(child, targets, collapses, removed_ids);
                 if removed == 0 {
                     return (Some(current), 0);
                 }
@@ -1223,8 +1462,10 @@ impl SceneDocument {
                 }
             }
             ScenePayload::Operator { left, right, .. } => {
-                let (left_replacement, left_removed) = self.remove_targets_from(left, targets);
-                let (right_replacement, right_removed) = self.remove_targets_from(right, targets);
+                let (left_replacement, left_removed) =
+                    self.remove_targets_from(left, targets, collapses, removed_ids);
+                let (right_replacement, right_removed) =
+                    self.remove_targets_from(right, targets, collapses, removed_ids);
                 let removed = left_removed + right_removed;
                 if removed == 0 {
                     return (Some(current), 0);
@@ -1240,12 +1481,16 @@ impl SceneDocument {
                         }
                         (Some(current), removed)
                     }
-                    (Some(survivor), None) | (None, Some(survivor)) => (Some(survivor), removed),
+                    (Some(survivor), None) | (None, Some(survivor)) => {
+                        collapses.push((current, survivor));
+                        (Some(survivor), removed)
+                    }
                     (None, None) => (None, removed),
                 }
             }
             ScenePayload::Extrude { section, .. } | ScenePayload::Revolve { section, .. } => {
-                let (replacement, removed) = self.remove_targets_from(section, targets);
+                let (replacement, removed) =
+                    self.remove_targets_from(section, targets, collapses, removed_ids);
                 if removed == 0 {
                     return (Some(current), 0);
                 }
@@ -1267,14 +1512,15 @@ impl SceneDocument {
         }
     }
 
-    /// Prune boundary regions and objects to nodes still reachable from the
-    /// roots, and prune domain kinds and the fluid record to *top-level*
-    /// nodes: only a root object can be a Domain, so a root demoted to a
-    /// child (by combine/wrap/extrude) loses its domain mark here.
+    /// Prune boundary regions, domain marks, and objects to nodes still
+    /// reachable from the roots. Domain marks may live on *nested* objects
+    /// (a subtracted solid domain stays a live domain inside the
+    /// difference) — a mark dies only with its object. Operations that
+    /// evolve an object (combine/wrap/extrude on the base operand) move
+    /// the mark themselves before calling this.
     pub fn refresh_domains(&mut self) {
         let live = self.live_ids();
-        let roots = self.roots.clone();
-        self.domain_kinds.retain(|id, _kind| roots.contains(id));
+        self.domain_kinds.retain(|id, _kind| live.contains(id));
         self.boundary_regions
             .retain(|region| live.contains(&region.owner_object_id));
         let region_ids: Vec<ObjectId> = self
@@ -1283,7 +1529,7 @@ impl SceneDocument {
             .map(|region| region.object_id)
             .collect();
         if let Some(fluid) = self.fluid_domain.take() {
-            if roots.contains(&fluid.root) {
+            if live.contains(&fluid.root) {
                 let tags = fluid
                     .tags
                     .into_iter()

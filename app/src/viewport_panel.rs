@@ -751,10 +751,12 @@ impl ViewportPanel {
             return;
         };
         self.pending_tiers.remove(0);
-        // Visible top-level components.
+        // Visible top-level components. A domain exposed as a root while
+        // nested in another chain already renders inside that chain, so
+        // only primary roots are meshed (no duplicate surfaces).
         let mut components = Vec::new();
-        for root in &document.roots {
-            if let Ok(node) = document.build_node(*root) {
+        for root in document.primary_roots() {
+            if let Ok(node) = document.build_node(root) {
                 components.push(node);
             }
         }

@@ -17,7 +17,6 @@ mod tools;
 mod viewport_panel;
 
 use caso_kernel::model::compile_model;
-use caso_kernel::roles::Domain;
 use caso_kernel::scene::{SceneDocument, ScenePayload};
 use caso_kernel::sdf::solid_from_2d::RevolveAxis;
 use caso_kernel::vec3::vec3;
@@ -480,51 +479,22 @@ impl CasoApp {
     }
 
     /// Compile the document's named Domains against the exact-SDF contract.
+    /// Uses the same derivation as meshing (`model_from_document`), so
+    /// validation sees exactly the carved regions the mesher will see.
     fn validate_domains(&mut self) {
-        let mut domains = Vec::new();
-        let mut entries: Vec<_> = self
-            .state
-            .document
-            .domain_kinds
-            .iter()
-            .map(|(id, kind)| (*id, *kind))
-            .collect();
-        if let Some(fluid) = &self.state.document.fluid_domain {
-            if !entries.iter().any(|(id, _)| *id == fluid.root) {
-                entries.push((fluid.root, caso_kernel::roles::DomainKind::Fluid));
+        let model = match caso_kernel::meshing::model_from_document(&self.state.document) {
+            Ok(model) => model,
+            Err(error) => {
+                self.state.status = format!("Validate: {error}");
+                return;
             }
-        }
-        if entries.is_empty() {
+        };
+        if model.domains.is_empty() {
             self.state.status = "Validate: no Domains set".to_string();
             return;
         }
-        for (id, kind) in entries {
-            let name = match self.state.document.object(id) {
-                Ok(object) => object.name.clone(),
-                Err(error) => {
-                    self.state.status = error.to_string();
-                    return;
-                }
-            };
-            let region = match self.state.document.build_node(id) {
-                Ok(node) => node,
-                Err(error) => {
-                    self.state.status = error.to_string();
-                    return;
-                }
-            };
-            match Domain::new(name, kind, region) {
-                Ok(domain) => domains.push(domain),
-                Err(error) => {
-                    self.state.status = format!("Validate: {error}");
-                    return;
-                }
-            }
-        }
-        let count = domains.len();
-        match caso_kernel::model::Model::new(domains)
-            .and_then(|model| compile_model(&model, DISJOINTNESS_RESOLUTION))
-        {
+        let count = model.domains.len();
+        match compile_model(&model, DISJOINTNESS_RESOLUTION) {
             Ok(()) => {
                 self.state.status = format!("Validate: {count} Domain(s) compile cleanly");
             }

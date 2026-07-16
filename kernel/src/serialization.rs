@@ -1260,7 +1260,9 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
         }
     }
 
-    // Domains.
+    // Domains. (root id, tags, had an explicit "tags" key — only the fluid
+    // record's root is saved with one, so it wins the record re-binding.)
+    let mut fluid_candidates: Vec<(ObjectId, Vec<TagRef>, bool)> = Vec::new();
     if let Some(raw_domains) = payload.get("domains") {
         let raw_domains = raw_domains
             .as_object()
@@ -1273,12 +1275,6 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
                 .ok_or_else(|| err(format!("domain '{domain_key}' requires a root")))?
                 .to_string();
             let root = loader.build(&root_name)?;
-            // Domains are only valid on top-level objects; files saved with
-            // stale nested domain marks (an old root demoted to a child)
-            // self-heal by dropping those records.
-            if !loader.document.roots.contains(&root) {
-                continue;
-            }
             let kind = DomainKind::parse(get_str(record, "type").unwrap_or("fluid"))
                 .map_err(|_| {
                     err(format!(
@@ -1291,6 +1287,7 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
                 continue;
             }
             let mut tags = Vec::new();
+            let has_tags_key = record.contains_key("tags");
             if let Some(Value::Array(raw_tags)) = record.get("tags") {
                 for tag_name in raw_tags {
                     let key = tag_name
@@ -1317,17 +1314,48 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
                     }
                 }
             }
-            if loader.document.fluid_domain.is_none() {
-                loader.document.fluid_domain = Some(FluidDomainRecord { root, tags });
-            }
+            fluid_candidates.push((root, tags, has_tags_key));
+        }
+    }
+
+    // Self-heal duplicate marks on one evolution chain: before marks moved
+    // on evolution, the old base kept its mark when a boolean/transform/
+    // extrude replaced it, leaving a duplicate on the result's lineage
+    // chain. Two marks on one chain can no longer be authored, so any in a
+    // file are corruption — drop the lineage descendants; genuinely nested
+    // domains (boolean second operands) are never on the chain and survive
+    // load untouched.
+    let marked: Vec<ObjectId> = loader.document.domain_kinds.keys().copied().collect();
+    for id in &marked {
+        let stale = marked
+            .iter()
+            .any(|ancestor| ancestor != id && loader.document.lineage_contains(*ancestor, *id));
+        if stale {
+            loader.document.domain_kinds.remove(id);
+        }
+    }
+    // Re-bind the fluid record to the first fluid root that survived
+    // healing, preferring the one saved with the record's tags.
+    fluid_candidates.sort_by_key(|(_root, _tags, has_tags_key)| !*has_tags_key);
+    for (root, tags, _has_tags_key) in fluid_candidates {
+        if loader.document.domain_kinds.get(&root) == Some(&DomainKind::Fluid) {
+            loader.document.fluid_domain = Some(FluidDomainRecord { root, tags });
+            break;
         }
     }
 
     let mut document = loader.document;
     document.bump_next_object_id(loader.next_object_id.saturating_sub(1));
-    // Domains are only valid on top-level objects; files saved with stale
-    // nested domain marks self-heal here.
+    // Backstop: drop marks whose objects are not reachable from the roots.
     document.refresh_domains();
+    // A domain is always exposed as a top-level object; normalize files
+    // saved by older versions.
+    let marked: Vec<ObjectId> = document.domain_kinds.keys().copied().collect();
+    for id in marked {
+        if !document.roots.contains(&id) {
+            document.roots.push(id);
+        }
+    }
     Ok(document)
 }
 

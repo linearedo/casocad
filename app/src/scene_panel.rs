@@ -182,25 +182,25 @@ impl ScenePanel {
                 ui.close();
             }
             ui.separator();
-            if top_level {
-                if ui.button("Set Fluid Domain").clicked() {
-                    state.push_undo();
-                    let result = state.document.set_domain_root(id, DomainKind::Fluid);
-                    state.report(result, "Fluid domain set");
-                    ui.close();
-                }
-                if ui.button("Set Solid Domain").clicked() {
-                    state.push_undo();
-                    let result = state.document.set_domain_root(id, DomainKind::Solid);
-                    state.report(result, "Solid domain set");
-                    ui.close();
-                }
-                if (domain.is_some() || is_fluid_root) && ui.button("Unset Domain").clicked() {
-                    state.push_undo();
-                    state.document.unset_domain_root(id);
-                    state.status = "Domain unset".to_string();
-                    ui.close();
-                }
+            // Domain marks are legal on nested objects too (a subtracted
+            // solid stays a live domain inside the difference).
+            if ui.button("Set Fluid Domain").clicked() {
+                state.push_undo();
+                let result = state.document.set_domain_root(id, DomainKind::Fluid);
+                state.report(result, "Fluid domain set");
+                ui.close();
+            }
+            if ui.button("Set Solid Domain").clicked() {
+                state.push_undo();
+                let result = state.document.set_domain_root(id, DomainKind::Solid);
+                state.report(result, "Solid domain set");
+                ui.close();
+            }
+            if (domain.is_some() || is_fluid_root) && ui.button("Unset Domain").clicked() {
+                state.push_undo();
+                state.document.unset_domain_root(id);
+                state.status = "Domain unset".to_string();
+                ui.close();
             }
         });
 

@@ -13,23 +13,101 @@ use crate::boundary_ops::{
 use crate::error::{GeometryError, GeometryResult};
 use crate::model::{compile_model, Model};
 use crate::roles::{Domain, DomainKind};
-use crate::scene::{SceneDocument, TagRef};
-use crate::sdf::node::Node;
+use crate::scene::{OperatorKind, SceneDocument, ScenePayload, TagRef};
+use crate::sdf::node::{Node, Shape};
 use crate::vec3::Vec3;
 use crate::BoundingBox3D;
 
 /// Derive a `Model` from explicitly declared document Domains. Free
 /// top-level construction objects are not Domains by default.
+///
+/// Domains may be nested (a subtracted solid stays a domain inside the
+/// difference). Each domain's region is its world-embedded geometry MINUS
+/// every domain marked strictly inside its subtree — an inner domain owns
+/// its space, so `sea = difference(box, pipe)` with a fluid `gas` nested in
+/// `pipe` meshes as `box − (pipe ∪ gas)` without any manual disjointness
+/// work. Regions are derived fresh here on every call; nothing is stored.
 pub fn model_from_document(document: &SceneDocument) -> GeometryResult<Model> {
     let mut domains = Vec::new();
     for (object_id, kind) in &document.domain_kinds {
-        let Ok(region) = document.build_node(*object_id) else {
+        let Ok(region) = domain_region(document, *object_id) else {
             continue;
         };
         let name = document.object(*object_id)?.name.clone();
         domains.push(Domain::new(name, *kind, region)?);
     }
     Model::new(domains)
+}
+
+/// The meshing region of a marked object: its world-embedded geometry MINUS
+/// every domain marked strictly inside its subtree.
+///
+/// Both sides are built from *additive bases* (see `additive_base`) so the
+/// derived CSG stays inside the exactness grammar: subtracting an inner
+/// domain back out of a difference is a set-level no-op
+/// (`(A − B) ∪ B = A ∪ B`), so `sea = box − (ball−gas)` with `ball−gas` and
+/// `gas` marked meshes as `box − (ball ∪ gas)` — exact primitives as
+/// cutters instead of an inside-exact difference.
+fn domain_region(document: &SceneDocument, object_id: u32) -> GeometryResult<Node> {
+    let inner: Vec<u32> = document
+        .domain_kinds
+        .keys()
+        .copied()
+        .filter(|other| *other != object_id && document.contains(object_id, *other))
+        .collect();
+    let mut region = document.embedded_node(additive_base(document, object_id, &inner))?;
+    if inner.is_empty() {
+        return Ok(region);
+    }
+    let dimension = region.dimension();
+    let cutter_ids: std::collections::BTreeSet<u32> = inner
+        .iter()
+        .map(|id| additive_base(document, *id, &inner))
+        .collect();
+    let mut cutter: Option<Node> = None;
+    for id in cutter_ids {
+        let node = document.embedded_node(id)?;
+        if node.dimension() != dimension {
+            continue;
+        }
+        cutter = Some(match cutter {
+            None => node,
+            Some(existing) => {
+                let name = existing.name.clone();
+                Node::new(name, Shape::union(existing, node)?)
+            }
+        });
+    }
+    if let Some(cutter) = cutter {
+        let name = document.object(object_id)?.name.clone();
+        region = Node::new(name, Shape::difference(region, cutter)?);
+    }
+    Ok(region)
+}
+
+/// Follow "additive base" links from `id`: through transform wrappers
+/// (embedding re-applies them) and through Difference operators whose right
+/// operand is itself a marked domain — that volume re-enters the region via
+/// the cutter union, so the set is unchanged while the expression stays
+/// exact.
+fn additive_base(document: &SceneDocument, id: u32, marked: &[u32]) -> u32 {
+    let mut current = id;
+    loop {
+        let Ok(object) = document.object(current) else {
+            return current;
+        };
+        current = match &object.payload {
+            ScenePayload::Operator {
+                kind: OperatorKind::Difference,
+                left,
+                right,
+            } if marked.contains(right) => *left,
+            ScenePayload::Translate { child, .. }
+            | ScenePayload::Rotate { child, .. }
+            | ScenePayload::Scale { child, .. } => *child,
+            _ => return current,
+        };
+    }
 }
 
 /// The signed classification field of a region's knife chain: negative
