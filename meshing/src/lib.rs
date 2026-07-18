@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod convert;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 

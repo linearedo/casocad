@@ -6,7 +6,10 @@ use std::collections::BTreeMap;
 use caso_kernel::meshing::meshable_domains_from_document;
 use caso_kernel::scene::SceneDocument;
 use caso_kernel::vec3::{vec3, Vec3};
-use caso_meshing::{element_wire_edges, read_mesh_ir, write_mesh_ir, MeshIr};
+use caso_meshing::{
+    convert::{MeshConverter, CONVERTERS},
+    element_wire_edges, read_mesh_ir, write_mesh_ir, MeshIr,
+};
 use caso_surfaces::types::mesh_tag_color;
 use caso_surfaces::{SurfaceStatus, ViewportSurface, ViewportSurfaceKey};
 use eframe::egui;
@@ -33,7 +36,7 @@ pub struct MeshingPanel {
     boundary_distances: BTreeMap<(String, u64), f64>,
     max_boundary_distance: f64,
     boundary_range: f64,
-    /// Filename for the browser download (empty means `mesh.arrow`).
+    /// Filename stem for browser downloads (empty uses the export default).
     #[cfg(target_arch = "wasm32")]
     download_name: String,
     /// File handed back by the async browser picker, consumed on the next
@@ -108,7 +111,7 @@ impl MeshingPanel {
             ui.add(
                 egui::TextEdit::singleline(&mut self.download_name)
                     .desired_width(140.0)
-                    .hint_text("mesh.arrow"),
+                    .hint_text("mesh"),
             );
             let export = ui
                 .add_enabled(
@@ -119,6 +122,16 @@ impl MeshingPanel {
             if export {
                 self.export(state);
             }
+            ui.add_enabled_ui(self.mesh.entity_count() > 0, |ui| {
+                ui.menu_button("Convert", |ui| {
+                    for converter in CONVERTERS {
+                        if ui.button(converter.label).clicked() {
+                            self.convert(state, converter);
+                            ui.close();
+                        }
+                    }
+                });
+            });
             if ui.button("Load .arrow…").clicked() {
                 self.load(ui, state);
             }
@@ -230,14 +243,24 @@ impl MeshingPanel {
             "cell_count": self.mesh.cells.len(),
         });
         match write_mesh_ir(&self.mesh, &metadata) {
-            Ok(bytes) => self.deliver(state, bytes),
+            Ok(bytes) => self.deliver(state, "mesh.arrow", bytes),
             Err(error) => state.status = format!("Arrow export failed: {error}"),
         }
     }
 
+    fn convert(&mut self, state: &mut AppState, converter: &MeshConverter) {
+        match (converter.write)(&self.mesh) {
+            Ok(bytes) => {
+                let name = format!("mesh.{}", converter.extension);
+                self.deliver(state, &name, bytes);
+            }
+            Err(error) => state.status = format!("{} conversion failed: {error}", converter.label),
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
-    fn deliver(&mut self, state: &mut AppState, bytes: Vec<u8>) {
-        let Some(path) = mesh_dialog().set_file_name("mesh.arrow").save_file() else {
+    fn deliver(&mut self, state: &mut AppState, default_name: &str, bytes: Vec<u8>) {
+        let Some(path) = mesh_dialog().set_file_name(default_name).save_file() else {
             return;
         };
         match std::fs::write(&path, bytes) {
@@ -247,8 +270,8 @@ impl MeshingPanel {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn deliver(&mut self, state: &mut AppState, bytes: Vec<u8>) {
-        let name = download_name(&self.download_name);
+    fn deliver(&mut self, state: &mut AppState, default_name: &str, bytes: Vec<u8>) {
+        let name = download_name(&self.download_name, default_name);
         match crate::web_download_bytes(&name, &bytes) {
             Ok(()) => state.status = format!("Downloaded {name}"),
             Err(error) => state.status = format!("Download failed: {error:?}"),
@@ -416,14 +439,20 @@ fn mesh_dialog() -> rfd::FileDialog {
 /// The download filename: trimmed user entry with `.arrow` appended when
 /// missing; `mesh.arrow` when empty.
 #[cfg(target_arch = "wasm32")]
-fn download_name(raw: &str) -> String {
+fn download_name(raw: &str, default_name: &str) -> String {
     let name = raw.trim();
     if name.is_empty() {
-        "mesh.arrow".to_string()
-    } else if name.ends_with(".arrow") {
+        default_name.to_string()
+    } else if default_name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| name.ends_with(&format!(".{extension}")))
+    {
         name.to_string()
     } else {
-        format!("{name}.arrow")
+        let extension = default_name
+            .rsplit_once('.')
+            .map_or("", |(_, extension)| extension);
+        format!("{name}.{extension}")
     }
 }
 

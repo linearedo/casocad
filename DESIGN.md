@@ -184,8 +184,8 @@ sheet so closed surfaces never show an antipodal phantom cut; see
 `design_docs/boundary_cutter_exactness.md`),
 `meshing_panel.rs` + `script_runner.rs`
 (Rhai scripting: `domains`, per-domain SDF/region queries, `mesh` MeshIR
-builder, 2D `mesh_space()` helpers; preview overlay; `.arrow` export —
-browser export is a Blob download).
+builder, 2D `mesh_space()` helpers; preview overlay; `.arrow` export and
+MeshIR converter exports such as SU2 — browser export is a Blob download).
 
 **Unified tool-interaction grammar.** Every viewport tool follows one
 lifecycle, enforced by a single dispatcher instead of per-tool key handling:
