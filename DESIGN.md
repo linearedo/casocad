@@ -147,10 +147,11 @@ opacity ~0 doubles as an x-ray mesh-inspection mode. See
 
 ### 4.4 `meshing` — FEA/CFD mesh artifacts
 
-Arrow IPC mesh artifact writer matching the Python
-`core/meshing/artifact.py` schema (`element_type`, `vertices` as
-`List<FixedSizeList<f64,3>>`, `tag_name`, sorted-compact JSON metadata;
-uncompressed IPC).
+Arrow IPC MeshIR v1 writer/reader. MeshIR is a single entity table with
+shared `point`, `edge`, `face`, `cell`, `zone`, `tag`, and `attribute`
+rows; cells reference shared topology instead of duplicating coordinates.
+The schema supports point/edge/triangle/quad/polygon/tet/hex/prism/pyramid/
+polyhedron element families, with world-space f64 xyz coordinates in meters.
 
 ### 4.5 `app` — the application
 
@@ -182,8 +183,9 @@ a bitwise-identical seam, and every area knife is bounded to the clicked
 sheet so closed surfaces never show an antipodal phantom cut; see
 `design_docs/boundary_cutter_exactness.md`),
 `meshing_panel.rs` + `script_runner.rs`
-(Rhai scripting: `domains`, per-domain SDF/region queries, `emit(...)`;
-preview overlay; `.arrow` export — browser export is a Blob download).
+(Rhai scripting: `domains`, per-domain SDF/region queries, `mesh` MeshIR
+builder, 2D `mesh_space()` helpers; preview overlay; `.arrow` export —
+browser export is a Blob download).
 
 **Unified tool-interaction grammar.** Every viewport tool follows one
 lifecycle, enforced by a single dispatcher instead of per-tool key handling:
@@ -240,8 +242,8 @@ casoCAD `.venv`) and replayed by Rust tests:
   **44 golden metric rows** (status / vertex / triangle / wire counts + max
   surface error, at res 12 and 96) match Python exactly.
 - Boundary/meshing: ports of `test_boundary_region_classifier.py`,
-  `test_boundary_split.py`, `test_mesh_api.py`; a Rust-written `.arrow` is
-  read back by the Python `read_mesh_artifact` with exact values + metadata.
+  `test_boundary_split.py`, `test_mesh_api.py`; MeshIR `.arrow` artifacts
+  round-trip through the Rust Arrow reader/writer with shared topology intact.
 
 The goldens are frozen: regenerating them requires the Python exporters
 (`tools/export_goldens.py` at the `python-final` tag). When adding a node

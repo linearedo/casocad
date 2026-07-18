@@ -1,35 +1,16 @@
-//! Rhai mesher-script runner — the WASM-compatible replacement for the
-//! Python-subprocess scripting page. Scripts receive the same surface as the
-//! Python contract: `domains` (lookup by name or unique kind) and
-//! `emit(element_type, vertices, tag_name)`.
-//!
-//! Example script:
-//! ```rhai
-//! let fluid = domains.get("fluid");
-//! let b = fluid.bounds();          // [xmin, xmax, ymin, ymax, zmin, zmax]
-//! let dx = 0.16;
-//! let x = b[0] + dx/2;
-//! while x < b[1] {
-//!     let y = b[2] + dx/2;
-//!     while y < b[3] {
-//!         if fluid.sdf(x, y, 0.0) < 0.0 {
-//!             emit("point", [[x, y, 0.0]], "fluid_internal");
-//!         }
-//!         y += dx;
-//!     }
-//!     x += dx;
-//! }
-//! ```
+//! Rhai mesher-script runner. Scripts receive exact meshable `domains` plus
+//! a topology-preserving `mesh` builder that emits MeshIR.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use caso_kernel::meshing::{
-    meshable_domains_from_document, MeshableBoundaryRegion, MeshableDomain, MeshableDomains,
+    meshable_domains_from_document, MeshableBoundaryRegion, MeshableDomain, MeshableDomainSpace,
+    MeshableDomains,
 };
 use caso_kernel::scene::SceneDocument;
 use caso_kernel::vec3::vec3;
-use caso_meshing::MeshElement;
+use caso_meshing::{MeshIr, MeshIrBuilder};
 use rhai::{Array, Dynamic, Engine, Scope};
 
 #[derive(Clone)]
@@ -41,32 +22,43 @@ struct DomainHandle(Rc<MeshableDomain>);
 #[derive(Clone)]
 struct RegionHandle(Rc<MeshableBoundaryRegion>);
 
-fn dynamic_to_vertex(value: &Dynamic) -> Result<[f64; 3], String> {
-    let array = value
-        .read_lock::<Array>()
-        .ok_or("each vertex must be an [x, y, z] array")?;
-    if array.len() != 3 {
-        return Err("each vertex must have exactly three components".to_string());
+#[derive(Clone)]
+struct SpaceHandle(Rc<MeshableDomainSpace>);
+
+#[derive(Clone)]
+struct MeshHandle(Rc<RefCell<MeshIrBuilder>>);
+
+fn dynamic_to_id(value: &Dynamic) -> Result<u64, String> {
+    let id = value
+        .as_int()
+        .map_err(|_| "mesh ids must be integers".to_string())?;
+    if id <= 0 {
+        return Err("mesh ids must be positive".to_string());
     }
-    let mut out = [0.0; 3];
-    for (slot, component) in out.iter_mut().zip(array.iter()) {
-        *slot = component
-            .as_float()
-            .or_else(|_| component.as_int().map(|value| value as f64))
-            .map_err(|_| "vertex components must be numbers".to_string())?;
+    Ok(id as u64)
+}
+
+fn array_to_ids(values: Array) -> Result<Vec<u64>, String> {
+    values.iter().map(dynamic_to_id).collect()
+}
+
+fn int_to_id(id: i64) -> Result<u64, String> {
+    if id <= 0 {
+        return Err("mesh ids must be positive".to_string());
     }
-    Ok(out)
+    Ok(id as u64)
+}
+
+fn id_to_int(id: u64) -> Result<i64, Box<rhai::EvalAltResult>> {
+    i64::try_from(id).map_err(|_| "mesh id exceeded Rhai integer range".to_string().into())
 }
 
 /// Run a mesher script against the document's declared Domains; returns the
-/// emitted elements. The exactness compile gate runs before any script code.
-pub fn run_mesher_script(
-    document: &SceneDocument,
-    script: &str,
-) -> Result<Vec<MeshElement>, String> {
+/// built MeshIR. The exactness compile gate runs before any script code.
+pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshIr, String> {
     let domains = meshable_domains_from_document(document).map_err(|error| error.to_string())?;
     let domains = DomainsHandle(Rc::new(domains));
-    let emitted: Rc<RefCell<Vec<MeshElement>>> = Rc::new(RefCell::new(Vec::new()));
+    let mesh = MeshHandle(Rc::new(RefCell::new(MeshIrBuilder::new())));
 
     let mut engine = Engine::new();
     engine.set_max_operations(200_000_000); // generous but bounded
@@ -119,9 +111,22 @@ pub fn run_mesher_script(
             .map(Dynamic::from)
             .collect::<Array>()
         })
-        .register_fn("sdf", |handle: &mut DomainHandle, x: f64, y: f64, z: f64| {
-            handle.0.domain_sdf(&[vec3(x, y, z)])[0]
-        })
+        .register_fn(
+            "sdf",
+            |handle: &mut DomainHandle, x: f64, y: f64, z: f64| {
+                handle.0.domain_sdf(&[vec3(x, y, z)])[0]
+            },
+        )
+        .register_fn(
+            "mesh_space",
+            |handle: &mut DomainHandle| -> Result<SpaceHandle, Box<rhai::EvalAltResult>> {
+                handle
+                    .0
+                    .mesh_space()
+                    .map(|space| SpaceHandle(Rc::new(space)))
+                    .map_err(|error| error.to_string().into())
+            },
+        )
         .register_fn("regions", |handle: &mut DomainHandle| {
             handle
                 .0
@@ -166,69 +171,180 @@ pub fn run_mesher_script(
             },
         );
 
-    let sink = emitted.clone();
-    engine.register_fn(
-        "emit",
-        move |element_type: &str, vertices: Array, tag_name: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-            let mut points = Vec::with_capacity(vertices.len());
-            for vertex in &vertices {
-                points.push(dynamic_to_vertex(vertex).map_err(|error| error.to_string())?);
-            }
-            sink.borrow_mut().push(MeshElement {
-                element_type: element_type.to_string(),
-                vertices: points,
-                tag_name: tag_name.to_string(),
-            });
-            Ok(())
-        },
-    );
+    engine
+        .register_type_with_name::<SpaceHandle>("MeshSpace")
+        .register_fn("bounds", |handle: &mut SpaceHandle| {
+            handle
+                .0
+                .bounds()
+                .iter()
+                .copied()
+                .map(Dynamic::from)
+                .collect::<Array>()
+        })
+        .register_fn("point", |handle: &mut SpaceHandle, a: f64, b: f64| {
+            let point = handle.0.point(a, b);
+            [point.x, point.y, point.z]
+                .into_iter()
+                .map(Dynamic::from)
+                .collect::<Array>()
+        })
+        .register_fn(
+            "coords",
+            |handle: &mut SpaceHandle, x: f64, y: f64, z: f64| {
+                handle
+                    .0
+                    .coords(vec3(x, y, z))
+                    .into_iter()
+                    .map(Dynamic::from)
+                    .collect::<Array>()
+            },
+        )
+        .register_fn("sdf", |handle: &mut SpaceHandle, a: f64, b: f64| {
+            handle.0.sdf(a, b)
+        });
+
+    engine
+        .register_type_with_name::<MeshHandle>("Mesh")
+        .register_fn("zone", |handle: &mut MeshHandle, name: &str, kind: &str| {
+            id_to_int(handle.0.borrow_mut().zone(name, kind))
+        })
+        .register_fn("tag", |handle: &mut MeshHandle, name: &str, kind: &str| {
+            id_to_int(handle.0.borrow_mut().tag(name, kind))
+        })
+        .register_fn(
+            "point",
+            |handle: &mut MeshHandle,
+             x: f64,
+             y: f64,
+             z: f64|
+             -> Result<i64, Box<rhai::EvalAltResult>> {
+                let id = handle.0.borrow_mut().point(x, y, z)?;
+                id_to_int(id)
+            },
+        )
+        .register_fn(
+            "face",
+            |handle: &mut MeshHandle,
+             type_name: &str,
+             point_ids: Array|
+             -> Result<i64, Box<rhai::EvalAltResult>> {
+                let point_ids = array_to_ids(point_ids)?;
+                let id = handle.0.borrow_mut().face(type_name, point_ids)?;
+                id_to_int(id)
+            },
+        )
+        .register_fn(
+            "cell",
+            |handle: &mut MeshHandle,
+             type_name: &str,
+             point_ids: Array,
+             zone_id: i64|
+             -> Result<i64, Box<rhai::EvalAltResult>> {
+                let point_ids = array_to_ids(point_ids)?;
+                let zone_id = int_to_id(zone_id)?;
+                let id = handle.0.borrow_mut().cell(type_name, point_ids, zone_id)?;
+                id_to_int(id)
+            },
+        )
+        .register_fn(
+            "cell_with_faces",
+            |handle: &mut MeshHandle,
+             type_name: &str,
+             point_ids: Array,
+             face_ids: Array,
+             zone_id: i64|
+             -> Result<i64, Box<rhai::EvalAltResult>> {
+                let point_ids = array_to_ids(point_ids)?;
+                let face_ids = array_to_ids(face_ids)?;
+                let zone_id = int_to_id(zone_id)?;
+                let id = handle
+                    .0
+                    .borrow_mut()
+                    .cell_with_faces(type_name, point_ids, face_ids, zone_id)?;
+                id_to_int(id)
+            },
+        )
+        .register_fn(
+            "tag_edge",
+            |handle: &mut MeshHandle,
+             point_ids: Array,
+             tag_id: i64|
+             -> Result<(), Box<rhai::EvalAltResult>> {
+                handle
+                    .0
+                    .borrow_mut()
+                    .tag_edge(array_to_ids(point_ids)?, int_to_id(tag_id)?);
+                Ok(())
+            },
+        )
+        .register_fn(
+            "tag_face",
+            |handle: &mut MeshHandle,
+             point_ids: Array,
+             tag_id: i64|
+             -> Result<(), Box<rhai::EvalAltResult>> {
+                handle
+                    .0
+                    .borrow_mut()
+                    .tag_face(array_to_ids(point_ids)?, int_to_id(tag_id)?);
+                Ok(())
+            },
+        )
+        .register_fn(
+            "attribute",
+            |handle: &mut MeshHandle,
+             target_kind: &str,
+             target_id: i64,
+             key: &str,
+             value_json: &str|
+             -> Result<(), Box<rhai::EvalAltResult>> {
+                let value: serde_json::Value =
+                    serde_json::from_str(value_json).map_err(|error| error.to_string())?;
+                handle
+                    .0
+                    .borrow_mut()
+                    .attribute(target_kind, int_to_id(target_id)?, key, value);
+                Ok(())
+            },
+        );
 
     let mut scope = Scope::new();
     scope.push("domains", domains);
+    scope.push("mesh", mesh.clone());
     engine
         .run_with_scope(&mut scope, script)
         .map_err(|error| error.to_string())?;
+    drop(scope);
     drop(engine);
-    Ok(Rc::try_unwrap(emitted)
-        .map(RefCell::into_inner)
-        .unwrap_or_default())
+
+    Rc::try_unwrap(mesh.0)
+        .map_err(|_| "mesh builder is still referenced".to_string())?
+        .into_inner()
+        .build()
 }
 
 /// The example script preloaded in the Meshing workspace.
-pub const EXAMPLE_SCRIPT: &str = r#"// casoCAD example 2D slice mesher script (Rhai).
-// `domains` exposes the declared Fluid/Solid Domains;
-// `emit(element_type, vertices, tag_name)`
-//streams mesh elements.
-  let fluid = domains.get("fluid");
-  let b = fluid.bounds();
-  let dx = 0.15;
-  let x = b[0];
-  while x + dx <= b[1] {
-    let y = b[2];
-    while y + dx <= b[3] {
-      // Cell corners on the z=0.5 plane.
-      let p00 = [x,      y,      0.5];
-      let p10 = [x + dx, y,      0.5];
-      let p01 = [x,      y + dx, 0.5];
-      let p11 = [x + dx, y + dx, 0.5];
-        // Emit only if the whole cell is inside the fluid.
-        if fluid.sdf(p00[0], p00[1], 0.5) < 0.0
-           && fluid.sdf(p10[0], p10[1], 0.5) < 0.0
-           && fluid.sdf(p01[0], p01[1], 0.5) < 0.0
-           && fluid.sdf(p11[0], p11[1], 0.5) < 0.0 {
-              emit("triangle",
-                    [p00, p10, p11],
-                    "fluid_internal"
-                    );
-              emit("triangle",
-                    [p00, p11, p01],
-                    "fluid_internal"
-                    );
-          }
-          y += dx;
-      }
-      x += dx;
-  }
+pub const EXAMPLE_SCRIPT: &str = r#"// casoCAD MeshIR example script (Rhai).
+let fluid = domains.get("fluid");
+let zone = mesh.zone(fluid.name, fluid.kind);
+let sample_edge = mesh.tag("sample_edge", "boundary");
+let b = fluid.bounds();
+let h = 0.15;
+let x = b[0] + h;
+let y = (b[2] + b[3]) * 0.5;
+let z = (b[4] + b[5]) * 0.5;
+
+let p00 = mesh.point(x,     y,     z);
+let p10 = mesh.point(x + h, y,     z);
+let p01 = mesh.point(x,     y + h, z);
+let p11 = mesh.point(x + h, y + h, z);
+
+if fluid.sdf(x + h * 0.5, y + h * 0.5, z) < 0.0 {
+    mesh.cell("tri3", [p00, p10, p11], zone);
+    mesh.cell("tri3", [p00, p11, p01], zone);
+    mesh.tag_edge([p00, p10], sample_edge);
+}
 "#;
 
 #[cfg(test)]
@@ -236,22 +352,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn example_script_emits_interior_slice_triangles() {
+    fn example_script_builds_mesh_ir_slice_triangles() {
         let document = SceneDocument::default_scene().expect("default scene");
-        let elements = run_mesher_script(&document, EXAMPLE_SCRIPT).expect("script runs");
-        assert!(!elements.is_empty());
-        // Every emitted triangle lies on the z=0.5 slice, strictly inside
-        // the fluid (not in the cylinder obstacle, not outside the box).
+        let mesh = run_mesher_script(&document, EXAMPLE_SCRIPT).expect("script runs");
+        assert_eq!(mesh.points.len(), 4);
+        assert_eq!(mesh.cells.len(), 2);
+        assert_eq!(mesh.edges.len(), 5);
+        assert!(mesh.edges.iter().any(|edge| !edge.tag_ids.is_empty()));
+
         let domains = meshable_domains_from_document(&document).expect("domains");
         let fluid = domains.get("fluid").expect("fluid");
-        for element in &elements {
-            assert_eq!(element.element_type, "triangle");
-            assert_eq!(element.tag_name, "fluid_internal");
-            assert_eq!(element.vertices.len(), 3);
-            for point in &element.vertices {
-                assert_eq!(point[2], 0.5);
-                assert!(fluid.domain_sdf(&[vec3(point[0], point[1], point[2])])[0] < 0.0);
-            }
+        for point in &mesh.points {
+            assert!(
+                fluid.domain_sdf(&[vec3(
+                    point.position[0],
+                    point.position[1],
+                    point.position[2],
+                )])[0]
+                    < 0.0
+            );
         }
     }
 
@@ -280,16 +399,14 @@ mod tests {
                 }
             }
             if r.contains(0.0, 0.0, 0.5) {
-                emit("point", [[0.0, 0.0, 0.5]], r.name);
+                mesh.point(0.0, 0.0, 0.5);
             }
             if !r.contains(4.5, 0.0, 0.5) {
-                emit("point", [[9.0, 9.0, 9.0]], "not_in_region");
+                mesh.point(9.0, 9.0, 9.0);
             }
         "#;
-        let elements = run_mesher_script(&document, script).expect("script runs");
-        assert_eq!(elements.len(), 2);
-        assert!(elements[0].tag_name.contains("-X"));
-        assert_eq!(elements[1].tag_name, "not_in_region");
+        let mesh = run_mesher_script(&document, script).expect("script runs");
+        assert_eq!(mesh.points.len(), 2);
     }
 
     #[test]
@@ -299,5 +416,39 @@ mod tests {
         assert!(run_mesher_script(&document, r#"domains.get("nope");"#)
             .unwrap_err()
             .contains("unknown meshable domain"));
+        assert!(
+            run_mesher_script(&document, r#"mesh.cell("tri3", [1, 2, 3], 1);"#)
+                .unwrap_err()
+                .contains("does not exist")
+        );
+    }
+
+    #[test]
+    fn mesh_space_is_scriptable_for_2d_domains() {
+        let mut document = SceneDocument::new();
+        let section = document
+            .add_primitive_from_drag("rectangle", vec3(0.0, 0.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+            .expect("rectangle");
+        document
+            .set_domain_root(section, caso_kernel::roles::DomainKind::Fluid)
+            .expect("domain");
+        let script = r#"
+            let fluid = domains.get("fluid");
+            let space = fluid.mesh_space();
+            let zone = mesh.zone("fluid", "fluid");
+            let b = space.bounds();
+            let p0 = space.point(b[0], b[2]);
+            let p1 = space.point(b[1], b[2]);
+            let p2 = space.point(b[1], b[3]);
+            if space.sdf(0.0, 0.0) < 0.0 {
+                let a = mesh.point(p0[0], p0[1], p0[2]);
+                let c = mesh.point(p1[0], p1[1], p1[2]);
+                let d = mesh.point(p2[0], p2[1], p2[2]);
+                mesh.cell("tri3", [a, c, d], zone);
+            }
+        "#;
+        let mesh = run_mesher_script(&document, script).expect("script runs");
+        assert_eq!(mesh.points.len(), 3);
+        assert_eq!(mesh.cells.len(), 1);
     }
 }

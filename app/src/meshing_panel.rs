@@ -1,11 +1,12 @@
-//! The Meshing workspace: Rhai mesher-script editor, run/preview, and Arrow
-//! artifact export — the port of casoCAD's Meshing workspace page (with Rhai
-//! replacing the Python subprocess, so it also runs in the browser).
+//! The Meshing workspace: Rhai MeshIR builder script editor, run/preview,
+//! and Arrow artifact export.
+
+use std::collections::BTreeMap;
 
 use caso_kernel::meshing::meshable_domains_from_document;
 use caso_kernel::scene::SceneDocument;
 use caso_kernel::vec3::{vec3, Vec3};
-use caso_meshing::{write_mesh_artifact, MeshElement};
+use caso_meshing::{element_wire_edges, write_mesh_ir, MeshIr};
 use caso_surfaces::types::mesh_tag_color;
 use caso_surfaces::{SurfaceStatus, ViewportSurface, ViewportSurfaceKey};
 use eframe::egui;
@@ -13,21 +14,17 @@ use eframe::egui;
 use crate::script_runner::{run_mesher_script, EXAMPLE_SCRIPT};
 use crate::state::AppState;
 
+type WireBuffers = (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>);
+
 pub struct MeshingPanel {
     script: String,
-    pub elements: Vec<MeshElement>,
+    pub mesh: MeshIr,
     pub show_preview: bool,
-    /// Bumped when `elements` change (viewport rebuilds the preview overlay).
+    /// Bumped when `mesh` changes (viewport rebuilds the preview overlay).
     pub preview_revision: u64,
-    /// Per-element distance to the nearest Domain boundary (min |sdf| over
-    /// the element's vertices, across all declared Domains). Parallel to
-    /// `elements`; computed once per script run.
-    boundary_distances: Vec<f64>,
-    /// Largest value in `boundary_distances` — the boundary-distance
-    /// slider's upper bound.
+    /// Per preview entity distance to the nearest Domain boundary.
+    boundary_distances: BTreeMap<(String, u64), f64>,
     max_boundary_distance: f64,
-    /// Preview only elements within this distance of a boundary (the
-    /// slider); at `max_boundary_distance` the whole mesh shows.
     boundary_range: f64,
     #[cfg(not(target_arch = "wasm32"))]
     export_path: String,
@@ -37,10 +34,10 @@ impl Default for MeshingPanel {
     fn default() -> Self {
         Self {
             script: EXAMPLE_SCRIPT.to_string(),
-            elements: Vec::new(),
+            mesh: MeshIr::default(),
             show_preview: true,
             preview_revision: 0,
-            boundary_distances: Vec::new(),
+            boundary_distances: BTreeMap::new(),
             max_boundary_distance: 0.0,
             boundary_range: 0.0,
             #[cfg(not(target_arch = "wasm32"))]
@@ -54,9 +51,13 @@ impl MeshingPanel {
         ui.horizontal(|ui| {
             if ui.button("Run Script").clicked() {
                 match run_mesher_script(&state.document, &self.script) {
-                    Ok(elements) => {
-                        state.status = format!("Mesher script: {} element(s)", elements.len());
-                        self.elements = elements;
+                    Ok(mesh) => {
+                        state.status = format!(
+                            "Mesher script: {} point(s), {} cell(s)",
+                            mesh.points.len(),
+                            mesh.cells.len()
+                        );
+                        self.mesh = mesh;
                         self.update_boundary_distances(&state.document);
                         self.preview_revision += 1;
                     }
@@ -65,30 +66,23 @@ impl MeshingPanel {
             }
             if ui
                 .checkbox(&mut self.show_preview, "Preview")
-                .on_hover_text("Show emitted elements in the viewport")
+                .on_hover_text("Show MeshIR topology in the viewport")
                 .changed()
             {
                 self.preview_revision += 1;
             }
-            if !self.elements.is_empty() {
-                let shown = (0..self.elements.len())
-                    .filter(|index| self.is_shown(*index))
-                    .count();
-                if shown == self.elements.len() {
-                    ui.weak(format!("{shown} element(s)"));
-                } else {
-                    ui.weak(format!("{shown}/{} element(s)", self.elements.len()));
-                }
+            if self.mesh.entity_count() > 0 {
+                ui.weak(format!("{} MeshIR entities", self.mesh.entity_count()));
             }
         });
-        if !self.elements.is_empty() && self.max_boundary_distance > 0.0 {
+        if self.mesh.entity_count() > 0 && self.max_boundary_distance > 0.0 {
             let slider = ui
                 .add(
                     egui::Slider::new(&mut self.boundary_range, 0.0..=self.max_boundary_distance)
                         .text("Boundary distance"),
                 )
                 .on_hover_text(
-                    "Preview only elements within this distance of a Domain boundary",
+                    "Preview only mesh topology within this distance of a Domain boundary",
                 );
             if slider.changed() {
                 self.preview_revision += 1;
@@ -105,7 +99,7 @@ impl MeshingPanel {
             }
             let export = ui
                 .add_enabled(
-                    !self.elements.is_empty(),
+                    self.mesh.entity_count() > 0,
                     egui::Button::new("Mesh and Export .arrow"),
                 )
                 .clicked();
@@ -126,66 +120,100 @@ impl MeshingPanel {
             });
     }
 
-    /// Caches each element's distance to the nearest Domain boundary: the
-    /// domain SDF is a signed distance, so min |sdf| over the element's
-    /// vertices (across all Domains) is that distance. One batched SDF pass
-    /// per Domain here keeps the slider free of per-frame SDF work.
     fn update_boundary_distances(&mut self, document: &SceneDocument) {
         self.boundary_distances.clear();
         self.max_boundary_distance = 0.0;
         let Ok(domains) = meshable_domains_from_document(document) else {
-            // No compilable Domains: treat everything as on-boundary so the
-            // q filter never hides elements.
-            self.boundary_distances = vec![0.0; self.elements.len()];
             self.boundary_range = 0.0;
             return;
         };
         let points: Vec<Vec3> = self
-            .elements
+            .mesh
+            .points
             .iter()
-            .flat_map(|element| element.vertices.iter())
-            .map(|point| vec3(point[0], point[1], point[2]))
+            .map(|point| vec3(point.position[0], point.position[1], point.position[2]))
             .collect();
         let mut nearest = vec![f64::INFINITY; points.len()];
-        for key in domains.keys() {
-            let Ok(domain) = domains.get(&key) else {
-                continue;
-            };
+        for domain in domains.iter() {
             for (slot, sdf) in nearest.iter_mut().zip(domain.domain_sdf(&points)) {
                 *slot = slot.min(sdf.abs());
             }
         }
-        let mut cursor = 0;
-        for element in &self.elements {
-            let distance = nearest[cursor..cursor + element.vertices.len()]
+        let by_point: BTreeMap<u64, f64> = self
+            .mesh
+            .points
+            .iter()
+            .map(|point| point.id)
+            .zip(nearest)
+            .collect();
+
+        let mut rows: Vec<(&'static str, u64, Vec<u64>)> = Vec::new();
+        rows.extend(
+            self.mesh
+                .points
                 .iter()
-                .copied()
-                .fold(f64::INFINITY, f64::min);
-            let distance = if distance.is_finite() { distance } else { 0.0 };
-            self.boundary_distances.push(distance);
-            self.max_boundary_distance = self.max_boundary_distance.max(distance);
-            cursor += element.vertices.len();
+                .map(|point| ("point", point.id, vec![point.id])),
+        );
+        rows.extend(
+            self.mesh
+                .edges
+                .iter()
+                .map(|edge| ("edge", edge.id, edge.point_ids.clone())),
+        );
+        rows.extend(
+            self.mesh
+                .faces
+                .iter()
+                .map(|face| ("face", face.id, face.point_ids.clone())),
+        );
+        rows.extend(
+            self.mesh
+                .cells
+                .iter()
+                .map(|cell| ("cell", cell.id, cell.point_ids.clone())),
+        );
+        for (kind, id, point_ids) in rows {
+            self.insert_distance(kind, id, &point_ids, &by_point);
         }
-        // Keep the user's range across reruns; unset or stale values show all.
         if self.boundary_range <= 0.0 || self.boundary_range > self.max_boundary_distance {
             self.boundary_range = self.max_boundary_distance;
         }
     }
 
-    /// Whether the boundary-distance filter keeps the element visible
-    /// (elements without a cached distance always show).
-    fn is_shown(&self, index: usize) -> bool {
+    fn insert_distance(
+        &mut self,
+        kind: &str,
+        id: u64,
+        point_ids: &[u64],
+        by_point: &BTreeMap<u64, f64>,
+    ) {
+        let distance = point_ids
+            .iter()
+            .filter_map(|point_id| by_point.get(point_id))
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let distance = if distance.is_finite() { distance } else { 0.0 };
         self.boundary_distances
-            .get(index)
+            .insert((kind.to_string(), id), distance);
+        self.max_boundary_distance = self.max_boundary_distance.max(distance);
+    }
+
+    fn is_shown(&self, kind: &str, id: u64) -> bool {
+        self.boundary_distances
+            .get(&(kind.to_string(), id))
             .is_none_or(|distance| *distance <= self.boundary_range)
     }
 
     fn export(&mut self, state: &mut AppState) {
         let metadata = serde_json::json!({
             "source": "casowasm",
-            "element_count": self.elements.len(),
+            "schema": "casocad.mesh_ir.v1",
+            "point_count": self.mesh.points.len(),
+            "edge_count": self.mesh.edges.len(),
+            "face_count": self.mesh.faces.len(),
+            "cell_count": self.mesh.cells.len(),
         });
-        match write_mesh_artifact(&self.elements, &metadata) {
+        match write_mesh_ir(&self.mesh, &metadata) {
             Ok(bytes) => self.deliver(state, bytes),
             Err(error) => state.status = format!("Arrow export failed: {error}"),
         }
@@ -199,7 +227,6 @@ impl MeshingPanel {
         }
     }
 
-    /// Browser: download the artifact bytes as mesh.arrow.
     #[cfg(target_arch = "wasm32")]
     fn deliver(&mut self, state: &mut AppState, bytes: Vec<u8>) {
         match crate::web_download_bytes("mesh.arrow", &bytes) {
@@ -208,91 +235,78 @@ impl MeshingPanel {
         }
     }
 
-    /// The emitted point elements as flat instance data (xyz + rgb per
-    /// point) for the renderer's sphere-impostor markers.
     pub fn preview_points(&self) -> Vec<f32> {
         if !self.show_preview {
             return Vec::new();
         }
         let mut points = Vec::new();
-        for (index, element) in self.elements.iter().enumerate() {
-            if element.vertices.len() != 1 || !self.is_shown(index) {
+        for point in &self.mesh.points {
+            if !self.is_shown("point", point.id) {
                 continue;
             }
-            let point = element.vertices[0];
-            let color = mesh_tag_color(tag_color_id(&element.tag_name));
-            points.extend([point[0] as f32, point[1] as f32, point[2] as f32]);
+            let color = mesh_tag_color(tag_color_id(
+                point
+                    .tag_ids
+                    .first()
+                    .and_then(|id| self.mesh.tag_name(*id))
+                    .unwrap_or("mesh_points"),
+            ));
+            points.extend([
+                point.position[0] as f32,
+                point.position[1] as f32,
+                point.position[2] as f32,
+            ]);
             points.extend(color);
         }
         points
     }
 
-    /// The emitted elements as wire-only viewport preview surfaces (face
-    /// outlines and segments), colored stably per tag.
     pub fn preview_surfaces(&self) -> Vec<ViewportSurface> {
-        if !self.show_preview || self.elements.is_empty() {
+        if !self.show_preview || self.mesh.entity_count() == 0 {
             return Vec::new();
         }
-        // Group by tag so each physics tag keeps one stable color.
-        let mut tags: Vec<&str> = self
-            .elements
+        let point_positions: BTreeMap<u64, [f64; 3]> = self
+            .mesh
+            .points
             .iter()
-            .map(|element| element.tag_name.as_str())
+            .map(|point| (point.id, point.position))
             .collect();
-        tags.sort_unstable();
-        tags.dedup();
+        let mut groups: BTreeMap<String, WireBuffers> = BTreeMap::new();
+
+        if self.mesh.faces.is_empty() {
+            for edge in &self.mesh.edges {
+                if self.is_shown("edge", edge.id) {
+                    let label = edge_label(&self.mesh, edge);
+                    append_wire(
+                        groups.entry(label).or_default(),
+                        &point_positions,
+                        &edge.type_name,
+                        &edge.point_ids,
+                    );
+                }
+            }
+        } else {
+            for face in &self.mesh.faces {
+                if self.is_shown("face", face.id) {
+                    let label = face_label(&self.mesh, face);
+                    append_wire(
+                        groups.entry(label).or_default(),
+                        &point_positions,
+                        &face.type_name,
+                        &face.point_ids,
+                    );
+                }
+            }
+        }
+
         let mut surfaces = Vec::new();
-        for (tag_index, tag) in tags.iter().enumerate() {
-            let mut vertices: Vec<[f32; 3]> = Vec::new();
-            let mut normals: Vec<[f32; 3]> = Vec::new();
-            let mut wire_indices: Vec<u32> = Vec::new();
-            let color = mesh_tag_color(tag_color_id(tag));
-            for element in self
-                .elements
-                .iter()
-                .enumerate()
-                .filter(|(index, element)| element.tag_name == **tag && self.is_shown(*index))
-                .map(|(_, element)| element)
-            {
-                let base = vertices.len() as u32;
-                match element.vertices.len() {
-                    // Points are drawn separately as sphere impostors
-                    // (`preview_points`), not as wire geometry.
-                    0 | 1 => continue,
-                    2 => {
-                        for point in &element.vertices {
-                            vertices
-                                .push([point[0] as f32, point[1] as f32, point[2] as f32]);
-                            normals.push([0.0, 0.0, 1.0]);
-                        }
-                        wire_indices.extend([base, base + 1]);
-                    }
-                    _ => {
-                        // Face elements: wire outline only (no filled
-                        // triangles by design — see design_docs/
-                        // mesh_preview_opacity_independence.md).
-                        for point in &element.vertices {
-                            vertices
-                                .push([point[0] as f32, point[1] as f32, point[2] as f32]);
-                            normals.push([0.0, 0.0, 1.0]);
-                        }
-                        for index in 0..element.vertices.len() as u32 {
-                            wire_indices.extend([
-                                base + index,
-                                base + (index + 1) % element.vertices.len() as u32,
-                            ]);
-                        }
-                    }
-                }
+        for (tag_index, (label, (vertices, normals, wire_indices))) in
+            groups.into_iter().enumerate()
+        {
+            if vertices.is_empty() {
+                continue;
             }
-            let mut bounds_min = [f64::INFINITY; 3];
-            let mut bounds_max = [f64::NEG_INFINITY; 3];
-            for vertex in &vertices {
-                for axis in 0..3 {
-                    bounds_min[axis] = bounds_min[axis].min(vertex[axis] as f64);
-                    bounds_max[axis] = bounds_max[axis].max(vertex[axis] as f64);
-                }
-            }
+            let (bounds_min, bounds_max) = f32_bounds(&vertices);
             surfaces.push(ViewportSurface {
                 key: ViewportSurfaceKey {
                     object_id: u32::MAX - 10 - tag_index as u32,
@@ -305,7 +319,7 @@ impl MeshingPanel {
                 normals,
                 indices: Vec::new(),
                 wire_indices,
-                color,
+                color: mesh_tag_color(tag_color_id(&label)),
                 alpha: 1.0,
                 bounds_min,
                 bounds_max,
@@ -316,8 +330,67 @@ impl MeshingPanel {
     }
 }
 
+fn append_wire(
+    buffers: &mut WireBuffers,
+    points: &BTreeMap<u64, [f64; 3]>,
+    type_name: &str,
+    point_ids: &[u64],
+) {
+    let (vertices, normals, wire_indices) = buffers;
+    for (a, b) in element_wire_edges(type_name, point_ids) {
+        let (Some(a), Some(b)) = (points.get(&a), points.get(&b)) else {
+            continue;
+        };
+        let base = vertices.len() as u32;
+        vertices.push([a[0] as f32, a[1] as f32, a[2] as f32]);
+        vertices.push([b[0] as f32, b[1] as f32, b[2] as f32]);
+        normals.push([0.0, 0.0, 1.0]);
+        normals.push([0.0, 0.0, 1.0]);
+        wire_indices.extend([base, base + 1]);
+    }
+}
+
+fn edge_label(mesh: &MeshIr, edge: &caso_meshing::MeshEdge) -> String {
+    edge.tag_ids
+        .first()
+        .and_then(|id| mesh.tag_name(*id))
+        .map(str::to_string)
+        .or_else(|| cell_zone_label(mesh, edge.owner_cell_id))
+        .unwrap_or_else(|| "mesh".to_string())
+}
+
+fn face_label(mesh: &MeshIr, face: &caso_meshing::MeshFace) -> String {
+    face.tag_ids
+        .first()
+        .and_then(|id| mesh.tag_name(*id))
+        .map(str::to_string)
+        .or_else(|| cell_zone_label(mesh, face.owner_cell_id))
+        .unwrap_or_else(|| "mesh".to_string())
+}
+
+fn cell_zone_label(mesh: &MeshIr, cell_id: Option<u64>) -> Option<String> {
+    let cell = mesh.cells.iter().find(|cell| Some(cell.id) == cell_id)?;
+    cell.zone_id
+        .and_then(|zone_id| mesh.zone_name(zone_id))
+        .map(str::to_string)
+}
+
+fn f32_bounds(vertices: &[[f32; 3]]) -> ([f64; 3], [f64; 3]) {
+    let mut bounds_min = [f64::INFINITY; 3];
+    let mut bounds_max = [f64::NEG_INFINITY; 3];
+    for vertex in vertices {
+        for axis in 0..3 {
+            bounds_min[axis] = bounds_min[axis].min(vertex[axis] as f64);
+            bounds_max[axis] = bounds_max[axis].max(vertex[axis] as f64);
+        }
+    }
+    if vertices.is_empty() {
+        return ([0.0; 3], [0.0; 3]);
+    }
+    (bounds_min, bounds_max)
+}
+
 fn tag_color_id(tag: &str) -> u32 {
-    // FNV-1a over the tag name → stable per-tag hue.
     let mut hash: u32 = 2_166_136_261;
     for byte in tag.bytes() {
         hash ^= byte as u32;
@@ -325,4 +398,3 @@ fn tag_color_id(tag: &str) -> u32 {
     }
     (hash % 60_000).max(1)
 }
-

@@ -7,15 +7,13 @@
 //! before a mesher script receives field callables.
 
 use crate::boundary::{BoundaryRegion, CutSide};
-use crate::boundary_ops::{
-    boundary_region_mask, cut_volume, find_node_by_object_id,
-};
+use crate::boundary_ops::{boundary_region_mask, cut_volume, find_node_by_object_id};
 use crate::error::{GeometryError, GeometryResult};
 use crate::model::{compile_model, Model};
 use crate::roles::{Domain, DomainKind};
 use crate::scene::{OperatorKind, SceneDocument, ScenePayload, TagRef};
 use crate::sdf::node::{Node, Shape};
-use crate::vec3::Vec3;
+use crate::vec3::{vec3, Vec3};
 use crate::BoundingBox3D;
 
 /// Derive a `Model` from explicitly declared document Domains. Free
@@ -155,7 +153,10 @@ impl MeshableBoundaryRegion {
     /// The exact field of the region's generating surface (y+ layers,
     /// grading, refinement bands).
     pub fn owner_sdf(&self, points: &[Vec3]) -> Vec<f64> {
-        points.iter().map(|point| self.owner.eval_point(*point)).collect()
+        points
+            .iter()
+            .map(|point| self.owner.eval_point(*point))
+            .collect()
     }
 
     /// Combined signed field of the cut chain (negative inside every kept
@@ -189,6 +190,39 @@ pub struct MeshableDomain {
     pub boundary_regions: Vec<MeshableBoundaryRegion>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MeshableDomainSpace {
+    origin: Vec3,
+    axis_a: Vec3,
+    axis_b: Vec3,
+    normal: Vec3,
+    bounds: [f64; 4],
+    region: Node,
+}
+
+impl MeshableDomainSpace {
+    pub fn bounds(&self) -> [f64; 4] {
+        self.bounds
+    }
+
+    pub fn point(&self, a: f64, b: f64) -> Vec3 {
+        self.origin + self.axis_a * a + self.axis_b * b
+    }
+
+    pub fn coords(&self, point: Vec3) -> [f64; 3] {
+        let offset = point - self.origin;
+        [
+            offset.dot(self.axis_a),
+            offset.dot(self.axis_b),
+            offset.dot(self.normal),
+        ]
+    }
+
+    pub fn sdf(&self, a: f64, b: f64) -> f64 {
+        self.region.eval_point(self.point(a, b))
+    }
+}
+
 impl MeshableDomain {
     pub fn domain_sdf(&self, points: &[Vec3]) -> Vec<f64> {
         points
@@ -199,6 +233,16 @@ impl MeshableDomain {
 
     pub fn region_node(&self) -> &Node {
         &self.region
+    }
+
+    pub fn mesh_space(&self) -> GeometryResult<MeshableDomainSpace> {
+        if self.dimension != 2 {
+            return Err(GeometryError::new(
+                "mesh_space is only available for 2D meshable domains",
+            ));
+        }
+        mesh_space_from_node(&self.region)
+            .ok_or_else(|| GeometryError::new("2D mesh space requires a placed 2D domain"))
     }
 
     pub fn region_by_name(&self, name: &str) -> GeometryResult<&MeshableBoundaryRegion> {
@@ -217,6 +261,88 @@ impl MeshableDomain {
                 ))
             })
     }
+}
+
+fn mesh_space_from_node(node: &Node) -> Option<MeshableDomainSpace> {
+    match &node.shape {
+        Shape::PlacedSdf2D(placed) => {
+            let normal = placed.normal();
+            let (a_min, a_max, b_min, b_max) = placed.profile.bounds();
+            Some(MeshableDomainSpace {
+                origin: placed.origin,
+                axis_a: placed.axis_u,
+                axis_b: placed.axis_v,
+                normal,
+                bounds: [a_min, a_max, b_min, b_max],
+                region: node.clone(),
+            })
+        }
+        Shape::Translate { child, offset } => {
+            let mut space = mesh_space_from_node(child)?;
+            space.origin += *offset;
+            space.region = node.clone();
+            Some(space)
+        }
+        Shape::Scale { child, factor } => {
+            let mut space = mesh_space_from_node(child)?;
+            space.origin = space.origin * *factor;
+            space.bounds = [
+                space.bounds[0] * *factor,
+                space.bounds[1] * *factor,
+                space.bounds[2] * *factor,
+                space.bounds[3] * *factor,
+            ];
+            space.region = node.clone();
+            Some(space)
+        }
+        Shape::Rotate {
+            child,
+            axis,
+            angle_degrees,
+        } => {
+            let mut space = mesh_space_from_node(child)?;
+            space.origin = axis.rotate(space.origin, *angle_degrees);
+            space.axis_a = axis.rotate(space.axis_a, *angle_degrees);
+            space.axis_b = axis.rotate(space.axis_b, *angle_degrees);
+            space.normal = space.axis_a.cross(space.axis_b);
+            space.normal = space.normal / space.normal.length().max(1.0e-12);
+            space.region = node.clone();
+            Some(space)
+        }
+        Shape::Union(operands)
+        | Shape::Intersection(operands)
+        | Shape::Difference(operands)
+        | Shape::Xor(operands) => {
+            let mut space = mesh_space_from_node(&operands.left)?;
+            if let Ok(bounds) = node.bounding_box() {
+                space.bounds = projected_bounds(&bounds, space.origin, space.axis_a, space.axis_b);
+            }
+            space.region = node.clone();
+            Some(space)
+        }
+        _ => None,
+    }
+}
+
+fn projected_bounds(bounds: &BoundingBox3D, origin: Vec3, axis_a: Vec3, axis_b: Vec3) -> [f64; 4] {
+    let mut a_min = f64::INFINITY;
+    let mut a_max = f64::NEG_INFINITY;
+    let mut b_min = f64::INFINITY;
+    let mut b_max = f64::NEG_INFINITY;
+    for x in [bounds.x_min, bounds.x_max] {
+        for y in [bounds.y_min, bounds.y_max] {
+            for z in [bounds.z_min, bounds.z_max] {
+                let offset = vec3(x, y, z) - origin;
+                let a = offset.dot(axis_a);
+                let b = offset.dot(axis_b);
+                a_min = a_min.min(a);
+                a_max = a_max.max(a);
+                b_min = b_min.min(b);
+                b_max = b_max.max(b);
+            }
+        }
+    }
+    [a_min, a_max, b_min, b_max]
 }
 
 /// Name- (or unique-kind-) keyed collection of meshable domains.
@@ -260,8 +386,7 @@ impl MeshableDomains {
                 return Ok(matches[0]);
             }
             if matches.len() > 1 {
-                let names: Vec<&str> =
-                    matches.iter().map(|domain| domain.name.as_str()).collect();
+                let names: Vec<&str> = matches.iter().map(|domain| domain.name.as_str()).collect();
                 return Err(GeometryError::new(format!(
                     "domain kind {key:?} is ambiguous: {}",
                     names.join(", ")
@@ -276,7 +401,11 @@ impl MeshableDomains {
 
     /// Domain names plus the kinds that are unique to one domain.
     pub fn keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self.items.iter().map(|domain| domain.name.clone()).collect();
+        let mut keys: Vec<String> = self
+            .items
+            .iter()
+            .map(|domain| domain.name.clone())
+            .collect();
         for kind in [DomainKind::Fluid, DomainKind::Solid] {
             if self.by_kind(kind).len() == 1 {
                 keys.push(kind.as_str().to_string());
@@ -362,9 +491,7 @@ fn fluid_boundary_entries(
 
 /// Expose an exact-SDF document through the public meshing API
 /// (`load_meshable_domains`, from an in-memory document).
-pub fn meshable_domains_from_document(
-    document: &SceneDocument,
-) -> GeometryResult<MeshableDomains> {
+pub fn meshable_domains_from_document(document: &SceneDocument) -> GeometryResult<MeshableDomains> {
     let model = model_from_document(document)?;
     compile_model(&model, 32)?;
     let fluid_root_id = document.fluid_domain.as_ref().map(|fluid| fluid.root);

@@ -5,6 +5,7 @@ use caso_kernel::meshing::{
 };
 use caso_kernel::roles::DomainKind;
 use caso_kernel::scene::{SceneDocument, ScenePayload};
+use caso_kernel::sdf::node::RotationAxis;
 use caso_kernel::serialization::save_scene_to_string;
 use caso_kernel::vec3::vec3;
 
@@ -36,7 +37,10 @@ fn load_meshable_domains_from_scene_json() {
         vec3(0.5, 0.0, 0.5),
         vec3(6.0, 4.0, 4.0),
     ]);
-    assert!(values[0] > 0.0, "cylinder obstacle is carved out of the fluid");
+    assert!(
+        values[0] > 0.0,
+        "cylinder obstacle is carved out of the fluid"
+    );
     assert!(values[1] < 0.0);
     assert!(values[2] > 0.0);
 }
@@ -46,8 +50,7 @@ fn ambiguous_kind_lookup_is_reported() {
     let mut document = SceneDocument::new();
     let water = document.add_primitive("sphere", 1.0).expect("water");
     let air = document.add_primitive("sphere", 1.0).expect("air");
-    if let ScenePayload::Sphere(sphere) =
-        &mut document.object_mut(air).expect("air object").payload
+    if let ScenePayload::Sphere(sphere) = &mut document.object_mut(air).expect("air object").payload
     {
         sphere.center = vec3(3.0, 0.0, 0.0);
     }
@@ -75,8 +78,12 @@ fn compile_gate_refuses_overlapping_domains() {
     if let ScenePayload::Sphere(sphere) = &mut document.object_mut(b).expect("b").payload {
         sphere.center = vec3(0.2, 0.0, 0.0);
     }
-    document.set_domain_root(a, DomainKind::Fluid).expect("a domain");
-    document.set_domain_root(b, DomainKind::Solid).expect("b domain");
+    document
+        .set_domain_root(a, DomainKind::Fluid)
+        .expect("a domain");
+    document
+        .set_domain_root(b, DomainKind::Solid)
+        .expect("b domain");
     assert!(meshable_domains_from_document(&document).is_err());
 }
 
@@ -95,6 +102,36 @@ fn saved_solid_domain_is_loadable() {
     let domain = domains.get("solid").expect("by unique kind");
     assert_eq!(domain.name, name);
     assert_eq!(domain.kind, DomainKind::Solid);
+}
+
+#[test]
+fn rotated_2d_domain_exposes_mesh_space() {
+    let mut document = SceneDocument::new();
+    let section = document
+        .add_primitive_from_drag("rectangle", vec3(0.0, 0.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+        .expect("rectangle");
+    document
+        .rotate_object(section, RotationAxis::Z, 90.0, Some(vec3(0.0, 0.0, 0.0)))
+        .expect("rotate");
+    document
+        .set_domain_root(section, DomainKind::Fluid)
+        .expect("domain");
+
+    let domains = meshable_domains_from_document(&document).expect("domains");
+    let domain = domains.get("fluid").expect("fluid");
+    assert_eq!(domain.dimension, 2);
+    let space = domain.mesh_space().expect("space");
+    let bounds = space.bounds();
+    assert!((bounds[0] + 1.0).abs() < 1e-12);
+    assert!((bounds[1] - 1.0).abs() < 1e-12);
+    assert!((bounds[2] + 0.5).abs() < 1e-12);
+    assert!((bounds[3] - 0.5).abs() < 1e-12);
+
+    let center = space.point(0.0, 0.0);
+    assert!(domain.domain_sdf(&[center])[0] < 0.0);
+    assert!(space.sdf(0.0, 0.0) < 0.0);
+    let local = space.coords(center);
+    assert!(local.iter().all(|value| value.abs() < 1e-12));
 }
 
 #[test]
@@ -125,8 +162,7 @@ fn boundary_regions_are_callable_from_mesher_scripts() {
     let ghost = caso_kernel::Node::new(
         "knife",
         caso_kernel::Shape::Sphere(
-            caso_kernel::sdf::primitives_3d::Sphere::new(vec3(0.0, 0.0, 0.5), 0.5)
-                .expect("sphere"),
+            caso_kernel::sdf::primitives_3d::Sphere::new(vec3(0.0, 0.0, 0.5), 0.5).expect("sphere"),
         ),
     );
     let (inside_id, _outside_id) = document
