@@ -52,10 +52,97 @@ impl Frame {
     pub fn to_world(&self, local: Vec3, center: Vec3) -> Vec3 {
         center + self.u * local.x + self.v * local.y + self.w * local.z
     }
+
+    /// Frame -> intrinsic Euler angles `[rx, ry, rz]` in degrees, under the
+    /// convention `R = Rz(rz) · Ry(ry) · Rx(rx)` with `u`, `v`, `w` as the
+    /// columns of `R`. At gimbal lock (`|u.z| ≈ 1`) `rz` is fixed to 0 and
+    /// the remaining rotation is folded into `rx`.
+    pub fn to_euler_degrees(&self) -> [f64; 3] {
+        let sy = (-self.u.z).clamp(-1.0, 1.0);
+        let ry = sy.asin();
+        let (rx, rz) = if self.u.z.abs() >= 1.0 - 1e-9 {
+            let rx = if self.u.z < 0.0 {
+                self.v.x.atan2(self.v.y)
+            } else {
+                (-self.v.x).atan2(self.v.y)
+            };
+            (rx, 0.0)
+        } else {
+            (self.v.z.atan2(self.w.z), self.u.y.atan2(self.u.x))
+        };
+        [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()]
+    }
+
+    /// Intrinsic Euler angles in degrees -> frame (`R = Rz · Ry · Rx`).
+    /// The columns of a rotation matrix are orthonormal by construction, so
+    /// the result always satisfies [`Frame::orthonormal`].
+    pub fn from_euler_degrees(rx: f64, ry: f64, rz: f64) -> Frame {
+        let (sa, ca) = rx.to_radians().sin_cos();
+        let (sb, cb) = ry.to_radians().sin_cos();
+        let (sg, cg) = rz.to_radians().sin_cos();
+        Frame {
+            u: vec3(cg * cb, sg * cb, -sb),
+            v: vec3(cg * sb * sa - sg * ca, sg * sb * sa + cg * ca, cb * sa),
+            w: vec3(cg * sb * ca + sg * sa, sg * sb * ca - cg * sa, cb * ca),
+        }
+    }
 }
 
 impl Default for Frame {
     fn default() -> Self {
         IDENTITY_FRAME
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_frames_close(a: &Frame, b: &Frame) {
+        for (left, right) in [(a.u, b.u), (a.v, b.v), (a.w, b.w)] {
+            assert!(
+                (left - right).length() < 1e-9,
+                "frames differ: {left:?} vs {right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_round_trip() {
+        assert_eq!(IDENTITY_FRAME.to_euler_degrees(), [0.0, 0.0, 0.0]);
+        assert_frames_close(&Frame::from_euler_degrees(0.0, 0.0, 0.0), &IDENTITY_FRAME);
+    }
+
+    #[test]
+    fn single_axis_round_trip() {
+        for angles in [[30.0, 0.0, 0.0], [0.0, 30.0, 0.0], [0.0, 0.0, 30.0]] {
+            let frame = Frame::from_euler_degrees(angles[0], angles[1], angles[2]);
+            let recovered = frame.to_euler_degrees();
+            for (expected, actual) in angles.iter().zip(recovered.iter()) {
+                assert!((expected - actual).abs() < 1e-9, "{angles:?} -> {recovered:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn combined_rotation_round_trip() {
+        let angles = [30.0, -20.0, 45.0];
+        let frame = Frame::from_euler_degrees(angles[0], angles[1], angles[2]);
+        Frame::orthonormal(frame.u, frame.v, frame.w).expect("orthonormal");
+        let recovered = frame.to_euler_degrees();
+        for (expected, actual) in angles.iter().zip(recovered.iter()) {
+            assert!((expected - actual).abs() < 1e-9, "{angles:?} -> {recovered:?}");
+        }
+    }
+
+    #[test]
+    fn gimbal_lock_reproduces_frame() {
+        for ry in [90.0, -90.0] {
+            let frame = Frame::from_euler_degrees(25.0, ry, 40.0);
+            let [rx, recovered_ry, rz] = frame.to_euler_degrees();
+            assert!((recovered_ry - ry).abs() < 1e-6);
+            assert_eq!(rz, 0.0);
+            assert_frames_close(&frame, &Frame::from_euler_degrees(rx, recovered_ry, rz));
+        }
     }
 }

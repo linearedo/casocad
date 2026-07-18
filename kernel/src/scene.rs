@@ -2221,20 +2221,5 @@ fn reference_plane_axes(plane: &str) -> GeometryResult<(Vec3, Vec3)> {
 }
 
 fn rotate_about(vector: Vec3, axis: RotationAxis, angle_degrees: f64) -> Vec3 {
-    let angle = angle_degrees.to_radians();
-    let c = angle.cos();
-    let s = angle.sin();
-    match axis {
-        RotationAxis::X => vec3(vector.x, c * vector.y - s * vector.z, s * vector.y + c * vector.z),
-        RotationAxis::Y => vec3(
-            c * vector.x + s * vector.z,
-            vector.y,
-            -s * vector.x + c * vector.z,
-        ),
-        RotationAxis::Z => vec3(
-            c * vector.x - s * vector.y,
-            s * vector.x + c * vector.y,
-            vector.z,
-        ),
-    }
+    axis.rotate(vector, angle_degrees)
 }

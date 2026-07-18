@@ -635,11 +635,12 @@ impl eframe::App for CasoApp {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.state.status);
-                if let Some(point) = self.state.cursor_world {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(point) = self.state.cursor_world {
                         ui.monospace(crate::dimensions::format_cursor(point, &self.state.unit));
-                    });
-                }
+                    }
+                    ui.weak(format!("surf {:.1} ms", self.viewport.surface_build_ms()));
+                });
             });
         });
         if self.show_log {

@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
-use caso_kernel::sdf::node::{Node, Shape};
+use caso_kernel::sdf::node::{BinaryOperands, Node, Shape};
 use caso_kernel::sdf::placed::PlacedSdf2D;
 use caso_kernel::sdf::primitives_3d::{
     Box3, BoxFrame, CappedCone, Cone, Cylinder, Pyramid, Sphere, Torus,
@@ -1056,6 +1056,21 @@ fn translation_anchor(node: &Node) -> Option<Vec3> {
         Shape::Extrude(extrude) => Some(extrude.section2d().origin),
         Shape::Revolve(revolve) => Some(revolve.section2d().origin),
         Shape::Translate { offset, .. } => Some(*offset),
+        // Composites: the anchor must move exactly as the surface translates.
+        // Booleans translate with their leaves; Scale/Rotate act about the
+        // world origin, so the child anchor maps through the same transform.
+        Shape::Union(operands)
+        | Shape::Intersection(operands)
+        | Shape::Difference(operands)
+        | Shape::Xor(operands) => translation_anchor(&operands.left),
+        Shape::Scale { child, factor } => {
+            translation_anchor(child).map(|anchor| anchor * *factor)
+        }
+        Shape::Rotate {
+            child,
+            axis,
+            angle_degrees,
+        } => translation_anchor(child).map(|anchor| axis.rotate(anchor, *angle_degrees)),
         _ => None,
     }
 }
@@ -1179,8 +1194,52 @@ fn translation_shape_signature(node: &Node, anchor: Vec3) -> Option<String> {
             ))
         }
         Shape::Translate { child, .. } => Some(format!("Translate{child:?}")),
+        Shape::Union(operands) => binary_translation_signature("Union", operands, anchor),
+        Shape::Intersection(operands) => {
+            binary_translation_signature("Intersection", operands, anchor)
+        }
+        Shape::Difference(operands) => binary_translation_signature("Difference", operands, anchor),
+        Shape::Xor(operands) => binary_translation_signature("Xor", operands, anchor),
+        Shape::Scale { child, factor } => {
+            let child_anchor = translation_anchor(child)?;
+            let child_signature = translation_shape_signature(child, child_anchor)?;
+            Some(format!("Scale[{child_signature}]{:?}", sig_float(*factor)))
+        }
+        Shape::Rotate {
+            child,
+            axis,
+            angle_degrees,
+        } => {
+            let child_anchor = translation_anchor(child)?;
+            let child_signature = translation_shape_signature(child, child_anchor)?;
+            Some(format!(
+                "Rotate[{child_signature}]{}{:?}",
+                axis.as_str(),
+                sig_float(*angle_degrees)
+            ))
+        }
         _ => None,
     }
+}
+
+/// Signature of a boolean node: each operand's shape relative to its own
+/// anchor, plus both anchors relative to the node's anchor. Invariant under
+/// translation of the whole subtree, different whenever an operand changes
+/// shape or the operands move relative to each other.
+fn binary_translation_signature(
+    kind: &str,
+    operands: &BinaryOperands,
+    anchor: Vec3,
+) -> Option<String> {
+    let left_anchor = translation_anchor(&operands.left)?;
+    let right_anchor = translation_anchor(&operands.right)?;
+    let left_signature = translation_shape_signature(&operands.left, left_anchor)?;
+    let right_signature = translation_shape_signature(&operands.right, right_anchor)?;
+    Some(format!(
+        "{kind}[{left_signature}]{:?}[{right_signature}]{:?}",
+        sig_vec(left_anchor - anchor),
+        sig_vec(right_anchor - anchor)
+    ))
 }
 
 fn translated_surface(
@@ -1317,5 +1376,111 @@ pub fn build_viewport_surface_scene(
         surfaces,
         build_ms,
         primary_object_ids,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use caso_kernel::sdf::node::RotationAxis;
+    use caso_kernel::sdf::primitives_3d::Sphere;
+
+    fn sphere_node(center: Vec3, radius: f64, id: u32) -> Node {
+        Node::with_id(
+            "sphere",
+            id,
+            Shape::Sphere(Sphere::new(center, radius).expect("sphere")),
+        )
+    }
+
+    fn union_node(offset: Vec3) -> Node {
+        let left = sphere_node(offset, 0.5, 2);
+        let right = sphere_node(vec3(0.4, 0.0, 0.0) + offset, 0.5, 3);
+        Node::with_id(
+            "union",
+            1,
+            Shape::union(left, right).expect("union"),
+        )
+    }
+
+    fn anchored_signature(node: &Node) -> (Vec3, String) {
+        let anchor = translation_anchor(node).expect("anchor");
+        let signature = translation_shape_signature(node, anchor).expect("signature");
+        (anchor, signature)
+    }
+
+    #[test]
+    fn union_signature_invariant_under_translation() {
+        let (anchor_a, sig_a) = anchored_signature(&union_node(Vec3::ZERO));
+        let delta = vec3(1.25, -0.5, 3.0);
+        let (anchor_b, sig_b) = anchored_signature(&union_node(delta));
+        assert_eq!(sig_a, sig_b);
+        assert!((anchor_b - anchor_a - delta).length() < 1e-12);
+    }
+
+    #[test]
+    fn union_signature_changes_with_relative_placement_or_shape() {
+        let (_, base) = anchored_signature(&union_node(Vec3::ZERO));
+        let widened = Node::with_id(
+            "union",
+            1,
+            Shape::union(sphere_node(Vec3::ZERO, 0.5, 2), sphere_node(vec3(0.9, 0.0, 0.0), 0.5, 3))
+                .expect("union"),
+        );
+        let (_, moved_operand) = anchored_signature(&widened);
+        assert_ne!(base, moved_operand);
+        let resized = Node::with_id(
+            "union",
+            1,
+            Shape::union(sphere_node(Vec3::ZERO, 0.5, 2), sphere_node(vec3(0.4, 0.0, 0.0), 0.6, 3))
+                .expect("union"),
+        );
+        let (_, resized_operand) = anchored_signature(&resized);
+        assert_ne!(base, resized_operand);
+    }
+
+    #[test]
+    fn rotate_scale_anchor_tracks_surface_transform() {
+        let child = sphere_node(vec3(1.0, 0.0, 0.0), 0.5, 2);
+        let rotated = Node::with_id(
+            "rotate",
+            1,
+            Shape::Rotate {
+                child: Box::new(child.clone()),
+                axis: RotationAxis::Z,
+                angle_degrees: 90.0,
+            },
+        );
+        let anchor = translation_anchor(&rotated).expect("anchor");
+        // The rotated sphere's center sits at (0, 1, 0); the SDF there is -r.
+        assert!((anchor - vec3(0.0, 1.0, 0.0)).length() < 1e-12);
+        assert!((rotated.eval_point(anchor) + 0.5).abs() < 1e-9);
+        let scaled = Node::with_id(
+            "scale",
+            1,
+            Shape::scale(child, 2.0).expect("scale"),
+        );
+        let anchor = translation_anchor(&scaled).expect("anchor");
+        assert!((anchor - vec3(2.0, 0.0, 0.0)).length() < 1e-12);
+        assert!((scaled.eval_point(anchor) + 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_reuses_translated_boolean_surface() {
+        let mut cache = ViewportSurfaceCache::new(12);
+        let first = cache.get_or_build(&union_node(Vec3::ZERO), 1);
+        assert!(first.has_geometry());
+        let delta = vec3(0.75, 0.25, -0.5);
+        let moved = cache.get_or_build(&union_node(delta), 2);
+        // Reuse produces the identical buffers shifted by exactly delta; a
+        // from-scratch re-contour would re-grid and not match bitwise.
+        assert_eq!(first.vertices.len(), moved.vertices.len());
+        assert_eq!(first.indices, moved.indices);
+        let delta_f32 = [delta.x as f32, delta.y as f32, delta.z as f32];
+        for (a, b) in first.vertices.iter().zip(moved.vertices.iter()) {
+            for axis in 0..3 {
+                assert_eq!(a[axis] + delta_f32[axis], b[axis]);
+            }
+        }
     }
 }

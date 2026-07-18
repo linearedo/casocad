@@ -37,6 +37,28 @@ impl RotationAxis {
             Self::Z => "z",
         }
     }
+
+    /// Rotate `vector` by `angle_degrees` about this axis (right-handed).
+    /// Matches the surface orientation produced by `Shape::Rotate`, whose
+    /// eval applies the inverse rotation to sample points.
+    pub fn rotate(&self, vector: Vec3, angle_degrees: f64) -> Vec3 {
+        let angle = angle_degrees.to_radians();
+        let c = angle.cos();
+        let s = angle.sin();
+        match self {
+            Self::X => vec3(vector.x, c * vector.y - s * vector.z, s * vector.y + c * vector.z),
+            Self::Y => vec3(
+                c * vector.x + s * vector.z,
+                vector.y,
+                -s * vector.x + c * vector.z,
+            ),
+            Self::Z => vec3(
+                c * vector.x - s * vector.y,
+                s * vector.x + c * vector.y,
+                vector.z,
+            ),
+        }
+    }
 }
 
 /// The two operands of an SDF operator (same dimension, checked at build).

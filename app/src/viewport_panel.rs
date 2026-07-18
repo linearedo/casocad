@@ -61,6 +61,11 @@ pub struct ViewportPanel {
     caches: Vec<(u32, ViewportSurfaceCache)>,
     pending_tiers: Vec<u32>,
     scene_version: u64,
+    /// egui clock time of the last edit-triggered rebuild, and its cost:
+    /// together they throttle rebuilds during continuous drags so an
+    /// expensive scene cannot pin every frame on re-contouring.
+    last_rebuild_time: f64,
+    last_build_ms: f64,
     framed_once: bool,
     /// Latest built surface scene (base colors, no highlight applied).
     base_scene: Option<caso_surfaces::ViewportSurfaceScene>,
@@ -98,6 +103,8 @@ impl Default for ViewportPanel {
                 .collect(),
             pending_tiers: REFINEMENT_TIERS.to_vec(),
             scene_version: u64::MAX,
+            last_rebuild_time: f64::NEG_INFINITY,
+            last_build_ms: 0.0,
             framed_once: false,
             base_scene: None,
             selection: None,
@@ -733,6 +740,11 @@ impl ViewportPanel {
         label_with_backdrop(painter, mid, &text, MEASURE_COLOR);
     }
 
+    /// Cost of the most recent surface rebuild, for the status-bar readout.
+    pub fn surface_build_ms(&self) -> f64 {
+        self.last_build_ms
+    }
+
     /// Drop all committed measurements (Delete while the Measure tool is
     /// active).
     pub fn clear_measurements(&mut self) -> usize {
@@ -742,10 +754,31 @@ impl ViewportPanel {
     }
 
     /// Build the next pending refinement tier and upload it.
-    fn refresh_surfaces(&mut self, document: &SceneDocument, render_state: &RenderState) {
+    ///
+    /// While the pointer is held down (gizmo drags, panel value drags) an
+    /// edit-triggered rebuild is deferred until the last rebuild's cost times
+    /// a backoff factor has elapsed, so heavy scenes update at a bounded rate
+    /// instead of re-contouring every frame; cheap scenes stay per-frame.
+    /// The deferred rebuild happens automatically on a later frame because
+    /// the version mismatch persists.
+    fn refresh_surfaces(
+        &mut self,
+        document: &SceneDocument,
+        render_state: &RenderState,
+        now: f64,
+        editing: bool,
+    ) {
+        const REBUILD_BACKOFF: f64 = 2.5;
+        const MAX_REBUILD_INTERVAL_S: f64 = 0.3;
         if document.version != self.scene_version {
+            let interval =
+                (self.last_build_ms / 1000.0 * REBUILD_BACKOFF).min(MAX_REBUILD_INTERVAL_S);
+            if editing && now - self.last_rebuild_time < interval {
+                return;
+            }
             self.scene_version = document.version;
             self.pending_tiers = REFINEMENT_TIERS.to_vec();
+            self.last_rebuild_time = now;
         }
         let Some(tier) = self.pending_tiers.first().copied() else {
             return;
@@ -768,6 +801,7 @@ impl ViewportPanel {
             .expect("tier cache");
         let scene =
             caso_surfaces::build_viewport_surface_scene(&components, document.version, cache);
+        self.last_build_ms = scene.build_ms;
         self.base_scene = Some(scene);
         self.upload_scene(render_state);
         // Force the boundary overlays to re-filter against the new surfaces.
@@ -790,7 +824,16 @@ impl ViewportPanel {
         tools: &mut ToolState,
         render_state: &RenderState,
     ) {
-        self.refresh_surfaces(&state.document, render_state);
+        let now = ui.input(|input| input.time);
+        let editing = ui.ctx().input(|input| input.pointer.any_down());
+        self.refresh_surfaces(&state.document, render_state, now, editing);
+        // Keep frames coming while a rebuild is deferred or refinement tiers
+        // remain, so throttled drags and background refinement both complete
+        // without waiting for the next input event.
+        if state.document.version != self.scene_version || !self.pending_tiers.is_empty() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(30));
+        }
         if self.selection != self.applied_selection || self.upload_pending {
             self.upload_scene(render_state);
         }
