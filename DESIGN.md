@@ -61,6 +61,10 @@ Per crate, the complete allowed set:
 | `app` | `eframe 0.35` (with the `wgpu` feature), `egui_dock 0.20`, `egui_extras 0.35` (`svg` only, for the vector wordmark), `rhai 1`, `serde_json` |
 | `app` (wasm32 only) | `wasm-bindgen`, `wasm-bindgen-futures`, `web-sys`, `js-sys`, `getrandom` (`wasm_js` backend), `log` |
 
+Internal workspace dependencies flow strictly downward and are not restricted
+by the table above: `meshing` uses `surfaces` for exact 2D outline arcs
+(`boundary_outline`), on top of its `kernel` dependency.
+
 Constraints and deliberate rejections:
 
 - **`wgpu` in `render` must match the `wgpu` version bundled by `eframe`**
@@ -118,7 +122,13 @@ Port of `core/`. Modules:
   records and ghost knives (leaf shapes plus the recursive `extrude` composite
   record for one-sided stencils).
 - `meshing.rs` — the `MeshableDomain` / `MeshableBoundaryRegion` API loaded
-  from a saved scene (the FEA/CFD-facing view of the document).
+  from a saved scene (the FEA/CFD-facing view of the document), plus the
+  mesher toolkit queries: total boundary classification with owner
+  attribution, and `MeshableInterface` (the exact shared wall between
+  nested marked domains; see `design_docs/meshing_toolkit.md`).
+- `differential.rs` — batch differential queries on exact fields: normals,
+  interior-seeded Newton projection onto the boundary (positive starts are
+  refused — the interior-exactness contract), curvature stencils.
 
 ### 4.2 `surfaces` — CPU display-surface builders
 
@@ -152,6 +162,12 @@ shared `point`, `edge`, `face`, `cell`, `zone`, `tag`, and `attribute`
 rows; cells reference shared topology instead of duplicating coordinates.
 The schema supports point/edge/triangle/quad/polygon/tet/hex/prism/pyramid/
 polyhedron element families, with world-space f64 xyz coordinates in meters.
+
+The `toolkit` module is the mesher-facing base layer
+(`design_docs/meshing_toolkit.md`): exact tagged 2D boundary loops
+(`loops2d`, via `surfaces::boundary_outline`) and the analytic sizing field
+(`sizing`). It obeys the interior-exactness contract: no positive field
+value is ever consumed as a distance.
 
 ### 4.5 `app` — the application
 

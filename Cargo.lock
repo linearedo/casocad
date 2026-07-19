@@ -726,6 +726,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "caso-kernel",
+ "caso-surfaces",
  "serde_json",
 ]
 

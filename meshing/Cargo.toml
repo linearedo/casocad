@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 caso-kernel = { path = "../kernel" }
+caso-surfaces = { path = "../surfaces" }
 arrow-array = "56"
 arrow-schema = "56"
 arrow-ipc = "56"

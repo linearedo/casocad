@@ -12,6 +12,7 @@ pub mod bbox;
 pub mod boundary;
 pub mod boundary_ops;
 pub mod boundary_paths;
+pub mod differential;
 pub mod error;
 pub mod frame;
 pub mod meshing;

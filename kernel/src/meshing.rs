@@ -7,7 +7,14 @@
 //! before a mesher script receives field callables.
 
 use crate::boundary::{BoundaryRegion, CutSide};
-use crate::boundary_ops::{boundary_region_mask, cut_volume, find_node_by_object_id};
+use crate::boundary_ops::{
+    boundary_region_mask, cut_volume, evaluate_with_attribution, find_node_by_object_id,
+    RELATIVE_SURFACE_TOLERANCE,
+};
+use crate::differential::{
+    batch_normals, curvature_2d, differential_steps, mean_curvature, project_to_zero_set,
+    project_to_zero_set_in_plane, Projection,
+};
 use crate::error::{GeometryError, GeometryResult};
 use crate::model::{compile_model, Model};
 use crate::roles::{Domain, DomainKind};
@@ -164,6 +171,30 @@ impl MeshableBoundaryRegion {
     pub fn selector_sdf(&self, points: &[Vec3]) -> Option<Vec<f64>> {
         self.selector.as_ref().map(|field| field.eval(points))
     }
+
+    /// Outward normals of the domain boundary at these points (gradient of
+    /// the domain root — correct on cut surfaces too).
+    pub fn normals(&self, points: &[Vec3]) -> Vec<Vec3> {
+        let (normal_step, _, _) = differential_steps(&self.root);
+        batch_normals(&self.root, points, normal_step)
+    }
+
+    /// Newton projection onto the region's generating surface (the owner
+    /// leaf — exact everywhere, so layer seeding may start on either side).
+    pub fn project_to_owner(&self, points: &[Vec3]) -> Vec<Projection> {
+        let (normal_step, _, zero_band) = differential_steps(&self.owner);
+        points
+            .iter()
+            .map(|point| {
+                crate::differential::project_leaf_to_zero_set(
+                    &self.owner,
+                    *point,
+                    normal_step,
+                    zero_band,
+                )
+            })
+            .collect()
+    }
 }
 
 /// A boundary tag exposed to mesher scripts: name + signed field.
@@ -177,6 +208,20 @@ impl MeshableBoundaryTag {
     pub fn eval(&self, points: &[Vec3]) -> Vec<f64> {
         self.field.eval(points)
     }
+}
+
+/// Total classification of one point against a domain boundary
+/// (`design_docs/meshing_toolkit.md` §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundaryClass {
+    /// Band test `|f| <= tol` on the domain region field.
+    pub on_boundary: bool,
+    /// The controlling leaf (same owner attribution picking uses); lets a
+    /// mesher form default patches for untagged boundary.
+    pub owner_object_id: u32,
+    /// The winning region (index into `boundary_regions`), `None` when no
+    /// region claims the point.
+    pub region_index: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +288,130 @@ impl MeshableDomain {
         }
         mesh_space_from_node(&self.region)
             .ok_or_else(|| GeometryError::new("2D mesh space requires a placed 2D domain"))
+    }
+
+    /// Outward boundary normals at these points (central differences on the
+    /// region field).
+    pub fn normals(&self, points: &[Vec3]) -> Vec<Vec3> {
+        let (normal_step, _, _) = differential_steps(&self.region);
+        batch_normals(&self.region, points, normal_step)
+    }
+
+    /// Newton projection of **interior** points onto the domain boundary.
+    /// Positive-side starts are refused (`converged: false`, no iteration):
+    /// only the interior distance is exact. 2D domains project in-plane.
+    pub fn project_to_boundary(&self, points: &[Vec3]) -> GeometryResult<Vec<Projection>> {
+        let (normal_step, _, zero_band) = differential_steps(&self.region);
+        if self.dimension == 2 {
+            let space = self.mesh_space()?;
+            return Ok(points
+                .iter()
+                .map(|point| {
+                    project_to_zero_set_in_plane(
+                        &self.region,
+                        *point,
+                        space.origin,
+                        space.normal,
+                        normal_step,
+                        zero_band,
+                    )
+                })
+                .collect());
+        }
+        Ok(points
+            .iter()
+            .map(|point| project_to_zero_set(&self.region, *point, normal_step, zero_band))
+            .collect())
+    }
+
+    /// Curvature of the boundary at near-wall points reached from the
+    /// interior (project first): mean curvature `H` for 3D domains,
+    /// in-plane `kappa` for 2D. At creases the stencil returns O(1/step) —
+    /// meaningful as "refine here", not as a curvature.
+    pub fn curvature(&self, points: &[Vec3]) -> GeometryResult<Vec<f64>> {
+        let (_, curvature_step, _) = differential_steps(&self.region);
+        if self.dimension == 2 {
+            let space = self.mesh_space()?;
+            return Ok(points
+                .iter()
+                .map(|point| {
+                    curvature_2d(&self.region, *point, space.axis_a, space.axis_b, curvature_step)
+                })
+                .collect());
+        }
+        Ok(points
+            .iter()
+            .map(|point| mean_curvature(&self.region, *point, curvature_step))
+            .collect())
+    }
+
+    /// The classification default band: `1e-3 x` bounds diagonal — the same
+    /// scale-relative constant the viewport classifier uses. Wide enough to
+    /// accept unprojected samples (a straight face's centroid on a curved
+    /// wall, offset by the sagitta); callers classifying projected vertices
+    /// pass the tight band explicitly instead.
+    pub fn boundary_tolerance(&self) -> f64 {
+        RELATIVE_SURFACE_TOLERANCE * self.bounds.diagonal()
+    }
+
+    /// All regions whose classifier accepts each point (multi-label view).
+    /// `tolerance: None` means each region's own default, exactly as the
+    /// viewport highlights — what is highlighted is what the mesher gets.
+    pub fn regions_containing(
+        &self,
+        points: &[Vec3],
+        tolerance: Option<f64>,
+    ) -> GeometryResult<Vec<Vec<usize>>> {
+        let mut matches = vec![Vec::new(); points.len()];
+        for (index, entry) in self.boundary_regions.iter().enumerate() {
+            let mask = boundary_region_mask(&entry.root, &entry.region, points, tolerance)?;
+            for (hits, hit) in matches.iter_mut().zip(mask) {
+                if hit {
+                    hits.push(index);
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    /// Total boundary classification: for each point, whether it is on the
+    /// domain boundary, which leaf owns it, and which region (if any) wins.
+    ///
+    /// Precedence among matching regions is the lexicographic maximum of
+    /// `(cuts, patch_scoped, creation index)`: more knife cuts is more
+    /// specific, a patch-/direction-scoped region beats a whole-surface one
+    /// at equal cuts, and the final tie goes to the later-created region so
+    /// newer refinements override older broad tags.
+    pub fn classify_boundary(
+        &self,
+        points: &[Vec3],
+        tolerance: Option<f64>,
+    ) -> GeometryResult<Vec<BoundaryClass>> {
+        let band = tolerance.unwrap_or_else(|| self.boundary_tolerance());
+        let matches = self.regions_containing(points, tolerance)?;
+        Ok(points
+            .iter()
+            .zip(matches)
+            .map(|(point, hits)| {
+                let (value, owner_object_id) = evaluate_with_attribution(&self.region, *point);
+                let on_boundary = value.abs() <= band;
+                let region_index = if on_boundary {
+                    hits.into_iter().max_by_key(|index| {
+                        let region = &self.boundary_regions[*index].region;
+                        let patch_scoped =
+                            region.patch_id.is_some() || region.outside_direction.is_some();
+                        (region.cuts.len(), patch_scoped, *index)
+                    })
+                } else {
+                    None
+                };
+                BoundaryClass {
+                    on_boundary,
+                    owner_object_id,
+                    region_index,
+                }
+            })
+            .collect())
     }
 
     pub fn region_by_name(&self, name: &str) -> GeometryResult<&MeshableBoundaryRegion> {
@@ -345,15 +514,137 @@ fn projected_bounds(bounds: &BoundingBox3D, origin: Vec3, axis_a: Vec3, axis_b: 
     [a_min, a_max, b_min, b_max]
 }
 
+/// The exact shared wall between two directly nested marked domains
+/// (`design_docs/meshing_toolkit.md` §6). The surface node is the inner
+/// domain's embedded additive base — the *same* node the outer region was
+/// cut with, so the interface IS the cut surface: one known exact field, no
+/// numerical differencing (spec §8).
+#[derive(Debug, Clone)]
+pub struct MeshableInterface {
+    /// The outer domain's name.
+    pub domain_a: String,
+    /// The inner domain's name.
+    pub domain_b: String,
+    /// The inner additive-base object generating the shared surface.
+    pub owner_object_id: u32,
+    surface: Node,
+    side_a: Node,
+    side_b: Node,
+    surface_tolerance: f64,
+    side_a_tolerance: f64,
+    side_b_tolerance: f64,
+}
+
+impl MeshableInterface {
+    /// The shared surface's exact field (the generating node's own SDF).
+    pub fn surface_sdf(&self, points: &[Vec3]) -> Vec<f64> {
+        points
+            .iter()
+            .map(|point| self.surface.eval_point(*point))
+            .collect()
+    }
+
+    pub fn surface_node(&self) -> &Node {
+        &self.surface
+    }
+
+    /// Membership of the shared wall: on the generating surface AND on both
+    /// domains' boundaries (band tests) — this clips the generating node's
+    /// zero set to the actual contact area.
+    pub fn contains(&self, points: &[Vec3]) -> Vec<bool> {
+        points
+            .iter()
+            .map(|point| {
+                self.surface.eval_point(*point).abs() <= self.surface_tolerance
+                    && self.side_a.eval_point(*point).abs() <= self.side_a_tolerance
+                    && self.side_b.eval_point(*point).abs() <= self.side_b_tolerance
+            })
+            .collect()
+    }
+
+    /// Newton projection onto the shared wall through an **interior** field
+    /// (interior-exactness contract): a start inside the inner domain
+    /// projects through the inner region node, a start inside the outer
+    /// domain through the outer region node, a start in neither is refused.
+    /// Seed near the intended wall (the inner interior band `-h < f < 0`);
+    /// `contains` verifies the landing.
+    pub fn project(&self, points: &[Vec3]) -> Vec<Projection> {
+        points
+            .iter()
+            .map(|point| {
+                let side = if self.side_b.eval_point(*point) <= 0.0 {
+                    Some(&self.side_b)
+                } else if self.side_a.eval_point(*point) <= 0.0 {
+                    Some(&self.side_a)
+                } else {
+                    None
+                };
+                match side {
+                    Some(field) => {
+                        let (normal_step, _, zero_band) = differential_steps(field);
+                        project_to_zero_set(field, *point, normal_step, zero_band)
+                    }
+                    None => Projection {
+                        point: *point,
+                        residual: self.surface.eval_point(*point),
+                        distance_moved: 0.0,
+                        converged: false,
+                    },
+                }
+            })
+            .collect()
+    }
+}
+
 /// Name- (or unique-kind-) keyed collection of meshable domains.
 #[derive(Debug, Clone, Default)]
 pub struct MeshableDomains {
     items: Vec<MeshableDomain>,
+    interfaces: Vec<MeshableInterface>,
 }
 
 impl MeshableDomains {
-    pub fn new(items: Vec<MeshableDomain>) -> Self {
-        Self { items }
+    pub fn new(items: Vec<MeshableDomain>, interfaces: Vec<MeshableInterface>) -> Self {
+        Self { items, interfaces }
+    }
+
+    /// All domain interfaces, for iteration; lookup goes through
+    /// `interface_between` / `interfaces_of`.
+    pub fn interfaces(&self) -> &[MeshableInterface] {
+        &self.interfaces
+    }
+
+    /// Every interface one domain participates in.
+    pub fn interfaces_of(&self, name: &str) -> Vec<&MeshableInterface> {
+        self.interfaces
+            .iter()
+            .filter(|interface| interface.domain_a == name || interface.domain_b == name)
+            .collect()
+    }
+
+    /// The interface between two domains, in either order.
+    pub fn interface_between(&self, a: &str, b: &str) -> GeometryResult<&MeshableInterface> {
+        self.interfaces
+            .iter()
+            .find(|interface| {
+                (interface.domain_a == a && interface.domain_b == b)
+                    || (interface.domain_a == b && interface.domain_b == a)
+            })
+            .ok_or_else(|| {
+                let available: Vec<String> = self
+                    .interfaces
+                    .iter()
+                    .map(|interface| format!("{}<->{}", interface.domain_a, interface.domain_b))
+                    .collect();
+                GeometryError::new(format!(
+                    "unknown interface {a}<->{b}; available: {}",
+                    if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                ))
+            })
     }
 
     pub fn len(&self) -> usize {
@@ -561,7 +852,73 @@ pub fn meshable_domains_from_document(document: &SceneDocument) -> GeometryResul
             boundary_regions,
         });
     }
-    Ok(MeshableDomains::new(items))
+    let interfaces = derive_interfaces(document, &items);
+    Ok(MeshableDomains::new(items, interfaces))
+}
+
+/// Interfaces between directly nested marked domains
+/// (`design_docs/meshing_toolkit.md` §6): each marked domain pairs with its
+/// nearest marked strict ancestor, and the shared surface is the inner
+/// domain's embedded additive base — the identical node `domain_region`
+/// subtracts from the outer region. Pairs of unequal dimension are skipped.
+fn derive_interfaces(document: &SceneDocument, items: &[MeshableDomain]) -> Vec<MeshableInterface> {
+    let marked: Vec<u32> = document.domain_kinds.keys().copied().collect();
+    let domain_by_id = |id: u32| -> Option<&MeshableDomain> {
+        let name = &document.object(id).ok()?.name;
+        items.iter().find(|domain| &domain.name == name)
+    };
+    let mut interfaces = Vec::new();
+    for inner_id in &marked {
+        // Nearest marked strict ancestor: contains inner, and no other
+        // marked domain sits between them.
+        let Some(outer_id) = marked
+            .iter()
+            .filter(|outer| **outer != *inner_id && document.contains(**outer, *inner_id))
+            .copied()
+            .find(|outer| {
+                !marked.iter().any(|middle| {
+                    *middle != *outer
+                        && *middle != *inner_id
+                        && document.contains(*outer, *middle)
+                        && document.contains(*middle, *inner_id)
+                })
+            })
+        else {
+            continue;
+        };
+        let (Some(outer), Some(inner)) = (domain_by_id(outer_id), domain_by_id(*inner_id)) else {
+            continue;
+        };
+        if outer.dimension != inner.dimension {
+            continue;
+        }
+        let inner_of_outer: Vec<u32> = marked
+            .iter()
+            .copied()
+            .filter(|other| *other != outer_id && document.contains(outer_id, *other))
+            .collect();
+        let base_id = additive_base(document, *inner_id, &inner_of_outer);
+        let Ok(surface) = document.embedded_node(base_id) else {
+            continue;
+        };
+        let surface_tolerance = RELATIVE_SURFACE_TOLERANCE
+            * surface
+                .bounding_box()
+                .map(|bounds| bounds.diagonal())
+                .unwrap_or_else(|_| outer.bounds.diagonal());
+        interfaces.push(MeshableInterface {
+            domain_a: outer.name.clone(),
+            domain_b: inner.name.clone(),
+            owner_object_id: base_id,
+            surface,
+            side_a: outer.region.clone(),
+            side_b: inner.region.clone(),
+            surface_tolerance,
+            side_a_tolerance: outer.boundary_tolerance(),
+            side_b_tolerance: inner.boundary_tolerance(),
+        });
+    }
+    interfaces
 }
 
 /// Load meshable domains from a saved casoCAD `scene.json` string.
