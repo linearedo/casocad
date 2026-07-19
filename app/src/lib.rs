@@ -29,23 +29,10 @@ use properties_panel::PropertiesPanel;
 use scene_panel::ScenePanel;
 use state::{AppState, LENGTH_UNITS};
 use tools::{
-    ToolKind, ToolState, DRAG_KINDS_2D, DRAG_KINDS_3D, KNIFE_KINDS, POINT_KINDS, POINT_KINDS_2D,
+    ToolKind, ToolState, ADD_KINDS_1D, ADD_KINDS_2D, ADD_KINDS_3D, DRAG_KINDS_2D, DRAG_KINDS_3D,
+    KNIFE_KINDS, POINT_KINDS, POINT_KINDS_2D,
 };
 use viewport_panel::ViewportPanel;
-
-/// (menu label, `SceneDocument::add_primitive` kind key)
-const PRIMITIVE_KINDS: [(&str, &str); 10] = [
-    ("Sphere", "sphere"),
-    ("Box", "box"),
-    ("Cylinder", "cylinder"),
-    ("Cone", "cone"),
-    ("Capped Cone", "capped_cone"),
-    ("Pyramid", "pyramid"),
-    ("Box Frame", "box_frame"),
-    ("Torus", "torus"),
-    ("Polyline Tube", "polyline_tube"),
-    ("Bezier Tube", "quadratic_bezier_tube"),
-];
 
 /// (button label, SDF operator key) — Difference is first − second.
 const SDF_OPERATORS: [(&str, &str); 3] = [
@@ -298,15 +285,25 @@ impl CasoApp {
     fn toolbar_row_tools(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button("Add", |ui| {
-                for (label, kind) in PRIMITIVE_KINDS {
-                    if sdf_menu_button(ui, label, kind, false).clicked() {
-                        self.state.push_undo();
-                        let scale = self.state.unit.factor;
-                        let result = self.state.document.add_primitive(kind, scale);
-                        if let Some(id) = self.state.report(result, &format!("Added {label}")) {
-                            self.state.select_only(id);
+                for (header, kinds) in [
+                    ("3D solids", &ADD_KINDS_3D[..]),
+                    ("2D sections", &ADD_KINDS_2D[..]),
+                    ("1D & curves", &ADD_KINDS_1D[..]),
+                ] {
+                    if header != "3D solids" {
+                        ui.separator();
+                    }
+                    ui.label(egui::RichText::new(header).weak());
+                    for (label, kind) in kinds {
+                        if sdf_menu_button(ui, label, kind, false).clicked() {
+                            self.state.push_undo();
+                            let scale = self.state.unit.factor;
+                            let result = self.state.document.add_primitive(kind, scale);
+                            if let Some(id) = self.state.report(result, &format!("Added {label}")) {
+                                self.state.select_only(id);
+                            }
+                            ui.close();
                         }
-                        ui.close();
                     }
                 }
             });

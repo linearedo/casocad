@@ -39,10 +39,12 @@ pub const DRAG_KINDS_2D: [(&str, &str); 5] = [
 
 /// Point-placed 2D sections, shown alongside the drag kinds. Regular
 /// Polygon takes exactly two clicks (center, then a vertex — that click
-/// sets radius AND rotation); Polygon takes one click per corner.
-pub const POINT_KINDS_2D: [(&str, &str); 2] = [
+/// sets radius AND rotation); Polygon takes one click per corner; Bezier
+/// Surface alternates anchor and control clicks (odd count commits).
+pub const POINT_KINDS_2D: [(&str, &str); 3] = [
     ("Regular Polygon", "regular_polygon"),
     ("Polygon", "polygon"),
+    ("Bezier Surface", "quadratic_bezier_surface"),
 ];
 
 /// Point-placed kinds (click points, Enter commits). All 1D objects are
@@ -54,6 +56,40 @@ pub const POINT_KINDS: [(&str, &str); 6] = [
     ("Bezier Polycurve", "quadratic_bezier_polycurve"),
     ("Polyline Tube", "polyline_tube"),
     ("Bezier Tube", "quadratic_bezier_tube"),
+];
+
+/// Add-menu catalog: every kind `SceneDocument::add_primitive` can build
+/// with default parameters, grouped like the Draw menu. Invariant (tested
+/// below): every Draw-menu kind appears here too, so the menus can't drift.
+pub const ADD_KINDS_3D: [(&str, &str); 10] = [
+    ("Box", "box"),
+    ("Sphere", "sphere"),
+    ("Cylinder", "cylinder"),
+    ("Cone", "cone"),
+    ("Capped Cone", "capped_cone"),
+    ("Pyramid", "pyramid"),
+    ("Box Frame", "box_frame"),
+    ("Torus", "torus"),
+    ("Polyline Tube", "polyline_tube"),
+    ("Bezier Tube", "quadratic_bezier_tube"),
+];
+
+pub const ADD_KINDS_2D: [(&str, &str); 8] = [
+    ("Rectangle", "rectangle"),
+    ("Circle", "circle"),
+    ("Square", "square"),
+    ("Rounded Rectangle", "rounded_rectangle"),
+    ("Ellipse", "ellipse"),
+    ("Regular Polygon", "regular_polygon"),
+    ("Polygon", "polygon"),
+    ("Bezier Surface", "quadratic_bezier_surface"),
+];
+
+pub const ADD_KINDS_1D: [(&str, &str); 4] = [
+    ("Segment 1D", "segment"),
+    ("Polyline", "polyline"),
+    ("Bezier Curve", "quadratic_bezier_curve"),
+    ("Bezier Polycurve", "quadratic_bezier_polycurve"),
 ];
 
 /// Cutter knife kinds: (menu label, kind key). A smooth on-surface polyline
@@ -80,7 +116,10 @@ fn point_capacity(kind: &str) -> Option<usize> {
 /// Kinds the kernel only accepts with an odd point count (chained
 /// anchor-control-anchor bezier spans).
 fn needs_odd_points(kind: &str) -> bool {
-    matches!(kind, "quadratic_bezier_polycurve" | "quadratic_bezier_tube")
+    matches!(
+        kind,
+        "quadratic_bezier_polycurve" | "quadratic_bezier_tube" | "quadratic_bezier_surface"
+    )
 }
 
 /// Fewest points that define a knife of the given kind.
@@ -1917,6 +1956,95 @@ mod tests {
             .expect("polygon");
         let committed = document.build_node(id).expect("polygon");
         assert_eq!(format!("{ghost:?}"), format!("{committed:?}"));
+    }
+
+    /// Fix-pack invariant: the Add menu must offer at least everything the
+    /// Draw menu can create, so the two can never drift apart again.
+    #[test]
+    fn add_menu_covers_every_draw_kind() {
+        let add: Vec<&str> = ADD_KINDS_3D
+            .iter()
+            .chain(&ADD_KINDS_2D)
+            .chain(&ADD_KINDS_1D)
+            .map(|(_, kind)| *kind)
+            .collect();
+        let draw = DRAG_KINDS_3D
+            .iter()
+            .chain(&DRAG_KINDS_2D)
+            .chain(&POINT_KINDS_2D)
+            .chain(&POINT_KINDS);
+        for (label, kind) in draw {
+            assert!(
+                add.contains(kind),
+                "Draw kind {label} ({kind}) is missing from the Add menu catalog"
+            );
+        }
+    }
+
+    /// Every Add-menu entry creates a default object that builds a node and
+    /// survives a save/load round trip.
+    #[test]
+    fn every_add_kind_builds_and_round_trips() {
+        use caso_kernel::serialization::{load_scene_from_str, save_scene_to_string};
+        for (label, kind) in ADD_KINDS_3D.iter().chain(&ADD_KINDS_2D).chain(&ADD_KINDS_1D) {
+            let mut document = SceneDocument::new();
+            let id = document
+                .add_primitive(kind, 1.0)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            document
+                .build_node(id)
+                .unwrap_or_else(|error| panic!("{label} node: {error}"));
+            let saved = save_scene_to_string(&document)
+                .unwrap_or_else(|error| panic!("{label} save: {error}"));
+            let loaded = load_scene_from_str(&saved)
+                .unwrap_or_else(|error| panic!("{label} load: {error}"));
+            assert_eq!(
+                loaded.objects.len(),
+                document.objects.len(),
+                "{label} lost objects in the round trip"
+            );
+        }
+    }
+
+    /// The Bezier Surface point tool commits a closed 2D section through
+    /// the same kernel path as its ghost, and refuses even point counts.
+    #[test]
+    fn bezier_surface_point_tool_commits_a_2d_section() {
+        use caso_kernel::scene::ScenePayload;
+        use caso_kernel::sdf::primitives_2d::Profile2D;
+        let points = [
+            vec3(0.0, 1.0, 0.0),
+            vec3(-1.0, 0.0, 0.0),
+            vec3(0.0, -1.0, 0.0),
+            vec3(1.0, -0.2, 0.0),
+            vec3(0.0, 1.0, 0.0),
+        ];
+        assert!(
+            ghost_from_points("quadratic_bezier_surface", &points, 6).is_some(),
+            "odd point count must produce a live ghost"
+        );
+        assert!(
+            ghost_from_points("quadratic_bezier_surface", &points[..4], 6).is_none(),
+            "even point count must not build"
+        );
+        let mut document = SceneDocument::new();
+        let id = document
+            .add_point_shape_from_world_points("quadratic_bezier_surface", &points, "xy")
+            .expect("bezier surface");
+        match &document.object(id).expect("object").payload {
+            ScenePayload::Placed2D {
+                profile: Profile2D::QuadraticBezierSurface { points },
+                ..
+            } => assert_eq!(points.len(), 5),
+            other => panic!("expected a bezier surface section, got {other:?}"),
+        }
+        let error = document
+            .add_point_shape_from_world_points("quadratic_bezier_surface", &points[..4], "xy")
+            .expect_err("even count refused");
+        assert!(
+            error.to_string().contains("odd"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

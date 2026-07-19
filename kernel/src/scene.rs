@@ -607,10 +607,29 @@ impl SceneDocument {
         })
     }
 
-    /// Create a default-sized 3D primitive (sizes in `scale` scene units) and
-    /// add it as a root. Mirrors Python `create_primitive` + `add_primitive`.
+    /// Create a default-sized primitive (sizes in `scale` scene units) and
+    /// add it as a root: 3D solids and tubes, plus default 2D sections and
+    /// 1D curves on the XY grid plane at the origin — every kind the Add
+    /// menu offers. Mirrors Python `create_primitive` + `add_primitive`.
     pub fn add_primitive(&mut self, kind: &str, scale: f64) -> GeometryResult<ObjectId> {
-        let name = self.default_name(kind);
+        let name_key = match kind {
+            "quadratic_bezier_polycurve" => "quadratic_bezier_curve",
+            other => other,
+        };
+        let name = self.default_name(name_key);
+        let placed_2d = |profile: Profile2D| ScenePayload::Placed2D {
+            profile,
+            origin: Vec3::ZERO,
+            axis_u: vec3(1.0, 0.0, 0.0),
+            axis_v: vec3(0.0, 1.0, 0.0),
+            sources: Vec::new(),
+        };
+        let placed_curve = |profile: Profile2D| ScenePayload::PlacedPolyline1D {
+            profile,
+            origin: Vec3::ZERO,
+            axis_u: vec3(1.0, 0.0, 0.0),
+            axis_v: vec3(0.0, 1.0, 0.0),
+        };
         let payload = match kind {
             "sphere" => ScenePayload::Sphere(Sphere::new(Vec3::ZERO, 0.5 * scale)?),
             "box" => ScenePayload::Box3(Box3::new(
@@ -662,8 +681,82 @@ impl SceneDocument {
                 0.0,
                 CapStyle::Round,
             )?),
+            "rectangle" => placed_2d(Profile2D::rectangle(
+                [0.0, 0.0],
+                [0.6 * scale, 0.4 * scale],
+            )?),
+            "square" => placed_2d(Profile2D::square([0.0, 0.0], 0.5 * scale)?),
+            "circle" => placed_2d(Profile2D::circle([0.0, 0.0], 0.5 * scale)?),
+            "rounded_rectangle" => placed_2d(Profile2D::rounded_rectangle(
+                [0.0, 0.0],
+                [0.6 * scale, 0.4 * scale],
+                0.1 * scale,
+            )?),
+            "ellipse" => placed_2d(Profile2D::ellipse(
+                [0.0, 0.0],
+                [0.6 * scale, 0.35 * scale],
+            )?),
+            "regular_polygon" => placed_2d(Profile2D::regular_polygon(
+                [0.0, 0.0],
+                0.5 * scale,
+                6,
+                0.0,
+            )?),
+            "polygon" => {
+                let points = (0..5)
+                    .map(|index| {
+                        let angle = std::f64::consts::FRAC_PI_2
+                            + index as f64 * 2.0 * std::f64::consts::PI / 5.0;
+                        [0.5 * scale * angle.cos(), 0.5 * scale * angle.sin()]
+                    })
+                    .collect();
+                placed_2d(Profile2D::polygon(points)?)
+            }
+            "quadratic_bezier_surface" => {
+                // Closed three-span blob: anchors on a triangle, controls
+                // bulging outward, last point repeating the first (the
+                // closed-outline rule for bezier surfaces).
+                let anchor = 0.5 * scale;
+                let control = 0.9 * scale;
+                let at = |radius: f64, degree: f64| {
+                    let angle = degree.to_radians();
+                    [radius * angle.cos(), radius * angle.sin()]
+                };
+                placed_2d(Profile2D::quadratic_bezier_surface(vec![
+                    at(anchor, 90.0),
+                    at(control, 150.0),
+                    at(anchor, 210.0),
+                    at(control, 270.0),
+                    at(anchor, 330.0),
+                    at(control, 30.0),
+                    at(anchor, 90.0),
+                ])?)
+            }
+            "segment" => ScenePayload::Placed1D {
+                profile: Profile1D::segment(0.0, 0.5 * scale)?,
+                origin: Vec3::ZERO,
+                axis_u: vec3(1.0, 0.0, 0.0),
+                sources: Vec::new(),
+            },
+            "polyline" => placed_curve(Profile2D::polyline(vec![
+                [-0.5 * scale, 0.0],
+                [0.0, 0.4 * scale],
+                [0.5 * scale, 0.0],
+            ])?),
+            "quadratic_bezier_curve" => placed_curve(Profile2D::quadratic_bezier_curve(vec![
+                [-0.5 * scale, 0.0],
+                [0.0, 0.55 * scale],
+                [0.5 * scale, 0.0],
+            ])?),
+            "quadratic_bezier_polycurve" => placed_curve(Profile2D::quadratic_bezier_curve(vec![
+                [-0.75 * scale, 0.0],
+                [-0.4 * scale, 0.5 * scale],
+                [0.0, 0.0],
+                [0.4 * scale, -0.5 * scale],
+                [0.75 * scale, 0.0],
+            ])?),
             other => {
-                return Err(GeometryError::new(format!("unknown 3D primitive type: {other}")))
+                return Err(GeometryError::new(format!("unknown primitive kind: {other}")))
             }
         };
         let id = self.insert_object(name, payload)?;
