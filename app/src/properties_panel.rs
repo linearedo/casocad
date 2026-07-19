@@ -216,18 +216,143 @@ fn point_label(index: usize, bezier: bool) -> String {
 /// sluggish, so only the visible rows are built.
 const INLINE_POINT_ROWS: usize = 10;
 
+/// What structural edits a point list allows, dictated by the kernel's
+/// validation rules for the profile kind that owns the points.
+#[derive(Clone, Copy, PartialEq)]
+enum PointListPolicy {
+    /// Insert/delete one point at a time; `closed` picks midpoint wrap
+    /// (polygon) versus tail extension (polyline, tube path).
+    Single { min: usize, closed: bool },
+    /// Bezier kinds (odd anchor-control-anchor chains): insert splits a
+    /// span exactly (De Casteljau), delete removes a control+anchor pair;
+    /// buttons live on anchor rows only.
+    Spans { min: usize },
+}
+
+#[derive(Clone, Copy)]
+enum PointEdit {
+    InsertAfter(usize),
+    Delete(usize),
+}
+
+/// (insert allowed, delete allowed) for the row at `index`.
+fn point_row_buttons(policy: PointListPolicy, index: usize, len: usize) -> (bool, bool) {
+    match policy {
+        PointListPolicy::Single { min, .. } => (true, len > min),
+        PointListPolicy::Spans { min } => {
+            let anchor = index.is_multiple_of(2);
+            (anchor && len >= 3, anchor && len >= min + 2)
+        }
+    }
+}
+
+/// Apply an insert/delete to the raw point list; `lerp(a, b, t)` is the
+/// only geometry the helper needs, so (u, v) and world points share it.
+/// Returns false when the policy forbids the edit (list left untouched).
+fn apply_point_edit<T: Copy>(
+    points: &mut Vec<T>,
+    edit: PointEdit,
+    policy: PointListPolicy,
+    lerp: impl Fn(T, T, f64) -> T,
+) -> bool {
+    let len = points.len();
+    match (policy, edit) {
+        (PointListPolicy::Single { closed, .. }, PointEdit::InsertAfter(index)) if index < len => {
+            let point = if index + 1 < len {
+                lerp(points[index], points[index + 1], 0.5)
+            } else if closed {
+                lerp(points[index], points[0], 0.5)
+            } else if len >= 2 {
+                // Extend the open tail by mirroring the last segment.
+                lerp(points[index - 1], points[index], 2.0)
+            } else {
+                return false;
+            };
+            points.insert(index + 1, point);
+            true
+        }
+        (PointListPolicy::Single { min, .. }, PointEdit::Delete(index))
+            if index < len && len > min =>
+        {
+            points.remove(index);
+            true
+        }
+        (PointListPolicy::Spans { .. }, PointEdit::InsertAfter(index))
+            if index < len && index.is_multiple_of(2) && len >= 3 =>
+        {
+            // Split the span starting at this anchor (the one ending here
+            // for the last anchor) at t = 0.5 — the curve is unchanged.
+            let start = if index + 2 < len { index } else { index - 2 };
+            let (a, c, b) = (points[start], points[start + 1], points[start + 2]);
+            let c1 = lerp(a, c, 0.5);
+            let c2 = lerp(c, b, 0.5);
+            let mid = lerp(c1, c2, 0.5);
+            points[start + 1] = c1;
+            points.insert(start + 2, mid);
+            points.insert(start + 3, c2);
+            true
+        }
+        (PointListPolicy::Spans { min }, PointEdit::Delete(index))
+            if index < len && index.is_multiple_of(2) && len >= min + 2 =>
+        {
+            // Remove the anchor with its preceding control (following
+            // control for the first anchor): one span disappears.
+            if index == 0 {
+                points.remove(1);
+                points.remove(0);
+            } else {
+                points.remove(index);
+                points.remove(index - 1);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Insert/delete buttons for one row; returns the requested edit.
+fn point_row_edit_buttons(
+    ui: &mut egui::Ui,
+    policy: PointListPolicy,
+    index: usize,
+    len: usize,
+) -> Option<PointEdit> {
+    let (insert, delete) = point_row_buttons(policy, index, len);
+    let mut edit = None;
+    if insert
+        && ui
+            .small_button("+")
+            .on_hover_text("Insert a point after this one")
+            .clicked()
+    {
+        edit = Some(PointEdit::InsertAfter(index));
+    }
+    if delete
+        && ui
+            .small_button("✕")
+            .on_hover_text("Delete this point")
+            .clicked()
+    {
+        edit = Some(PointEdit::Delete(index));
+    }
+    edit
+}
+
 fn uv_point_list_ui(
     ui: &mut egui::Ui,
-    points: &mut [Point2],
-    bezier: bool,
+    points: &mut Vec<Point2>,
+    policy: PointListPolicy,
     origin: Vec3,
     axis_u: Vec3,
     axis_v: Vec3,
     factor: f64,
 ) -> bool {
+    let bezier = matches!(policy, PointListPolicy::Spans { .. });
     let mut changed = false;
-    if points.len() <= INLINE_POINT_ROWS {
-        for (index, point) in points.iter_mut().enumerate() {
+    let mut edit: Option<PointEdit> = None;
+    let len = points.len();
+    let mut row = |ui: &mut egui::Ui, index: usize, point: &mut Point2| {
+        ui.horizontal(|ui| {
             changed |= world_point_field(
                 ui,
                 &point_label(index, bezier),
@@ -237,48 +362,76 @@ fn uv_point_list_ui(
                 axis_v,
                 factor,
             );
-        }
-        return changed;
-    }
-    ui.weak(format!("Points: {}", points.len()));
-    let row_height = ui.spacing().interact_size.y;
-    egui::ScrollArea::vertical()
-        .id_salt("uv_points")
-        .max_height(row_height * INLINE_POINT_ROWS as f32)
-        .show_rows(ui, row_height, points.len(), |ui, rows| {
-            for index in rows {
-                changed |= world_point_field(
-                    ui,
-                    &point_label(index, bezier),
-                    &mut points[index],
-                    origin,
-                    axis_u,
-                    axis_v,
-                    factor,
-                );
+            if let Some(requested) = point_row_edit_buttons(ui, policy, index, len) {
+                edit = Some(requested);
             }
         });
+    };
+    if points.len() <= INLINE_POINT_ROWS {
+        for (index, point) in points.iter_mut().enumerate() {
+            row(ui, index, point);
+        }
+    } else {
+        ui.weak(format!("Points: {}", points.len()));
+        let row_height = ui.spacing().interact_size.y;
+        egui::ScrollArea::vertical()
+            .id_salt("uv_points")
+            .max_height(row_height * INLINE_POINT_ROWS as f32)
+            .show_rows(ui, row_height, points.len(), |ui, rows| {
+                for index in rows {
+                    let mut point = points[index];
+                    row(ui, index, &mut point);
+                    points[index] = point;
+                }
+            });
+    }
+    if let Some(edit) = edit {
+        changed |= apply_point_edit(points, edit, policy, |a, b, t| {
+            [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+        });
+    }
     changed
 }
 
-fn vec3_point_list_ui(ui: &mut egui::Ui, points: &mut [Vec3], bezier: bool, factor: f64) -> bool {
+fn vec3_point_list_ui(
+    ui: &mut egui::Ui,
+    points: &mut Vec<Vec3>,
+    policy: PointListPolicy,
+    factor: f64,
+) -> bool {
+    let bezier = matches!(policy, PointListPolicy::Spans { .. });
     let mut changed = false;
-    if points.len() <= INLINE_POINT_ROWS {
-        for (index, point) in points.iter_mut().enumerate() {
+    let mut edit: Option<PointEdit> = None;
+    let len = points.len();
+    let mut row = |ui: &mut egui::Ui, index: usize, point: &mut Vec3| {
+        ui.horizontal(|ui| {
             changed |= vec3_field(ui, &point_label(index, bezier), point, factor);
-        }
-        return changed;
-    }
-    ui.weak(format!("Points: {}", points.len()));
-    let row_height = ui.spacing().interact_size.y;
-    egui::ScrollArea::vertical()
-        .id_salt("world_points")
-        .max_height(row_height * INLINE_POINT_ROWS as f32)
-        .show_rows(ui, row_height, points.len(), |ui, rows| {
-            for index in rows {
-                changed |= vec3_field(ui, &point_label(index, bezier), &mut points[index], factor);
+            if let Some(requested) = point_row_edit_buttons(ui, policy, index, len) {
+                edit = Some(requested);
             }
         });
+    };
+    if points.len() <= INLINE_POINT_ROWS {
+        for (index, point) in points.iter_mut().enumerate() {
+            row(ui, index, point);
+        }
+    } else {
+        ui.weak(format!("Points: {}", points.len()));
+        let row_height = ui.spacing().interact_size.y;
+        egui::ScrollArea::vertical()
+            .id_salt("world_points")
+            .max_height(row_height * INLINE_POINT_ROWS as f32)
+            .show_rows(ui, row_height, points.len(), |ui, rows| {
+                for index in rows {
+                    let mut point = points[index];
+                    row(ui, index, &mut point);
+                    points[index] = point;
+                }
+            });
+    }
+    if let Some(edit) = edit {
+        changed |= apply_point_edit(points, edit, policy, |a, b, t| a + (b - a) * t);
+    }
     changed
 }
 
@@ -295,12 +448,45 @@ fn profile2d_ui(
 ) -> bool {
     let mut changed = false;
     match profile {
-        Profile2D::Polyline { points } | Profile2D::Polygon { points } => {
-            changed |= uv_point_list_ui(ui, points, false, origin, axis_u, axis_v, factor);
+        Profile2D::Polyline { points } => {
+            changed |= uv_point_list_ui(
+                ui,
+                points,
+                PointListPolicy::Single {
+                    min: 2,
+                    closed: false,
+                },
+                origin,
+                axis_u,
+                axis_v,
+                factor,
+            );
+        }
+        Profile2D::Polygon { points } => {
+            changed |= uv_point_list_ui(
+                ui,
+                points,
+                PointListPolicy::Single {
+                    min: 3,
+                    closed: true,
+                },
+                origin,
+                axis_u,
+                axis_v,
+                factor,
+            );
         }
         Profile2D::QuadraticBezierCurve { points }
         | Profile2D::QuadraticBezierSurface { points } => {
-            changed |= uv_point_list_ui(ui, points, true, origin, axis_u, axis_v, factor);
+            changed |= uv_point_list_ui(
+                ui,
+                points,
+                PointListPolicy::Spans { min: 3 },
+                origin,
+                axis_u,
+                axis_v,
+                factor,
+            );
         }
         Profile2D::Circle { center, radius } => {
             changed |= world_point_field(ui, "Center", center, origin, axis_u, axis_v, factor);
@@ -667,7 +853,15 @@ impl PropertiesPanel {
                 changed |=
                     bounded_length_field(ui, "Inner radius", &mut tube.inner_radius, factor, max_inner);
                 changed |= caps_field(ui, &mut tube.caps);
-                changed |= vec3_point_list_ui(ui, &mut tube.points, false, factor);
+                changed |= vec3_point_list_ui(
+                    ui,
+                    &mut tube.points,
+                    PointListPolicy::Single {
+                        min: 2,
+                        closed: false,
+                    },
+                    factor,
+                );
             }
             ScenePayload::QuadraticBezierTube(tube) => {
                 changed |= length_field(ui, "Radius", &mut tube.radius, factor, true);
@@ -675,7 +869,12 @@ impl PropertiesPanel {
                 changed |=
                     bounded_length_field(ui, "Inner radius", &mut tube.inner_radius, factor, max_inner);
                 changed |= caps_field(ui, &mut tube.caps);
-                changed |= vec3_point_list_ui(ui, &mut tube.points, true, factor);
+                changed |= vec3_point_list_ui(
+                    ui,
+                    &mut tube.points,
+                    PointListPolicy::Spans { min: 3 },
+                    factor,
+                );
             }
             ScenePayload::NormalCurtain(curtain) => {
                 let mut extent = curtain.extent;
@@ -1219,5 +1418,81 @@ mod tests {
                 "panel render alone bumped document version for object {id}"
             );
         }
+    }
+
+    fn lerp2(a: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+    }
+
+    #[test]
+    fn polygon_point_edits_respect_the_minimum() {
+        let policy = PointListPolicy::Single {
+            min: 3,
+            closed: true,
+        };
+        let mut points = vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0]];
+        // Insert after the last corner wraps to the first: midpoint (1, 1).
+        assert!(apply_point_edit(&mut points, PointEdit::InsertAfter(2), policy, lerp2));
+        assert_eq!(points, vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [1.0, 1.0]]);
+        assert!(apply_point_edit(&mut points, PointEdit::Delete(3), policy, lerp2));
+        // At the minimum of three corners, delete refuses.
+        assert!(!apply_point_edit(&mut points, PointEdit::Delete(0), policy, lerp2));
+        assert_eq!(points.len(), 3);
+    }
+
+    #[test]
+    fn open_polyline_insert_extends_the_tail() {
+        let policy = PointListPolicy::Single {
+            min: 2,
+            closed: false,
+        };
+        let mut points = vec![[0.0, 0.0], [1.0, 1.0]];
+        assert!(apply_point_edit(&mut points, PointEdit::InsertAfter(1), policy, lerp2));
+        // Tail insert mirrors the last segment instead of wrapping.
+        assert_eq!(points, vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]);
+    }
+
+    #[test]
+    fn bezier_span_insert_splits_without_changing_the_curve() {
+        let policy = PointListPolicy::Spans { min: 3 };
+        let mut points = vec![[0.0, 0.0], [1.0, 2.0], [2.0, 0.0]];
+        assert!(apply_point_edit(&mut points, PointEdit::InsertAfter(0), policy, lerp2));
+        // De Casteljau split at t = 0.5: the midpoint anchor lies ON the
+        // original curve at (1, 1), and the count stays odd.
+        assert_eq!(
+            points,
+            vec![[0.0, 0.0], [0.5, 1.0], [1.0, 1.0], [1.5, 1.0], [2.0, 0.0]]
+        );
+        // The last anchor splits the span that ends at it.
+        assert!(apply_point_edit(&mut points, PointEdit::InsertAfter(4), policy, lerp2));
+        assert_eq!(points.len(), 7);
+        assert_eq!(points.len() % 2, 1, "span edits must keep the odd count");
+    }
+
+    #[test]
+    fn bezier_span_delete_keeps_odd_count_and_minimum() {
+        let policy = PointListPolicy::Spans { min: 3 };
+        let mut points = vec![[0.0, 0.0], [0.5, 1.0], [1.0, 1.0], [1.5, 1.0], [2.0, 0.0]];
+        // Control rows never edit; anchors drop a control+anchor pair.
+        assert!(!apply_point_edit(&mut points, PointEdit::Delete(1), policy, lerp2));
+        assert!(apply_point_edit(&mut points, PointEdit::Delete(2), policy, lerp2));
+        assert_eq!(points, vec![[0.0, 0.0], [1.5, 1.0], [2.0, 0.0]]);
+        // A single span is the floor: delete refuses.
+        assert!(!apply_point_edit(&mut points, PointEdit::Delete(0), policy, lerp2));
+        assert_eq!(points.len(), 3);
+    }
+
+    #[test]
+    fn point_row_buttons_follow_the_policy() {
+        let spans = PointListPolicy::Spans { min: 3 };
+        assert_eq!(point_row_buttons(spans, 0, 5), (true, true));
+        assert_eq!(point_row_buttons(spans, 1, 5), (false, false), "control row");
+        assert_eq!(point_row_buttons(spans, 2, 3), (true, false), "at the span floor");
+        let polygon = PointListPolicy::Single {
+            min: 3,
+            closed: true,
+        };
+        assert_eq!(point_row_buttons(polygon, 0, 3), (true, false));
+        assert_eq!(point_row_buttons(polygon, 2, 4), (true, true));
     }
 }
