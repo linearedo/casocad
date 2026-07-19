@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod boundary_outline;
 pub mod builders;
 pub mod clipping;
 pub mod contouring;

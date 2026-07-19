@@ -27,7 +27,14 @@ use crate::vec3::{vec3, Vec3};
 pub const RELATIVE_SURFACE_TOLERANCE: f64 = 1.0e-3;
 pub const DIRECTION_ALIGNMENT_MINIMUM: f64 = 0.95;
 pub const PATCH_TOLERANCE: f64 = 1.5e-3;
-pub const CURVE_PATCH_PICK_TOLERANCE: f64 = 0.05;
+/// Default 2D hover pick radius (fraction of the domain diagonal) when the
+/// caller supplies no screen-derived radius. Deliberately tight — hover must
+/// not trigger from far away in a CAD viewport.
+pub const CURVE_PATCH_PICK_TOLERANCE: f64 = 0.01;
+/// Cutter-click snap radius (fraction of the domain diagonal): knife
+/// endpoints stay forgiving — clicks near the outline snap onto it, far
+/// clicks keep the raw in-plane point.
+pub const OUTLINE_SNAP_TOLERANCE: f64 = 0.05;
 
 // ---------------------------------------------------------------------------
 // sdf_attribution
@@ -1071,13 +1078,36 @@ fn surface_patch_hit(
     })
 }
 
-/// Analytic-first boundary pick (`pick_boundary_patch`, 3D path).
+/// Analytic-first boundary pick (`pick_boundary_patch`, 3D path). 2D picks
+/// use the default scale-relative radius; viewports that know their pixel
+/// size should call `pick_boundary_patch_with_radius`.
 pub fn pick_boundary_patch(
     root: &Node,
     ray_origin: Vec3,
     ray_direction: Vec3,
     hit_tolerance: f64,
     maximum_travel: f64,
+) -> Option<BoundaryPatchHit> {
+    pick_boundary_patch_with_radius(
+        root,
+        ray_origin,
+        ray_direction,
+        hit_tolerance,
+        maximum_travel,
+        None,
+    )
+}
+
+/// `pick_boundary_patch` with an explicit world-space pick radius for the
+/// 2D curve pick (typically derived from a few screen pixels at the
+/// workplane). Ignored on 3D roots, where the ray itself is the precision.
+pub fn pick_boundary_patch_with_radius(
+    root: &Node,
+    ray_origin: Vec3,
+    ray_direction: Vec3,
+    hit_tolerance: f64,
+    maximum_travel: f64,
+    curve_pick_radius: Option<f64>,
 ) -> Option<BoundaryPatchHit> {
     let length = ray_direction.length();
     if length <= 1.0e-12 {
@@ -1088,7 +1118,7 @@ pub fn pick_boundary_patch(
         // 2D path: the boundary is the outline curve on the domain
         // workplane — analytic ray ∩ plane, then snap to the nearest curve
         // patch (the curve analog of the analytic face pick below).
-        return pick_curve_patch(root, ray_origin, direction);
+        return pick_curve_patch(root, ray_origin, direction, curve_pick_radius);
     }
     let patches = surface_patches_for_root(root);
 
@@ -1169,13 +1199,22 @@ fn snap_to_outline(field: &Node, start: Vec3, step: f64, zero_band: f64) -> Vec3
 }
 
 /// The 2D boundary pick: nearest curve patch to the ray's workplane hit,
-/// within `CURVE_PATCH_PICK_TOLERANCE` of the domain diagonal. A cut
-/// surface (subtracted operand's outline) wins outright, as in 3D.
-fn pick_curve_patch(root: &Node, ray_origin: Vec3, direction: Vec3) -> Option<BoundaryPatchHit> {
+/// within `pick_radius` (default `CURVE_PATCH_PICK_TOLERANCE` of the domain
+/// diagonal). The overall nearest patch wins; a cut surface (subtracted
+/// operand's outline) is preferred only when its distance ties the nearest
+/// regular patch within the surface band — the 2D reading of the 3D
+/// "coincident cut surface wins" rule, without letting a far cut patch
+/// steal the hover from a clearly closer edge.
+fn pick_curve_patch(
+    root: &Node,
+    ray_origin: Vec3,
+    direction: Vec3,
+    pick_radius: Option<f64>,
+) -> Option<BoundaryPatchHit> {
     let placed = placed_2d_root(root)?;
     let plane_point = workplane_hit(placed, ray_origin, direction)?;
     let diagonal = bounding_diagonal(root).max(1.0e-9);
-    let pick_tolerance = CURVE_PATCH_PICK_TOLERANCE * diagonal;
+    let pick_tolerance = pick_radius.unwrap_or(CURVE_PATCH_PICK_TOLERANCE * diagonal);
     let surface_tolerance = RELATIVE_SURFACE_TOLERANCE * diagonal;
     let step = (diagonal * 1.0e-5).max(1.0e-9);
     let mut best: Option<(f64, BoundaryPatchHit)> = None;
@@ -1226,13 +1265,33 @@ fn pick_curve_patch(root: &Node, ray_origin: Vec3, direction: Vec3) -> Option<Bo
             *slot = Some((distance, hit));
         }
     }
-    best_cut.or(best).map(|(_, hit)| hit)
+    match (best_cut, best) {
+        (Some((cut_distance, cut_hit)), Some((distance, hit))) => {
+            if cut_distance <= distance + surface_tolerance {
+                Some(cut_hit)
+            } else {
+                Some(hit)
+            }
+        }
+        (cut, regular) => cut.or(regular).map(|(_, hit)| hit),
+    }
 }
 
 /// Cutter clicks on a 2D domain: ray ∩ workplane, snapped onto the domain
-/// outline when the in-plane hit is within the pick tolerance of it (the
+/// outline when the in-plane hit is within the snap radius of it (the
 /// raw in-plane point otherwise, so knife endpoints stay forgiving).
 pub fn pick_outline_point(root: &Node, ray_origin: Vec3, ray_direction: Vec3) -> Option<Vec3> {
+    pick_outline_point_with_radius(root, ray_origin, ray_direction, None)
+}
+
+/// `pick_outline_point` with an explicit world-space snap radius (default
+/// `OUTLINE_SNAP_TOLERANCE` of the domain diagonal).
+pub fn pick_outline_point_with_radius(
+    root: &Node,
+    ray_origin: Vec3,
+    ray_direction: Vec3,
+    snap_radius: Option<f64>,
+) -> Option<Vec3> {
     let placed = placed_2d_root(root)?;
     let length = ray_direction.length();
     if length <= 1.0e-12 {
@@ -1242,7 +1301,7 @@ pub fn pick_outline_point(root: &Node, ray_origin: Vec3, ray_direction: Vec3) ->
     let diagonal = bounding_diagonal(root).max(1.0e-9);
     let step = (diagonal * 1.0e-5).max(1.0e-9);
     let snapped = snap_to_outline(root, plane_point, step, 1.0e-12 * diagonal);
-    if (plane_point - snapped).length() <= CURVE_PATCH_PICK_TOLERANCE * diagonal
+    if (plane_point - snapped).length() <= snap_radius.unwrap_or(OUTLINE_SNAP_TOLERANCE * diagonal)
         && root.eval_point(snapped).abs() <= RELATIVE_SURFACE_TOLERANCE * diagonal
     {
         Some(snapped)
@@ -1357,6 +1416,14 @@ pub fn surface_selector_volume(root: &Node, selector: &Node) -> GeometryResult<O
     }
 }
 
+/// The analytic patch a region tags, when it still resolves on this root.
+fn region_patch(root: &Node, region: &BoundaryRegion) -> Option<BoundarySurfacePatch> {
+    let patch_id_value = region.patch_id.as_deref()?;
+    surface_patches_for_root(root).into_iter().find(|patch| {
+        patch.owner_object_id == region.owner_object_id && patch.patch_id == patch_id_value
+    })
+}
+
 /// `_region_patch_scope_volume` — the thin volume that limits a region to
 /// its analytic patch.
 pub fn region_patch_scope_volume(
@@ -1364,14 +1431,17 @@ pub fn region_patch_scope_volume(
     region: &BoundaryRegion,
     thickness: f64,
 ) -> Option<Node> {
-    let patch_id_value = region.patch_id.as_deref()?;
-    let patch = surface_patches_for_root(root).into_iter().find(|patch| {
-        patch.owner_object_id == region.owner_object_id && patch.patch_id == patch_id_value
-    })?;
+    let patch = region_patch(root, region)?;
     if let Some(curve) = patch.curve.clone() {
-        return curve_patch_scope_volume(root, &patch, &curve, thickness);
+        return curve_patch_scope_volume(root, &patch, &curve, thickness, 0.0);
     }
-    let face = patch_face(&patch).to_string();
+    surface_patch_scope_volume(&patch, thickness)
+}
+
+/// Scope volume of a 3D (non-curve) patch: the box-face slab, else the
+/// generic preview volume.
+fn surface_patch_scope_volume(patch: &BoundarySurfacePatch, thickness: f64) -> Option<Node> {
+    let face = patch_face(patch).to_string();
     match &patch.owner.shape {
         Shape::Box3(shape) => {
             if let Some((index, sign)) = box_face_axis(&face) {
@@ -1390,9 +1460,9 @@ pub fn region_patch_scope_volume(
                     shape: Shape::Box3(Box3::new(center, half, shape.frame).ok()?),
                 });
             }
-            patch_preview_volume(&patch, thickness)
+            patch_preview_volume(patch, thickness)
         }
-        _ => patch_preview_volume(&patch, thickness),
+        _ => patch_preview_volume(patch, thickness),
     }
 }
 
@@ -1400,11 +1470,20 @@ pub fn region_patch_scope_volume(
 /// edge or operand outline — the 2D analog of the box-face scope slab.
 /// Every classification field of a 2D domain is a prism along the workplane
 /// normal (placed fields ignore the plane offset), so the scope is one too.
+///
+/// `lateral` is the half-width across the curve; `tangential_pad` is the
+/// slack past an edge's corners. They differ on purpose: the lateral band
+/// must absorb criterion 1's on-boundary tolerance, while the tangential
+/// end must stop AT the corner so an edge region never claims points on the
+/// neighbor edge. Callers evaluate the result against `<= 0.0` — the slack
+/// is baked into the volume, never into the eval limit (an eval limit pads
+/// isotropically, which is exactly the corner bleed this shape avoids).
 fn curve_patch_scope_volume(
     root: &Node,
     patch: &BoundarySurfacePatch,
     curve: &CurvePatchKind,
-    thickness: f64,
+    lateral: f64,
+    tangential_pad: f64,
 ) -> Option<Node> {
     let span = root_span(root);
     match curve {
@@ -1428,7 +1507,7 @@ fn curve_patch_scope_volume(
                 shape: Shape::Box3(
                     Box3::new(
                         center,
-                        vec3(length * 0.5, thickness, span * 2.0),
+                        vec3(length * 0.5 + tangential_pad, lateral, span * 2.0),
                         Frame {
                             u: axis_u,
                             v: *outward,
@@ -1456,9 +1535,10 @@ fn curve_patch_scope_volume(
                 })
             };
             // Difference(grown, shrunk) evaluates to |operand field| −
-            // thickness: the band around the operand's outline.
-            let grown = band(thickness)?;
-            let shrunk = band(-thickness)?;
+            // lateral: the band around the operand's outline (a closed
+            // curve has no corners, so `tangential_pad` does not apply).
+            let grown = band(lateral)?;
+            let shrunk = band(-lateral)?;
             Shape::difference(grown, shrunk).ok().map(|shape| {
                 Node::new(
                     format!("{}_{}_scope", patch.owner.name, patch.patch_id),
@@ -1567,7 +1647,11 @@ fn patch_preview_volume(patch: &BoundarySurfacePatch, thickness: f64) -> Option<
 }
 
 /// `boundary_region_scope_mask`: which points lie within the region's
-/// analytic patch scope.
+/// analytic patch scope. Curve patches (2D domains) evaluate an exactly
+/// padded volume against zero — the lateral band still absorbs the
+/// on-boundary tolerance, but past an edge's corners only a hairline of
+/// slack remains, so adjacent edge regions meet at the corner instead of
+/// overlapping by a scale-relative band.
 pub fn boundary_region_scope_mask(
     root: &Node,
     region: &BoundaryRegion,
@@ -1575,7 +1659,30 @@ pub fn boundary_region_scope_mask(
     tolerance: f64,
 ) -> GeometryResult<Vec<bool>> {
     let thickness = (PATCH_TOLERANCE * 4.0).max(0.006);
-    let Some(scope) = region_patch_scope_volume(root, region, thickness) else {
+    let Some(patch) = region_patch(root, region) else {
+        return Ok(vec![true; points.len()]);
+    };
+    if let Some(curve) = patch.curve.clone() {
+        // Straight edges: membership points (outline rings, mesh boundary
+        // nodes) lie ON the line, so the lateral band stays absolute —
+        // widening it by the scale-relative tolerance is exactly what let
+        // an edge region claim a stretch of the neighbor edge past the
+        // corner. Whole outlines have no corners to bleed past; their band
+        // keeps the tolerance slack for faceted/curved robustness.
+        let lateral = match curve {
+            CurvePatchKind::Edge { .. } => thickness,
+            CurvePatchKind::Outline => thickness + tolerance.max(PATCH_TOLERANCE),
+        };
+        let Some(scope) = curve_patch_scope_volume(root, &patch, &curve, lateral, thickness)
+        else {
+            return Ok(vec![true; points.len()]);
+        };
+        return Ok(points
+            .iter()
+            .map(|point| scope.eval_point(*point) <= 0.0)
+            .collect());
+    }
+    let Some(scope) = surface_patch_scope_volume(&patch, thickness) else {
         return Ok(vec![true; points.len()]);
     };
     let limit = tolerance.max(PATCH_TOLERANCE);

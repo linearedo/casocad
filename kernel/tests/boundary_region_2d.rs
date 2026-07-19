@@ -8,7 +8,8 @@
 
 use caso_kernel::boundary::{BoundaryCut, BoundaryRegion, CutSide};
 use caso_kernel::boundary_ops::{
-    boundary_region_mask, pick_boundary_patch, pick_outline_point, surface_patches_for_root,
+    boundary_region_mask, pick_boundary_patch, pick_boundary_patch_with_radius,
+    pick_outline_point, surface_patches_for_root,
 };
 use caso_kernel::boundary_paths::{point_knife, straight_knife, workplane_normal};
 use caso_kernel::sdf::node::{Node, Shape};
@@ -438,6 +439,110 @@ fn nested_solid_and_fluid_each_carry_their_own_wall_region() {
         .boundary_regions
         .iter()
         .any(|region| region.name.contains("cut_surface.side_wall")));
+}
+
+/// Like `fixture_root`, but with the obstacle circle close to the +U edge
+/// so a hover between them has both curves inside the pick radius.
+fn fixture_with_near_edge_obstacle() -> Node {
+    let rect_profile = Profile2D::Rectangle {
+        center: [0.0, 0.0],
+        half_size: [2.0, 1.0],
+    };
+    let circle_profile = Profile2D::Circle {
+        center: [1.64, 0.0],
+        radius: 0.3,
+    };
+    let axis_u = vec3(1.0, 0.0, 0.0);
+    let axis_v = vec3(0.0, 1.0, 0.0);
+    let rect = Node::with_id(
+        "flowbox",
+        10,
+        Shape::PlacedSdf2D(
+            PlacedSdf2D::new(rect_profile.clone(), Vec3::ZERO, axis_u, axis_v, Vec::new())
+                .expect("rect"),
+        ),
+    );
+    let circle = Node::with_id(
+        "obstacle",
+        11,
+        Shape::PlacedSdf2D(
+            PlacedSdf2D::new(circle_profile.clone(), Vec3::ZERO, axis_u, axis_v, Vec::new())
+                .expect("circle"),
+        ),
+    );
+    let merged = Profile2D::Binary {
+        left: Box::new(rect_profile),
+        right: Box::new(Profile2D::Offset {
+            child: Box::new(circle_profile),
+            offset: [0.0, 0.0],
+        }),
+        operation: BooleanOp1D::Difference,
+        smoothing: 0.1,
+    };
+    Node::with_id(
+        "domain",
+        12,
+        Shape::PlacedSdf2D(
+            PlacedSdf2D::new(merged, Vec3::ZERO, axis_u, axis_v, vec![rect, circle])
+                .expect("merged"),
+        ),
+    )
+}
+
+/// The nearest curve wins the hover; a cut surface no longer steals a pick
+/// from a clearly closer regular edge (it is preferred only on near-ties,
+/// the coincident-boundary case).
+#[test]
+fn pick_is_nearest_wins_between_cut_and_edge() {
+    let root = fixture_with_near_edge_obstacle();
+    // Between circle (rightmost point x = 1.94) and the +U edge (x = 2):
+    // 0.025 from the edge, 0.035 from the circle — both within the radius.
+    let hit = pick_down(&root, 1.975, 0.0).expect("hit between the curves");
+    assert_eq!(hit.patch_id, "flowbox.+U", "the closer edge wins");
+    // Close to the circle only: the cut surface still picks normally.
+    let hit = pick_down(&root, 1.93, 0.0).expect("hit at the circle");
+    assert_eq!(hit.patch_id, "cut_surface.obstacle.outline");
+}
+
+/// The caller-supplied pick radius bounds the hover snap distance.
+#[test]
+fn pick_radius_parameter_is_honored() {
+    let root = fixture_root();
+    let pick = |radius: f64| {
+        pick_boundary_patch_with_radius(
+            &root,
+            vec3(-1.99, 0.5, 5.0),
+            vec3(0.0, 0.0, -1.0),
+            PICK_TOLERANCE,
+            PICK_TRAVEL,
+            Some(radius),
+        )
+    };
+    // The ray's plane hit is 0.01 from the -U edge.
+    assert!(pick(0.005).is_none(), "radius below the distance: no hit");
+    let hit = pick(0.02).expect("radius above the distance: hit");
+    assert_eq!(hit.patch_id, "flowbox.-U");
+}
+
+/// An edge region ends at its corners: a point on the neighbor edge just
+/// past the corner belongs to the neighbor only (the scope box used to
+/// bleed a scale-relative band around the corner).
+#[test]
+fn edge_scope_stops_at_the_corner() {
+    let root = fixture_root();
+    let left = region_for(&root, "flowbox.-U");
+    let bottom = region_for(&root, "flowbox.-V");
+    let corner = vec3(-2.0, -1.0, 0.0);
+    let past_corner = vec3(-1.992, -1.0, 0.0); // on the bottom edge, 8 mm in
+    let points = vec![corner, past_corner];
+    let left_mask = boundary_region_mask(&root, &left, &points, None).expect("mask");
+    let bottom_mask = boundary_region_mask(&root, &bottom, &points, None).expect("mask");
+    assert_eq!(bottom_mask, vec![true, true], "the bottom edge owns both");
+    assert!(left_mask[0], "the shared corner belongs to both edges");
+    assert!(
+        !left_mask[1],
+        "past the corner the left edge region must not claim the bottom edge"
+    );
 }
 
 #[test]

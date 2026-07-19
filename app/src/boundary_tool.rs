@@ -5,8 +5,10 @@
 
 use caso_kernel::boundary::{BoundaryCut, BoundaryRegion, CutSide};
 use caso_kernel::boundary_ops::{
-    boundary_region_base_mask, cut_volume, pick_boundary_patch, pick_outline_point,
-    pick_sdf_surface, placed_2d_root, sdf_normal, BoundaryPatchHit,
+    boundary_region_base_mask, cut_volume, pick_boundary_patch,
+    pick_boundary_patch_with_radius, pick_outline_point_with_radius, pick_sdf_surface,
+    placed_2d_root, sdf_normal, surface_patches_for_root, BoundaryPatchHit,
+    BoundarySurfacePatch,
 };
 use caso_kernel::boundary_paths::{
     point_knife, stencil_knife, straight_knife, workplane_normal,
@@ -15,6 +17,7 @@ use caso_kernel::boundary_paths::{
 use caso_kernel::scene::SceneDocument;
 use caso_kernel::sdf::node::Node;
 use caso_kernel::vec3::{vec3, Vec3};
+use caso_surfaces::boundary_outline::curve_patch_arcs;
 use caso_surfaces::clipping::{clip_mesh_to_sdf, tessellate_for_clip, OperandMesh};
 use caso_surfaces::profiles2d::placed_outline_rings;
 use caso_surfaces::{SurfaceStatus, ViewportSurface, ViewportSurfaceKey, ViewportSurfaceScene};
@@ -68,9 +71,30 @@ pub fn selected_region_root(document: &SceneDocument, selected: Option<u32>) -> 
     region_root_node(document, region)
 }
 
-/// Ray-pick the domain boundary and return the analytic patch hit.
+/// Ray-pick the domain boundary with the default pick radius. Production
+/// picks go through `pick_patch_with_radius` (screen-derived radius); this
+/// stays for the test fixtures.
+#[allow(dead_code)]
 pub fn pick_patch(root: &Node, origin: Vec3, direction: Vec3) -> Option<BoundaryPatchHit> {
     pick_boundary_patch(root, origin, direction, PICK_TOLERANCE, PICK_TRAVEL)
+}
+
+/// `pick_patch` with a world-space 2D pick radius (screen-derived by the
+/// viewport; `None` keeps the kernel's scale-relative default).
+pub fn pick_patch_with_radius(
+    root: &Node,
+    origin: Vec3,
+    direction: Vec3,
+    curve_pick_radius: Option<f64>,
+) -> Option<BoundaryPatchHit> {
+    pick_boundary_patch_with_radius(
+        root,
+        origin,
+        direction,
+        PICK_TOLERANCE,
+        PICK_TRAVEL,
+        curve_pick_radius,
+    )
 }
 
 /// Ray-pick the boundary surface point (for cutter knife points).
@@ -311,14 +335,53 @@ fn bisect_crossing(volume: &Node, p: Vec3, q: Vec3) -> Vec3 {
     p + (q - p) * (0.5 * (lo + hi))
 }
 
+/// The curve patch a region tags, when it still resolves on this root.
+fn region_curve_patch(root: &Node, region: &BoundaryRegion) -> Option<BoundarySurfacePatch> {
+    let patch_id = region.patch_id.as_deref()?;
+    surface_patches_for_root(root).into_iter().find(|patch| {
+        patch.owner_object_id == region.owner_object_id
+            && patch.patch_id == patch_id
+            && patch.curve.is_some()
+    })
+}
+
+/// The polylines the ribbon draws for a region: patch-exact arcs when the
+/// region tags a curve patch (corners exact, ends root-found on the boolean
+/// junctions — see `curve_patch_arcs`), else the legacy classifier-masked
+/// outline-ring segments (regions without a resolvable patch). Every arc is
+/// open: consecutive pairs only, closure is explicit.
+fn region_highlight_arcs(root: &Node, region: &BoundaryRegion) -> Vec<Vec<Vec3>> {
+    if let Some(patch) = region_curve_patch(root, region) {
+        return curve_patch_arcs(root, &patch, OUTLINE_RING_RESOLUTION);
+    }
+    let Some(placed) = placed_2d_root(root) else {
+        return Vec::new();
+    };
+    let mut arcs = Vec::new();
+    for ring in placed_outline_rings(placed, OUTLINE_RING_RESOLUTION) {
+        if ring.len() < 2 {
+            continue;
+        }
+        let Ok(mask) = boundary_region_base_mask(root, region, &ring, None) else {
+            continue;
+        };
+        for i in 0..ring.len() {
+            let j = (i + 1) % ring.len();
+            if mask[i] && mask[j] {
+                arcs.push(vec![ring[i], ring[j]]);
+            }
+        }
+    }
+    arcs
+}
+
 /// The 2D analog of `region_highlight_mesh` + lift: the arcs of the domain
 /// outline that belong to the region, drawn as a thin triangle ribbon
 /// centered on the outline and lifted off the sheet plane on BOTH sides
 /// (the filled sheet would z-fight a coplanar ribbon, and the domain must
-/// read correctly from either side of its plane). Outline vertices come
-/// from `placed_outline_rings` (Newton-refined onto the exact zero set);
-/// segments are kept whole when both endpoints pass the classifier's
-/// mesh-aligned criteria, then shortened exactly at each cut crossing.
+/// read correctly from either side of its plane). Arcs come from
+/// `region_highlight_arcs`; each segment is then shortened exactly at each
+/// cut crossing.
 fn region_highlight_ribbon(
     root: &Node,
     region: &BoundaryRegion,
@@ -345,19 +408,9 @@ fn region_highlight_ribbon(
     let mut vertices: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
-    for ring in placed_outline_rings(placed, OUTLINE_RING_RESOLUTION) {
-        if ring.len() < 2 {
-            continue;
-        }
-        let Ok(mask) = boundary_region_base_mask(root, region, &ring, None) else {
-            continue;
-        };
-        for i in 0..ring.len() {
-            let j = (i + 1) % ring.len();
-            if !(mask[i] && mask[j]) {
-                continue;
-            }
-            let (mut p, mut q) = (ring[i], ring[j]);
+    for arc in region_highlight_arcs(root, region) {
+        for pair in arc.windows(2) {
+            let (mut p, mut q) = (pair[0], pair[1]);
             let mut dropped = false;
             for (volume, side) in &cut_volumes {
                 let keep = |value: f64| match side {
@@ -574,10 +627,17 @@ fn cutter_ghost_2d(root: &Node, kind: &str, points: &[Vec3]) -> Result<KnifeGhos
 }
 
 /// Cutter click pick: the outline-snapped workplane point for 2D domains,
-/// the sphere-traced surface point for 3D.
-pub fn pick_cut_point(root: &Node, origin: Vec3, direction: Vec3) -> Option<Vec3> {
+/// the sphere-traced surface point for 3D. `snap_radius` is the world-space
+/// 2D snap distance (screen-derived by the viewport; `None` keeps the
+/// kernel's forgiving default).
+pub fn pick_cut_point(
+    root: &Node,
+    origin: Vec3,
+    direction: Vec3,
+    snap_radius: Option<f64>,
+) -> Option<Vec3> {
     if root.dimension() == 2 {
-        pick_outline_point(root, origin, direction)
+        pick_outline_point_with_radius(root, origin, direction, snap_radius)
     } else {
         pick_surface_point(root, origin, direction)
     }

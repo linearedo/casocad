@@ -1190,7 +1190,7 @@ fn newton_refine_onto_outline(profile: &Profile2D, span: f64, u: f64, v: f64) ->
 /// Cleaned, Newton-snapped marching-squares rings of a profile over the
 /// feature-refined grid. Ring orientation is whatever the stitcher
 /// produced; callers normalize per role.
-fn profile_contour_rings(profile: &Profile2D, base_cells: usize) -> Vec<Vec<Point2>> {
+pub(crate) fn profile_contour_rings(profile: &Profile2D, base_cells: usize) -> Vec<Vec<Point2>> {
     let (u_min, u_max, v_min, v_max, span) = padded_profile_bounds(profile);
     let (us, vs) = refined_grid_axes(profile, (u_min, u_max, v_min, v_max), base_cells);
     let mut values = Vec::with_capacity(us.len() * vs.len());

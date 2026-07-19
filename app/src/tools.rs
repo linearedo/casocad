@@ -246,6 +246,36 @@ pub fn screen_ray(
     )
 }
 
+/// World-space distance that `pixels` screen pixels cover on a 2D domain's
+/// workplane under the cursor: two rays that many pixels apart are both
+/// intersected with the plane. `None` for 3D roots or grazing views — the
+/// pick then falls back to its scale-relative default radius.
+pub fn workplane_pixel_radius(
+    camera: &OrbitCamera,
+    pos: egui::Pos2,
+    rect: egui::Rect,
+    pixels_per_point: f32,
+    root: &caso_kernel::sdf::node::Node,
+    pixels: f64,
+) -> Option<f64> {
+    let placed = caso_kernel::boundary_ops::placed_2d_root(root)?;
+    let normal = placed.normal();
+    let plane_hit = |pos: egui::Pos2| -> Option<Vec3> {
+        let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
+        let denominator = direction.dot(normal);
+        if denominator.abs() <= 1.0e-12 {
+            return None;
+        }
+        let travel = (placed.origin - origin).dot(normal) / denominator;
+        if travel < 0.0 {
+            return None;
+        }
+        Some(origin + direction * travel)
+    };
+    let offset = egui::vec2((pixels / pixels_per_point as f64) as f32, 0.0);
+    Some((plane_hit(pos + offset)? - plane_hit(pos)?).length())
+}
+
 /// Intersect the screen ray with the `Z = 0` grid plane.
 pub fn grid_point(
     camera: &OrbitCamera,
@@ -688,7 +718,13 @@ impl ToolState {
             let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
             let mut best: Option<(f64, u32, BoundaryPatchHit)> = None;
             for (domain_id, root) in &roots {
-                let Some(candidate) = boundary_tool::pick_patch(root, origin, direction) else {
+                // 2D domains pick within ~8 px at the workplane — the hover
+                // must feel like a CAD snap, not a fat world-sized band.
+                let radius =
+                    workplane_pixel_radius(camera, pos, rect, pixels_per_point, root, 8.0);
+                let Some(candidate) =
+                    boundary_tool::pick_patch_with_radius(root, origin, direction, radius)
+                else {
                     continue;
                 };
                 let travel = (candidate.point - origin).length();
@@ -785,7 +821,9 @@ impl ToolState {
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
         let pick = |pos: egui::Pos2| -> Option<Vec3> {
             let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
-            boundary_tool::pick_cut_point(&root, origin, direction)
+            // Knife clicks snap onto the outline within ~12 px at the plane.
+            let radius = workplane_pixel_radius(camera, pos, rect, pixels_per_point, &root, 12.0);
+            boundary_tool::pick_cut_point(&root, origin, direction, radius)
                 .or_else(|| grid_point(camera, pos, rect, pixels_per_point))
         };
         let mut points_changed = false;
