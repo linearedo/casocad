@@ -955,6 +955,49 @@ mod tests {
     }
 
     #[test]
+    fn example_script_meshes_a_nested_2d_solid() {
+        use caso_kernel::roles::DomainKind;
+
+        // Rectangle fluid minus a circle that is itself a solid domain: the
+        // script must mesh BOTH zones, hole and pin, in the same plane.
+        let mut document = SceneDocument::new();
+        let rect = document
+            .add_primitive_from_drag(
+                "rectangle",
+                vec3(-2.0, -1.0, 0.0),
+                vec3(2.0, 1.0, 0.0),
+                1.0,
+            )
+            .expect("rectangle");
+        let circle = document
+            .add_primitive_from_drag("circle", vec3(0.2, -0.3, 0.0), vec3(0.8, 0.3, 0.0), 1.0)
+            .expect("circle");
+        document.rename(circle, "pin").expect("rename");
+        document
+            .set_domain_root(circle, DomainKind::Solid)
+            .expect("solid mark");
+        let domain = document
+            .combine(rect, circle, "difference")
+            .expect("difference");
+        document
+            .set_domain_root(domain, DomainKind::Fluid)
+            .expect("fluid domain");
+
+        let mesh =
+            run_mesher_script(&document, &example_script_at_test_resolution()).expect("script runs");
+        assert_eq!(mesh.zones.len(), 2, "fluid and pin zones");
+        let mut zones_with_cells: Vec<u64> = mesh
+            .cells
+            .iter()
+            .filter_map(|cell| cell.zone_id)
+            .collect();
+        zones_with_cells.sort_unstable();
+        zones_with_cells.dedup();
+        assert_eq!(zones_with_cells.len(), 2, "cells in both zones");
+        assert!(mesh.cells.iter().all(|cell| cell.type_name == "quad4"));
+    }
+
+    #[test]
     fn boundary_regions_are_scriptable() {
         let mut document = SceneDocument::default_scene().expect("default scene");
         let mut box_id = 0;

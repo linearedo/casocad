@@ -20,6 +20,8 @@ use crate::model::{compile_model, Model};
 use crate::roles::{Domain, DomainKind};
 use crate::scene::{OperatorKind, SceneDocument, ScenePayload, TagRef};
 use crate::sdf::node::{Node, Shape};
+use crate::sdf::primitives_1d::BooleanOp1D;
+use crate::sdf::primitives_2d::Profile2D;
 use crate::vec3::{vec3, Vec3};
 use crate::BoundingBox3D;
 
@@ -35,10 +37,10 @@ use crate::BoundingBox3D;
 pub fn model_from_document(document: &SceneDocument) -> GeometryResult<Model> {
     let mut domains = Vec::new();
     for (object_id, kind) in &document.domain_kinds {
-        let Ok(region) = domain_region(document, *object_id) else {
-            continue;
-        };
         let name = document.object(*object_id)?.name.clone();
+        let region = domain_region(document, *object_id).map_err(|error| {
+            GeometryError::new(format!("domain '{name}' has no meshable region: {error}"))
+        })?;
         domains.push(Domain::new(name, *kind, region)?);
     }
     Model::new(domains)
@@ -107,6 +109,18 @@ fn additive_base(document: &SceneDocument, id: u32, marked: &[u32]) -> u32 {
                 left,
                 right,
             } if marked.contains(right) => *left,
+            // Flattened 2D difference (`combine` merges coplanar booleans
+            // into one Placed2D): sources[0] mirrors the left subtree,
+            // sources[1] the subtracted operand — same rule as above.
+            ScenePayload::Placed2D {
+                profile:
+                    Profile2D::Binary {
+                        operation: BooleanOp1D::Difference,
+                        ..
+                    },
+                sources,
+                ..
+            } if sources.len() == 2 && marked.contains(&sources[1]) => sources[0],
             ScenePayload::Translate { child, .. }
             | ScenePayload::Rotate { child, .. }
             | ScenePayload::Scale { child, .. } => *child,

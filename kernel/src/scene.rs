@@ -353,7 +353,9 @@ impl SceneDocument {
     /// Roots that are not contained inside another root's chain — the true
     /// top-level components. A domain exposed as a root while also nested in
     /// another chain is omitted: its geometry already renders inside that
-    /// chain, so the viewport draws `primary_roots` to avoid duplicates.
+    /// chain, so the viewport draws `primary_roots` to avoid duplicates
+    /// (plus `subtracted_domain_roots`, whose material the chain does NOT
+    /// render).
     pub fn primary_roots(&self) -> Vec<ObjectId> {
         self.roots
             .iter()
@@ -365,6 +367,68 @@ impl SceneDocument {
                     .any(|other| other != id && self.contains(*other, *id))
             })
             .collect()
+    }
+
+    /// Marked domain roots whose material is subtracted out of the chain
+    /// that contains them: reached through a Difference right operand, or
+    /// the right source of a flattened 1D/2D boolean difference. The
+    /// containing chain renders a hole where their material sits, so the
+    /// viewport must draw these separately (`primary_roots` omits them).
+    pub fn subtracted_domain_roots(&self) -> Vec<ObjectId> {
+        let primary = self.primary_roots();
+        self.domain_kinds
+            .keys()
+            .copied()
+            .filter(|id| !primary.contains(id))
+            .filter(|id| {
+                primary.iter().any(|root| {
+                    let mut path = Vec::new();
+                    self.path_to(*root, *id, &mut path) && self.path_is_subtractive(&path)
+                })
+            })
+            .collect()
+    }
+
+    /// True if the parent→child steps in `path` cross an ODD number of
+    /// difference-right links: the object's material is a hole in the
+    /// rendered chain. (An even count re-adds it: in `box − (shell − gas)`
+    /// the gas volume is part of the rendered result.)
+    fn path_is_subtractive(&self, path: &[ObjectId]) -> bool {
+        let crossings = path
+            .windows(2)
+            .filter(|pair| {
+                let Some(object) = self.objects.get(&pair[0]) else {
+                    return false;
+                };
+                match &object.payload {
+                    ScenePayload::Operator {
+                        kind: OperatorKind::Difference,
+                        right,
+                        ..
+                    } => *right == pair[1],
+                    ScenePayload::Placed2D {
+                        profile:
+                            Profile2D::Binary {
+                                operation: BooleanOp1D::Difference,
+                                ..
+                            },
+                        sources,
+                        ..
+                    } if sources.len() == 2 => sources[1] == pair[1],
+                    ScenePayload::Placed1D {
+                        profile:
+                            Profile1D::Binary {
+                                operation: BooleanOp1D::Difference,
+                                ..
+                            },
+                        sources,
+                        ..
+                    } if sources.len() == 2 => sources[1] == pair[1],
+                    _ => false,
+                }
+            })
+            .count();
+        crossings % 2 == 1
     }
 
     pub fn default_name(&self, kind: &str) -> String {
@@ -564,6 +628,10 @@ impl SceneDocument {
                 },
                 ScenePayload::Scale { factor, .. } => Shape::scale(node, *factor)?,
                 ScenePayload::Operator { .. } => continue,
+                // Flattened 1D/2D boolean chains are transparent: the resync
+                // machinery keeps every source payload at its true world
+                // placement, so the built node needs no ancestor wrapper.
+                ScenePayload::Placed1D { .. } | ScenePayload::Placed2D { .. } => continue,
                 _ => {
                     return Err(GeometryError::new(format!(
                         "'{}' is consumed by generator '{}' and has no world region of its own",

@@ -7,6 +7,7 @@ use caso_kernel::roles::DomainKind;
 use caso_kernel::scene::{ObjectId, SceneDocument, ScenePayload};
 use caso_kernel::sdf::node::{Node, Shape};
 use caso_kernel::sdf::primitives_3d::Sphere;
+use caso_kernel::sdf::solid_from_2d::RevolveAxis;
 use caso_kernel::vec3::{vec3, Vec3};
 
 fn default_scene_ids() -> (SceneDocument, ObjectId, ObjectId) {
@@ -268,6 +269,131 @@ fn interface_project_uses_interior_fields_only() {
     let refused = &shell_gas.project(&[vec3(0.7, 0.0, 0.0)])[0];
     assert!(!refused.converged);
     assert_eq!(refused.distance_moved, 0.0);
+}
+
+/// 2D: rectangle sheet (fluid) minus an ellipse (solid). The coplanar
+/// boolean flattens into ONE Placed2D node — the subtracted operand
+/// survives only in `sources`, yet stays a live nested domain.
+fn nested_2d_fixture() -> (SceneDocument, ObjectId, ObjectId) {
+    let mut document = SceneDocument::new();
+    let rect = document
+        .add_primitive_from_drag("rectangle", vec3(-2.0, -1.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+        .expect("rectangle");
+    let ellipse = document
+        .add_primitive_from_drag("ellipse", vec3(0.1, -0.2, 0.0), vec3(0.9, 0.2, 0.0), 1.0)
+        .expect("ellipse");
+    document.rename(ellipse, "ball").expect("rename");
+    document
+        .set_domain_root(ellipse, DomainKind::Solid)
+        .expect("solid mark");
+    let combined = document
+        .combine(rect, ellipse, "difference")
+        .expect("difference");
+    document.rename(combined, "fluid").expect("rename");
+    document
+        .set_domain_root(combined, DomainKind::Fluid)
+        .expect("fluid mark");
+    (document, combined, ellipse)
+}
+
+#[test]
+fn nested_2d_solid_meshes_and_pairs_an_interface() {
+    // Ellipse from the drag: center (0.5, 0), semi-axes (0.4, 0.2).
+    let (document, _combined, ellipse_id) = nested_2d_fixture();
+    let domains = meshable_domains_from_document(&document).expect("domains");
+
+    let fluid = domains.get("fluid").expect("fluid");
+    let solid = domains.get("ball").expect("ball");
+    assert_eq!(fluid.dimension, 2);
+    assert_eq!(solid.dimension, 2);
+
+    // The domains partition the sheet: the ellipse interior belongs to the
+    // solid and is a hole in the fluid (sign checks only).
+    let inside_ellipse = [vec3(0.5, 0.0, 0.0)];
+    assert!(solid.domain_sdf(&inside_ellipse)[0] < 0.0);
+    assert!(fluid.domain_sdf(&inside_ellipse)[0] > 0.0);
+    let inside_fluid = [vec3(-1.0, 0.0, 0.0)];
+    assert!(fluid.domain_sdf(&inside_fluid)[0] < 0.0);
+    assert!(solid.domain_sdf(&inside_fluid)[0] > 0.0);
+
+    // The interface is the ellipse outline; the rect edge is not on it.
+    let interface = domains.interface_between("fluid", "ball").expect("pair");
+    let on_outline = [
+        vec3(0.9, 0.0, 0.0),
+        vec3(0.1, 0.0, 0.0),
+        vec3(0.5, 0.2, 0.0),
+    ];
+    assert!(interface.contains(&on_outline).iter().all(|hit| *hit));
+    assert!(!interface.contains(&[vec3(-2.0, 0.0, 0.0)])[0]);
+
+    // Interior-only projection from both sides lands on the outline.
+    let starts = [vec3(0.7, 0.0, 0.0), vec3(1.2, 0.0, 0.0)];
+    for projection in interface.project(&starts) {
+        assert!(projection.converged);
+        assert!(interface.contains(&[projection.point])[0]);
+    }
+    // Outside both interiors: refused without iterating.
+    let refused = &interface.project(&[vec3(3.0, 0.0, 0.0)])[0];
+    assert!(!refused.converged);
+    assert_eq!(refused.distance_moved, 0.0);
+
+    // The hole boundary keeps the ellipse leaf as its owner.
+    let classes = fluid
+        .classify_boundary(&[vec3(0.9, 0.0, 0.0)], None)
+        .expect("classify");
+    assert!(classes[0].on_boundary);
+    assert_eq!(classes[0].owner_object_id, ellipse_id);
+}
+
+#[test]
+fn subtracted_domain_roots_use_difference_parity() {
+    // 2D flattened difference: the ellipse is a hole in the rendered sheet.
+    let (document, _combined, ellipse_id) = nested_2d_fixture();
+    assert_eq!(document.subtracted_domain_roots(), vec![ellipse_id]);
+
+    // 3D water/shell/gas: shell (one difference-right crossing) is a hole;
+    // gas (two crossings) re-enters the rendered volume.
+    let document = nested_fixture();
+    let mut shell_id = None;
+    for (id, _parent) in document.walk() {
+        if document.object(id).expect("object").name == "shell" {
+            shell_id = Some(id);
+        }
+    }
+    assert_eq!(
+        document.subtracted_domain_roots(),
+        vec![shell_id.expect("shell id")]
+    );
+}
+
+#[test]
+fn embedded_2d_source_follows_the_combined_placement() {
+    let (mut document, combined, ellipse_id) = nested_2d_fixture();
+    document
+        .move_object(combined, vec3(0.5, 0.25, 0.0))
+        .expect("move");
+    let embedded = document.embedded_node(ellipse_id).expect("embedded");
+    let center = embedded.bounding_box().expect("bounds").center();
+    assert!((center - vec3(1.0, 0.25, 0.0)).length() < 1e-9);
+}
+
+#[test]
+fn consumed_extrude_section_reports_a_meshing_error() {
+    let mut document = SceneDocument::new();
+    let section = document
+        .add_primitive_from_drag("circle", vec3(-0.5, -0.5, 0.0), vec3(0.5, 0.5, 0.0), 1.0)
+        .expect("circle");
+    document.rename(section, "profile").expect("rename");
+    document
+        .solid_from_2d(section, "extrude", Some(1.0), RevolveAxis::U, None, None, None, 360.0)
+        .expect("extrude");
+    document
+        .set_domain_root(section, DomainKind::Fluid)
+        .expect("mark section");
+    let error = meshable_domains_from_document(&document).expect_err("consumed section");
+    let message = error.to_string();
+    assert!(message.contains("profile"), "names the domain: {message}");
+    assert!(message.contains("consumed"), "names the cause: {message}");
 }
 
 #[test]

@@ -841,6 +841,18 @@ impl ViewportPanel {
                 components.push(node);
             }
         }
+        // Subtracted 2D solid domains: their sheet is exactly the hole the
+        // containing chain renders, so draw it separately. 3D subtracted
+        // solids stay omitted — their wall already renders as the cavity
+        // surface of the difference.
+        for root in document.subtracted_domain_roots() {
+            if !matches!(document.dimension_of(root), Ok(2)) {
+                continue;
+            }
+            if let Ok(node) = document.embedded_node(root) {
+                components.push(node);
+            }
+        }
         let cache = self
             .caches
             .iter_mut()

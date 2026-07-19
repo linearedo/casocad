@@ -134,6 +134,21 @@ differencing (spec §8).
   `−h < f_inner < 0` (exact by the grammar), projected outward; both volume
   meshes then adopt the resulting faces (owner cell on one side, neighbor
   cell on the other — MeshIR already models this).
+- Flattened 2D booleans are supported: coplanar `combine` merges both
+  operands into one `Placed2D` node (a `Profile2D::Binary` profile with the
+  operand objects kept in `sources`), so nesting is carried by `sources`
+  instead of an `Operator` child. `additive_base` follows a Binary
+  *difference* whose right source is marked (sources[0] mirrors the left
+  subtree, kept world-placed by the boolean resync), and `embedded_node`
+  treats boolean-chain ancestors as transparent. The derived 2D region is
+  then `Difference(left source, inner primitive)` — a scene-level boolean of
+  two placed 2D nodes, which the patch walk, `mesh_space`, loops, and
+  classification all handle with the 3D semantics. Building the region from
+  the *left source* (not the full combined node) is load-bearing: the full
+  node would emit the subtracted outline's cut patches twice. Extrude and
+  revolve sections remain genuinely consumed: a domain mark on one is
+  refused at mesh time with a hard error (`model_from_document` no longer
+  skips underivable domains silently).
 
 ## 7. Exact 2D boundary loops (`meshing/src/toolkit/loops2d.rs`)
 

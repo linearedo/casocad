@@ -186,6 +186,63 @@ fn rotated_domain_loops_are_frame_invariant() {
     }
 }
 
+/// The rectangle-minus-circle fixture with the circle ALSO marked as a
+/// solid domain: the fluid region becomes a scene-level difference of two
+/// placed 2D nodes (additive base minus the exact circle primitive).
+fn rectangle_with_marked_hole() -> (SceneDocument, u32) {
+    let mut document = SceneDocument::new();
+    let rect = document
+        .add_primitive_from_drag("rectangle", vec3(-2.0, -1.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+        .expect("rectangle");
+    let circle = document
+        .add_primitive_from_drag("circle", vec3(0.2, -0.3, 0.0), vec3(0.8, 0.3, 0.0), 1.0)
+        .expect("circle");
+    document.rename(circle, "pin").expect("rename");
+    document
+        .set_domain_root(circle, DomainKind::Solid)
+        .expect("solid mark");
+    let domain = document
+        .combine(rect, circle, "difference")
+        .expect("difference");
+    document
+        .set_domain_root(domain, DomainKind::Fluid)
+        .expect("fluid domain");
+    (document, circle)
+}
+
+#[test]
+fn loops_with_a_marked_solid_hole() {
+    let (document, circle_id) = rectangle_with_marked_hole();
+    let domains = meshable_domains_from_document(&document).expect("domains");
+
+    // Fluid: the same two loops as the unmarked fixture — each patch
+    // contributes exactly once (no duplicate arcs from the double
+    // representation of the subtracted circle).
+    let fluid_domain = domains.get("fluid").expect("fluid").clone();
+    let loops = boundary_loops(&fluid_domain, 64).expect("loops");
+    assert_eq!(loops.len(), 2, "outer rectangle + hole");
+    let outer = loops.iter().find(|chain| chain.is_outer).expect("outer");
+    let hole = loops.iter().find(|chain| !chain.is_outer).expect("hole");
+    assert!((outer.signed_area - 8.0).abs() < 1e-9);
+    let radius = (vec3(0.8, 0.3, 0.0) - vec3(0.5, 0.0, 0.0)).length();
+    let circle_area = std::f64::consts::PI * radius * radius;
+    assert!(hole.signed_area < 0.0, "hole runs clockwise");
+    assert!(hole.signed_area.abs() > 0.98 * circle_area);
+    assert!(hole.signed_area.abs() < circle_area);
+    // The hole boundary is owned by the subtracted solid's leaf.
+    for span in &hole.spans {
+        assert_eq!(span.owner_object_id, circle_id);
+    }
+
+    // The solid pin domain has its own single outer loop.
+    let pin = domains.get("pin").expect("pin").clone();
+    let pin_loops = boundary_loops(&pin, 64).expect("pin loops");
+    assert_eq!(pin_loops.len(), 1);
+    assert!(pin_loops[0].is_outer, "solid outline runs CCW");
+    assert!(pin_loops[0].signed_area > 0.98 * circle_area);
+    assert!(pin_loops[0].signed_area < circle_area);
+}
+
 fn von_karman_fluid() -> MeshableDomain {
     let document = SceneDocument::default_scene().expect("default scene");
     meshable_domains_from_document(&document)
