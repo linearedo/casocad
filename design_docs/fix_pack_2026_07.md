@@ -4,7 +4,12 @@ Five user-reported fixes, planned together. They touch different layers but
 share files, so they are ordered to avoid rework. Each fix is one commit (or
 a few small ones), independently shippable, with its own tests.
 
-Status: **planned — not started**.
+Status: **implemented** (branch `fixviewprop`, commits `af991d4`, `c59724a`,
+`dfaa362`, `ab310cc` — one per fix, 3+5 shared). Implementation notes that
+differ from the plan below: the bezier-curve point list allows span
+insert/delete too (the kernel accepts any odd count, so a curve can grow
+into a polycurve — `Fixed` policy was dropped as unreachable), and span
+insertion splits at t = 0.5 via De Casteljau so the curve is unchanged.
 
 | # | Report | Real defect | Layer |
 | --- | --- | --- | --- |
