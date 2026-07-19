@@ -598,6 +598,9 @@ impl PropertiesPanel {
     fn apply(&mut self, state: &mut AppState, id: ObjectId, payload: ScenePayload) {
         if let Ok(object) = state.document.object_mut(id) {
             object.payload = payload;
+            // Keep combined booleans and their operand objects in lockstep
+            // whichever side was edited.
+            state.document.resync_boolean_chains(id);
             state.document.mark_changed();
             state.status = "Edited".to_string();
         }

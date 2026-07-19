@@ -875,6 +875,9 @@ impl SceneDocument {
             self.retarget_region_domains(first, combined);
         }
         self.replace_child_references(first, combined, combined);
+        // Normalize the operands onto the combined placement right away, so
+        // their payloads and the Binary profile can never disagree.
+        self.resync_boolean_chains(combined);
         self.refresh_domains();
         self.mark_changed();
         Ok(combined)
@@ -922,6 +925,260 @@ impl SceneDocument {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Ids of combined 1D/2D booleans whose `sources` include `id`.
+    fn boolean_parents_of(&self, id: ObjectId) -> Vec<ObjectId> {
+        self.objects
+            .iter()
+            .filter(|(parent, object)| {
+                **parent != id
+                    && match &object.payload {
+                        ScenePayload::Placed2D { sources, .. }
+                        | ScenePayload::Placed1D { sources, .. } => sources.contains(&id),
+                        _ => false,
+                    }
+            })
+            .map(|(parent, _)| *parent)
+            .collect()
+    }
+
+    /// Push a combined boolean's state down onto its two source objects,
+    /// whose payloads were cloned at `combine` time and would otherwise go
+    /// stale: sources[0] mirrors the Binary left subtree at the combined
+    /// placement, sources[1] the right subtree at the Offset displacement.
+    /// Returns the sources whose payloads actually changed.
+    fn sync_boolean_down_step(&mut self, id: ObjectId) -> Vec<ObjectId> {
+        let Ok(object) = self.object(id) else {
+            return Vec::new();
+        };
+        let mut updates: Vec<(ObjectId, ScenePayload)> = Vec::new();
+        match &object.payload {
+            ScenePayload::Placed2D {
+                profile: Profile2D::Binary { left, right, .. },
+                origin,
+                axis_u,
+                axis_v,
+                sources,
+            } if sources.len() == 2 => {
+                let (offset, second_profile) = match right.as_ref() {
+                    Profile2D::Offset { child, offset } => (*offset, child.as_ref().clone()),
+                    other => ([0.0, 0.0], other.clone()),
+                };
+                let second_origin = *origin + *axis_u * offset[0] + *axis_v * offset[1];
+                for (source, profile, source_origin) in [
+                    (sources[0], left.as_ref().clone(), *origin),
+                    (sources[1], second_profile, second_origin),
+                ] {
+                    let Ok(target) = self.object(source) else {
+                        continue;
+                    };
+                    if let ScenePayload::Placed2D {
+                        sources: own_sources,
+                        ..
+                    } = &target.payload
+                    {
+                        updates.push((
+                            source,
+                            ScenePayload::Placed2D {
+                                profile,
+                                origin: source_origin,
+                                axis_u: *axis_u,
+                                axis_v: *axis_v,
+                                sources: own_sources.clone(),
+                            },
+                        ));
+                    }
+                }
+            }
+            ScenePayload::Placed1D {
+                profile: Profile1D::Binary { left, right, .. },
+                origin,
+                axis_u,
+                sources,
+            } if sources.len() == 2 => {
+                let (offset, second_profile) = match right.as_ref() {
+                    Profile1D::Offset { child, offset } => (*offset, child.as_ref().clone()),
+                    other => (0.0, other.clone()),
+                };
+                let second_origin = *origin + *axis_u * offset;
+                for (source, profile, source_origin) in [
+                    (sources[0], left.as_ref().clone(), *origin),
+                    (sources[1], second_profile, second_origin),
+                ] {
+                    let Ok(target) = self.object(source) else {
+                        continue;
+                    };
+                    if let ScenePayload::Placed1D {
+                        sources: own_sources,
+                        ..
+                    } = &target.payload
+                    {
+                        updates.push((
+                            source,
+                            ScenePayload::Placed1D {
+                                profile,
+                                origin: source_origin,
+                                axis_u: *axis_u,
+                                sources: own_sources.clone(),
+                            },
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut changed = Vec::new();
+        for (source, payload) in updates {
+            if let Ok(target) = self.object_mut(source) {
+                if target.payload != payload {
+                    target.payload = payload;
+                    changed.push(source);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Rebuild a combined boolean's profile and placement from its (edited)
+    /// source objects — the up direction of the sync. True when changed.
+    fn sync_boolean_up_step(&mut self, id: ObjectId) -> bool {
+        let Ok(object) = self.object(id) else {
+            return false;
+        };
+        let payload = match &object.payload {
+            ScenePayload::Placed2D {
+                profile:
+                    Profile2D::Binary {
+                        operation,
+                        smoothing,
+                        ..
+                    },
+                sources,
+                ..
+            } if sources.len() == 2 => {
+                let (Ok(first), Ok(second)) = (self.object(sources[0]), self.object(sources[1]))
+                else {
+                    return false;
+                };
+                let (
+                    ScenePayload::Placed2D {
+                        profile: first_profile,
+                        origin: first_origin,
+                        axis_u,
+                        axis_v,
+                        ..
+                    },
+                    ScenePayload::Placed2D {
+                        profile: second_profile,
+                        origin: second_origin,
+                        ..
+                    },
+                ) = (&first.payload, &second.payload)
+                else {
+                    return false;
+                };
+                let displacement = *second_origin - *first_origin;
+                ScenePayload::Placed2D {
+                    profile: Profile2D::Binary {
+                        left: Box::new(first_profile.clone()),
+                        right: Box::new(Profile2D::Offset {
+                            child: Box::new(second_profile.clone()),
+                            offset: [displacement.dot(*axis_u), displacement.dot(*axis_v)],
+                        }),
+                        operation: *operation,
+                        smoothing: *smoothing,
+                    },
+                    origin: *first_origin,
+                    axis_u: *axis_u,
+                    axis_v: *axis_v,
+                    sources: sources.clone(),
+                }
+            }
+            ScenePayload::Placed1D {
+                profile:
+                    Profile1D::Binary {
+                        operation,
+                        smoothing,
+                        ..
+                    },
+                sources,
+                ..
+            } if sources.len() == 2 => {
+                let (Ok(first), Ok(second)) = (self.object(sources[0]), self.object(sources[1]))
+                else {
+                    return false;
+                };
+                let (
+                    ScenePayload::Placed1D {
+                        profile: first_profile,
+                        origin: first_origin,
+                        axis_u,
+                        ..
+                    },
+                    ScenePayload::Placed1D {
+                        profile: second_profile,
+                        origin: second_origin,
+                        ..
+                    },
+                ) = (&first.payload, &second.payload)
+                else {
+                    return false;
+                };
+                ScenePayload::Placed1D {
+                    profile: Profile1D::Binary {
+                        left: Box::new(first_profile.clone()),
+                        right: Box::new(Profile1D::Offset {
+                            child: Box::new(second_profile.clone()),
+                            offset: (*second_origin - *first_origin).dot(*axis_u),
+                        }),
+                        operation: *operation,
+                        smoothing: *smoothing,
+                    },
+                    origin: *first_origin,
+                    axis_u: *axis_u,
+                    sources: sources.clone(),
+                }
+            }
+            _ => return false,
+        };
+        match self.object_mut(id) {
+            Ok(target) if target.payload != payload => {
+                target.payload = payload;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Re-establish the boolean invariants around an edited object: derived
+    /// operand payloads below it, and every combined ancestor above it.
+    /// Convergence is by change detection (untouched payloads stop the
+    /// walk); the step guard only protects against pathological sharing.
+    pub fn resync_boolean_chains(&mut self, edited: ObjectId) {
+        use std::collections::VecDeque;
+        let mut queue: VecDeque<ObjectId> = VecDeque::from([edited]);
+        let mut any_changed = false;
+        let mut steps = 0usize;
+        while let Some(id) = queue.pop_front() {
+            steps += 1;
+            if steps > 4096 {
+                break;
+            }
+            for changed in self.sync_boolean_down_step(id) {
+                any_changed = true;
+                queue.push_back(changed);
+            }
+            for parent in self.boolean_parents_of(id) {
+                if self.sync_boolean_up_step(parent) {
+                    any_changed = true;
+                    queue.push_back(parent);
+                }
+            }
+        }
+        if any_changed {
+            self.mark_changed();
         }
     }
 
@@ -1120,6 +1377,7 @@ impl SceneDocument {
     pub fn move_object(&mut self, id: ObjectId, delta: Vec3) -> GeometryResult<ObjectId> {
         let moved = self.translate_in_place(id, delta)?;
         if moved {
+            self.resync_boolean_chains(id);
             self.mark_changed();
             return Ok(id);
         }
@@ -1213,6 +1471,7 @@ impl SceneDocument {
             None => self.build_node(id)?.bounding_box()?.center(),
         };
         if self.rotate_in_place(id, axis, angle_degrees, pivot)? {
+            self.resync_boolean_chains(id);
             self.mark_changed();
             Ok(())
         } else {
