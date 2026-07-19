@@ -5,12 +5,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use caso_kernel::meshing::{
-    meshable_domains_from_document, MeshableBoundaryRegion, MeshableDomain, MeshableDomainSpace,
-    MeshableDomains, MeshableInterface,
+    meshable_domains_from_document, BoundaryBand, MeshableBoundaryRegion, MeshableDomain,
+    MeshableDomainSpace, MeshableDomains, MeshableInterface,
 };
 use caso_kernel::scene::SceneDocument;
 use caso_kernel::vec3::{vec3, Vec3};
-use caso_meshing::toolkit::{boundary_loops, SizingBand, SizingField, SizingSpec};
+use caso_meshing::toolkit::{
+    boundary_marching_sample, boundary_names, SizingBand, SizingField, SizingSpec,
+};
 use caso_meshing::{MeshIr, MeshIrBuilder};
 use rhai::{Array, Dynamic, Engine, Map, Scope};
 
@@ -102,10 +104,10 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
             },
         )
         .register_fn("len", |handle: &mut DomainsHandle| handle.0.len() as i64)
-        .register_fn("keys", |handle: &mut DomainsHandle| {
+        .register_fn("names", |handle: &mut DomainsHandle| {
             handle
                 .0
-                .keys()
+                .names()
                 .into_iter()
                 .map(Dynamic::from)
                 .collect::<Array>()
@@ -122,18 +124,14 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
         })
         .register_fn("bounds", |handle: &mut DomainHandle| {
             let bounds = &handle.0.bounds;
-            [
-                bounds.x_min,
-                bounds.x_max,
-                bounds.y_min,
-                bounds.y_max,
-                bounds.z_min,
-                bounds.z_max,
-            ]
-            .iter()
-            .copied()
-            .map(Dynamic::from)
-            .collect::<Array>()
+            let mut map = Map::new();
+            map.insert("x_min".into(), Dynamic::from(bounds.x_min));
+            map.insert("x_max".into(), Dynamic::from(bounds.x_max));
+            map.insert("y_min".into(), Dynamic::from(bounds.y_min));
+            map.insert("y_max".into(), Dynamic::from(bounds.y_max));
+            map.insert("z_min".into(), Dynamic::from(bounds.z_min));
+            map.insert("z_max".into(), Dynamic::from(bounds.z_max));
+            map
         })
         .register_fn(
             "sdf",
@@ -218,17 +216,17 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
             },
         );
 
-    // Toolkit queries on domains: normals, interior projection, curvature,
-    // total classification, exact 2D boundary loops.
+    // Toolkit queries on domains: boundary normals, interior projection,
+    // curvature, total classification, keyed boundary sampling.
     engine
         .register_fn(
-            "normal",
+            "boundary_normal",
             |handle: &mut DomainHandle, x: f64, y: f64, z: f64| {
                 vec3_array(handle.0.normals(&[vec3(x, y, z)])[0])
             },
         )
         .register_fn(
-            "project",
+            "boundary_projection",
             |handle: &mut DomainHandle,
              x: f64,
              y: f64,
@@ -249,7 +247,7 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
             },
         )
         .register_fn(
-            "curvature",
+            "boundary_curvature",
             |handle: &mut DomainHandle,
              x: f64,
              y: f64,
@@ -271,7 +269,7 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
              -> Result<Map, Box<rhai::EvalAltResult>> {
                 let class = handle
                     .0
-                    .classify_boundary(&[vec3(x, y, z)], None)
+                    .classify_boundary(&[vec3(x, y, z)], BoundaryBand::UnprojectedSamples)
                     .map_err(|error| error.to_string())?[0]
                     .clone();
                 let mut map = Map::new();
@@ -282,10 +280,8 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
                 );
                 map.insert(
                     "region".into(),
-                    match class.region_index {
-                        Some(index) => {
-                            Dynamic::from(handle.0.boundary_regions[index].name.clone())
-                        }
+                    match class.region_name {
+                        Some(name) => Dynamic::from(name),
                         None => Dynamic::UNIT,
                     },
                 );
@@ -293,47 +289,24 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
             },
         )
         .register_fn(
-            "boundary_loops",
+            "boundaries",
+            |handle: &mut DomainHandle| -> Result<Array, Box<rhai::EvalAltResult>> {
+                let names = boundary_names(&handle.0).map_err(|error| error.to_string())?;
+                Ok(names.into_iter().map(Dynamic::from).collect())
+            },
+        )
+        .register_fn(
+            "boundary_marching_sample",
             |handle: &mut DomainHandle,
-             resolution: i64|
+             name: &str,
+             npoints: i64|
              -> Result<Array, Box<rhai::EvalAltResult>> {
-                let loops = boundary_loops(&handle.0, resolution.max(1) as usize)
-                    .map_err(|error| error.to_string())?;
-                Ok(loops
+                let points =
+                    boundary_marching_sample(&handle.0, name, npoints.max(0) as usize)
+                        .map_err(|error| error.to_string())?;
+                Ok(points
                     .into_iter()
-                    .map(|chain| {
-                        let mut map = Map::new();
-                        map.insert("is_outer".into(), Dynamic::from(chain.is_outer));
-                        map.insert("area".into(), Dynamic::from(chain.signed_area));
-                        let spans: Array = chain
-                            .spans
-                            .into_iter()
-                            .map(|span| {
-                                let mut entry = Map::new();
-                                entry.insert("patch".into(), Dynamic::from(span.patch_id));
-                                entry.insert(
-                                    "owner".into(),
-                                    Dynamic::from(i64::from(span.owner_object_id)),
-                                );
-                                entry.insert(
-                                    "region".into(),
-                                    match span.region_name {
-                                        Some(name) => Dynamic::from(name),
-                                        None => Dynamic::UNIT,
-                                    },
-                                );
-                                let points: Array = span
-                                    .points
-                                    .into_iter()
-                                    .map(|point| Dynamic::from(vec3_array(point)))
-                                    .collect();
-                                entry.insert("points".into(), Dynamic::from(points));
-                                Dynamic::from(entry)
-                            })
-                            .collect();
-                        map.insert("spans".into(), Dynamic::from(spans));
-                        Dynamic::from(map)
-                    })
+                    .map(|point| Dynamic::from(vec3_array(point)))
                     .collect())
             },
         );
@@ -478,13 +451,13 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
     engine
         .register_type_with_name::<SpaceHandle>("MeshSpace")
         .register_fn("bounds", |handle: &mut SpaceHandle| {
-            handle
-                .0
-                .bounds()
-                .iter()
-                .copied()
-                .map(Dynamic::from)
-                .collect::<Array>()
+            let bounds = handle.0.bounds();
+            let mut map = Map::new();
+            map.insert("a_min".into(), Dynamic::from(bounds[0]));
+            map.insert("a_max".into(), Dynamic::from(bounds[1]));
+            map.insert("b_min".into(), Dynamic::from(bounds[2]));
+            map.insert("b_max".into(), Dynamic::from(bounds[3]));
+            map
         })
         .register_fn("point", |handle: &mut SpaceHandle, a: f64, b: f64| {
             let point = handle.0.point(a, b);
@@ -653,7 +626,7 @@ fn corner(mesh, d, ids, key, x, y, z, band) {
     let snapped = false;
     if d.sdf(x, y, z) > -band {
         try {
-            let p = d.project(x, y, z);
+            let p = d.boundary_projection(x, y, z);
             x = p[0]; y = p[1]; z = p[2];
             snapped = true;
         } catch { }
@@ -678,14 +651,14 @@ fn boundary_tag(d, tags, wall_tag, x, y, z) {
 
 fn mesh_domain_3d(mesh, d, zone, tags, wall_tag, cells) {
     let b = d.bounds();
-    let h = b[1] - b[0];
-    if b[3] - b[2] > h { h = b[3] - b[2]; }
-    if b[5] - b[4] > h { h = b[5] - b[4]; }
+    let h = b.x_max - b.x_min;
+    if b.y_max - b.y_min > h { h = b.y_max - b.y_min; }
+    if b.z_max - b.z_min > h { h = b.z_max - b.z_min; }
     h = h / cells;
     let band = 1.05 * h;
-    let nx = cell_count(b[1] - b[0], h);
-    let ny = cell_count(b[3] - b[2], h);
-    let nz = cell_count(b[5] - b[4], h);
+    let nx = cell_count(b.x_max - b.x_min, h);
+    let ny = cell_count(b.y_max - b.y_min, h);
+    let nz = cell_count(b.z_max - b.z_min, h);
     let off = [[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]];
     let faces = [[0,3,7,4],[1,2,6,5],[0,1,5,4],[3,2,6,7],[0,1,2,3],[4,5,6,7]];
     let ids = #{};
@@ -695,22 +668,22 @@ fn mesh_domain_3d(mesh, d, zone, tags, wall_tag, cells) {
                 // keep the cell only if all corners and the centre are inside
                 let inside = true;
                 for o in off {
-                    let x = b[0] + (i + o[0]) * h;
-                    let y = b[2] + (j + o[1]) * h;
-                    let z = b[4] + (k + o[2]) * h;
+                    let x = b.x_min + (i + o[0]) * h;
+                    let y = b.y_min + (j + o[1]) * h;
+                    let z = b.z_min + (k + o[2]) * h;
                     if d.sdf(x, y, z) >= 0.0 { inside = false; break; }
                 }
                 if !inside { continue; }
-                let cx = b[0] + (i + 0.5) * h;
-                let cy = b[2] + (j + 0.5) * h;
-                let cz = b[4] + (k + 0.5) * h;
+                let cx = b.x_min + (i + 0.5) * h;
+                let cy = b.y_min + (j + 0.5) * h;
+                let cz = b.z_min + (k + 0.5) * h;
                 if d.sdf(cx, cy, cz) >= 0.0 { continue; }
 
                 let cs = [];
                 for o in off {
-                    let x = b[0] + (i + o[0]) * h;
-                    let y = b[2] + (j + o[1]) * h;
-                    let z = b[4] + (k + o[2]) * h;
+                    let x = b.x_min + (i + o[0]) * h;
+                    let y = b.y_min + (j + o[1]) * h;
+                    let z = b.z_min + (k + o[2]) * h;
                     let key = `${i + o[0]},${j + o[1]},${k + o[2]}`;
                     cs.push(corner(mesh, d, ids, key, x, y, z, band));
                 }
@@ -736,12 +709,12 @@ fn mesh_domain_3d(mesh, d, zone, tags, wall_tag, cells) {
 fn mesh_domain_2d(mesh, d, zone, tags, wall_tag, cells) {
     let space = d.mesh_space();
     let sb = space.bounds();
-    let h = sb[1] - sb[0];
-    if sb[3] - sb[2] > h { h = sb[3] - sb[2]; }
+    let h = sb.a_max - sb.a_min;
+    if sb.b_max - sb.b_min > h { h = sb.b_max - sb.b_min; }
     h = h / cells;
     let band = 1.05 * h;
-    let na = cell_count(sb[1] - sb[0], h);
-    let nb = cell_count(sb[3] - sb[2], h);
+    let na = cell_count(sb.a_max - sb.a_min, h);
+    let nb = cell_count(sb.b_max - sb.b_min, h);
     let off = [[0,0],[1,0],[1,1],[0,1]];
     let edges = [[0,1],[1,2],[2,3],[3,0]];
     let ids = #{};
@@ -749,16 +722,16 @@ fn mesh_domain_2d(mesh, d, zone, tags, wall_tag, cells) {
         for j in 0..nb {
             let inside = true;
             for o in off {
-                let w = space.point(sb[0] + (i + o[0]) * h, sb[2] + (j + o[1]) * h);
+                let w = space.point(sb.a_min + (i + o[0]) * h, sb.b_min + (j + o[1]) * h);
                 if d.sdf(w[0], w[1], w[2]) >= 0.0 { inside = false; break; }
             }
             if !inside { continue; }
-            let c = space.point(sb[0] + (i + 0.5) * h, sb[2] + (j + 0.5) * h);
+            let c = space.point(sb.a_min + (i + 0.5) * h, sb.b_min + (j + 0.5) * h);
             if d.sdf(c[0], c[1], c[2]) >= 0.0 { continue; }
 
             let cs = [];
             for o in off {
-                let w = space.point(sb[0] + (i + o[0]) * h, sb[2] + (j + o[1]) * h);
+                let w = space.point(sb.a_min + (i + o[0]) * h, sb.b_min + (j + o[1]) * h);
                 let key = `${i + o[0]},${j + o[1]}`;
                 cs.push(corner(mesh, d, ids, key, w[0], w[1], w[2], band));
             }
@@ -780,12 +753,8 @@ fn mesh_domain_2d(mesh, d, zone, tags, wall_tag, cells) {
 
 // ---------- every domain in the document ----------
 
-let seen = [];
-for key in domains.keys() {
-    let d = domains.get(key);
-    if d.name in seen { continue; }     // keys() also lists unique kinds
-    seen.push(d.name);
-
+for name in domains.names() {
+    let d = domains.get(name);
     let zone = mesh.zone(d.name, d.kind);
     let tags = #{};                     // physics tags travel with the mesh
     for r in d.regions() { tags[r.name] = mesh.tag(r.name, r.tag); }
@@ -821,7 +790,7 @@ mod tests {
         assert_eq!(mesh.tags.len(), 3);
 
         let domains = meshable_domains_from_document(&document).expect("domains");
-        let fluid = domains.get("fluid").expect("fluid");
+        let fluid = domains.get("von_karman_fluid").expect("fluid");
         let mut snapped = 0;
         for point in &mesh.points {
             let value = fluid.domain_sdf(&[vec3(
@@ -894,6 +863,7 @@ mod tests {
         let domain = document
             .combine(rect, circle, "difference")
             .expect("difference");
+        document.rename(domain, "fluid").expect("rename");
         document
             .set_domain_root(domain, DomainKind::Fluid)
             .expect("fluid domain");
@@ -904,7 +874,7 @@ mod tests {
             domains
                 .get("fluid")
                 .expect("fluid")
-                .classify_boundary(&[vec3(-2.0, 0.5, 0.0)], None)
+                .classify_boundary(&[vec3(-2.0, 0.5, 0.0)], BoundaryBand::UnprojectedSamples)
                 .expect("classify")[0]
                 .owner_object_id
         };
@@ -1013,7 +983,7 @@ mod tests {
             .add_boundary_region(box_id, None, Some("-X"), None)
             .expect("region");
         let script = r#"
-            let fluid = domains.get("fluid");
+            let fluid = domains.get("von_karman_fluid");
             let regions = fluid.regions();
             let r = regions[0];
             for candidate in regions {
@@ -1088,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_loops_are_scriptable() {
+    fn boundary_marching_samples_are_scriptable() {
         use caso_kernel::roles::DomainKind;
 
         let mut document = SceneDocument::new();
@@ -1103,30 +1073,47 @@ mod tests {
         let circle = document
             .add_primitive_from_drag("circle", vec3(0.2, -0.3, 0.0), vec3(0.8, 0.3, 0.0), 1.0)
             .expect("circle");
+        document.rename(circle, "pin").expect("rename");
         let domain = document
             .combine(rect, circle, "difference")
             .expect("difference");
+        document.rename(domain, "fluid").expect("rename");
         document
             .set_domain_root(domain, DomainKind::Fluid)
             .expect("fluid domain");
 
         let script = r#"
             let fluid = domains.get("fluid");
-            let loops = fluid.boundary_loops(32);
-            if loops.len() == 2 {
+            // The keyed listing names the outer loop and the hole's owner.
+            let names = fluid.boundaries();
+            if "outer" in names && "pin" in names {
                 mesh.point(1.0, 0.0, 0.0);
             }
-            for chain in loops {
-                if chain.is_outer && chain.spans.len() == 4 {
-                    mesh.point(2.0, 0.0, 0.0);
-                }
-                if !chain.is_outer && chain.area < 0.0 {
-                    mesh.point(3.0, 0.0, 0.0);
+            // The outer rectangle, sampled by name: exact ordered points.
+            let outer = fluid.boundary_marching_sample("outer", 24);
+            if outer.len() == 24 {
+                mesh.point(2.0, 0.0, 0.0);
+            }
+            // The hole, sampled by the subtracted object's name.
+            let hole = fluid.boundary_marching_sample("pin", 16);
+            let on_wall = hole.len() == 16;
+            for p in hole {
+                if fluid.sdf(p[0], p[1], p[2]).abs() > 1e-9 { on_wall = false; }
+            }
+            if on_wall {
+                mesh.point(3.0, 0.0, 0.0);
+            }
+            // Unknown names error, listing what exists.
+            try {
+                fluid.boundary_marching_sample("nope", 8);
+            } catch (error) {
+                if error.contains("outer") && error.contains("pin") {
+                    mesh.point(4.0, 0.0, 0.0);
                 }
             }
         "#;
         let mesh = run_mesher_script(&document, script).expect("script runs");
-        assert_eq!(mesh.points.len(), 3, "loops delivered to the script");
+        assert_eq!(mesh.points.len(), 4, "keyed sampling delivered to the script");
     }
 
     #[test]
@@ -1149,6 +1136,7 @@ mod tests {
         let section = document
             .add_primitive_from_drag("rectangle", vec3(0.0, 0.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
             .expect("rectangle");
+        document.rename(section, "fluid").expect("rename");
         document
             .set_domain_root(section, caso_kernel::roles::DomainKind::Fluid)
             .expect("domain");
@@ -1157,9 +1145,9 @@ mod tests {
             let space = fluid.mesh_space();
             let zone = mesh.zone("fluid", "fluid");
             let b = space.bounds();
-            let p0 = space.point(b[0], b[2]);
-            let p1 = space.point(b[1], b[2]);
-            let p2 = space.point(b[1], b[3]);
+            let p0 = space.point(b.a_min, b.b_min);
+            let p1 = space.point(b.a_max, b.b_min);
+            let p2 = space.point(b.a_max, b.b_max);
             if space.sdf(0.0, 0.0) < 0.0 {
                 let a = mesh.point(p0[0], p0[1], p0[2]);
                 let c = mesh.point(p1[0], p1[1], p1[2]);

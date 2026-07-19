@@ -224,6 +224,25 @@ impl MeshableBoundaryTag {
     }
 }
 
+/// Which on-boundary tolerance band a classification call means — the two
+/// named bands have different jobs (`design_docs/meshing_toolkit.md` §3),
+/// and the call site states which one it intends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BoundaryBand {
+    /// `1e-3 ×` diagonal (`RELATIVE_SURFACE_TOLERANCE`): accepts
+    /// unprojected samples — e.g. a straight face's centroid on a curved
+    /// wall, offset from it by the sagitta. The classifier/viewport
+    /// default.
+    UnprojectedSamples,
+    /// `1e-9 ×` diagonal (`differential::ZERO_BAND_RELATIVE`): for
+    /// vertices that went through `boundary_project` and sit exactly on
+    /// the wall — tight enough to resolve which side of a region junction
+    /// a vertex fell on.
+    ProjectedVertices,
+    /// An explicit absolute tolerance.
+    Custom(f64),
+}
+
 /// Total classification of one point against a domain boundary
 /// (`design_docs/meshing_toolkit.md` §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,8 +252,11 @@ pub struct BoundaryClass {
     /// The controlling leaf (same owner attribution picking uses); lets a
     /// mesher form default patches for untagged boundary.
     pub owner_object_id: u32,
-    /// The winning region (index into `boundary_regions`), `None` when no
+    /// The winning region's name — the answer itself; `None` when no
     /// region claims the point.
+    pub region_name: Option<String>,
+    /// The winning region's index into `boundary_regions`, paired with
+    /// `region_name` for callers that need the full region record.
     pub region_index: Option<usize>,
 }
 
@@ -368,14 +390,35 @@ impl MeshableDomain {
         RELATIVE_SURFACE_TOLERANCE * self.bounds.diagonal()
     }
 
-    /// All regions whose classifier accepts each point (multi-label view).
-    /// `tolerance: None` means each region's own default, exactly as the
-    /// viewport highlights — what is highlighted is what the mesher gets.
-    pub fn regions_containing(
+    /// The band's absolute value for the on-boundary test.
+    fn band_value(&self, band: BoundaryBand) -> f64 {
+        match band {
+            BoundaryBand::UnprojectedSamples => self.boundary_tolerance(),
+            BoundaryBand::ProjectedVertices => {
+                crate::differential::ZERO_BAND_RELATIVE * self.bounds.diagonal()
+            }
+            BoundaryBand::Custom(value) => value,
+        }
+    }
+
+    /// The band as a per-region mask override: `UnprojectedSamples` keeps
+    /// each region's own default (exactly what the viewport highlights —
+    /// what is highlighted is what the mesher gets).
+    fn band_override(&self, band: BoundaryBand) -> Option<f64> {
+        match band {
+            BoundaryBand::UnprojectedSamples => None,
+            other => Some(self.band_value(other)),
+        }
+    }
+
+    /// All regions whose classifier accepts each point, by index —
+    /// precedence needs the region records.
+    fn region_matches(
         &self,
         points: &[Vec3],
-        tolerance: Option<f64>,
+        band: BoundaryBand,
     ) -> GeometryResult<Vec<Vec<usize>>> {
+        let tolerance = self.band_override(band);
         let mut matches = vec![Vec::new(); points.len()];
         for (index, entry) in self.boundary_regions.iter().enumerate() {
             let mask = boundary_region_mask(&entry.root, &entry.region, points, tolerance)?;
@@ -386,6 +429,24 @@ impl MeshableDomain {
             }
         }
         Ok(matches)
+    }
+
+    /// All regions whose classifier accepts each point (multi-label view),
+    /// by NAME.
+    pub fn regions_containing(
+        &self,
+        points: &[Vec3],
+        band: BoundaryBand,
+    ) -> GeometryResult<Vec<Vec<String>>> {
+        Ok(self
+            .region_matches(points, band)?
+            .into_iter()
+            .map(|hits| {
+                hits.into_iter()
+                    .map(|index| self.boundary_regions[index].name.clone())
+                    .collect()
+            })
+            .collect())
     }
 
     /// Total boundary classification: for each point, whether it is on the
@@ -399,16 +460,16 @@ impl MeshableDomain {
     pub fn classify_boundary(
         &self,
         points: &[Vec3],
-        tolerance: Option<f64>,
+        band: BoundaryBand,
     ) -> GeometryResult<Vec<BoundaryClass>> {
-        let band = tolerance.unwrap_or_else(|| self.boundary_tolerance());
-        let matches = self.regions_containing(points, tolerance)?;
+        let band_value = self.band_value(band);
+        let matches = self.region_matches(points, band)?;
         Ok(points
             .iter()
             .zip(matches)
             .map(|(point, hits)| {
                 let (value, owner_object_id) = evaluate_with_attribution(&self.region, *point);
-                let on_boundary = value.abs() <= band;
+                let on_boundary = value.abs() <= band_value;
                 let region_index = if on_boundary {
                     hits.into_iter().max_by_key(|index| {
                         let region = &self.boundary_regions[*index].region;
@@ -422,6 +483,8 @@ impl MeshableDomain {
                 BoundaryClass {
                     on_boundary,
                     owner_object_id,
+                    region_name: region_index
+                        .map(|index| self.boundary_regions[index].name.clone()),
                     region_index,
                 }
             })
@@ -680,43 +743,26 @@ impl MeshableDomains {
             .collect()
     }
 
-    /// Lookup by name, or by domain kind when exactly one domain has it.
-    pub fn get(&self, key: &str) -> GeometryResult<&MeshableDomain> {
-        if let Some(domain) = self.items.iter().find(|domain| domain.name == key) {
-            return Ok(domain);
-        }
-        if let Ok(kind) = DomainKind::parse(key) {
-            let matches = self.by_kind(kind);
-            if matches.len() == 1 {
-                return Ok(matches[0]);
-            }
-            if matches.len() > 1 {
-                let names: Vec<&str> = matches.iter().map(|domain| domain.name.as_str()).collect();
-                return Err(GeometryError::new(format!(
-                    "domain kind {key:?} is ambiguous: {}",
-                    names.join(", ")
-                )));
-            }
-        }
-        Err(GeometryError::new(format!(
-            "unknown meshable domain {key:?}; available: {}",
-            self.keys().join(", ")
-        )))
+    /// Lookup by domain name only — never by kind. To find a domain of a
+    /// given kind, iterate `names()` and check `kind`, or use `by_kind`.
+    pub fn get(&self, name: &str) -> GeometryResult<&MeshableDomain> {
+        self.items
+            .iter()
+            .find(|domain| domain.name == name)
+            .ok_or_else(|| {
+                GeometryError::new(format!(
+                    "unknown meshable domain {name:?}; available: {}",
+                    self.names().join(", ")
+                ))
+            })
     }
 
-    /// Domain names plus the kinds that are unique to one domain.
-    pub fn keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self
-            .items
+    /// The domain names, in document order.
+    pub fn names(&self) -> Vec<String> {
+        self.items
             .iter()
             .map(|domain| domain.name.clone())
-            .collect();
-        for kind in [DomainKind::Fluid, DomainKind::Solid] {
-            if self.by_kind(kind).len() == 1 {
-                keys.push(kind.as_str().to_string());
-            }
-        }
-        keys
+            .collect()
     }
 }
 

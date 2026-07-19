@@ -57,9 +57,10 @@ centered on the true wall. Two bands, two jobs:
 | projection acceptance | `1e-9 ×` bbox diagonal | "this projected point landed on the wall" |
 | classification default | `1e-3 ×` owner bbox diagonal (`RELATIVE_SURFACE_TOLERANCE`, `boundary_ops.rs`) | "this unprojected sample belongs to the wall" — e.g. the centroid of a straight face on a curved wall, offset by the sagitta `h²/8r` |
 
-`classify_boundary` takes an explicit `Option<f64>` tolerance (mirroring
-`boundary_region_mask`): `None` means the classification default; a caller
-classifying projected vertices passes the tight band.
+`classify_boundary` takes the band by NAME (`BoundaryBand`, §5):
+`UnprojectedSamples` is the classification default, `ProjectedVertices` the
+tight band, `Custom(x)` an explicit absolute tolerance — the call site
+states which band it means.
 
 ## 4. Differential queries (`kernel/src/differential.rs`)
 
@@ -90,23 +91,31 @@ everywhere — layer seeding).
 
 ## 5. Total boundary classification (`kernel/src/meshing.rs`)
 
-`MeshableDomain::classify_boundary(points, tolerance)` returns per point
-`BoundaryClass { on_boundary, owner_object_id, region_index }`:
+`MeshableDomain::classify_boundary(points, band)` takes a **named** band —
+the call site states which tolerance it means, mapping §3's two bands to
+code: `BoundaryBand::UnprojectedSamples` (1e-3·diag, the classifier
+default; per-region masks keep each region's own default, exactly what the
+viewport highlights), `BoundaryBand::ProjectedVertices` (1e-9·diag, for
+vertices that went through `boundary_projection`), `BoundaryBand::Custom(x)`.
+Per point it returns
+`BoundaryClass { on_boundary, owner_object_id, region_name, region_index }`:
 
 - `on_boundary`: the band test (§3) on the domain region field.
 - `owner_object_id`: the controlling leaf from `evaluate_with_attribution` —
   the same owner attribution picking uses. Untagged boundary keeps this so
   a mesher can form default patches per owner leaf.
-- `region_index`: the winning region among those whose
+- `region_name`: the winning region's NAME among those whose
   `boundary_region_mask` accepts the point (the identical classifier the
-  viewport highlights use — what is highlighted is what the mesher gets).
+  viewport highlights use — what is highlighted is what the mesher gets);
+  the answer carries its meaning, no index chasing. `region_index` pairs
+  with it for callers that need the full region record.
 
 Precedence when several regions match: lexicographic maximum of
 `(cuts.len(), patch_scoped, index)` — more knife cuts is more specific; a
 patch- or direction-scoped region beats a whole-surface one at equal cuts;
 the final tie goes to the later-created region, so newer refinements
-override older broad tags. `regions_containing` returns all matches for
-callers that want the multi-label view.
+override older broad tags. `regions_containing` returns all matches — by
+name — for callers that want the multi-label view.
 
 ## 6. Domain interfaces (`kernel/src/meshing.rs`)
 
@@ -170,6 +179,22 @@ loops of a 2D domain:
    are CCW, holes CW in `mesh_space` chart coordinates; `signed_area` is
    computed in the chart; `is_outer = signed_area > 0`.
 
+### Keyed sampling (`meshing/src/toolkit/marching.rs`)
+
+Scripts consume loops through named boundaries, never positionally.
+`boundary_names(domain)` lists what a domain offers: `"outer"` (the outer
+loop), every boundary-region name, every contributing scene object's name
+(each span carries `owner_name`, the boolean operand whose outline it is).
+`boundary_marching_sample(domain, name, npoints)` selects the named spans
+("outer" first, then exact region names, then owner names), requires them
+to chain into ONE connected curve (selections wrapping a closed chain's
+seam are rotated; disconnected pieces error with the piece count — a
+direction-scoped region legitimately matches several walls), then marches
+by cumulative chord length and returns the EXACT vertices nearest to even
+spacing — never an interpolated chord point (§2). Closed boundaries give
+`npoints` points without repeating the head; open pieces include both
+endpoints; unknown names error listing `boundary_names`.
+
 ## 8. Sizing field (`meshing/src/toolkit/sizing.rs`)
 
 `SizingSpec { background = diag/20, min_size = diag·1e-4, gradation = 0.3,
@@ -187,12 +212,18 @@ error listing the available ones). `size_at(p)`:
 
 ## 9. Rhai bindings
 
-Same information, same names, thin handles: `d.normals / d.project /
-d.curvature / d.classify / d.boundary_loops`; `domains.interface(a, b)` (by
-names or handles, order-independent) + `domains.interfaces()`;
-`itf.sdf / itf.project / itf.contains`; `sizing(domain, spec_map)` →
-`size_at / sizes`. Scripts and future built-in meshers consume the identical
-API — no privileged path.
+Same information, self-describing names, thin handles — the full script
+reference lives in `docs/mesher_script_api.md`. Style rules the bindings
+follow: lookups are keyed by NAME only (`domains.get(name)`,
+`domains.names()` — kind is a property to filter on, never a lookup key);
+boundary queries carry their subject in the name (`boundary_projection`,
+`boundary_normal`, `boundary_curvature`, `boundary_marching_sample`,
+`boundaries`); bounds are named maps (`b.x_max - b.x_min`,
+`sb.a_min`), never flat arrays; every lookup error lists the available
+keys. `domains.interface(a, b)` (by names or handles, order-independent) +
+`domains.interfaces()`; `itf.sdf / itf.project / itf.contains`;
+`sizing(domain, spec_map)` → `size_at`. Scripts and future built-in meshers
+consume the identical API — no privileged path.
 
 ## 10. Verification
 

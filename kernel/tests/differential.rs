@@ -55,7 +55,7 @@ fn normals_match_analytic_on_sphere_and_box_faces() {
 #[test]
 fn projection_lands_on_surface_from_interior() {
     let domains = fluid_domain();
-    let domain = domains.get("fluid").expect("fluid");
+    let domain = domains.get("von_karman_fluid").expect("fluid");
     let (_, _, zero_band) = differential_steps(domain.region_node());
     // Unique nearest wall for each start: the -X face (0.3 away) and the
     // cylinder side wall (0.15 away).
@@ -85,7 +85,7 @@ fn projection_lands_on_surface_from_interior() {
 #[test]
 fn positive_start_is_refused_without_iterating() {
     let domains = fluid_domain();
-    let domain = domains.get("fluid").expect("fluid");
+    let domain = domains.get("von_karman_fluid").expect("fluid");
     let outside = vec3(-1.0, 0.0, 0.5);
     let projection = &domain.project_to_boundary(&[outside]).expect("projection")[0];
     assert!(!projection.converged);
@@ -97,7 +97,7 @@ fn positive_start_is_refused_without_iterating() {
 #[test]
 fn projection_reports_nonconvergence_on_equidistant_seam() {
     let domains = fluid_domain();
-    let domain = domains.get("fluid").expect("fluid");
+    let domain = domains.get("von_karman_fluid").expect("fluid");
     // Exactly midway between the parallel z = 0 and z = 1 walls, away from
     // every other wall: the gradient vanishes, no step can improve.
     let seam = vec3(3.5, 0.0, 0.5);
@@ -115,6 +115,7 @@ fn projection_2d_stays_in_plane() {
     document
         .rotate_object(section, RotationAxis::Z, 90.0, Some(vec3(0.0, 0.0, 0.0)))
         .expect("rotate");
+    document.rename(section, "fluid").expect("rename");
     document
         .set_domain_root(section, DomainKind::Fluid)
         .expect("domain");

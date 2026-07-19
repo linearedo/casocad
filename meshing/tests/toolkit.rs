@@ -1,10 +1,12 @@
 //! Toolkit gates (`design_docs/meshing_toolkit.md` §7-§8): exact tagged 2D
 //! boundary loops and the analytic sizing field.
 
-use caso_meshing::toolkit::{boundary_loops, SizingBand, SizingField, SizingSpec};
+use caso_meshing::toolkit::{
+    boundary_loops, boundary_marching_sample, boundary_names, SizingBand, SizingField, SizingSpec,
+};
 
 use caso_kernel::boundary_paths::point_knife;
-use caso_kernel::meshing::{meshable_domains_from_document, MeshableDomain};
+use caso_kernel::meshing::{meshable_domains_from_document, BoundaryBand, MeshableDomain};
 use caso_kernel::roles::DomainKind;
 use caso_kernel::scene::SceneDocument;
 use caso_kernel::sdf::node::RotationAxis;
@@ -22,6 +24,7 @@ fn rectangle_with_hole() -> SceneDocument {
     let domain = document
         .combine(rect, circle, "difference")
         .expect("difference");
+    document.rename(domain, "fluid").expect("rename");
     document
         .set_domain_root(domain, DomainKind::Fluid)
         .expect("fluid domain");
@@ -126,7 +129,7 @@ fn spans_split_exactly_at_region_junctions() {
     let owner = {
         let domains = meshable_domains_from_document(&document).expect("domains");
         let domain = domains.get("fluid").expect("fluid");
-        domain.classify_boundary(&[vec3(-2.0, 0.5, 0.0)], None).expect("classify")[0]
+        domain.classify_boundary(&[vec3(-2.0, 0.5, 0.0)], BoundaryBand::UnprojectedSamples).expect("classify")[0]
             .owner_object_id
     };
     let region_id = document
@@ -204,6 +207,7 @@ fn rectangle_with_marked_hole() -> (SceneDocument, u32) {
     let domain = document
         .combine(rect, circle, "difference")
         .expect("difference");
+    document.rename(domain, "fluid").expect("rename");
     document
         .set_domain_root(domain, DomainKind::Fluid)
         .expect("fluid domain");
@@ -243,11 +247,178 @@ fn loops_with_a_marked_solid_hole() {
     assert!(pin_loops[0].signed_area < circle_area);
 }
 
+#[test]
+fn boundary_names_list_outer_regions_and_owners() {
+    let (document, _circle_id) = rectangle_with_marked_hole();
+    let domains = meshable_domains_from_document(&document).expect("domains");
+
+    let fluid_names = boundary_names(domains.get("fluid").expect("fluid")).expect("names");
+    assert_eq!(fluid_names[0], "outer", "the outer loop is always first");
+    assert!(fluid_names.iter().any(|name| name == "pin"), "{fluid_names:?}");
+
+    let pin_names = boundary_names(domains.get("pin").expect("pin")).expect("names");
+    assert_eq!(pin_names, vec!["outer".to_string(), "pin".to_string()]);
+}
+
+#[test]
+fn marching_sample_outer_is_exact_ordered_and_even() {
+    let (document, _circle_id) = rectangle_with_marked_hole();
+    let domains = meshable_domains_from_document(&document).expect("domains");
+    let pin = domains.get("pin").expect("pin");
+
+    let sample = boundary_marching_sample(pin, "outer", 16).expect("sample");
+    assert_eq!(sample.len(), 16, "closed loop: npoints, head not repeated");
+    let band = 1e-8 * pin.bounds.diagonal();
+    let root = pin.region_node();
+    for point in &sample {
+        assert!(root.eval_point(*point).abs() <= band, "exact vertex {point:?}");
+    }
+    // CCW (material on the left of an outer loop) and roughly even spacing.
+    let mut area = 0.0;
+    let mut shortest = f64::INFINITY;
+    let mut longest = 0.0f64;
+    for index in 0..sample.len() {
+        let a = sample[index];
+        let b = sample[(index + 1) % sample.len()];
+        area += a.x * b.y - b.x * a.y;
+        let chord = (b - a).length();
+        shortest = shortest.min(chord);
+        longest = longest.max(chord);
+    }
+    assert!(area > 0.0, "solid outline runs CCW");
+    assert!(longest / shortest < 3.0, "even spacing: {shortest}..{longest}");
+}
+
+#[test]
+fn marching_sample_reaches_the_hole_by_owner_name() {
+    let (document, _circle_id) = rectangle_with_marked_hole();
+    let domains = meshable_domains_from_document(&document).expect("domains");
+    let fluid_domain = domains.get("fluid").expect("fluid");
+
+    let sample = boundary_marching_sample(fluid_domain, "pin", 16).expect("sample");
+    assert_eq!(sample.len(), 16);
+    let radius = (vec3(0.8, 0.3, 0.0) - vec3(0.5, 0.0, 0.0)).length();
+    for point in &sample {
+        let radial = (*point - vec3(0.5, 0.0, 0.0)).length();
+        assert!((radial - radius).abs() < 1e-8, "on the circle: {point:?}");
+    }
+    // The hole runs CW: material (the fluid) on the left.
+    let mut area = 0.0;
+    for index in 0..sample.len() {
+        let a = sample[index];
+        let b = sample[(index + 1) % sample.len()];
+        area += a.x * b.y - b.x * a.y;
+    }
+    assert!(area < 0.0, "hole sample runs CW");
+}
+
+#[test]
+fn marching_sample_region_is_open_with_exact_endpoints() {
+    // A plain rectangle: with a hole present, a direction-scoped region
+    // also claims the hole arc facing the same way (correctly reported as
+    // "not a single connected curve"), so the clean open piece needs a
+    // hole-free domain.
+    let mut document = SceneDocument::new();
+    let rect = document
+        .add_primitive_from_drag("rectangle", vec3(-2.0, -1.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+        .expect("rectangle");
+    document.rename(rect, "fluid").expect("rename");
+    document
+        .set_domain_root(rect, DomainKind::Fluid)
+        .expect("fluid domain");
+    // Tag the left edge (-axis_u direction) of the rectangle as "west".
+    let owner = {
+        let domains = meshable_domains_from_document(&document).expect("domains");
+        domains
+            .get("fluid")
+            .expect("fluid")
+            .classify_boundary(&[vec3(-2.0, 0.5, 0.0)], BoundaryBand::UnprojectedSamples)
+            .expect("classify")[0]
+            .owner_object_id
+    };
+    let region_id = document
+        .add_boundary_region(owner, Some(0), None, None)
+        .expect("west region");
+    document
+        .boundary_regions
+        .iter_mut()
+        .find(|region| region.object_id == region_id)
+        .expect("region")
+        .name = "west".to_string();
+
+    let domain = fluid(&document);
+    let names = boundary_names(&domain).expect("names");
+    assert!(names.iter().any(|name| name == "west"), "{names:?}");
+
+    let sample = boundary_marching_sample(&domain, "west", 5).expect("sample");
+    assert_eq!(sample.len(), 5, "open piece: both endpoints included");
+    // Endpoints land at the region's true extent: the classification
+    // transition sits within the tight band (~1e-9·diag) of each corner
+    // (the exact corner has no single outward direction, so it is not part
+    // of a direction-scoped region).
+    for corner in [vec3(-2.0, 1.0, 0.0), vec3(-2.0, -1.0, 0.0)] {
+        assert!(
+            [sample[0], sample[4]]
+                .iter()
+                .any(|point| (*point - corner).length() < 1e-6),
+            "endpoint at corner {corner:?}"
+        );
+    }
+    for point in &sample {
+        assert!((point.x + 2.0).abs() < 1e-12, "on the left edge: {point:?}");
+    }
+
+    // On the holed fixture the same direction region ALSO claims the arc of
+    // the hole facing -x: honestly refused as two pieces.
+    let holed = fluid(&{
+        let mut document = rectangle_with_hole();
+        let owner = {
+            let domains = meshable_domains_from_document(&document).expect("domains");
+            domains
+                .get("fluid")
+                .expect("fluid")
+                .classify_boundary(&[vec3(-2.0, 0.5, 0.0)], BoundaryBand::UnprojectedSamples)
+                .expect("classify")[0]
+                .owner_object_id
+        };
+        let region_id = document
+            .add_boundary_region(owner, Some(0), None, None)
+            .expect("west region");
+        document
+            .boundary_regions
+            .iter_mut()
+            .find(|region| region.object_id == region_id)
+            .expect("region")
+            .name = "west".to_string();
+        document
+    });
+    let split = boundary_marching_sample(&holed, "west", 5).expect_err("two pieces");
+    assert!(split.to_string().contains("not a single connected curve"));
+}
+
+#[test]
+fn marching_sample_errors_are_keyed_and_guarded() {
+    let (document, _circle_id) = rectangle_with_marked_hole();
+    let domains = meshable_domains_from_document(&document).expect("domains");
+    let fluid_domain = domains.get("fluid").expect("fluid");
+
+    let unknown = boundary_marching_sample(fluid_domain, "nope", 8).expect_err("unknown");
+    let message = unknown.to_string();
+    assert!(message.contains("outer"), "lists names: {message}");
+    assert!(message.contains("pin"), "lists names: {message}");
+
+    let too_few = boundary_marching_sample(fluid_domain, "outer", 1).expect_err("npoints");
+    assert!(too_few.to_string().contains("npoints"));
+
+    let volume = von_karman_fluid();
+    assert!(boundary_names(&volume).is_err(), "3D domains have no loops");
+}
+
 fn von_karman_fluid() -> MeshableDomain {
     let document = SceneDocument::default_scene().expect("default scene");
     meshable_domains_from_document(&document)
         .expect("domains")
-        .get("fluid")
+        .get("von_karman_fluid")
         .expect("fluid")
         .clone()
 }

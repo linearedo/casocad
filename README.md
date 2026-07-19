@@ -17,7 +17,9 @@ Principles:
 - SDF terminology: boolean operations are *SDF operators* (never "CSG");
   "meshing" is reserved for FEA/CFD — the viewport makes *surfaces*.
 
-See `DESIGN.md` for the architecture and product scope.
+See `DESIGN.md` for the architecture and product scope, and
+`docs/mesher_script_api.md` for the mesher scripting reference (the Rhai
+API the Meshing panel exposes).
 
 ## Crates
 

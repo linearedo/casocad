@@ -21,11 +21,10 @@ fn load_meshable_domains_from_scene_json() {
     assert_eq!(domains.len(), 1);
     let domain = domains.get("von_karman_fluid").expect("by name");
     assert_eq!(domain.kind, DomainKind::Fluid);
-    assert!(domains.get("fluid").is_ok(), "unique kind lookup");
-    assert_eq!(
-        domains.keys(),
-        vec!["von_karman_fluid".to_string(), "fluid".to_string()]
-    );
+    // Lookup is by NAME only — never by kind; the miss lists the names.
+    let error = domains.get("fluid").expect_err("name-only lookup");
+    assert!(error.to_string().contains("von_karman_fluid"));
+    assert_eq!(domains.names(), vec!["von_karman_fluid".to_string()]);
     assert_eq!(domain.dimension, 3);
     // inlet + outlet are direction-only regions: addressable as regions,
     // with no cut-chain tag fields.
@@ -46,7 +45,7 @@ fn load_meshable_domains_from_scene_json() {
 }
 
 #[test]
-fn ambiguous_kind_lookup_is_reported() {
+fn kind_is_queried_explicitly_never_by_name() {
     let mut document = SceneDocument::new();
     let water = document.add_primitive("sphere", 1.0).expect("water");
     let air = document.add_primitive("sphere", 1.0).expect("air");
@@ -62,12 +61,14 @@ fn ambiguous_kind_lookup_is_reported() {
     document
         .set_domain_root(air, DomainKind::Fluid)
         .expect("air domain");
-    // Two fluid domains: name lookup works, kind lookup is ambiguous.
+    // Two fluid domains: name lookup works; the explicit kind query is the
+    // only way to ask by kind ("fluid" is not a name here).
     let domains = meshable_domains_from_document(&document).expect("domains");
     assert_eq!(domains.get("water").expect("water").name, "water");
     assert_eq!(domains.by_kind(DomainKind::Fluid).len(), 2);
-    let error = domains.get("fluid").expect_err("ambiguous");
-    assert!(error.to_string().contains("ambiguous"));
+    let error = domains.get("fluid").expect_err("not a domain name");
+    assert!(error.to_string().contains("water"));
+    assert!(error.to_string().contains("air"));
 }
 
 #[test]
@@ -99,7 +100,7 @@ fn saved_solid_domain_is_loadable() {
 
     let domains = load_meshable_domains_from_str(&saved).expect("domains");
     assert_eq!(domains.len(), 1);
-    let domain = domains.get("solid").expect("by unique kind");
+    let domain = domains.get(&name).expect("by name");
     assert_eq!(domain.name, name);
     assert_eq!(domain.kind, DomainKind::Solid);
 }
@@ -113,6 +114,7 @@ fn rotated_2d_domain_exposes_mesh_space() {
     document
         .rotate_object(section, RotationAxis::Z, 90.0, Some(vec3(0.0, 0.0, 0.0)))
         .expect("rotate");
+    document.rename(section, "fluid").expect("rename");
     document
         .set_domain_root(section, DomainKind::Fluid)
         .expect("domain");

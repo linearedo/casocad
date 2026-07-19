@@ -425,7 +425,7 @@ fn nested_solid_and_fluid_each_carry_their_own_wall_region() {
     assert_eq!(domain_of(solid_region), Some(cylinder_id));
 
     let domains = meshable_domains_from_document(&document).expect("meshable");
-    let solid = domains.get("solid").expect("one solid domain");
+    let solid = domains.get("cylinder_obstacle").expect("one solid domain");
     assert_eq!(
         solid
             .boundary_regions
@@ -434,7 +434,7 @@ fn nested_solid_and_fluid_each_carry_their_own_wall_region() {
             .collect::<Vec<_>>(),
         vec!["cylinder_obstacle side_wall"],
     );
-    let fluid = domains.get("fluid").expect("one fluid domain");
+    let fluid = domains.get("von_karman_fluid").expect("one fluid domain");
     assert!(fluid
         .boundary_regions
         .iter()

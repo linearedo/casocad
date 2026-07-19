@@ -8,7 +8,7 @@
 //! `mesh_space` chart).
 
 use caso_kernel::boundary_ops::surface_patches_for_root;
-use caso_kernel::meshing::{MeshableDomain, MeshableDomainSpace};
+use caso_kernel::meshing::{BoundaryBand, MeshableDomain, MeshableDomainSpace};
 use caso_kernel::vec3::Vec3;
 use caso_kernel::{GeometryError, GeometryResult};
 use caso_surfaces::boundary_outline::curve_patch_arcs;
@@ -19,13 +19,12 @@ use caso_surfaces::boundary_outline::curve_patch_arcs;
 const WELD_RELATIVE: f64 = 1.0e-7;
 /// Interior probe offset for the orientation test, relative to the diagonal.
 const ORIENT_PROBE_RELATIVE: f64 = 1.0e-6;
-/// Classification band for loop vertices, relative to the diagonal. Loop
-/// vertices lie exactly on the outline, so the tight band suffices — and it
-/// is required: with the default (sagitta) band both halves of a knife-split
-/// region match near the knife, and the label transition would land at the
-/// band edge instead of on the knife's zero set, where the highlight seam
-/// lies.
-const LABEL_BAND_RELATIVE: f64 = 1.0e-9;
+// Loop vertices are classified with `BoundaryBand::ProjectedVertices`: they
+// lie exactly on the outline, so the tight band suffices — and it is
+// required: with the default (sagitta) band both halves of a knife-split
+// region match near the knife, and the label transition would land at the
+// band edge instead of on the knife's zero set, where the highlight seam
+// lies.
 const REGION_BISECTION_ITERATIONS: usize = 48;
 
 /// One run of boundary with a single classification: points exactly on the
@@ -34,6 +33,9 @@ const REGION_BISECTION_ITERATIONS: usize = 48;
 pub struct BoundarySpan {
     pub points: Vec<Vec3>,
     pub owner_object_id: u32,
+    /// Name of the scene object whose outline this piece is (the boolean
+    /// operand, not the merged root) — the key untagged pieces go by.
+    pub owner_name: String,
     pub patch_id: String,
     pub region_index: Option<usize>,
     pub region_name: Option<String>,
@@ -64,7 +66,6 @@ pub fn boundary_loops(
     let root = domain.region_node();
     let diagonal = domain.bounds.diagonal().max(1.0e-9);
     let weld = diagonal * WELD_RELATIVE;
-    let label_band = diagonal * LABEL_BAND_RELATIVE;
 
     let mut ring_chains: Vec<Vec<BoundarySpan>> = Vec::new();
     let mut open_spans: Vec<BoundarySpan> = Vec::new();
@@ -78,7 +79,7 @@ pub fn boundary_loops(
             }
             let closed =
                 arc.len() >= 3 && (arc[0] - arc[arc.len() - 1]).length() <= weld;
-            let spans = split_by_region(domain, &patch, &arc, label_band)?;
+            let spans = split_by_region(domain, &patch, &arc)?;
             if closed {
                 ring_chains.push(merge_ring_seam(spans));
             } else {
@@ -102,10 +103,9 @@ fn split_by_region(
     domain: &MeshableDomain,
     patch: &caso_kernel::boundary_ops::BoundarySurfacePatch,
     arc: &[Vec3],
-    label_band: f64,
 ) -> GeometryResult<Vec<BoundarySpan>> {
     let labels: Vec<Option<usize>> = domain
-        .classify_boundary(arc, Some(label_band))?
+        .classify_boundary(arc, BoundaryBand::ProjectedVertices)?
         .into_iter()
         .map(|class| class.region_index)
         .collect();
@@ -123,7 +123,6 @@ fn split_by_region(
             arc[index],
             arc[index + 1],
             labels[index],
-            label_band,
         )?;
         points.push(junction);
         spans.push(make_span(
@@ -152,6 +151,7 @@ fn make_span(
     BoundarySpan {
         points,
         owner_object_id: patch.owner_object_id,
+        owner_name: patch.owner.name.clone(),
         patch_id: patch.patch_id.clone(),
         region_index,
         region_name: region_index.map(|index| domain.boundary_regions[index].name.clone()),
@@ -165,13 +165,13 @@ fn bisect_region_transition(
     p: Vec3,
     q: Vec3,
     from_label: Option<usize>,
-    label_band: f64,
 ) -> GeometryResult<Vec3> {
     let (mut lo, mut hi) = (0.0f64, 1.0f64);
     for _ in 0..REGION_BISECTION_ITERATIONS {
         let mid = 0.5 * (lo + hi);
         let point = p + (q - p) * mid;
-        let label = domain.classify_boundary(&[point], Some(label_band))?[0].region_index;
+        let label =
+            domain.classify_boundary(&[point], BoundaryBand::ProjectedVertices)?[0].region_index;
         if label == from_label {
             lo = mid;
         } else {

@@ -2,7 +2,7 @@
 //! classification with owner attribution and precedence, and domain
 //! interfaces between nested marked domains.
 
-use caso_kernel::meshing::meshable_domains_from_document;
+use caso_kernel::meshing::{meshable_domains_from_document, BoundaryBand};
 use caso_kernel::roles::DomainKind;
 use caso_kernel::scene::{ObjectId, SceneDocument, ScenePayload};
 use caso_kernel::sdf::node::{Node, Shape};
@@ -29,17 +29,21 @@ fn default_scene_ids() -> (SceneDocument, ObjectId, ObjectId) {
 fn classification_covers_tagged_and_untagged_boundary() {
     let (document, box_id, cylinder_id) = default_scene_ids();
     let domains = meshable_domains_from_document(&document).expect("domains");
-    let domain = domains.get("fluid").expect("fluid");
+    let domain = domains.get("von_karman_fluid").expect("fluid");
 
     let points = [
         vec3(0.0, 0.0, 0.5),   // -X face centre: the inlet direction region
         vec3(1.95, 0.0, 0.5),  // cylinder wall: untagged boundary
         vec3(0.5, 0.0, 0.5),   // interior
     ];
-    let classes = domain.classify_boundary(&points, None).expect("classify");
+    let classes = domain
+        .classify_boundary(&points, BoundaryBand::UnprojectedSamples)
+        .expect("classify");
 
     assert!(classes[0].on_boundary);
     assert_eq!(classes[0].owner_object_id, box_id);
+    // The answer carries its name; the index pairs with it for record access.
+    assert_eq!(classes[0].region_name.as_deref(), Some("inlet"));
     let winner = classes[0].region_index.expect("inlet claims the -X face");
     assert_eq!(domain.boundary_regions[winner].name, "inlet");
 
@@ -48,49 +52,55 @@ fn classification_covers_tagged_and_untagged_boundary() {
         classes[1].owner_object_id, cylinder_id,
         "untagged boundary keeps its owner leaf for default patches"
     );
+    assert_eq!(classes[1].region_name, None);
     assert_eq!(classes[1].region_index, None);
 
     assert!(!classes[2].on_boundary);
-    assert_eq!(classes[2].region_index, None);
+    assert_eq!(classes[2].region_name, None);
 }
 
 #[test]
-fn explicit_tolerance_selects_the_band() {
+fn named_bands_select_the_tolerance() {
     let (document, _box_id, cylinder_id) = default_scene_ids();
     let domains = meshable_domains_from_document(&document).expect("domains");
-    let domain = domains.get("fluid").expect("fluid");
+    let domain = domains.get("von_karman_fluid").expect("fluid");
 
     // A centroid-like sample 1 mm off the cylinder wall (the sagitta case).
     let sample = [vec3(1.949, 0.0, 0.5)];
-    let default_band = domain.classify_boundary(&sample, None).expect("classify");
-    assert!(default_band[0].on_boundary, "default band accepts the sample");
-    assert_eq!(default_band[0].owner_object_id, cylinder_id);
+    let samples_band = domain
+        .classify_boundary(&sample, BoundaryBand::UnprojectedSamples)
+        .expect("classify");
+    assert!(samples_band[0].on_boundary, "the sample band accepts it");
+    assert_eq!(samples_band[0].owner_object_id, cylinder_id);
 
-    let tight = 1e-9 * domain.bounds.diagonal();
     let tight_band = domain
-        .classify_boundary(&sample, Some(tight))
+        .classify_boundary(&sample, BoundaryBand::ProjectedVertices)
         .expect("classify");
     assert!(
         !tight_band[0].on_boundary,
         "the projected-vertex band rejects an unprojected sample"
     );
+    // Custom with the same absolute value behaves identically to the name.
+    let custom = domain
+        .classify_boundary(&sample, BoundaryBand::Custom(1e-9 * domain.bounds.diagonal()))
+        .expect("classify");
+    assert_eq!(custom[0].on_boundary, tight_band[0].on_boundary);
 
     // A point exactly on the wall passes both bands.
     let on_wall = [vec3(1.95, 0.0, 0.5)];
-    assert!(domain.classify_boundary(&on_wall, Some(tight)).expect("classify")[0].on_boundary);
-}
-
-fn region_name(
-    domain: &caso_kernel::meshing::MeshableDomain,
-    index: Option<usize>,
-) -> &str {
-    &domain.boundary_regions[index.expect("a region wins")].name
+    assert!(
+        domain
+            .classify_boundary(&on_wall, BoundaryBand::ProjectedVertices)
+            .expect("classify")[0]
+            .on_boundary
+    );
 }
 
 #[test]
 fn classification_precedence_is_cuts_then_scope_then_creation_order() {
     let mut document = SceneDocument::new();
     let box_id = document.add_primitive("box", 1.0).expect("box");
+    document.rename(box_id, "fluid").expect("rename");
     document
         .set_domain_root(box_id, DomainKind::Fluid)
         .expect("fluid domain");
@@ -135,17 +145,20 @@ fn classification_precedence_is_cuts_then_scope_then_creation_order() {
 
     // -X face: only the whole regions match — later creation wins the tie.
     let classes = domain
-        .classify_boundary(&[minus_x, plus_x], None)
+        .classify_boundary(&[minus_x, plus_x], BoundaryBand::UnprojectedSamples)
         .expect("classify");
-    assert_eq!(region_name(domain, classes[0].region_index), "whole_b");
+    assert_eq!(classes[0].region_name.as_deref(), Some("whole_b"));
     // +X face: the scoped region beats both whole-surface ones despite
     // being created first.
-    assert_eq!(region_name(domain, classes[1].region_index), "outlet_face");
-    // Multi-label view returns every match.
+    assert_eq!(classes[1].region_name.as_deref(), Some("outlet_face"));
+    // Multi-label view returns every match, by name.
     let matches = domain
-        .regions_containing(&[plus_x], None)
+        .regions_containing(&[plus_x], BoundaryBand::UnprojectedSamples)
         .expect("containing");
     assert_eq!(matches[0].len(), 3);
+    for name in ["outlet_face", "whole_a", "whole_b"] {
+        assert!(matches[0].iter().any(|hit| hit == name), "{name}");
+    }
 
     // Split whole_b with a knife around the -X face centre: the cut region
     // (1 cut) now beats every 0-cut region there.
@@ -158,9 +171,11 @@ fn classification_precedence_is_cuts_then_scope_then_creation_order() {
         .expect("split");
     let domains = meshable_domains_from_document(&document).expect("domains");
     let domain = domains.get("fluid").expect("fluid");
-    let classes = domain.classify_boundary(&[minus_x], None).expect("classify");
+    let classes = domain
+        .classify_boundary(&[minus_x], BoundaryBand::UnprojectedSamples)
+        .expect("classify");
     assert!(
-        region_name(domain, classes[0].region_index).contains("inside"),
+        classes[0].region_name.as_deref().expect("a region wins").contains("inside"),
         "the knife-cut region is the most specific"
     );
 }
@@ -339,7 +354,7 @@ fn nested_2d_solid_meshes_and_pairs_an_interface() {
 
     // The hole boundary keeps the ellipse leaf as its owner.
     let classes = fluid
-        .classify_boundary(&[vec3(0.9, 0.0, 0.0)], None)
+        .classify_boundary(&[vec3(0.9, 0.0, 0.0)], BoundaryBand::UnprojectedSamples)
         .expect("classify");
     assert!(classes[0].on_boundary);
     assert_eq!(classes[0].owner_object_id, ellipse_id);
