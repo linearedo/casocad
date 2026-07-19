@@ -350,9 +350,13 @@ fn region_curve_patch(root: &Node, region: &BoundaryRegion) -> Option<BoundarySu
 /// junctions — see `curve_patch_arcs`), else the legacy classifier-masked
 /// outline-ring segments (regions without a resolvable patch). Every arc is
 /// open: consecutive pairs only, closure is explicit.
-fn region_highlight_arcs(root: &Node, region: &BoundaryRegion) -> Vec<Vec<Vec3>> {
-    if let Some(patch) = region_curve_patch(root, region) {
-        return curve_patch_arcs(root, &patch, OUTLINE_RING_RESOLUTION);
+fn region_highlight_arcs(
+    root: &Node,
+    region: &BoundaryRegion,
+    patch: Option<&BoundarySurfacePatch>,
+) -> Vec<Vec<Vec3>> {
+    if let Some(patch) = patch {
+        return curve_patch_arcs(root, patch, OUTLINE_RING_RESOLUTION);
     }
     let Some(placed) = placed_2d_root(root) else {
         return Vec::new();
@@ -396,8 +400,17 @@ fn region_highlight_ribbon(
         .map(|bounds| bounds.diagonal())
         .unwrap_or(1.0);
     let step = (diagonal * 1.0e-5).max(1.0e-9);
-    let half_width = diagonal * 4.0e-3;
-    let lift = diagonal * 1.5e-3;
+    // Ribbon size follows the feature the region tags (the operand that owns
+    // the patch), not the whole domain: editing an unrelated operand must not
+    // fatten the highlight of an unchanged one.
+    let patch = region_curve_patch(root, region);
+    let feature_diagonal = patch
+        .as_ref()
+        .and_then(|patch| patch.owner.bounding_box().ok())
+        .map(|bounds| bounds.diagonal())
+        .unwrap_or(diagonal);
+    let half_width = feature_diagonal * 4.0e-3;
+    let lift = feature_diagonal * 1.5e-3;
     // Cut volumes once per call; a failed cut_volume hides the highlight
     // (matching the classifier's error behavior), as in the 3D path.
     let mut cut_volumes: Vec<(Node, CutSide)> = Vec::with_capacity(region.cuts.len());
@@ -408,7 +421,7 @@ fn region_highlight_ribbon(
     let mut vertices: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
-    for arc in region_highlight_arcs(root, region) {
+    for arc in region_highlight_arcs(root, region, patch.as_ref()) {
         for pair in arc.windows(2) {
             let (mut p, mut q) = (pair[0], pair[1]);
             let mut dropped = false;
@@ -942,9 +955,15 @@ mod tests {
     /// circle obstacle (center (0.5, 0), r 0.3), merged like coplanar 2D
     /// scene booleans (one placed node, operand nodes in `sources`).
     fn fixture_2d() -> (Node, ViewportSurfaceScene) {
+        fixture_2d_scaled(1.0)
+    }
+
+    /// `fixture_2d` with the flowbox rectangle enlarged by `scale`; the
+    /// circle obstacle stays the same.
+    fn fixture_2d_scaled(scale: f64) -> (Node, ViewportSurfaceScene) {
         let rect_profile = Profile2D::Rectangle {
             center: [0.0, 0.0],
-            half_size: [2.0, 1.0],
+            half_size: [2.0 * scale, 1.0 * scale],
         };
         let circle_profile = Profile2D::Circle {
             center: [0.5, 0.0],
@@ -1097,5 +1116,50 @@ mod tests {
         let error = cutter_ghost(&root, "point", &[vec3(0.0, 0.0, 0.5)])
             .expect_err("3D root refused");
         assert!(error.contains("2D"), "unexpected error: {error}");
+    }
+
+    /// Ribbon width of a region's highlight: the first quad's first two
+    /// vertices are `p ± outward * half_width`.
+    fn ribbon_width(root: &Node, scene: &ViewportSurfaceScene, patch_id: &str) -> f64 {
+        let patch = surface_patches_for_root(root)
+            .into_iter()
+            .find(|patch| patch.patch_id == patch_id)
+            .unwrap_or_else(|| panic!("patch {patch_id} exists"));
+        let mut region = BoundaryRegion::new("region", 100, patch.owner_object_id);
+        region.patch_id = Some(patch.patch_id.clone());
+        region.patch_type = Some(patch.patch_type.clone());
+        region.outside_direction = patch.outside_direction;
+        let surface =
+            region_highlight_ribbon(root, &region, scene, [1.0, 0.0, 0.0], 999).expect("ribbon");
+        let a = surface.vertices[0];
+        let b = surface.vertices[1];
+        vec3(
+            (a[0] - b[0]) as f64,
+            (a[1] - b[1]) as f64,
+            (a[2] - b[2]) as f64,
+        )
+        .length()
+    }
+
+    #[test]
+    fn highlight_width_follows_the_patch_owner_not_the_whole_domain() {
+        let (small, small_scene) = fixture_2d();
+        let (large, large_scene) = fixture_2d_scaled(3.0);
+        // The circle is unchanged, so its highlight must not grow with the
+        // flowbox (it used to scale with the whole root's diagonal).
+        let hole = "cut_surface.obstacle.outline";
+        let width_small = ribbon_width(&small, &small_scene, hole);
+        let width_large = ribbon_width(&large, &large_scene, hole);
+        assert!(
+            ((width_large - width_small) / width_small).abs() < 1.0e-5,
+            "circle ribbon width changed with the flowbox: {width_small} -> {width_large}"
+        );
+        // A flowbox edge is owned by the flowbox: its ribbon still scales.
+        let edge_small = ribbon_width(&small, &small_scene, "flowbox.-U");
+        let edge_large = ribbon_width(&large, &large_scene, "flowbox.-U");
+        assert!(
+            edge_large > edge_small * 2.0,
+            "flowbox edge ribbon should scale with the flowbox: {edge_small} -> {edge_large}"
+        );
     }
 }

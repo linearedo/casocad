@@ -91,6 +91,20 @@ lateral + tangential pads) instead of an isotropic eval limit:
 3D patches are untouched, and `region_patch_scope_volume` keeps its old
 behavior for external callers.
 
+### Ribbon size follows the patch owner (follow-up fix)
+
+The highlight ribbon's `half_width` and `lift` used to scale with the
+WHOLE root's bounding-box diagonal, so enlarging one operand (the flowbox
+rectangle) visibly fattened the highlight of an unchanged one (the
+subtracted ellipse). `region_highlight_ribbon` now sizes the ribbon from
+the bounding box of `patch.owner` — the operand the region tags — falling
+back to the root diagonal only when no curve patch resolves (legacy ring
+path). Numerical epsilons (gradient step, degenerate-chord drop) stay on
+the root diagonal; they are field tolerances, not visuals. Deferred:
+constant screen-pixel ribbon width, which would need camera-dependent
+overlay rebuilds (`refresh_boundary_overlays` keys only on scene/overlay
+revision and selection today).
+
 ## 3. Tests
 
 - `surfaces/tests/boundary_outline_arcs.rs`: interior-hole edges run
@@ -100,6 +114,9 @@ behavior for external callers.
 - `kernel/tests/boundary_region_2d.rs`: nearest-wins between cut and edge,
   pick radius honored, edge scope stops at the corner (shared corner still
   belongs to both edges).
+- `app/src/boundary_tool.rs` tests: ribbon width of the subtracted
+  circle's highlight is unchanged when the flowbox rectangle triples;
+  a flowbox edge's ribbon still scales with the flowbox.
 - Existing suites pass unmodified.
 
 ## 4. Deliberately unchanged / deferred
