@@ -14,6 +14,11 @@ use crate::types::{
 
 const MAX_CONTOURED_2D_CELLS: u32 = 96;
 const MAX_SAMPLED_2D_CELLS: u32 = 48;
+/// Cells across a small operand's bbox when splicing refinement lines into
+/// the contouring grid, and the refinement budget in extra boxes — a tiny
+/// subtracted hole in a huge surface must land on several cells, not zero.
+const FINE_OPERAND_CELLS: usize = 32;
+const MAX_REFINED_OPERAND_BOXES: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Analytic profile outlines
@@ -380,40 +385,41 @@ pub fn marching_squares_rings(
     us: &[f64],
     vs: &[f64],
 ) -> Vec<Vec<Point2>> {
-    let resolution = us.len() - 1;
-    let value_at = |i: usize, j: usize| values[i * (resolution + 1) + j];
-    let mut horizontal = vec![-1i64; resolution * (resolution + 1)];
-    let mut vertical = vec![-1i64; (resolution + 1) * resolution];
+    let cells_u = us.len() - 1;
+    let cells_v = vs.len() - 1;
+    let value_at = |i: usize, j: usize| values[i * (cells_v + 1) + j];
+    let mut horizontal = vec![-1i64; cells_u * (cells_v + 1)];
+    let mut vertical = vec![-1i64; (cells_u + 1) * cells_v];
     let mut vertices: Vec<Point2> = Vec::new();
 
-    for i in 0..resolution {
-        for j in 0..=resolution {
+    for i in 0..cells_u {
+        for j in 0..=cells_v {
             let first = value_at(i, j);
             let second = value_at(i + 1, j);
             if !edge_has_crossing(first, second) {
                 continue;
             }
             let t = (first / (first - second)).clamp(0.0, 1.0);
-            horizontal[i * (resolution + 1) + j] = vertices.len() as i64;
+            horizontal[i * (cells_v + 1) + j] = vertices.len() as i64;
             vertices.push([us[i] + t * (us[i + 1] - us[i]), vs[j]]);
         }
     }
-    for i in 0..=resolution {
-        for j in 0..resolution {
+    for i in 0..=cells_u {
+        for j in 0..cells_v {
             let first = value_at(i, j);
             let second = value_at(i, j + 1);
             if !edge_has_crossing(first, second) {
                 continue;
             }
             let t = (first / (first - second)).clamp(0.0, 1.0);
-            vertical[i * resolution + j] = vertices.len() as i64;
+            vertical[i * cells_v + j] = vertices.len() as i64;
             vertices.push([us[i], vs[j] + t * (vs[j + 1] - vs[j])]);
         }
     }
 
     let mut segments: Vec<(usize, usize)> = Vec::new();
-    for i in 0..resolution {
-        for j in 0..resolution {
+    for i in 0..cells_u {
+        for j in 0..cells_v {
             let mut mask = 0u8;
             if value_at(i, j) <= 0.0 {
                 mask |= 1;
@@ -437,10 +443,10 @@ pub fn marching_squares_rings(
                 / 4.0
                 <= 0.0;
             let edge_vertices = [
-                horizontal[i * (resolution + 1) + j],
-                vertical[(i + 1) * resolution + j],
-                horizontal[i * (resolution + 1) + j + 1],
-                vertical[i * resolution + j],
+                horizontal[i * (cells_v + 1) + j],
+                vertical[(i + 1) * cells_v + j],
+                horizontal[i * (cells_v + 1) + j + 1],
+                vertical[i * cells_v + j],
             ];
             for (first, second) in marching_square_pairs(mask, center_inside) {
                 let first_vertex = edge_vertices[*first];
@@ -561,23 +567,280 @@ fn clean_polygon_ring(ring: &[Point2]) -> Vec<Point2> {
     cleaned
 }
 
-fn contour_rings_have_holes(rings: &[Vec<Point2>]) -> bool {
+/// Group contour rings by even-odd nesting: every even-depth ring is an
+/// outer boundary (returned CCW) carrying the odd-depth rings directly
+/// inside it as holes (returned CW). Islands inside holes come back as
+/// their own outer group.
+fn classify_contour_rings(rings: &[Vec<Point2>]) -> Vec<(Vec<Point2>, Vec<Vec<Point2>>)> {
+    let depths: Vec<usize> = (0..rings.len())
+        .map(|index| {
+            rings
+                .iter()
+                .enumerate()
+                .filter(|(other_index, other)| {
+                    *other_index != index && point_in_polygon_2d(rings[index][0], other)
+                })
+                .count()
+        })
+        .collect();
+    let mut groups: Vec<(Vec<Point2>, Vec<Vec<Point2>>)> = Vec::new();
+    let mut group_of_ring: Vec<Option<usize>> = vec![None; rings.len()];
     for (index, ring) in rings.iter().enumerate() {
-        let probe = ring[0];
-        let mut depth = 0;
-        for (other_index, other) in rings.iter().enumerate() {
-            if index == other_index {
-                continue;
-            }
-            if point_in_polygon_2d(probe, other) {
-                depth += 1;
-            }
+        if !depths[index].is_multiple_of(2) {
+            continue;
         }
-        if depth % 2 == 1 {
-            return true;
+        let mut outer = ring.clone();
+        if signed_area_2d(&outer) < 0.0 {
+            outer.reverse();
+        }
+        group_of_ring[index] = Some(groups.len());
+        groups.push((outer, Vec::new()));
+    }
+    for (index, ring) in rings.iter().enumerate() {
+        if depths[index] % 2 != 1 {
+            continue;
+        }
+        // Immediate parent: the smallest even-depth ring one level up that
+        // contains this hole's probe point.
+        let parent = rings
+            .iter()
+            .enumerate()
+            .filter(|(other_index, other)| {
+                depths[*other_index] == depths[index] - 1
+                    && point_in_polygon_2d(ring[0], other)
+            })
+            .min_by(|(_, a), (_, b)| {
+                signed_area_2d(a)
+                    .abs()
+                    .partial_cmp(&signed_area_2d(b).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .and_then(|(other_index, _)| group_of_ring[other_index]);
+        if let Some(group) = parent {
+            let mut hole = ring.clone();
+            if signed_area_2d(&hole) > 0.0 {
+                hole.reverse();
+            }
+            groups[group].1.push(hole);
         }
     }
-    false
+    groups
+}
+
+/// Keyhole cut: splice `hole` (CW, global indices `hole_start..hole_start +
+/// hole_len` into `verts`) into the merged polygon `seq` (CCW, global
+/// indices) through a bridge at the hole's max-u vertex, per Eberly's
+/// "Triangulation by Ear Clipping". False = no visible bridge target.
+fn bridge_hole_into(
+    seq: &mut Vec<usize>,
+    verts: &[Point2],
+    hole_start: usize,
+    hole_len: usize,
+) -> bool {
+    let hole_at = |k: usize| verts[hole_start + k % hole_len];
+    let mutual = (0..hole_len).max_by(|a, b| {
+        let (pa, pb) = (hole_at(*a), hole_at(*b));
+        (pa[0], pa[1])
+            .partial_cmp(&(pb[0], pb[1]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let Some(m) = mutual else {
+        return false;
+    };
+    let anchor = hole_at(m);
+    // Nearest crossing of the +u ray from the anchor with the current
+    // merged polygon (half-open edge rule so shared vertices count once).
+    let mut best: Option<(f64, usize)> = None;
+    for position in 0..seq.len() {
+        let a = verts[seq[position]];
+        let b = verts[seq[(position + 1) % seq.len()]];
+        let (low, high) = if a[1] <= b[1] { (a, b) } else { (b, a) };
+        if !(low[1] <= anchor[1] && anchor[1] < high[1]) {
+            continue;
+        }
+        let t = (anchor[1] - a[1]) / (b[1] - a[1]);
+        let crossing_u = a[0] + t * (b[0] - a[0]);
+        if crossing_u <= anchor[0] {
+            continue;
+        }
+        if best.is_none_or(|(u, _)| crossing_u < u) {
+            best = Some((crossing_u, position));
+        }
+    }
+    let Some((crossing_u, edge_position)) = best else {
+        return false;
+    };
+    let intersection = [crossing_u, anchor[1]];
+    // Candidate bridge target: the intersected edge's endpoint of larger u;
+    // any reflex vertex inside triangle (anchor, intersection, candidate)
+    // is closer to the ray and must be used instead (pick the closest).
+    let edge_a = seq[edge_position];
+    let edge_b = seq[(edge_position + 1) % seq.len()];
+    let mut target_position = if verts[edge_a][0] >= verts[edge_b][0] {
+        edge_position
+    } else {
+        (edge_position + 1) % seq.len()
+    };
+    let mut target_distance = {
+        let p = verts[seq[target_position]];
+        (p[0] - anchor[0]).hypot(p[1] - anchor[1])
+    };
+    for position in 0..seq.len() {
+        let previous = verts[seq[(position + seq.len() - 1) % seq.len()]];
+        let point = verts[seq[position]];
+        let next = verts[seq[(position + 1) % seq.len()]];
+        if cross_2d(previous, point, next) >= -1.0e-12 {
+            continue; // convex vertex of the CCW polygon
+        }
+        if !point_in_triangle_2d(point, anchor, intersection, verts[seq[target_position]])
+            && !point_in_triangle_2d(point, anchor, verts[seq[target_position]], intersection)
+        {
+            continue;
+        }
+        let distance = (point[0] - anchor[0]).hypot(point[1] - anchor[1]);
+        if distance < target_distance {
+            target_position = position;
+            target_distance = distance;
+        }
+    }
+    // Splice: ...target, anchor, hole walk (back to anchor), target...
+    let mut merged = Vec::with_capacity(seq.len() + hole_len + 2);
+    merged.extend_from_slice(&seq[..=target_position]);
+    for k in 0..=hole_len {
+        merged.push(hole_start + (m + k) % hole_len);
+    }
+    merged.extend_from_slice(&seq[target_position..]);
+    *seq = merged;
+    true
+}
+
+/// Ear-clip a weakly simple CCW polygon given as global indices into
+/// `verts` (bridge vertices appear twice). Emits global-index triangles;
+/// None when clipping gets stuck on a degenerate configuration.
+fn ear_clip_indexed(seq: &[usize], verts: &[Point2]) -> Option<Vec<u32>> {
+    let mut remaining: Vec<usize> = seq.to_vec();
+    let mut triangles: Vec<u32> = Vec::new();
+    let mut guard = remaining.len() * remaining.len();
+    while remaining.len() > 3 && guard > 0 {
+        guard -= 1;
+        let mut clipped = false;
+        for position in 0..remaining.len() {
+            let previous = remaining[(position + remaining.len() - 1) % remaining.len()];
+            let current = remaining[position];
+            let next = remaining[(position + 1) % remaining.len()];
+            let (a, b, c) = (verts[previous], verts[current], verts[next]);
+            if cross_2d(a, b, c) <= 1.0e-12 {
+                continue;
+            }
+            let blocked = remaining.iter().any(|candidate| {
+                let point = verts[*candidate];
+                *candidate != previous
+                    && *candidate != current
+                    && *candidate != next
+                    && !points_close_2d(point, a)
+                    && !points_close_2d(point, b)
+                    && !points_close_2d(point, c)
+                    && point_in_triangle_2d(point, a, b, c)
+            });
+            if blocked {
+                continue;
+            }
+            triangles.extend_from_slice(&[previous as u32, current as u32, next as u32]);
+            remaining.remove(position);
+            clipped = true;
+            break;
+        }
+        if clipped {
+            continue;
+        }
+        // Degenerate sweep: drop a collinear vertex and retry.
+        for position in 0..remaining.len() {
+            let previous = remaining[(position + remaining.len() - 1) % remaining.len()];
+            let current = remaining[position];
+            let next = remaining[(position + 1) % remaining.len()];
+            if cross_2d(verts[previous], verts[current], verts[next]).abs() <= 1.0e-12 {
+                remaining.remove(position);
+                clipped = true;
+                break;
+            }
+        }
+        if !clipped {
+            return None;
+        }
+    }
+    if remaining.len() == 3 {
+        triangles.extend_from_slice(&[
+            remaining[0] as u32,
+            remaining[1] as u32,
+            remaining[2] as u32,
+        ]);
+    }
+    if triangles.is_empty() {
+        None
+    } else {
+        Some(triangles)
+    }
+}
+
+/// Fill one outer ring (CCW) with its holes (CW): vertices are outer then
+/// holes in order; fill indices come from keyhole bridging + ear clipping,
+/// wire indices outline every ring. None = the caller should fall back.
+fn triangulate_ring_group(
+    outer: &[Point2],
+    holes: &[Vec<Point2>],
+) -> Option<(Vec<Point2>, Vec<u32>, Vec<u32>)> {
+    let mut verts: Vec<Point2> = outer.to_vec();
+    let mut hole_ranges: Vec<(usize, usize)> = Vec::with_capacity(holes.len());
+    for hole in holes {
+        hole_ranges.push((verts.len(), hole.len()));
+        verts.extend_from_slice(hole);
+    }
+    let mut wire: Vec<u32> = Vec::new();
+    let mut ring_wire = |start: usize, len: usize| {
+        for k in 0..len {
+            wire.push((start + k) as u32);
+            wire.push((start + (k + 1) % len) as u32);
+        }
+    };
+    ring_wire(0, outer.len());
+    for (start, len) in &hole_ranges {
+        ring_wire(*start, *len);
+    }
+
+    let indices = if holes.is_empty() {
+        let triangles = triangulate_simple_polygon(outer);
+        if triangles.is_empty() {
+            return None;
+        }
+        triangles
+            .iter()
+            .flat_map(|triangle| triangle.map(|index| index as u32))
+            .collect()
+    } else {
+        // Bridge the rightmost hole first so later rays can only hit the
+        // outer ring or already-merged holes.
+        let mut order: Vec<usize> = (0..hole_ranges.len()).collect();
+        let hole_max_u = |group: usize| -> f64 {
+            let (start, len) = hole_ranges[group];
+            verts[start..start + len]
+                .iter()
+                .fold(f64::NEG_INFINITY, |acc, point| acc.max(point[0]))
+        };
+        order.sort_by(|a, b| {
+            hole_max_u(*b)
+                .partial_cmp(&hole_max_u(*a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut seq: Vec<usize> = (0..outer.len()).collect();
+        for group in order {
+            let (start, len) = hole_ranges[group];
+            if !bridge_hole_into(&mut seq, &verts, start, len) {
+                return None;
+            }
+        }
+        ear_clip_indexed(&seq, &verts)?
+    };
+    Some((verts, indices, wire))
 }
 
 // ---------------------------------------------------------------------------
@@ -790,27 +1053,152 @@ fn ordered_placed_2d_surface(
 /// which need a polyline that lies ON the outline (the display fill's wire
 /// is a staircase of grid edges on the sampled fallback path).
 pub fn placed_outline_rings(placed: &PlacedSdf2D, resolution: usize) -> Vec<Vec<Vec3>> {
-    let (mut u_min, mut u_max, mut v_min, mut v_max) = placed.profile.bounds();
+    profile_contour_rings(&placed.profile, resolution.clamp(16, 512))
+        .iter()
+        .map(|ring| {
+            ring.iter()
+                .map(|point| placed.origin + placed.axis_u * point[0] + placed.axis_v * point[1])
+                .collect()
+        })
+        .collect()
+}
+
+/// Padded sampling window of a profile: (u_min, u_max, v_min, v_max, span).
+fn padded_profile_bounds(profile: &Profile2D) -> (f64, f64, f64, f64, f64) {
+    let (mut u_min, mut u_max, mut v_min, mut v_max) = profile.bounds();
     let span = (u_max - u_min).max(v_max - v_min).max(1.0e-6);
     let pad = span * 0.025;
     u_min -= pad;
     u_max += pad;
     v_min -= pad;
     v_max += pad;
-    let resolution = resolution.clamp(16, 512);
-    let us: Vec<f64> = (0..=resolution)
-        .map(|index| u_min + (u_max - u_min) * index as f64 / resolution as f64)
-        .collect();
-    let vs: Vec<f64> = (0..=resolution)
-        .map(|index| v_min + (v_max - v_min) * index as f64 / resolution as f64)
-        .collect();
-    let mut values = Vec::with_capacity((resolution + 1) * (resolution + 1));
-    for u in &us {
-        for v in &vs {
-            values.push(placed.profile.eval(*u, *v));
+    (u_min, u_max, v_min, v_max, span)
+}
+
+/// Bboxes of every leaf operand of a profile tree, in the tree root's
+/// (u, v) frame: Binary recurses both sides, Offset shifts, DistanceOffset
+/// pads. Feeds grid refinement around operands the coarse grid would miss.
+fn collect_operand_bounds(
+    profile: &Profile2D,
+    du: f64,
+    dv: f64,
+    out: &mut Vec<(f64, f64, f64, f64)>,
+) {
+    match profile {
+        Profile2D::Binary { left, right, .. } => {
+            collect_operand_bounds(left, du, dv, out);
+            collect_operand_bounds(right, du, dv, out);
+        }
+        Profile2D::Offset { child, offset } => {
+            collect_operand_bounds(child, du + offset[0], dv + offset[1], out);
+        }
+        Profile2D::DistanceOffset { child, offset } => {
+            let start = out.len();
+            collect_operand_bounds(child, du, dv, out);
+            let padding = offset.abs();
+            for bounds in &mut out[start..] {
+                bounds.0 -= padding;
+                bounds.1 += padding;
+                bounds.2 -= padding;
+                bounds.3 += padding;
+            }
+        }
+        leaf => {
+            let (u_min, u_max, v_min, v_max) = leaf.bounds();
+            out.push((u_min + du, u_max + du, v_min + dv, v_max + dv));
         }
     }
+}
+
+/// Contouring grid axes: `base_cells` uniform lines over the window, with
+/// `FINE_OPERAND_CELLS` finer lines spliced across every leaf operand too
+/// small for the coarse grid to resolve (smallest operands first, budget
+/// capped). Sorted and deduped; non-uniform spacing is fine for marching
+/// squares.
+fn refined_grid_axes(
+    profile: &Profile2D,
+    window: (f64, f64, f64, f64),
+    base_cells: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let (u_min, u_max, v_min, v_max) = window;
+    let mut us: Vec<f64> = (0..=base_cells)
+        .map(|index| u_min + (u_max - u_min) * index as f64 / base_cells as f64)
+        .collect();
+    let mut vs: Vec<f64> = (0..=base_cells)
+        .map(|index| v_min + (v_max - v_min) * index as f64 / base_cells as f64)
+        .collect();
+    let coarse_u = (u_max - u_min) / base_cells as f64;
+    let coarse_v = (v_max - v_min) / base_cells as f64;
+    let mut boxes: Vec<(f64, f64, f64, f64)> = Vec::new();
+    collect_operand_bounds(profile, 0.0, 0.0, &mut boxes);
+    boxes.retain(|(bu_min, bu_max, bv_min, bv_max)| {
+        let span_u = bu_max - bu_min;
+        let span_v = bv_max - bv_min;
+        span_u > 0.0 && span_v > 0.0 && (span_u < 2.0 * coarse_u || span_v < 2.0 * coarse_v)
+    });
+    boxes.sort_by(|a, b| {
+        ((a.1 - a.0).max(a.3 - a.2))
+            .partial_cmp(&(b.1 - b.0).max(b.3 - b.2))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (bu_min, bu_max, bv_min, bv_max) in boxes.into_iter().take(MAX_REFINED_OPERAND_BOXES) {
+        let pad_u = (bu_max - bu_min) * 0.2;
+        let pad_v = (bv_max - bv_min) * 0.2;
+        for index in 0..=FINE_OPERAND_CELLS {
+            let t = index as f64 / FINE_OPERAND_CELLS as f64;
+            let u = bu_min - pad_u + (bu_max - bu_min + 2.0 * pad_u) * t;
+            if u > u_min && u < u_max {
+                us.push(u);
+            }
+            let v = bv_min - pad_v + (bv_max - bv_min + 2.0 * pad_v) * t;
+            if v > v_min && v < v_max {
+                vs.push(v);
+            }
+        }
+    }
+    let dedupe = |lines: &mut Vec<f64>, epsilon: f64| {
+        lines.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        lines.dedup_by(|a, b| (*a - *b).abs() <= epsilon);
+    };
+    dedupe(&mut us, (u_max - u_min) * 1.0e-9);
+    dedupe(&mut vs, (v_max - v_min) * 1.0e-9);
+    (us, vs)
+}
+
+/// Newton-refine a local (u, v) sample onto the profile's exact zero set
+/// (shared by the boundary outline rings and the contoured display fill).
+fn newton_refine_onto_outline(profile: &Profile2D, span: f64, u: f64, v: f64) -> (f64, f64) {
     let step = span * 1.0e-7;
+    let (mut u, mut v) = (u, v);
+    for _ in 0..12 {
+        let value = profile.eval(u, v);
+        if value.abs() <= span * 1.0e-12 {
+            break;
+        }
+        let gu = (profile.eval(u + step, v) - profile.eval(u - step, v)) / (2.0 * step);
+        let gv = (profile.eval(u, v + step) - profile.eval(u, v - step)) / (2.0 * step);
+        let squared = gu * gu + gv * gv;
+        if squared <= 1.0e-18 {
+            break;
+        }
+        u -= value * gu / squared;
+        v -= value * gv / squared;
+    }
+    (u, v)
+}
+
+/// Cleaned, Newton-snapped marching-squares rings of a profile over the
+/// feature-refined grid. Ring orientation is whatever the stitcher
+/// produced; callers normalize per role.
+fn profile_contour_rings(profile: &Profile2D, base_cells: usize) -> Vec<Vec<Point2>> {
+    let (u_min, u_max, v_min, v_max, span) = padded_profile_bounds(profile);
+    let (us, vs) = refined_grid_axes(profile, (u_min, u_max, v_min, v_max), base_cells);
+    let mut values = Vec::with_capacity(us.len() * vs.len());
+    for u in &us {
+        for v in &vs {
+            values.push(profile.eval(*u, *v));
+        }
+    }
     marching_squares_rings(&values, &us, &vs)
         .iter()
         .filter_map(|ring| {
@@ -822,26 +1210,8 @@ pub fn placed_outline_rings(placed: &PlacedSdf2D, resolution: usize) -> Vec<Vec<
                 cleaned
                     .iter()
                     .map(|point| {
-                        let (mut u, mut v) = (point[0], point[1]);
-                        for _ in 0..12 {
-                            let value = placed.profile.eval(u, v);
-                            if value.abs() <= span * 1.0e-12 {
-                                break;
-                            }
-                            let gu = (placed.profile.eval(u + step, v)
-                                - placed.profile.eval(u - step, v))
-                                / (2.0 * step);
-                            let gv = (placed.profile.eval(u, v + step)
-                                - placed.profile.eval(u, v - step))
-                                / (2.0 * step);
-                            let squared = gu * gu + gv * gv;
-                            if squared <= 1.0e-18 {
-                                break;
-                            }
-                            u -= value * gu / squared;
-                            v -= value * gv / squared;
-                        }
-                        placed.origin + placed.axis_u * u + placed.axis_v * v
+                        let (u, v) = newton_refine_onto_outline(profile, span, point[0], point[1]);
+                        [u, v]
                     })
                     .collect(),
             )
@@ -855,65 +1225,21 @@ fn contoured_placed_2d_surface(
     key: ViewportSurfaceKey,
     color: [f32; 3],
 ) -> Option<ViewportSurface> {
-    let (mut u_min, mut u_max, mut v_min, mut v_max) = placed.profile.bounds();
-    let span = (u_max - u_min).max(v_max - v_min).max(1.0e-6);
-    let pad = span * 0.025;
-    u_min -= pad;
-    u_max += pad;
-    v_min -= pad;
-    v_max += pad;
-    let resolution = (key.resolution * 5).clamp(64, MAX_CONTOURED_2D_CELLS) as usize;
-    let us: Vec<f64> = (0..=resolution)
-        .map(|index| u_min + (u_max - u_min) * index as f64 / resolution as f64)
-        .collect();
-    let vs: Vec<f64> = (0..=resolution)
-        .map(|index| v_min + (v_max - v_min) * index as f64 / resolution as f64)
-        .collect();
-    let mut values = Vec::with_capacity((resolution + 1) * (resolution + 1));
-    for u in &us {
-        for v in &vs {
-            values.push(placed.profile.eval(*u, *v));
-        }
-    }
-    let local_rings = marching_squares_rings(&values, &us, &vs);
-    if local_rings.is_empty() {
-        return None;
-    }
-    let mut cleaned_rings: Vec<Vec<Point2>> = Vec::new();
-    for ring in &local_rings {
-        let mut cleaned = clean_polygon_ring(ring);
-        if cleaned.len() < 3 {
-            continue;
-        }
-        if signed_area_2d(&cleaned) < 0.0 {
-            cleaned.reverse();
-        }
-        cleaned_rings.push(cleaned);
-    }
-    if cleaned_rings.is_empty() || contour_rings_have_holes(&cleaned_rings) {
+    let base_cells = (key.resolution * 5).clamp(64, MAX_CONTOURED_2D_CELLS) as usize;
+    let cleaned_rings = profile_contour_rings(&placed.profile, base_cells);
+    if cleaned_rings.is_empty() {
         return None;
     }
 
     let mut local_vertices: Vec<Point2> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     let mut wire: Vec<u32> = Vec::new();
-    for cleaned in &cleaned_rings {
-        let triangles = triangulate_simple_polygon(cleaned);
-        if triangles.is_empty() {
-            continue;
-        }
+    for (outer, holes) in classify_contour_rings(&cleaned_rings) {
+        let (verts, fill, ring_wire) = triangulate_ring_group(&outer, &holes)?;
         let base = local_vertices.len() as u32;
-        local_vertices.extend_from_slice(cleaned);
-        for triangle in triangles {
-            for index in triangle {
-                indices.push(base + index as u32);
-            }
-        }
-        let count = cleaned.len() as u32;
-        for index in 0..count {
-            wire.push(base + index);
-            wire.push(base + (index + 1) % count);
-        }
+        local_vertices.extend_from_slice(&verts);
+        indices.extend(fill.iter().map(|index| base + index));
+        wire.extend(ring_wire.iter().map(|index| base + index));
     }
     if local_vertices.is_empty() || indices.is_empty() {
         return None;
