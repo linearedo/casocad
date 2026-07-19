@@ -335,7 +335,11 @@ Boundary regions are not fluid-only: they attach to ANY marked domain
 
 - Patch id naming for merged profiles: source object names
   (`airfoil.outline`) when `sources` are resolvable, index paths as fallback.
-- Whether `CURVE_PATCH_PICK_TOLERANCE` becomes `0.05 × diagonal` or a screen-
-  space radius like the sketch snap (`tools.rs` snap uses screen points);
-  start with scale-relative world tolerance for kernel purity, revisit UX.
+- ~~Whether `CURVE_PATCH_PICK_TOLERANCE` becomes `0.05 × diagonal` or a
+  screen-space radius~~ — RESOLVED (2026-07-19,
+  `boundary_region_2d_precision.md`): the viewport passes a screen-derived
+  world radius (~8 px at the workplane); the kernel default is
+  `0.01 × diagonal`, and picking is nearest-wins with cut preference only
+  on near-ties. The same doc replaces the ring-resampled highlight with
+  patch-exact arcs.
 - `BoundaryRegion::dimension()` hardcoded 2 — audit and possibly derive.
