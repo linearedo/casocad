@@ -431,6 +431,43 @@ fn cut_chain_field(root: &Node, region: &BoundaryRegion) -> GeometryResult<Optio
     Ok(Some(SelectorField { parts }))
 }
 
+/// Boundary entries of one non-fluid marked domain: its regions are
+/// attached by their `domain_root` (the fluid domain keeps its tag-list
+/// path below, which also carries `TagRef::Node` tag objects).
+fn domain_boundary_entries(
+    document: &SceneDocument,
+    root: &Node,
+    domain_root_id: u32,
+) -> (Vec<MeshableBoundaryTag>, Vec<MeshableBoundaryRegion>) {
+    let mut tags = Vec::new();
+    let mut regions = Vec::new();
+    for region in &document.boundary_regions {
+        if document.region_domain_root(region) != Some(domain_root_id) {
+            continue;
+        }
+        let Some(owner) = find_node_by_object_id(root, region.owner_object_id) else {
+            continue;
+        };
+        let selector = cut_chain_field(root, region).ok().flatten();
+        if let Some(field) = &selector {
+            tags.push(MeshableBoundaryTag {
+                name: region.name.clone(),
+                field: field.clone(),
+            });
+        }
+        regions.push(MeshableBoundaryRegion {
+            name: region.name.clone(),
+            tag: region.tag.clone(),
+            owner_object_id: region.owner_object_id,
+            root: root.clone(),
+            region: region.clone(),
+            owner: owner.clone(),
+            selector,
+        });
+    }
+    (tags, regions)
+}
+
 fn fluid_boundary_entries(
     document: &SceneDocument,
     root: &Node,
@@ -497,16 +534,22 @@ pub fn meshable_domains_from_document(document: &SceneDocument) -> GeometryResul
     let fluid_root_id = document.fluid_domain.as_ref().map(|fluid| fluid.root);
     let mut items = Vec::new();
     for domain in &model.domains {
-        let is_fluid_root = fluid_root_id.is_some_and(|root_id| {
-            document
-                .object(root_id)
-                .map(|object| object.name == domain.name)
-                .unwrap_or(false)
-        });
-        let (boundary_tags, boundary_regions) = if is_fluid_root {
-            fluid_boundary_entries(document, &domain.region)
-        } else {
-            (Vec::new(), Vec::new())
+        let marked_id = document
+            .domain_kinds
+            .keys()
+            .find(|id| {
+                document
+                    .object(**id)
+                    .map(|object| object.name == domain.name)
+                    .unwrap_or(false)
+            })
+            .copied();
+        let (boundary_tags, boundary_regions) = match marked_id {
+            Some(root_id) if fluid_root_id == Some(root_id) => {
+                fluid_boundary_entries(document, &domain.region)
+            }
+            Some(root_id) => domain_boundary_entries(document, &domain.region, root_id),
+            None => (Vec::new(), Vec::new()),
         };
         items.push(MeshableDomain {
             name: domain.name.clone(),

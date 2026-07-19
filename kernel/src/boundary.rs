@@ -50,6 +50,10 @@ pub struct BoundaryRegion {
     pub name: String,
     pub object_id: u32,
     pub owner_object_id: u32,
+    /// The marked domain whose boundary this region tags (any `DomainKind`,
+    /// not only fluid). `None` on regions from older files, which resolve
+    /// to the fluid domain for backward compatibility.
+    pub domain_root: Option<u32>,
     pub outside_direction: Option<u8>,
     pub patch_id: Option<String>,
     pub patch_type: Option<String>,
@@ -63,6 +67,7 @@ impl BoundaryRegion {
             name: name.into(),
             object_id,
             owner_object_id,
+            domain_root: None,
             outside_direction: None,
             patch_id: None,
             patch_type: None,

@@ -59,8 +59,9 @@ pub const POINT_KINDS: [(&str, &str); 6] = [
 /// Cutter knife kinds: (menu label, kind key). A smooth on-surface polyline
 /// knife existed until 2026-07-12 and was removed as unproven — see
 /// design_docs/boundary_cutter_exactness.md for its archived design record.
-pub const KNIFE_KINDS: [(&str, &str); 3] = [
+pub const KNIFE_KINDS: [(&str, &str); 4] = [
     ("Segment (drag)", "segment"),
+    ("Point (2D domains, click)", "point"),
     ("Polygon (points)", "polygon"),
     ("Bezier Surface (points)", "quadratic_bezier_surface"),
 ];
@@ -84,10 +85,10 @@ fn needs_odd_points(kind: &str) -> bool {
 
 /// Fewest points that define a knife of the given kind.
 fn knife_minimum_points(knife: &str) -> usize {
-    if knife == "segment" {
-        2
-    } else {
-        3
+    match knife {
+        "point" => 1,
+        "segment" => 2,
+        _ => 3,
     }
 }
 
@@ -143,6 +144,8 @@ pub struct ToolState {
     gizmo_pivot: Option<Vec3>,
     /// Boundary tool: the candidate patch under the cursor.
     pub hover_hit: Option<BoundaryPatchHit>,
+    /// The marked domain whose boundary `hover_hit` was picked on.
+    pub hover_domain: Option<u32>,
     /// Cutter: the knife ghost built from the current gesture.
     pub preview_ghost: Option<Node>,
     /// Create tools: real-geometry ghost of the object that would commit
@@ -178,6 +181,7 @@ impl Default for ToolState {
             gizmo_last: None,
             gizmo_pivot: None,
             hover_hit: None,
+            hover_domain: None,
             preview_ghost: None,
             create_ghost: None,
             create_ghost_sig: None,
@@ -287,6 +291,7 @@ impl ToolState {
             self.overlay_revision += 1;
         }
         self.hover_hit = None;
+        self.hover_domain = None;
         self.preview_ghost = None;
         self.create_ghost = None;
         self.create_ghost_sig = None;
@@ -476,13 +481,14 @@ impl ToolState {
         if self.points.is_empty() {
             return false;
         }
-        let Some(root) = boundary_tool::fluid_root_node(&state.document) else {
-            state.status = "Cutter: set a Fluid Domain first".to_string();
-            return true;
-        };
         let Some(region_id) = state.selected_region else {
             state.status =
                 "Cutter: select a boundary region first (Boundary Region tool)".to_string();
+            return true;
+        };
+        let Some(root) = boundary_tool::selected_region_root(&state.document, Some(region_id))
+        else {
+            state.status = "Cutter: the region's Domain is no longer marked".to_string();
             return true;
         };
         let minimum = knife_minimum_points(knife);
@@ -530,7 +536,7 @@ impl ToolState {
     /// below the knife's minimum); builder warnings/errors reach the status
     /// line at preview time.
     fn refresh_cutter_ghost(&mut self, knife: &'static str, state: &mut AppState) {
-        let root = boundary_tool::fluid_root_node(&state.document);
+        let root = boundary_tool::selected_region_root(&state.document, state.selected_region);
         self.preview_ghost = match root {
             Some(root) if self.points.len() >= knife_minimum_points(knife) => {
                 match boundary_tool::cutter_ghost(&root, knife, &self.points) {
@@ -627,32 +633,52 @@ impl ToolState {
         pixels_per_point: f32,
         state: &mut AppState,
     ) -> bool {
-        let Some(root) = boundary_tool::fluid_root_node(&state.document) else {
-            state.status = "Boundary Region: set a Fluid Domain first".to_string();
-            self.set_hover(None);
+        let roots = boundary_tool::domain_root_nodes(&state.document);
+        if roots.is_empty() {
+            state.status = "Boundary Region: mark a Domain (fluid or solid) first".to_string();
+            self.set_hover(None, None);
             // Camera stays usable while the tool cannot act.
             return false;
-        };
+        }
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        // Pick against every marked domain's boundary; the nearest hit
+        // along the ray wins (a solid nested in a fluid difference has both
+        // boundaries under the cursor — they coincide, so the first domain
+        // in fluid-first order takes strictly-equal ties).
         let hit = pointer.filter(|pos| rect.contains(*pos)).and_then(|pos| {
             let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
-            boundary_tool::pick_patch(&root, origin, direction)
+            let mut best: Option<(f64, u32, BoundaryPatchHit)> = None;
+            for (domain_id, root) in &roots {
+                let Some(candidate) = boundary_tool::pick_patch(root, origin, direction) else {
+                    continue;
+                };
+                let travel = (candidate.point - origin).length();
+                if best.as_ref().map(|(t, _, _)| travel < *t).unwrap_or(true) {
+                    best = Some((travel, *domain_id, candidate));
+                }
+            }
+            best.map(|(_, domain_id, candidate)| (domain_id, candidate))
         });
-        self.set_hover(hit);
+        match hit {
+            Some((domain_id, hit)) => self.set_hover(Some(hit), Some(domain_id)),
+            None => self.set_hover(None, None),
+        }
         if response.clicked() {
-            if let Some(hit) = self.hover_hit.clone() {
+            if let (Some(hit), Some(domain_id)) = (self.hover_hit.clone(), self.hover_domain) {
                 // Click selects an existing matching region, else creates one.
                 let existing = state.document.boundary_regions.iter().find(|region| {
                     region.owner_object_id == hit.owner_object_id
                         && region.patch_id.as_deref() == Some(hit.patch_id.as_str())
                         && region.cuts.is_empty()
+                        && state.document.region_domain_root(region) == Some(domain_id)
                 });
                 if let Some(region) = existing {
                     state.selected_region = Some(region.object_id);
                     state.status = format!("Selected region {}", region.name);
                 } else {
                     state.push_undo();
-                    let result = state.document.add_boundary_region(
+                    let result = state.document.add_boundary_region_in(
+                        domain_id,
                         hit.owner_object_id,
                         hit.outside_direction,
                         Some(&hit.patch_id),
@@ -683,14 +709,17 @@ impl ToolState {
         self.create_ghost_sig = sig;
     }
 
-    fn set_hover(&mut self, hit: Option<BoundaryPatchHit>) {
+    fn set_hover(&mut self, hit: Option<BoundaryPatchHit>, domain: Option<u32>) {
         let signature = |candidate: &BoundaryPatchHit| {
             (candidate.owner_object_id, candidate.patch_id.clone())
         };
-        if self.hover_hit.as_ref().map(&signature) != hit.as_ref().map(&signature) {
+        if self.hover_hit.as_ref().map(&signature) != hit.as_ref().map(&signature)
+            || self.hover_domain != domain
+        {
             self.overlay_revision += 1;
         }
         self.hover_hit = hit;
+        self.hover_domain = domain;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -704,19 +733,20 @@ impl ToolState {
         pixels_per_point: f32,
         state: &mut AppState,
     ) -> bool {
-        let Some(root) = boundary_tool::fluid_root_node(&state.document) else {
-            state.status = "Cutter: set a Fluid Domain first".to_string();
-            return false;
-        };
         if state.selected_region.is_none() {
             state.status = "Cutter: select a boundary region first (Boundary Region tool)"
                 .to_string();
             return false;
         }
+        let Some(root) = boundary_tool::selected_region_root(&state.document, state.selected_region)
+        else {
+            state.status = "Cutter: the region's Domain is no longer marked".to_string();
+            return false;
+        };
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
         let pick = |pos: egui::Pos2| -> Option<Vec3> {
             let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
-            boundary_tool::pick_surface_point(&root, origin, direction)
+            boundary_tool::pick_cut_point(&root, origin, direction)
                 .or_else(|| grid_point(camera, pos, rect, pixels_per_point))
         };
         let mut points_changed = false;
@@ -738,9 +768,16 @@ impl ToolState {
             }
         } else if response.clicked() {
             if let Some(point) = pointer.and_then(pick) {
-                self.points.push(point);
+                if knife == "point" {
+                    // One point defines the knife; another click moves it.
+                    self.points = vec![point];
+                    state.status = "point knife placed — Enter splits".to_string();
+                } else {
+                    self.points.push(point);
+                    state.status =
+                        format!("{} knife point(s) — Enter splits", self.points.len());
+                }
                 points_changed = true;
-                state.status = format!("{} knife point(s) — Enter splits", self.points.len());
             }
         }
         // Rebuild the knife ghost (drives the cyan/orange split preview);

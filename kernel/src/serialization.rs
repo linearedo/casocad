@@ -940,6 +940,14 @@ fn region_to_json(
         .ok_or_else(|| err(format!("region owner {} not in scene", region.owner_object_id)))?;
     let mut record = Map::new();
     record.insert("owner".into(), owner_key.clone().into());
+    // Which marked domain the region tags (absent in older files, where
+    // regions were implicitly fluid).
+    if let Some(domain_key) = region
+        .domain_root
+        .and_then(|root| names.node_keys.get(&root))
+    {
+        record.insert("domain".into(), domain_key.clone().into());
+    }
     if region.name != key {
         record.insert("name".into(), region.name.clone().into());
     }
@@ -1389,10 +1397,15 @@ fn region_from_record(
             });
         }
     }
+    let domain_root = match get_str(record, "domain") {
+        Some(domain_name) => Some(loader.build(domain_name)?),
+        None => None,
+    };
     let region = BoundaryRegion {
         name: get_str(record, "name").unwrap_or(key).to_string(),
         object_id,
         owner_object_id: owner,
+        domain_root,
         outside_direction: record
             .get("outside_direction")
             .and_then(Value::as_u64)

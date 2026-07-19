@@ -17,8 +17,8 @@ use crate::error::{GeometryError, GeometryResult};
 use crate::frame::Frame;
 use crate::sdf::node::{Node, RotationAxis, Shape};
 use crate::sdf::placed::PlacedSdf2D;
-use crate::sdf::primitives_1d::Profile1D;
-use crate::sdf::primitives_2d::Profile2D;
+use crate::sdf::primitives_1d::{BooleanOp1D, Profile1D};
+use crate::sdf::primitives_2d::{Point2, Profile2D};
 use crate::sdf::primitives_3d::{Box3, Cylinder, Sphere};
 use crate::sdf::solid_from_2d::Extrude;
 use crate::vec3::{vec3, Vec3};
@@ -477,10 +477,32 @@ pub struct BoundarySurfacePatch {
     pub patch_type: String,
     /// Path from the root to the owner is not retained; the owner node is
     /// cloned (matching the Python dataclass holding a node reference).
+    /// For curve patches (2D domains) this is the boolean *operand* whose
+    /// outline the patch belongs to, while `owner_object_id` stays the
+    /// merged root's id — the single provenance leaf a 2D domain has.
     pub owner: Node,
     pub normal: Option<Vec3>,
     pub outside_direction: Option<u8>,
     pub normal_sign: f64,
+    /// Present only for 2D domains: the patch is a piece of the outline
+    /// curve, not a surface.
+    pub curve: Option<CurvePatchKind>,
+}
+
+/// One nameable piece of a 2D domain's outline curve — the curve analog of a
+/// box face (2D domain → 1D boundary, one dimension down from 3D → 2D).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CurvePatchKind {
+    /// A straight edge between two world points with its in-plane outward
+    /// normal (rectangle edge, polygon segment).
+    Edge {
+        start: Vec3,
+        end: Vec3,
+        outward: Vec3,
+    },
+    /// The operand's whole outline (circles, beziers, non-decomposable
+    /// profiles) — the curve analog of the generic whole-surface patch.
+    Outline,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -539,6 +561,7 @@ fn surface_patches_for_node(
                     normal: Some(normal),
                     outside_direction: Some(index as u8),
                     normal_sign,
+                    curve: None,
                 });
             }
         }
@@ -552,6 +575,7 @@ fn surface_patches_for_node(
                 normal: None,
                 outside_direction: None,
                 normal_sign,
+                curve: None,
             });
             out.push(BoundarySurfacePatch {
                 owner_object_id: node.object_id,
@@ -561,6 +585,7 @@ fn surface_patches_for_node(
                 normal: Some(-frame.w),
                 outside_direction: Some(4),
                 normal_sign,
+                curve: None,
             });
             out.push(BoundarySurfacePatch {
                 owner_object_id: node.object_id,
@@ -570,7 +595,18 @@ fn surface_patches_for_node(
                 normal: Some(frame.w),
                 outside_direction: Some(5),
                 normal_sign,
+                curve: None,
             });
+        }
+        Shape::PlacedSdf2D(_) => {
+            if node.object_id == 0 {
+                return;
+            }
+            // 2D domain root: the boundary is the outline curve. Coplanar 2D
+            // booleans merge into ONE placed node (the single provenance
+            // leaf), keeping the operand nodes in `sources` — so the patch
+            // walk recurses the source tree, not the scene operators.
+            curve_patches_for_placed(node, node, cut_surface, normal_sign, out);
         }
         _ => {
             if node.object_id == 0 || node.dimension() != 3 {
@@ -586,9 +622,175 @@ fn surface_patches_for_node(
                 normal: None,
                 outside_direction: None,
                 normal_sign,
+                curve: None,
             });
         }
     }
+}
+
+/// Curve patches of one operand in a 2D domain's source tree. `owner` stays
+/// the merged root (its id is the provenance leaf id every region stores);
+/// `node` is the operand whose outline is decomposed. A Difference right
+/// operand becomes cut-surface patches with negated normal sign, exactly
+/// like the 3D Difference arm above.
+fn curve_patches_for_placed(
+    owner: &Node,
+    node: &Node,
+    cut_surface: bool,
+    normal_sign: f64,
+    out: &mut Vec<BoundarySurfacePatch>,
+) {
+    let Shape::PlacedSdf2D(placed) = &node.shape else {
+        return;
+    };
+    if placed.sources.len() == 2 {
+        if let Profile2D::Binary { operation, .. } = &placed.profile {
+            match operation {
+                BooleanOp1D::Difference => {
+                    curve_patches_for_placed(owner, &placed.sources[0], cut_surface, normal_sign, out);
+                    curve_patches_for_placed(owner, &placed.sources[1], true, -normal_sign, out);
+                }
+                _ => {
+                    curve_patches_for_placed(owner, &placed.sources[0], cut_surface, normal_sign, out);
+                    curve_patches_for_placed(owner, &placed.sources[1], cut_surface, normal_sign, out);
+                }
+            }
+            return;
+        }
+    }
+    // Leaf operand: straight-edge profiles decompose into named edges
+    // (the curve analog of box → 6 faces); everything else is one whole
+    // outline patch.
+    let prefix = if node.object_id == owner.object_id {
+        String::new()
+    } else {
+        format!("{}.", node.name)
+    };
+    let Shape::PlacedSdf2D(owner_placed) = &owner.shape else {
+        return;
+    };
+    let in_plane = |point: Point2| placed.origin + placed.axis_u * point[0] + placed.axis_v * point[1];
+    let edges: Option<Vec<ProfileEdge>> = match &placed.profile {
+        Profile2D::Rectangle { center, half_size } => Some(rectangle_edges(*center, *half_size)),
+        Profile2D::Square { center, half_size } => {
+            Some(rectangle_edges(*center, [*half_size, *half_size]))
+        }
+        Profile2D::Polygon { points } => Some(polygon_edges(points)),
+        _ => None,
+    };
+    match edges {
+        Some(edges) => {
+            for (name, start, end, outward2) in edges {
+                let outward = placed.axis_u * outward2[0] + placed.axis_v * outward2[1];
+                // outside_direction indexes the OWNER's ±axis_u/±axis_v
+                // (the PlacedSdf2D arm of `owner_outside_direction_vectors`).
+                let owner_axes = [
+                    -owner_placed.axis_u,
+                    owner_placed.axis_u,
+                    -owner_placed.axis_v,
+                    owner_placed.axis_v,
+                ];
+                let outside_direction = if cut_surface {
+                    None
+                } else {
+                    owner_axes
+                        .iter()
+                        .position(|axis| axis.dot(outward) > 0.999)
+                        .map(|index| index as u8)
+                };
+                out.push(BoundarySurfacePatch {
+                    owner_object_id: owner.object_id,
+                    patch_id: patch_id(&format!("{prefix}{name}"), cut_surface),
+                    patch_type: if cut_surface { "cut_surface" } else { "edge" }.to_string(),
+                    owner: node.clone(),
+                    normal: Some(outward),
+                    outside_direction,
+                    normal_sign,
+                    curve: Some(CurvePatchKind::Edge {
+                        start: in_plane(start),
+                        end: in_plane(end),
+                        outward,
+                    }),
+                });
+            }
+        }
+        None => {
+            out.push(BoundarySurfacePatch {
+                owner_object_id: owner.object_id,
+                patch_id: patch_id(&format!("{prefix}outline"), cut_surface),
+                patch_type: if cut_surface { "cut_surface" } else { "outline" }.to_string(),
+                owner: node.clone(),
+                normal: None,
+                outside_direction: None,
+                normal_sign,
+                curve: Some(CurvePatchKind::Outline),
+            });
+        }
+    }
+}
+
+/// One straight profile edge: (name, start, end, outward normal), all in
+/// profile (u, v) coordinates.
+type ProfileEdge = (String, Point2, Point2, [f64; 2]);
+
+/// The four edges of an axis-aligned rectangle in profile coordinates:
+/// (name, start, end, outward normal).
+fn rectangle_edges(
+    center: Point2,
+    half_size: Point2,
+) -> Vec<ProfileEdge> {
+    let (cx, cy) = (center[0], center[1]);
+    let (hx, hy) = (half_size[0], half_size[1]);
+    vec![
+        (
+            "-U".to_string(),
+            [cx - hx, cy - hy],
+            [cx - hx, cy + hy],
+            [-1.0, 0.0],
+        ),
+        (
+            "+U".to_string(),
+            [cx + hx, cy - hy],
+            [cx + hx, cy + hy],
+            [1.0, 0.0],
+        ),
+        (
+            "-V".to_string(),
+            [cx - hx, cy - hy],
+            [cx + hx, cy - hy],
+            [0.0, -1.0],
+        ),
+        (
+            "+V".to_string(),
+            [cx - hx, cy + hy],
+            [cx + hx, cy + hy],
+            [0.0, 1.0],
+        ),
+    ]
+}
+
+/// The closed polygon's edges with outward normals from its winding.
+fn polygon_edges(points: &[Point2]) -> Vec<ProfileEdge> {
+    let count = points.len();
+    let signed_area: f64 = (0..count)
+        .map(|i| {
+            let a = points[i];
+            let b = points[(i + 1) % count];
+            a[0] * b[1] - b[0] * a[1]
+        })
+        .sum();
+    let winding = if signed_area >= 0.0 { 1.0 } else { -1.0 };
+    (0..count)
+        .map(|i| {
+            let a = points[i];
+            let b = points[(i + 1) % count];
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let length = (dx * dx + dy * dy).sqrt().max(1.0e-12);
+            // CCW winding: outward = edge direction rotated -90 degrees.
+            let outward = [winding * dy / length, -winding * dx / length];
+            (format!("edge_{i}"), a, b, outward)
+        })
+        .collect()
 }
 
 fn cylinder_like_frame(node: &Node) -> Option<&Frame> {
@@ -882,6 +1084,12 @@ pub fn pick_boundary_patch(
         return None;
     }
     let direction = ray_direction * (1.0 / length);
+    if root.dimension() == 2 {
+        // 2D path: the boundary is the outline curve on the domain
+        // workplane — analytic ray ∩ plane, then snap to the nearest curve
+        // patch (the curve analog of the analytic face pick below).
+        return pick_curve_patch(root, ray_origin, direction);
+    }
     let patches = surface_patches_for_root(root);
 
     // Analytic candidates, nearest first; a cut surface wins outright.
@@ -920,6 +1128,127 @@ pub fn pick_boundary_patch(
                 .partial_cmp(&normal_alignment(b.normal, normal))
                 .expect("finite")
         })
+}
+
+/// The placed profile of a legal 2D domain root (coplanar booleans merge
+/// into one placed node; transforms are refused for non-3D objects, so the
+/// root of a 2D domain is always the placed node itself).
+pub fn placed_2d_root(root: &Node) -> Option<&PlacedSdf2D> {
+    match &root.shape {
+        Shape::PlacedSdf2D(placed) => Some(placed),
+        _ => None,
+    }
+}
+
+/// Ray ∩ the 2D domain's workplane, in world space.
+fn workplane_hit(placed: &PlacedSdf2D, ray_origin: Vec3, direction: Vec3) -> Option<Vec3> {
+    let normal = placed.normal();
+    let denominator = direction.dot(normal);
+    if denominator.abs() <= 1.0e-12 {
+        return None;
+    }
+    let travel = (placed.origin - ray_origin).dot(normal) / denominator;
+    if travel < 0.0 {
+        return None;
+    }
+    Some(ray_origin + direction * travel)
+}
+
+/// Newton-project an in-plane point onto the zero set of `field` (a placed
+/// 2D node: its gradient is in-plane, so the iteration stays on the plane).
+fn snap_to_outline(field: &Node, start: Vec3, step: f64, zero_band: f64) -> Vec3 {
+    let mut point = start;
+    for _ in 0..12 {
+        let value = field.eval_point(point);
+        if value.abs() <= zero_band {
+            break;
+        }
+        point = point - sdf_normal(field, point, step) * value;
+    }
+    point
+}
+
+/// The 2D boundary pick: nearest curve patch to the ray's workplane hit,
+/// within `CURVE_PATCH_PICK_TOLERANCE` of the domain diagonal. A cut
+/// surface (subtracted operand's outline) wins outright, as in 3D.
+fn pick_curve_patch(root: &Node, ray_origin: Vec3, direction: Vec3) -> Option<BoundaryPatchHit> {
+    let placed = placed_2d_root(root)?;
+    let plane_point = workplane_hit(placed, ray_origin, direction)?;
+    let diagonal = bounding_diagonal(root).max(1.0e-9);
+    let pick_tolerance = CURVE_PATCH_PICK_TOLERANCE * diagonal;
+    let surface_tolerance = RELATIVE_SURFACE_TOLERANCE * diagonal;
+    let step = (diagonal * 1.0e-5).max(1.0e-9);
+    let mut best: Option<(f64, BoundaryPatchHit)> = None;
+    let mut best_cut: Option<(f64, BoundaryPatchHit)> = None;
+    for patch in surface_patches_for_root(root) {
+        let Some(curve) = &patch.curve else {
+            continue;
+        };
+        let snapped = match curve {
+            CurvePatchKind::Edge { start, end, .. } => {
+                let axis = *end - *start;
+                let along = ((plane_point - *start).dot(axis)
+                    / axis.dot(axis).max(1.0e-24))
+                .clamp(0.0, 1.0);
+                *start + axis * along
+            }
+            CurvePatchKind::Outline => {
+                snap_to_outline(&patch.owner, plane_point, step, 1.0e-12 * diagonal)
+            }
+        };
+        let distance = (plane_point - snapped).length();
+        if distance > pick_tolerance {
+            continue;
+        }
+        // The snapped point must lie on the operand's outline AND still be
+        // part of the final domain boundary (not swallowed by another
+        // operand — e.g. the part of an edge inside a subtracted hole).
+        if patch.owner.eval_point(snapped).abs() > surface_tolerance {
+            continue;
+        }
+        if root.eval_point(snapped).abs() > surface_tolerance {
+            continue;
+        }
+        let hit = BoundaryPatchHit {
+            point: snapped,
+            owner_object_id: patch.owner_object_id,
+            patch_id: patch.patch_id.clone(),
+            patch_type: patch.patch_type.clone(),
+            normal: sdf_normal(root, snapped, step),
+            outside_direction: patch.outside_direction,
+        };
+        let slot = if patch.patch_type == "cut_surface" {
+            &mut best_cut
+        } else {
+            &mut best
+        };
+        if slot.as_ref().map(|(d, _)| distance < *d).unwrap_or(true) {
+            *slot = Some((distance, hit));
+        }
+    }
+    best_cut.or(best).map(|(_, hit)| hit)
+}
+
+/// Cutter clicks on a 2D domain: ray ∩ workplane, snapped onto the domain
+/// outline when the in-plane hit is within the pick tolerance of it (the
+/// raw in-plane point otherwise, so knife endpoints stay forgiving).
+pub fn pick_outline_point(root: &Node, ray_origin: Vec3, ray_direction: Vec3) -> Option<Vec3> {
+    let placed = placed_2d_root(root)?;
+    let length = ray_direction.length();
+    if length <= 1.0e-12 {
+        return None;
+    }
+    let plane_point = workplane_hit(placed, ray_origin, ray_direction * (1.0 / length))?;
+    let diagonal = bounding_diagonal(root).max(1.0e-9);
+    let step = (diagonal * 1.0e-5).max(1.0e-9);
+    let snapped = snap_to_outline(root, plane_point, step, 1.0e-12 * diagonal);
+    if (plane_point - snapped).length() <= CURVE_PATCH_PICK_TOLERANCE * diagonal
+        && root.eval_point(snapped).abs() <= RELATIVE_SURFACE_TOLERANCE * diagonal
+    {
+        Some(snapped)
+    } else {
+        Some(plane_point)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,6 +1368,9 @@ pub fn region_patch_scope_volume(
     let patch = surface_patches_for_root(root).into_iter().find(|patch| {
         patch.owner_object_id == region.owner_object_id && patch.patch_id == patch_id_value
     })?;
+    if let Some(curve) = patch.curve.clone() {
+        return curve_patch_scope_volume(root, &patch, &curve, thickness);
+    }
     let face = patch_face(&patch).to_string();
     match &patch.owner.shape {
         Shape::Box3(shape) => {
@@ -1061,6 +1393,79 @@ pub fn region_patch_scope_volume(
             patch_preview_volume(&patch, thickness)
         }
         _ => patch_preview_volume(&patch, thickness),
+    }
+}
+
+/// Scope volume for a curve patch: a thin prism limiting a region to its
+/// edge or operand outline — the 2D analog of the box-face scope slab.
+/// Every classification field of a 2D domain is a prism along the workplane
+/// normal (placed fields ignore the plane offset), so the scope is one too.
+fn curve_patch_scope_volume(
+    root: &Node,
+    patch: &BoundarySurfacePatch,
+    curve: &CurvePatchKind,
+    thickness: f64,
+) -> Option<Node> {
+    let span = root_span(root);
+    match curve {
+        CurvePatchKind::Edge {
+            start,
+            end,
+            outward,
+        } => {
+            let axis = *end - *start;
+            let length = axis.length();
+            if length <= 1.0e-12 {
+                return None;
+            }
+            let axis_u = axis * (1.0 / length);
+            let mut axis_w = axis_u.cross(*outward);
+            axis_w = axis_w * (1.0 / axis_w.length().max(1.0e-12));
+            let center = (*start + *end) * 0.5;
+            Some(Node {
+                name: format!("{}_{}_scope", patch.owner.name, patch.patch_id),
+                object_id: 0,
+                shape: Shape::Box3(
+                    Box3::new(
+                        center,
+                        vec3(length * 0.5, thickness, span * 2.0),
+                        Frame {
+                            u: axis_u,
+                            v: *outward,
+                            w: axis_w,
+                        },
+                    )
+                    .ok()?,
+                ),
+            })
+        }
+        CurvePatchKind::Outline => {
+            let Shape::PlacedSdf2D(placed) = &patch.owner.shape else {
+                return None;
+            };
+            let band = |offset: f64| -> Option<Node> {
+                let profile =
+                    Profile2D::distance_offset(placed.profile.clone(), offset).ok()?;
+                let section =
+                    PlacedSdf2D::new(profile, placed.origin, placed.axis_u, placed.axis_v, Vec::new())
+                        .ok()?;
+                Some(Node {
+                    name: format!("{}_{}_band", patch.owner.name, patch.patch_id),
+                    object_id: 0,
+                    shape: Shape::PlacedSdf2D(section),
+                })
+            };
+            // Difference(grown, shrunk) evaluates to |operand field| −
+            // thickness: the band around the operand's outline.
+            let grown = band(thickness)?;
+            let shrunk = band(-thickness)?;
+            Shape::difference(grown, shrunk).ok().map(|shape| {
+                Node::new(
+                    format!("{}_{}_scope", patch.owner.name, patch.patch_id),
+                    shape,
+                )
+            })
+        }
     }
 }
 

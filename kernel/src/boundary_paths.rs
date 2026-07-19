@@ -62,6 +62,44 @@ fn orthonormal_tangents(normal: Vec3) -> (Vec3, Vec3) {
     (axis_u, axis_v)
 }
 
+/// The workplane normal of a 2D domain root. The root of a legal 2D domain
+/// is always a placed profile (coplanar booleans merge into one placed
+/// node; transforms are refused for non-3D objects).
+pub fn workplane_normal(root: &Node) -> Option<Vec3> {
+    match &root.shape {
+        Shape::PlacedSdf2D(placed) => Some(placed.normal()),
+        _ => None,
+    }
+}
+
+/// Point knife for curve regions (2D domains): the half-plane bounded by
+/// the line through `click` along the outline's in-plane outward normal, so
+/// the line crosses the curve transversally at the click. Built through
+/// `straight_knife` with the workplane normal — its `side_axis` then comes
+/// out along the outline tangent, discriminating "before/after the click"
+/// along the curve. The ghost is the same `PlacedSdf2D` half-plane shape as
+/// every other knife, so cut storage and classification are unchanged.
+pub fn point_knife(root: &Node, click: Vec3) -> GeometryResult<Node> {
+    let plane_normal = workplane_normal(root).ok_or_else(|| {
+        GeometryError::new("point knife needs a 2D domain (a placed profile root)")
+    })?;
+    let diagonal = bounding_diagonal(root);
+    let step = (diagonal * 1.0e-5).max(1.0e-9);
+    let grad = gradient(root, click, step);
+    // Placed fields are constant along the plane normal, so the gradient is
+    // already in-plane; project anyway to shed numerical residue.
+    let mut direction = grad - plane_normal * grad.dot(plane_normal);
+    let length = direction.length();
+    if length <= 1.0e-9 {
+        return Err(GeometryError::new(
+            "could not resolve the outline normal at the click — click on the domain outline",
+        ));
+    }
+    direction = direction * (1.0 / length);
+    let end = click + direction * (0.05 * diagonal).max(1.0e-6);
+    straight_knife(root, click, end, plane_normal)
+}
+
 /// Half-plane ghost: a giant polygon on the plane spanned by the start-end
 /// line and the boundary normal, covering one side of the line
 /// (`_straight_knife_handle`).

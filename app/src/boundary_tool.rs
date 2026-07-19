@@ -5,17 +5,23 @@
 
 use caso_kernel::boundary::{BoundaryCut, BoundaryRegion, CutSide};
 use caso_kernel::boundary_ops::{
-    boundary_region_base_mask, cut_volume, pick_boundary_patch, pick_sdf_surface, sdf_normal,
-    BoundaryPatchHit,
+    boundary_region_base_mask, cut_volume, pick_boundary_patch, pick_outline_point,
+    pick_sdf_surface, placed_2d_root, sdf_normal, BoundaryPatchHit,
 };
 use caso_kernel::boundary_paths::{
-    stencil_knife, straight_knife, KNIFE_CURVATURE_WARNING_ALIGNMENT,
+    point_knife, stencil_knife, straight_knife, workplane_normal,
+    KNIFE_CURVATURE_WARNING_ALIGNMENT,
 };
 use caso_kernel::scene::SceneDocument;
 use caso_kernel::sdf::node::Node;
 use caso_kernel::vec3::{vec3, Vec3};
 use caso_surfaces::clipping::{clip_mesh_to_sdf, tessellate_for_clip, OperandMesh};
+use caso_surfaces::profiles2d::placed_outline_rings;
 use caso_surfaces::{SurfaceStatus, ViewportSurface, ViewportSurfaceKey, ViewportSurfaceScene};
+
+/// Ring sampling density for 2D outline work (highlight ribbon, knife
+/// crossing census, dense validation points).
+const OUTLINE_RING_RESOLUTION: usize = 192;
 
 pub const CANDIDATE_COLOR: [f32; 3] = [1.0, 0.9, 0.2]; // yellow
 pub const SELECTED_COLOR: [f32; 3] = [0.2, 0.95, 1.0]; // cyan
@@ -25,10 +31,41 @@ pub const PREVIEW_OUTSIDE_COLOR: [f32; 3] = [1.0, 0.55, 0.15]; // orange
 const PICK_TOLERANCE: f64 = 0.0008;
 const PICK_TRAVEL: f64 = 100.0;
 
-/// Build the fluid-domain root node, if a fluid domain is set.
+/// Build the fluid-domain root node, if a fluid domain is set. Production
+/// code resolves roots per marked domain (`domain_root_nodes`,
+/// `region_root_node`); this stays for the test fixtures.
+#[allow(dead_code)]
 pub fn fluid_root_node(document: &SceneDocument) -> Option<Node> {
     let fluid = document.fluid_domain.as_ref()?;
     document.build_node(fluid.root).ok()
+}
+
+/// Every marked domain's built root, fluid first — the boundaries the
+/// Boundary Region tool picks against. Regions work on ALL domain kinds
+/// (fluid, solid, future ones), not only fluid.
+pub fn domain_root_nodes(document: &SceneDocument) -> Vec<(u32, Node)> {
+    document
+        .marked_domain_roots()
+        .into_iter()
+        .filter_map(|id| document.build_node(id).ok().map(|node| (id, node)))
+        .collect()
+}
+
+/// The built root of the domain a region tags (the fluid domain for
+/// regions from older files, which carry no explicit domain).
+pub fn region_root_node(document: &SceneDocument, region: &BoundaryRegion) -> Option<Node> {
+    let root = document.region_domain_root(region)?;
+    document.build_node(root).ok()
+}
+
+/// The built root for the currently selected region, if any.
+pub fn selected_region_root(document: &SceneDocument, selected: Option<u32>) -> Option<Node> {
+    let region_id = selected?;
+    let region = document
+        .boundary_regions
+        .iter()
+        .find(|region| region.object_id == region_id)?;
+    region_root_node(document, region)
 }
 
 /// Ray-pick the domain boundary and return the analytic patch hit.
@@ -199,6 +236,11 @@ pub fn region_highlight_surface(
     color: [f32; 3],
     overlay_id: u32,
 ) -> Option<ViewportSurface> {
+    if root.dimension() == 2 {
+        // 2D domains: the region is an arc of the outline curve — a lifted
+        // ribbon, not a lifted triangle filter.
+        return region_highlight_ribbon(root, region, scene, color, overlay_id);
+    }
     let diagonal = root
         .bounding_box()
         .map(|bounds| bounds.diagonal())
@@ -249,6 +291,157 @@ pub fn region_highlight_surface(
     })
 }
 
+/// The crossing of a cut volume's zero set on the chord (p, q), by
+/// bisection. Both split-preview children run this identical call for the
+/// same chord and volume, so their shared split vertex is bitwise-identical
+/// — the 1D analog of the 3D seam root-finding. Never perturb the two
+/// calls independently.
+fn bisect_crossing(volume: &Node, p: Vec3, q: Vec3) -> Vec3 {
+    let sign_at_start = volume.eval_point(p) <= 0.0;
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    for _ in 0..48 {
+        let mid = 0.5 * (lo + hi);
+        let value = volume.eval_point(p + (q - p) * mid);
+        if (value <= 0.0) == sign_at_start {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    p + (q - p) * (0.5 * (lo + hi))
+}
+
+/// The 2D analog of `region_highlight_mesh` + lift: the arcs of the domain
+/// outline that belong to the region, drawn as a thin triangle ribbon
+/// centered on the outline and lifted off the sheet plane on BOTH sides
+/// (the filled sheet would z-fight a coplanar ribbon, and the domain must
+/// read correctly from either side of its plane). Outline vertices come
+/// from `placed_outline_rings` (Newton-refined onto the exact zero set);
+/// segments are kept whole when both endpoints pass the classifier's
+/// mesh-aligned criteria, then shortened exactly at each cut crossing.
+fn region_highlight_ribbon(
+    root: &Node,
+    region: &BoundaryRegion,
+    scene: &ViewportSurfaceScene,
+    color: [f32; 3],
+    overlay_id: u32,
+) -> Option<ViewportSurface> {
+    let placed = placed_2d_root(root)?;
+    let plane_normal = placed.normal();
+    let diagonal = root
+        .bounding_box()
+        .map(|bounds| bounds.diagonal())
+        .unwrap_or(1.0);
+    let step = (diagonal * 1.0e-5).max(1.0e-9);
+    let half_width = diagonal * 4.0e-3;
+    let lift = diagonal * 1.5e-3;
+    // Cut volumes once per call; a failed cut_volume hides the highlight
+    // (matching the classifier's error behavior), as in the 3D path.
+    let mut cut_volumes: Vec<(Node, CutSide)> = Vec::with_capacity(region.cuts.len());
+    for cut in &region.cuts {
+        let volume = cut_volume(root, cut).ok()?;
+        cut_volumes.push((volume, cut.side));
+    }
+    let mut vertices: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for ring in placed_outline_rings(placed, OUTLINE_RING_RESOLUTION) {
+        if ring.len() < 2 {
+            continue;
+        }
+        let Ok(mask) = boundary_region_base_mask(root, region, &ring, None) else {
+            continue;
+        };
+        for i in 0..ring.len() {
+            let j = (i + 1) % ring.len();
+            if !(mask[i] && mask[j]) {
+                continue;
+            }
+            let (mut p, mut q) = (ring[i], ring[j]);
+            let mut dropped = false;
+            for (volume, side) in &cut_volumes {
+                let keep = |value: f64| match side {
+                    CutSide::Inside => value <= 0.0,
+                    CutSide::Outside => value >= 0.0,
+                };
+                let keep_p = keep(volume.eval_point(p));
+                let keep_q = keep(volume.eval_point(q));
+                match (keep_p, keep_q) {
+                    (true, true) => {}
+                    (false, false) => {
+                        dropped = true;
+                        break;
+                    }
+                    _ => {
+                        let crossing = bisect_crossing(volume, p, q);
+                        if keep_p {
+                            q = crossing;
+                        } else {
+                            p = crossing;
+                        }
+                    }
+                }
+            }
+            let chord = q - p;
+            if dropped || chord.length() <= diagonal * 1.0e-12 {
+                continue;
+            }
+            // Per-segment outward direction (perpendicular to the chord in
+            // the plane, signed by the domain gradient): exact on straight
+            // edges, where per-vertex gradients would skew at corners.
+            let direction = chord * (1.0 / chord.length());
+            let mut outward = direction.cross(plane_normal);
+            if outward.dot(sdf_normal(root, (p + q) * 0.5, step)) < 0.0 {
+                outward = -outward;
+            }
+            for lift_sign in [1.0f64, -1.0] {
+                let shift = plane_normal * (lift * lift_sign);
+                let normal = plane_normal * lift_sign;
+                let base = vertices.len() as u32;
+                for corner in [
+                    p + outward * half_width + shift,
+                    p - outward * half_width + shift,
+                    q + outward * half_width + shift,
+                    q - outward * half_width + shift,
+                ] {
+                    vertices.push([corner.x as f32, corner.y as f32, corner.z as f32]);
+                    normals.push([normal.x as f32, normal.y as f32, normal.z as f32]);
+                }
+                indices.extend_from_slice(&[base, base + 2, base + 3, base, base + 3, base + 1]);
+            }
+        }
+    }
+    if indices.is_empty() {
+        return None;
+    }
+    let mut bounds_min = [f64::INFINITY; 3];
+    let mut bounds_max = [f64::NEG_INFINITY; 3];
+    for vertex in &vertices {
+        for axis in 0..3 {
+            bounds_min[axis] = bounds_min[axis].min(vertex[axis] as f64);
+            bounds_max[axis] = bounds_max[axis].max(vertex[axis] as f64);
+        }
+    }
+    Some(ViewportSurface {
+        key: ViewportSurfaceKey {
+            object_id: overlay_id,
+            scene_revision: scene.revision,
+            resolution: 0,
+        },
+        object_kind: "boundary_highlight".to_string(),
+        status: SurfaceStatus::Ready,
+        vertices,
+        normals,
+        indices,
+        wire_indices: Vec::new(),
+        color,
+        alpha: 1.0,
+        bounds_min,
+        bounds_max,
+        message: String::new(),
+    })
+}
+
 /// A knife ghost plus the warnings its construction raised. The ghost is
 /// never a scene object; warnings must reach the status line at preview AND
 /// commit so the user always knows what will be (was) stored.
@@ -262,7 +455,11 @@ pub struct KnifeGhost {
 
 /// Build the ghost knife node for a cutter gesture (never a scene object).
 pub fn cutter_ghost(root: &Node, kind: &str, points: &[Vec3]) -> Result<KnifeGhost, String> {
+    if root.dimension() == 2 {
+        return cutter_ghost_2d(root, kind, points);
+    }
     match kind {
+        "point" => Err("point knife works on 2D domains — use a segment or stencil".to_string()),
         "segment" => {
             if points.len() < 2 {
                 return Err("segment knife needs two points".to_string());
@@ -313,6 +510,79 @@ pub fn cutter_ghost(root: &Node, kind: &str, points: &[Vec3]) -> Result<KnifeGho
     }
 }
 
+/// 2D-domain knives. The segment knife is the same `straight_knife` as 3D
+/// but oriented by the WORKPLANE normal: the outline gradient is in-plane,
+/// and `side_axis = gradient × line` would come out perpendicular to the
+/// sheet — a knife that classifies by height above the plane, degenerate
+/// for curve points. With the plane normal, `side_axis` is the in-plane
+/// perpendicular and the ghost is a half-plane bounded by the click line.
+fn cutter_ghost_2d(root: &Node, kind: &str, points: &[Vec3]) -> Result<KnifeGhost, String> {
+    let plane_normal = workplane_normal(root)
+        .ok_or_else(|| "2D domain root is not a placed profile".to_string())?;
+    let node = match kind {
+        "segment" => {
+            if points.len() < 2 {
+                return Err("segment knife needs two points".to_string());
+            }
+            straight_knife(root, points[0], *points.last().expect("nonempty"), plane_normal)
+                .map_err(|error| error.to_string())?
+        }
+        "point" => {
+            if points.is_empty() {
+                return Err("point knife needs one point on the outline".to_string());
+            }
+            point_knife(root, points[0]).map_err(|error| error.to_string())?
+        }
+        other => return Err(format!("{other} knife is not available on 2D domains")),
+    };
+    // Crossing census on the outline: a line crosses a closed curve an even
+    // number of times — exactly two is a clean two-arc split; more means
+    // each side will hold several arcs (non-convex outline). A knife whose
+    // zero line runs ALONG an edge is degenerate and refused.
+    let placed = placed_2d_root(root)
+        .ok_or_else(|| "2D domain root is not a placed profile".to_string())?;
+    let diagonal = root
+        .bounding_box()
+        .map(|bounds| bounds.diagonal())
+        .unwrap_or(1.0);
+    let zero_band = diagonal * 1.0e-7;
+    let mut crossings = 0usize;
+    for ring in placed_outline_rings(placed, OUTLINE_RING_RESOLUTION) {
+        for i in 0..ring.len() {
+            let j = (i + 1) % ring.len();
+            let value_i = node.eval_point(ring[i]);
+            let value_j = node.eval_point(ring[j]);
+            if value_i.abs() <= zero_band && value_j.abs() <= zero_band {
+                return Err(
+                    "the cut line runs along the outline — pick points on different edges"
+                        .to_string(),
+                );
+            }
+            if (value_i <= 0.0) != (value_j <= 0.0) {
+                crossings += 1;
+            }
+        }
+    }
+    let mut warnings = Vec::new();
+    if crossings > 2 {
+        warnings.push(format!(
+            "cut line crosses the outline at {crossings} points; each side will contain \
+             multiple arcs"
+        ));
+    }
+    Ok(KnifeGhost { node, warnings })
+}
+
+/// Cutter click pick: the outline-snapped workplane point for 2D domains,
+/// the sphere-traced surface point for 3D.
+pub fn pick_cut_point(root: &Node, origin: Vec3, direction: Vec3) -> Option<Vec3> {
+    if root.dimension() == 2 {
+        pick_outline_point(root, origin, direction)
+    } else {
+        pick_surface_point(root, origin, direction)
+    }
+}
+
 /// The two child regions a knife would produce (for the split preview).
 pub fn split_preview_children(
     parent: &BoundaryRegion,
@@ -327,6 +597,21 @@ pub fn split_preview_children(
         child
     };
     (make(CutSide::Inside), make(CutSide::Outside))
+}
+
+/// Dense on-boundary validation points: outline-ring vertices for 2D
+/// domains (they lie ON the outline; the display fill's vertices generally
+/// do not), display-mesh vertices for 3D.
+pub fn validation_points_for(root: &Node, scene: &ViewportSurfaceScene) -> Vec<Vec3> {
+    if root.dimension() == 2 {
+        if let Some(placed) = placed_2d_root(root) {
+            return placed_outline_rings(placed, OUTLINE_RING_RESOLUTION)
+                .into_iter()
+                .flatten()
+                .collect();
+        }
+    }
+    validation_points(scene)
 }
 
 /// Dense on-surface validation points from the display mesh (so
@@ -584,5 +869,173 @@ mod tests {
         assert!(ghost.warnings.is_empty());
         // Unused warning suppression for IDENTITY_FRAME import parity.
         let _ = IDENTITY_FRAME;
+    }
+
+    // --- 2D domains (design_docs/boundary_region_2d.md) ------------------
+
+    use caso_kernel::boundary_ops::surface_patches_for_root;
+    use caso_kernel::sdf::placed::PlacedSdf2D;
+    use caso_kernel::sdf::primitives_1d::BooleanOp1D;
+    use caso_kernel::sdf::primitives_2d::Profile2D;
+
+    /// Planar flow case on z = 0: flowbox rectangle (half 2×1) minus a
+    /// circle obstacle (center (0.5, 0), r 0.3), merged like coplanar 2D
+    /// scene booleans (one placed node, operand nodes in `sources`).
+    fn fixture_2d() -> (Node, ViewportSurfaceScene) {
+        let rect_profile = Profile2D::Rectangle {
+            center: [0.0, 0.0],
+            half_size: [2.0, 1.0],
+        };
+        let circle_profile = Profile2D::Circle {
+            center: [0.5, 0.0],
+            radius: 0.3,
+        };
+        let axis_u = vec3(1.0, 0.0, 0.0);
+        let axis_v = vec3(0.0, 1.0, 0.0);
+        let rect = Node::with_id(
+            "flowbox",
+            10,
+            Shape::PlacedSdf2D(
+                PlacedSdf2D::new(rect_profile.clone(), Vec3::ZERO, axis_u, axis_v, Vec::new())
+                    .expect("rect"),
+            ),
+        );
+        let circle = Node::with_id(
+            "obstacle",
+            11,
+            Shape::PlacedSdf2D(
+                PlacedSdf2D::new(circle_profile.clone(), Vec3::ZERO, axis_u, axis_v, Vec::new())
+                    .expect("circle"),
+            ),
+        );
+        let merged = Profile2D::Binary {
+            left: Box::new(rect_profile),
+            right: Box::new(Profile2D::Offset {
+                child: Box::new(circle_profile),
+                offset: [0.0, 0.0],
+            }),
+            operation: BooleanOp1D::Difference,
+            smoothing: 0.1,
+        };
+        let root = Node::with_id(
+            "domain",
+            12,
+            Shape::PlacedSdf2D(
+                PlacedSdf2D::new(merged, Vec3::ZERO, axis_u, axis_v, vec![rect, circle])
+                    .expect("merged"),
+            ),
+        );
+        let mut cache = ViewportSurfaceCache::default();
+        let scene = build_viewport_surface_scene(std::slice::from_ref(&root), 1, &mut cache);
+        (root, scene)
+    }
+
+    fn left_edge_region(root: &Node) -> BoundaryRegion {
+        let patch = surface_patches_for_root(root)
+            .into_iter()
+            .find(|patch| patch.patch_id == "flowbox.-U")
+            .expect("left edge patch");
+        let mut region = BoundaryRegion::new("left", 100, patch.owner_object_id);
+        region.patch_id = Some(patch.patch_id.clone());
+        region.patch_type = Some(patch.patch_type.clone());
+        region.outside_direction = patch.outside_direction;
+        region
+    }
+
+    #[test]
+    fn ribbon_highlights_the_edge_region_only() {
+        let (root, scene) = fixture_2d();
+        let region = left_edge_region(&root);
+        let surface = region_highlight_surface(&root, &region, &scene, CANDIDATE_COLOR, 1)
+            .expect("ribbon");
+        assert!(!surface.indices.is_empty());
+        // Every ribbon vertex hugs the left edge x = -2, y in [-1, 1],
+        // lifted off the z = 0 plane by less than the ribbon scale.
+        for vertex in &surface.vertices {
+            assert!((vertex[0] as f64 + 2.0).abs() < 0.05, "off-edge x {}", vertex[0]);
+            assert!((vertex[1] as f64).abs() < 1.0 + 0.05, "off-edge y {}", vertex[1]);
+            assert!((vertex[2] as f64).abs() < 0.05, "off-plane z {}", vertex[2]);
+            assert!(vertex[2] != 0.0, "ribbon must be lifted off the sheet plane");
+        }
+    }
+
+    #[test]
+    fn split_preview_ribbons_share_the_exact_split_vertex() {
+        let (root, scene) = fixture_2d();
+        let region = left_edge_region(&root);
+        let ghost = cutter_ghost(&root, "point", &[vec3(-2.0, 0.25, 0.0)])
+            .expect("point knife")
+            .node;
+        let (inside, outside) = split_preview_children(&region, &ghost);
+        let inside_surface =
+            region_highlight_surface(&root, &inside, &scene, PREVIEW_INSIDE_COLOR, 2)
+                .expect("inside ribbon");
+        let outside_surface =
+            region_highlight_surface(&root, &outside, &scene, PREVIEW_OUTSIDE_COLOR, 3)
+                .expect("outside ribbon");
+        // The ribbon offsets along the edge's outward normal (±x) and the
+        // plane normal (±z), so y-coordinates are pure arc parameters: the
+        // two children must meet at a bitwise-identical split y.
+        let ys = |surface: &ViewportSurface| -> Vec<f32> {
+            surface.vertices.iter().map(|v| v[1]).collect()
+        };
+        let inside_ys = ys(&inside_surface);
+        let outside_ys = ys(&outside_surface);
+        let max = |values: &[f32]| values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min = |values: &[f32]| values.iter().cloned().fold(f32::INFINITY, f32::min);
+        let shared_touch = max(&inside_ys) == min(&outside_ys)
+            || max(&outside_ys) == min(&inside_ys);
+        assert!(shared_touch, "children must meet at one bitwise-identical split vertex");
+    }
+
+    #[test]
+    fn segment_through_the_hole_warns_about_multiple_arcs() {
+        let (root, _scene) = fixture_2d();
+        // The line y = 0 crosses the rectangle twice AND the circle twice.
+        let ghost = cutter_ghost(
+            &root,
+            "segment",
+            &[vec3(-2.0, 0.0, 0.0), vec3(2.0, 0.0, 0.0)],
+        )
+        .expect("ghost");
+        assert!(
+            ghost.warnings.iter().any(|warning| warning.contains("4 points")),
+            "expected the multi-arc warning, got {:?}",
+            ghost.warnings
+        );
+    }
+
+    #[test]
+    fn clean_two_arc_segment_raises_no_warning() {
+        let (root, _scene) = fixture_2d();
+        // A chord across the top-left corner misses the obstacle: exactly
+        // two crossings.
+        let ghost = cutter_ghost(
+            &root,
+            "segment",
+            &[vec3(-2.0, 0.5, 0.0), vec3(-0.5, 1.0, 0.0)],
+        )
+        .expect("ghost");
+        assert!(ghost.warnings.is_empty(), "unexpected: {:?}", ghost.warnings);
+    }
+
+    #[test]
+    fn collinear_segment_on_one_edge_is_refused() {
+        let (root, _scene) = fixture_2d();
+        let error = cutter_ghost(
+            &root,
+            "segment",
+            &[vec3(-2.0, -0.5, 0.0), vec3(-2.0, 0.5, 0.0)],
+        )
+        .expect_err("collinear cut refused");
+        assert!(error.contains("along the outline"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn point_knife_is_refused_on_3d_domains() {
+        let (root, _scene) = fixture();
+        let error = cutter_ghost(&root, "point", &[vec3(0.0, 0.0, 0.5)])
+            .expect_err("3D root refused");
+        assert!(error.contains("2D"), "unexpected error: {error}");
     }
 }

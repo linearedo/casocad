@@ -872,6 +872,7 @@ impl SceneDocument {
         }
         if let Some(kind) = moved_kind {
             self.domain_kinds.insert(combined, kind);
+            self.retarget_region_domains(first, combined);
         }
         self.replace_child_references(first, combined, combined);
         self.refresh_domains();
@@ -965,6 +966,7 @@ impl SceneDocument {
         }
         if let Some(kind) = moved_kind {
             self.domain_kinds.insert(wrapped, kind);
+            self.retarget_region_domains(id, wrapped);
         }
         self.replace_child_references(id, wrapped, wrapped);
         self.refresh_domains();
@@ -1042,6 +1044,7 @@ impl SceneDocument {
         }
         if let Some(kind) = moved_kind {
             self.domain_kinds.insert(result, kind);
+            self.retarget_region_domains(section, result);
         }
         self.replace_child_references(section, result, result);
         self.refresh_domains();
@@ -1942,24 +1945,59 @@ impl SceneDocument {
         Ok(pasted)
     }
 
-    /// Create a BoundaryRegion tagging part of the FluidDomain boundary
-    /// (Python `add_boundary_region`, 3D path).
-    pub fn add_boundary_region(
+    /// Follow a marked domain's evolution (combine, transform wrap, solid
+    /// from 2D): regions tagging the old root now tag the new one, exactly
+    /// as the mark itself moves.
+    fn retarget_region_domains(&mut self, old_root: ObjectId, new_root: ObjectId) {
+        for region in &mut self.boundary_regions {
+            if region.domain_root == Some(old_root) {
+                region.domain_root = Some(new_root);
+            }
+        }
+    }
+
+    /// Marked domain roots, fluid first (its record is authoritative for
+    /// fluid), then the rest in id order — the order region resolution and
+    /// the viewport pick walk them.
+    pub fn marked_domain_roots(&self) -> Vec<ObjectId> {
+        let mut roots = Vec::new();
+        if let Some(fluid) = &self.fluid_domain {
+            roots.push(fluid.root);
+        }
+        for id in self.domain_kinds.keys() {
+            if !roots.contains(id) {
+                roots.push(*id);
+            }
+        }
+        roots
+    }
+
+    /// The marked domain a region belongs to: its stored `domain_root` when
+    /// set, else the fluid domain (regions from older files).
+    pub fn region_domain_root(&self, region: &BoundaryRegion) -> Option<ObjectId> {
+        region
+            .domain_root
+            .or_else(|| self.fluid_domain.as_ref().map(|fluid| fluid.root))
+    }
+
+    /// Create a BoundaryRegion tagging part of one marked Domain's boundary
+    /// (any `DomainKind` — fluid, solid, and whatever is added later).
+    pub fn add_boundary_region_in(
         &mut self,
+        domain_root: ObjectId,
         owner_object_id: ObjectId,
         outside_direction: Option<u8>,
         patch_id: Option<&str>,
         patch_type: Option<&str>,
     ) -> GeometryResult<u32> {
-        let fluid = self
-            .fluid_domain
-            .clone()
-            .ok_or_else(|| GeometryError::new("select a FluidDomain root first"))?;
-        let root = self.build_node(fluid.root)?;
+        if !self.domain_kinds.contains_key(&domain_root) {
+            return Err(GeometryError::new("the region's domain root is not a marked Domain"));
+        }
+        let root = self.build_node(domain_root)?;
         let owners = crate::boundary_ops::boundary_owner_ids(&root);
         if !owners.contains(&owner_object_id) {
             return Err(GeometryError::new(
-                "selected object does not directly control the FluidDomain boundary",
+                "selected object does not directly control this Domain's boundary",
             ));
         }
         let owner_name = self.object(owner_object_id)?.name.clone();
@@ -1972,7 +2010,7 @@ impl SceneDocument {
         });
         if patch_id.is_some() && patch.is_none() {
             return Err(GeometryError::new(
-                "selected boundary patch is not part of the FluidDomain",
+                "selected boundary patch is not part of this Domain",
             ));
         }
         let name = match (patch_id, outside_direction) {
@@ -1982,6 +2020,7 @@ impl SceneDocument {
         };
         let object_id = self.allocate_object_id()?;
         let mut region = BoundaryRegion::new(name, object_id, owner_object_id);
+        region.domain_root = Some(domain_root);
         region.outside_direction =
             outside_direction.or(patch.as_ref().and_then(|p| p.outside_direction));
         region.patch_id = patch_id.map(str::to_string);
@@ -1989,11 +2028,60 @@ impl SceneDocument {
             .map(str::to_string)
             .or(patch.as_ref().map(|p| p.patch_type.clone()));
         self.boundary_regions.push(region);
+        // The fluid record's tag list feeds meshing and the scene file
+        // format; non-fluid regions are attached by their `domain_root`.
         if let Some(fluid) = self.fluid_domain.as_mut() {
-            fluid.tags.push(TagRef::Region(object_id));
+            if fluid.root == domain_root {
+                fluid.tags.push(TagRef::Region(object_id));
+            }
         }
         self.mark_changed();
         Ok(object_id)
+    }
+
+    /// Create a BoundaryRegion, resolving the owning Domain from the owner
+    /// and patch (fluid first, then the other marked domains). Kept for
+    /// callers that don't know which domain was picked; the viewport passes
+    /// the picked domain to `add_boundary_region_in` directly.
+    pub fn add_boundary_region(
+        &mut self,
+        owner_object_id: ObjectId,
+        outside_direction: Option<u8>,
+        patch_id: Option<&str>,
+        patch_type: Option<&str>,
+    ) -> GeometryResult<u32> {
+        let candidates = self.marked_domain_roots();
+        if candidates.is_empty() {
+            return Err(GeometryError::new("mark a Domain (fluid or solid) first"));
+        }
+        for domain_root in &candidates {
+            let Ok(root) = self.build_node(*domain_root) else {
+                continue;
+            };
+            if !crate::boundary_ops::boundary_owner_ids(&root).contains(&owner_object_id) {
+                continue;
+            }
+            if let Some(wanted) = patch_id {
+                let has_patch = crate::boundary_ops::surface_patches_for_root(&root)
+                    .into_iter()
+                    .any(|patch| {
+                        patch.owner_object_id == owner_object_id && patch.patch_id == wanted
+                    });
+                if !has_patch {
+                    continue;
+                }
+            }
+            return self.add_boundary_region_in(
+                *domain_root,
+                owner_object_id,
+                outside_direction,
+                patch_id,
+                patch_type,
+            );
+        }
+        Err(GeometryError::new(
+            "selected object does not directly control a marked Domain's boundary",
+        ))
     }
 
     /// Split a BoundaryRegion with a ghost knife (Python
@@ -2006,10 +2094,6 @@ impl SceneDocument {
         ghost: &Node,
         validation_points: Option<&[Vec3]>,
     ) -> GeometryResult<(u32, u32)> {
-        let fluid = self
-            .fluid_domain
-            .clone()
-            .ok_or_else(|| GeometryError::new("select a FluidDomain root first"))?;
         let base = self
             .boundary_regions
             .iter()
@@ -2018,8 +2102,11 @@ impl SceneDocument {
             .ok_or_else(|| {
                 GeometryError::new("base boundary region is not part of this document")
             })?;
+        let domain_root = self.region_domain_root(&base).ok_or_else(|| {
+            GeometryError::new("the region's Domain is no longer marked; mark a Domain first")
+        })?;
         let base_cuts = base.cuts.clone();
-        let root = self.build_node(fluid.root)?;
+        let root = self.build_node(domain_root)?;
         let cut_index = base_cuts.len() + 1;
         let mut children = Vec::new();
         for side in [CutSide::Inside, CutSide::Outside] {
@@ -2030,6 +2117,7 @@ impl SceneDocument {
                 self.allocate_object_id()?,
                 base.owner_object_id,
             );
+            child.domain_root = Some(domain_root);
             child.outside_direction = base.outside_direction;
             child.patch_id = base.patch_id.clone();
             child.patch_type = base.patch_type.clone();
@@ -2072,10 +2160,14 @@ impl SceneDocument {
         self.boundary_regions
             .retain(|region| region.object_id != region_object_id);
         self.boundary_regions.extend(children);
+        // Fluid keeps its tag list in sync; other domains attach regions by
+        // `domain_root` alone.
         if let Some(fluid) = self.fluid_domain.as_mut() {
-            fluid.tags.retain(|tag| *tag != TagRef::Region(region_object_id));
-            fluid.tags.push(TagRef::Region(child_ids.0));
-            fluid.tags.push(TagRef::Region(child_ids.1));
+            if fluid.root == domain_root {
+                fluid.tags.retain(|tag| *tag != TagRef::Region(region_object_id));
+                fluid.tags.push(TagRef::Region(child_ids.0));
+                fluid.tags.push(TagRef::Region(child_ids.1));
+            }
         }
         self.mark_changed();
         Ok(child_ids)

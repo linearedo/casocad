@@ -29,7 +29,7 @@ const REFINEMENT_TIERS: [u32; 3] = [12, 64, 96];
 /// grid plane (0=XY, 1=XZ, 2=YZ) and camera yaw/pitch in degrees.
 const REFERENCE_VIEWS: [(&str, egui::Key, u32, f64, f64); 4] = [
     ("3D", egui::Key::Num1, 0, 35.0, 28.0),
-    ("{x,y}", egui::Key::Num2, 0, 90.0, 89.5),
+    ("{x,y}", egui::Key::Num2, 0, -90.0, 89.5),
     ("{x,z}", egui::Key::Num3, 1, -90.0, 0.0),
     ("{y,z}", egui::Key::Num4, 2, 0.0, 0.0),
 ];
@@ -445,13 +445,14 @@ impl ViewportPanel {
             self.upload_scene(render_state);
             return;
         };
-        let Some(root) = crate::boundary_tool::fluid_root_node(&state.document) else {
+        // Every marked domain (fluid, solid, …) exposes its boundary to the
+        // region tools; each overlay classifies against ITS domain's root.
+        let roots = crate::boundary_tool::domain_root_nodes(&state.document);
+        if roots.is_empty() {
             tools.validation_points.clear();
             self.upload_scene(render_state);
             return;
-        };
-        tools.validation_points = crate::boundary_tool::validation_points(&base);
-
+        }
         let selected = state.selected_region.and_then(|region_id| {
             state
                 .document
@@ -459,12 +460,22 @@ impl ViewportPanel {
                 .iter()
                 .find(|region| region.object_id == region_id)
         });
-        if let (Some(region), Some(ghost)) = (selected, &tools.preview_ghost) {
+        let selected_root = selected
+            .and_then(|region| crate::boundary_tool::region_root_node(&state.document, region));
+        // Validation points serve the cutter, which operates on the selected
+        // region's domain; default to the first marked domain.
+        let validation_root = selected_root.as_ref().unwrap_or(&roots[0].1);
+        tools.validation_points =
+            crate::boundary_tool::validation_points_for(validation_root, &base);
+
+        if let (Some(region), Some(root), Some(ghost)) =
+            (selected, selected_root.as_ref(), &tools.preview_ghost)
+        {
             // Split preview supersedes the plain selection highlight.
             let (inside, outside) =
                 crate::boundary_tool::split_preview_children(region, ghost);
             if let Some(surface) = crate::boundary_tool::region_highlight_surface(
-                &root,
+                root,
                 &inside,
                 &base,
                 crate::boundary_tool::PREVIEW_INSIDE_COLOR,
@@ -473,7 +484,7 @@ impl ViewportPanel {
                 self.overlays.push(surface);
             }
             if let Some(surface) = crate::boundary_tool::region_highlight_surface(
-                &root,
+                root,
                 &outside,
                 &base,
                 crate::boundary_tool::PREVIEW_OUTSIDE_COLOR,
@@ -481,9 +492,9 @@ impl ViewportPanel {
             ) {
                 self.overlays.push(surface);
             }
-        } else if let Some(region) = selected {
+        } else if let (Some(region), Some(root)) = (selected, selected_root.as_ref()) {
             if let Some(surface) = crate::boundary_tool::region_highlight_surface(
-                &root,
+                root,
                 region,
                 &base,
                 crate::boundary_tool::SELECTED_COLOR,
@@ -493,9 +504,14 @@ impl ViewportPanel {
             }
         }
         if let Some(hit) = &tools.hover_hit {
+            let hover_root = tools
+                .hover_domain
+                .and_then(|id| roots.iter().find(|(root_id, _)| *root_id == id))
+                .map(|(_, node)| node)
+                .unwrap_or(&roots[0].1);
             let candidate = crate::boundary_tool::candidate_region(hit);
             if let Some(surface) = crate::boundary_tool::region_highlight_surface(
-                &root,
+                hover_root,
                 &candidate,
                 &base,
                 crate::boundary_tool::CANDIDATE_COLOR,

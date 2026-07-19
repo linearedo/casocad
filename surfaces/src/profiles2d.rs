@@ -784,6 +784,71 @@ fn ordered_placed_2d_surface(
     })
 }
 
+/// World-space outline rings of a placed profile: marching-squares rings of
+/// the profile field, cleaned, each vertex Newton-refined onto the exact
+/// zero set. Used by the app's 2D boundary-region highlight and cutter,
+/// which need a polyline that lies ON the outline (the display fill's wire
+/// is a staircase of grid edges on the sampled fallback path).
+pub fn placed_outline_rings(placed: &PlacedSdf2D, resolution: usize) -> Vec<Vec<Vec3>> {
+    let (mut u_min, mut u_max, mut v_min, mut v_max) = placed.profile.bounds();
+    let span = (u_max - u_min).max(v_max - v_min).max(1.0e-6);
+    let pad = span * 0.025;
+    u_min -= pad;
+    u_max += pad;
+    v_min -= pad;
+    v_max += pad;
+    let resolution = resolution.clamp(16, 512);
+    let us: Vec<f64> = (0..=resolution)
+        .map(|index| u_min + (u_max - u_min) * index as f64 / resolution as f64)
+        .collect();
+    let vs: Vec<f64> = (0..=resolution)
+        .map(|index| v_min + (v_max - v_min) * index as f64 / resolution as f64)
+        .collect();
+    let mut values = Vec::with_capacity((resolution + 1) * (resolution + 1));
+    for u in &us {
+        for v in &vs {
+            values.push(placed.profile.eval(*u, *v));
+        }
+    }
+    let step = span * 1.0e-7;
+    marching_squares_rings(&values, &us, &vs)
+        .iter()
+        .filter_map(|ring| {
+            let cleaned = clean_polygon_ring(ring);
+            if cleaned.len() < 3 {
+                return None;
+            }
+            Some(
+                cleaned
+                    .iter()
+                    .map(|point| {
+                        let (mut u, mut v) = (point[0], point[1]);
+                        for _ in 0..12 {
+                            let value = placed.profile.eval(u, v);
+                            if value.abs() <= span * 1.0e-12 {
+                                break;
+                            }
+                            let gu = (placed.profile.eval(u + step, v)
+                                - placed.profile.eval(u - step, v))
+                                / (2.0 * step);
+                            let gv = (placed.profile.eval(u, v + step)
+                                - placed.profile.eval(u, v - step))
+                                / (2.0 * step);
+                            let squared = gu * gu + gv * gv;
+                            if squared <= 1.0e-18 {
+                                break;
+                            }
+                            u -= value * gu / squared;
+                            v -= value * gv / squared;
+                        }
+                        placed.origin + placed.axis_u * u + placed.axis_v * v
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 fn contoured_placed_2d_surface(
     node: &Node,
     placed: &PlacedSdf2D,
