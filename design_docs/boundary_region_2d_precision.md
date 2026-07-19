@@ -91,19 +91,24 @@ lateral + tangential pads) instead of an isotropic eval limit:
 3D patches are untouched, and `region_patch_scope_volume` keeps its old
 behavior for external callers.
 
-### Ribbon size follows the patch owner (follow-up fix)
+### Ribbon size is constant in screen pixels (follow-up fixes)
 
 The highlight ribbon's `half_width` and `lift` used to scale with the
 WHOLE root's bounding-box diagonal, so enlarging one operand (the flowbox
 rectangle) visibly fattened the highlight of an unchanged one (the
-subtracted ellipse). `region_highlight_ribbon` now sizes the ribbon from
-the bounding box of `patch.owner` — the operand the region tags — falling
-back to the root diagonal only when no curve patch resolves (legacy ring
-path). Numerical epsilons (gradient step, degenerate-chord drop) stay on
-the root diagonal; they are field tolerances, not visuals. Deferred:
-constant screen-pixel ribbon width, which would need camera-dependent
-overlay rebuilds (`refresh_boundary_overlays` keys only on scene/overlay
-revision and selection today).
+subtracted ellipse) — and a large domain's own edges always drew fat next
+to a small operand's thin foil. The ribbon is now sized in screen pixels:
+the viewport measures the world length of one pixel on the domain's
+workplane (`workplane_pixel_radius` at the view center) and
+`region_highlight_ribbon` multiplies it by `RIBBON_HALF_WIDTH_PIXELS` /
+`RIBBON_LIFT_PIXELS` (~2 px total width) — every feature gets the same
+thin highlight at any zoom. To follow zoom without rebuilding overlays
+every orbit frame, `overlay_signature` carries a camera-only
+world-per-pixel proxy quantized in ~10% buckets. Without a pixel size
+(grazing view, tests), the ribbon falls back to scaling with the bounding
+box of `patch.owner` — the operand the region tags, never the whole
+domain. Numerical epsilons (gradient step, degenerate-chord drop) stay on
+the root diagonal; they are field tolerances, not visuals.
 
 ## 3. Tests
 
@@ -114,9 +119,10 @@ revision and selection today).
 - `kernel/tests/boundary_region_2d.rs`: nearest-wins between cut and edge,
   pick radius honored, edge scope stops at the corner (shared corner still
   belongs to both edges).
-- `app/src/boundary_tool.rs` tests: ribbon width of the subtracted
-  circle's highlight is unchanged when the flowbox rectangle triples;
-  a flowbox edge's ribbon still scales with the flowbox.
+- `app/src/boundary_tool.rs` tests: with a pixel size the ribbon width is
+  identical for the circle outline and a flowbox edge, and across a 3x
+  flowbox resize; the no-camera fallback keeps the subtracted circle's
+  width unchanged when the flowbox rectangle triples.
 - Existing suites pass unmodified.
 
 ## 4. Deliberately unchanged / deferred

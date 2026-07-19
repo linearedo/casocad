@@ -73,7 +73,10 @@ pub struct ViewportPanel {
     applied_selection: Option<u32>,
     /// Boundary-tool overlay surfaces (candidate/selected/split preview).
     overlays: Vec<caso_surfaces::ViewportSurface>,
-    overlay_signature: (u64, u64, Option<u32>),
+    /// (scene version, overlay revision, selected region, zoom bucket):
+    /// the zoom bucket quantizes world-per-pixel in ~10% steps so the
+    /// pixel-sized highlight ribbons rebuild on zoom, not every frame.
+    overlay_signature: (u64, u64, Option<u32>, i64),
     /// Meshing-workspace preview surfaces (per-tag lattice/mesh elements).
     mesh_overlays: Vec<caso_surfaces::ViewportSurface>,
     /// Meshing-workspace point elements (xyz + rgb per point), drawn as
@@ -110,7 +113,7 @@ impl Default for ViewportPanel {
             selection: None,
             applied_selection: None,
             overlays: Vec::new(),
-            overlay_signature: (u64::MAX, u64::MAX, None),
+            overlay_signature: (u64::MAX, u64::MAX, None, i64::MAX),
             mesh_overlays: Vec::new(),
             mesh_points: Vec::new(),
             mesh_preview_revision: u64::MAX,
@@ -411,11 +414,22 @@ impl ViewportPanel {
         state: &AppState,
         tools: &mut ToolState,
         render_state: &RenderState,
+        rect: egui::Rect,
+        pixels_per_point: f32,
     ) {
+        // Camera-only zoom proxy (same formula as OrbitCamera::pan),
+        // quantized in ~10% steps: the pixel-sized ribbons follow zoom and
+        // window resizes without rebuilding on every orbit frame. The exact
+        // per-workplane pixel size is measured below at build time.
+        let physical_height = (rect.height() * pixels_per_point).max(1.0) as f64;
+        let world_per_pixel =
+            2.0 * self.camera.distance / (self.camera.focal * physical_height);
+        let zoom_bucket = (world_per_pixel.max(1.0e-12).ln() * 10.0).round() as i64;
         let signature = (
             self.scene_version,
             tools.overlay_revision,
             state.selected_region,
+            zoom_bucket,
         );
         if signature == self.overlay_signature {
             return;
@@ -468,18 +482,33 @@ impl ViewportPanel {
         tools.validation_points =
             crate::boundary_tool::validation_points_for(validation_root, &base);
 
+        // World length of one screen pixel on each root's workplane: makes
+        // the 2D highlight ribbon a constant apparent width at any zoom.
+        let camera = self.camera;
+        let pixel_size_for = |root: &caso_kernel::sdf::node::Node| {
+            crate::tools::workplane_pixel_radius(
+                &camera,
+                rect.center(),
+                rect,
+                pixels_per_point,
+                root,
+                1.0,
+            )
+        };
         if let (Some(region), Some(root), Some(ghost)) =
             (selected, selected_root.as_ref(), &tools.preview_ghost)
         {
             // Split preview supersedes the plain selection highlight.
             let (inside, outside) =
                 crate::boundary_tool::split_preview_children(region, ghost);
+            let pixel_size = pixel_size_for(root);
             if let Some(surface) = crate::boundary_tool::region_highlight_surface(
                 root,
                 &inside,
                 &base,
                 crate::boundary_tool::PREVIEW_INSIDE_COLOR,
                 u32::MAX - 4,
+                pixel_size,
             ) {
                 self.overlays.push(surface);
             }
@@ -489,6 +518,7 @@ impl ViewportPanel {
                 &base,
                 crate::boundary_tool::PREVIEW_OUTSIDE_COLOR,
                 u32::MAX - 5,
+                pixel_size,
             ) {
                 self.overlays.push(surface);
             }
@@ -499,6 +529,7 @@ impl ViewportPanel {
                 &base,
                 crate::boundary_tool::SELECTED_COLOR,
                 u32::MAX - 2,
+                pixel_size_for(root),
             ) {
                 self.overlays.push(surface);
             }
@@ -516,6 +547,7 @@ impl ViewportPanel {
                 &base,
                 crate::boundary_tool::CANDIDATE_COLOR,
                 u32::MAX - 3,
+                pixel_size_for(hover_root),
             ) {
                 self.overlays.push(surface);
             }
@@ -821,7 +853,7 @@ impl ViewportPanel {
         self.base_scene = Some(scene);
         self.upload_scene(render_state);
         // Force the boundary overlays to re-filter against the new surfaces.
-        self.overlay_signature = (u64::MAX, u64::MAX, None);
+        self.overlay_signature = (u64::MAX, u64::MAX, None, i64::MAX);
 
         if !self.framed_once {
             self.framed_once = true;
@@ -979,7 +1011,7 @@ impl ViewportPanel {
             self.paint_bounds_tripods(ui, rect, pixels_per_point, state);
         }
         self.paint_revolve_axes(ui, rect, pixels_per_point, state);
-        self.refresh_boundary_overlays(state, tools, render_state);
+        self.refresh_boundary_overlays(state, tools, render_state, rect, pixels_per_point);
         // Keep painting while refinement tiers are pending.
         if !self.pending_tiers.is_empty() {
             ui.ctx().request_repaint();

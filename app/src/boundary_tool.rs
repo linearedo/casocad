@@ -251,19 +251,30 @@ pub fn region_highlight_mesh(
     Some(compact)
 }
 
+/// Ribbon half-width and plane lift of the 2D highlight, in screen pixels
+/// (applied to the world size of one pixel on the workplane). One knob for
+/// the highlight's apparent thickness at any zoom.
+const RIBBON_HALF_WIDTH_PIXELS: f64 = 1.0;
+const RIBBON_LIFT_PIXELS: f64 = 1.0;
+
 /// The classifier-filtered highlight: `region_highlight_mesh` lifted along
 /// its normals by diagonal·1e-3 so the overlay never z-fights the surface.
+/// `pixel_size` is the world length of one screen pixel on the domain's
+/// workplane (2D domains only): when given, the ribbon has constant
+/// apparent width; without it (degenerate camera, tests) the ribbon falls
+/// back to scaling with the tagged patch's owner.
 pub fn region_highlight_surface(
     root: &Node,
     region: &BoundaryRegion,
     scene: &ViewportSurfaceScene,
     color: [f32; 3],
     overlay_id: u32,
+    pixel_size: Option<f64>,
 ) -> Option<ViewportSurface> {
     if root.dimension() == 2 {
         // 2D domains: the region is an arc of the outline curve — a lifted
         // ribbon, not a lifted triangle filter.
-        return region_highlight_ribbon(root, region, scene, color, overlay_id);
+        return region_highlight_ribbon(root, region, scene, color, overlay_id, pixel_size);
     }
     let diagonal = root
         .bounding_box()
@@ -392,6 +403,7 @@ fn region_highlight_ribbon(
     scene: &ViewportSurfaceScene,
     color: [f32; 3],
     overlay_id: u32,
+    pixel_size: Option<f64>,
 ) -> Option<ViewportSurface> {
     let placed = placed_2d_root(root)?;
     let plane_normal = placed.normal();
@@ -400,17 +412,23 @@ fn region_highlight_ribbon(
         .map(|bounds| bounds.diagonal())
         .unwrap_or(1.0);
     let step = (diagonal * 1.0e-5).max(1.0e-9);
-    // Ribbon size follows the feature the region tags (the operand that owns
-    // the patch), not the whole domain: editing an unrelated operand must not
-    // fatten the highlight of an unchanged one.
     let patch = region_curve_patch(root, region);
-    let feature_diagonal = patch
-        .as_ref()
-        .and_then(|patch| patch.owner.bounding_box().ok())
-        .map(|bounds| bounds.diagonal())
-        .unwrap_or(diagonal);
-    let half_width = feature_diagonal * 4.0e-3;
-    let lift = feature_diagonal * 1.5e-3;
+    // Constant apparent width: size the ribbon by the world length of one
+    // screen pixel on the workplane. Without a pixel size (degenerate
+    // camera, tests), fall back to the feature the region tags (the operand
+    // that owns the patch) — never the whole domain, so editing an
+    // unrelated operand cannot fatten the highlight of an unchanged one.
+    let (half_width, lift) = match pixel_size {
+        Some(pixel) => (pixel * RIBBON_HALF_WIDTH_PIXELS, pixel * RIBBON_LIFT_PIXELS),
+        None => {
+            let feature_diagonal = patch
+                .as_ref()
+                .and_then(|patch| patch.owner.bounding_box().ok())
+                .map(|bounds| bounds.diagonal())
+                .unwrap_or(diagonal);
+            (feature_diagonal * 4.0e-3, feature_diagonal * 1.5e-3)
+        }
+    };
     // Cut volumes once per call; a failed cut_volume hides the highlight
     // (matching the classifier's error behavior), as in the 3D path.
     let mut cut_volumes: Vec<(Node, CutSide)> = Vec::with_capacity(region.cuts.len());
@@ -1025,7 +1043,7 @@ mod tests {
     fn ribbon_highlights_the_edge_region_only() {
         let (root, scene) = fixture_2d();
         let region = left_edge_region(&root);
-        let surface = region_highlight_surface(&root, &region, &scene, CANDIDATE_COLOR, 1)
+        let surface = region_highlight_surface(&root, &region, &scene, CANDIDATE_COLOR, 1, None)
             .expect("ribbon");
         assert!(!surface.indices.is_empty());
         // Every ribbon vertex hugs the left edge x = -2, y in [-1, 1],
@@ -1047,10 +1065,10 @@ mod tests {
             .node;
         let (inside, outside) = split_preview_children(&region, &ghost);
         let inside_surface =
-            region_highlight_surface(&root, &inside, &scene, PREVIEW_INSIDE_COLOR, 2)
+            region_highlight_surface(&root, &inside, &scene, PREVIEW_INSIDE_COLOR, 2, None)
                 .expect("inside ribbon");
         let outside_surface =
-            region_highlight_surface(&root, &outside, &scene, PREVIEW_OUTSIDE_COLOR, 3)
+            region_highlight_surface(&root, &outside, &scene, PREVIEW_OUTSIDE_COLOR, 3, None)
                 .expect("outside ribbon");
         // The ribbon offsets along the edge's outward normal (±x) and the
         // plane normal (±z), so y-coordinates are pure arc parameters: the
@@ -1120,7 +1138,12 @@ mod tests {
 
     /// Ribbon width of a region's highlight: the first quad's first two
     /// vertices are `p ± outward * half_width`.
-    fn ribbon_width(root: &Node, scene: &ViewportSurfaceScene, patch_id: &str) -> f64 {
+    fn ribbon_width(
+        root: &Node,
+        scene: &ViewportSurfaceScene,
+        patch_id: &str,
+        pixel_size: Option<f64>,
+    ) -> f64 {
         let patch = surface_patches_for_root(root)
             .into_iter()
             .find(|patch| patch.patch_id == patch_id)
@@ -1130,7 +1153,8 @@ mod tests {
         region.patch_type = Some(patch.patch_type.clone());
         region.outside_direction = patch.outside_direction;
         let surface =
-            region_highlight_ribbon(root, &region, scene, [1.0, 0.0, 0.0], 999).expect("ribbon");
+            region_highlight_ribbon(root, &region, scene, [1.0, 0.0, 0.0], 999, pixel_size)
+                .expect("ribbon");
         let a = surface.vertices[0];
         let b = surface.vertices[1];
         vec3(
@@ -1143,23 +1167,58 @@ mod tests {
 
     #[test]
     fn highlight_width_follows_the_patch_owner_not_the_whole_domain() {
+        // No pixel size (degenerate camera): the fallback scales with the
+        // tagged patch's owner, never the whole domain.
         let (small, small_scene) = fixture_2d();
         let (large, large_scene) = fixture_2d_scaled(3.0);
         // The circle is unchanged, so its highlight must not grow with the
         // flowbox (it used to scale with the whole root's diagonal).
         let hole = "cut_surface.obstacle.outline";
-        let width_small = ribbon_width(&small, &small_scene, hole);
-        let width_large = ribbon_width(&large, &large_scene, hole);
+        let width_small = ribbon_width(&small, &small_scene, hole, None);
+        let width_large = ribbon_width(&large, &large_scene, hole, None);
         assert!(
             ((width_large - width_small) / width_small).abs() < 1.0e-5,
             "circle ribbon width changed with the flowbox: {width_small} -> {width_large}"
         );
         // A flowbox edge is owned by the flowbox: its ribbon still scales.
-        let edge_small = ribbon_width(&small, &small_scene, "flowbox.-U");
-        let edge_large = ribbon_width(&large, &large_scene, "flowbox.-U");
+        let edge_small = ribbon_width(&small, &small_scene, "flowbox.-U", None);
+        let edge_large = ribbon_width(&large, &large_scene, "flowbox.-U", None);
         assert!(
             edge_large > edge_small * 2.0,
             "flowbox edge ribbon should scale with the flowbox: {edge_small} -> {edge_large}"
         );
+    }
+
+    #[test]
+    fn highlight_width_is_pixel_constant_across_features_and_scales() {
+        let (small, small_scene) = fixture_2d();
+        let (large, large_scene) = fixture_2d_scaled(3.0);
+        let pixel = Some(0.01);
+        let expected = 2.0 * 0.01 * RIBBON_HALF_WIDTH_PIXELS;
+        for (label, width) in [
+            (
+                "circle/small",
+                ribbon_width(&small, &small_scene, "cut_surface.obstacle.outline", pixel),
+            ),
+            (
+                "edge/small",
+                ribbon_width(&small, &small_scene, "flowbox.-U", pixel),
+            ),
+            (
+                "circle/large",
+                ribbon_width(&large, &large_scene, "cut_surface.obstacle.outline", pixel),
+            ),
+            (
+                "edge/large",
+                ribbon_width(&large, &large_scene, "flowbox.-U", pixel),
+            ),
+        ] {
+            // Tolerance covers the f32 vertex storage (~1e-6 absolute at the
+            // large fixture's coordinates); the old behavior was off by 3-10x.
+            assert!(
+                ((width - expected) / expected).abs() < 1.0e-3,
+                "{label}: ribbon width {width} != {expected}"
+            );
+        }
     }
 }
