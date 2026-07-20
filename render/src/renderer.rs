@@ -2,7 +2,7 @@
 //! (analytic grid/axes, surface chunks, screen-space thick lines), ported
 //! from the QRhi surface renderer.
 
-use caso_surfaces::types::{SurfaceStatus, ViewportSurfaceScene};
+use caso_surfaces::types::{SurfaceStatus, ViewportSurface, ViewportSurfaceScene};
 
 use crate::camera::OrbitCamera;
 
@@ -60,7 +60,26 @@ pub struct ViewportRenderer {
     grid_uniforms: wgpu::Buffer,
     surface_uniforms: wgpu::Buffer,
     line_uniforms: wgpu::Buffer,
-    chunks: Vec<SurfaceChunk>,
+    /// Surfaces from the last `set_scene` (base mesh + selection highlight):
+    /// rebuilt only when the document or selection actually changes.
+    base_chunks: Vec<SurfaceChunk>,
+    /// Surfaces from the last `set_overlays` (boundary highlight ribbons,
+    /// create-tool ghost): rebuilt on zoom-bucket/overlay-revision changes
+    /// without touching `base_chunks` or `mesh_chunks`, so per-zoom-step
+    /// ribbon rebuilds never re-upload the base mesh or the meshing preview.
+    overlay_chunks: Vec<SurfaceChunk>,
+    /// Surfaces from the last `set_mesh_overlays` (meshing-workspace preview
+    /// — every previewed mesh element): rebuilt only on an actual
+    /// `mesh_preview_revision` change, never by zoom or boundary-overlay
+    /// churn, since this can be the largest surface set in the scene.
+    mesh_chunks: Vec<SurfaceChunk>,
+    /// Raw thick-line vertex floats from the base/overlay/mesh surface sets,
+    /// concatenated into `line_buffer` whenever any one of `set_scene`/
+    /// `set_overlays`/`set_mesh_overlays` runs. Kept separate so rebuilding
+    /// one side doesn't require re-walking the others' wire surfaces.
+    base_line_vertices: Vec<f32>,
+    overlay_line_vertices: Vec<f32>,
+    mesh_line_vertices: Vec<f32>,
     line_buffer: Option<wgpu::Buffer>,
     line_vertex_count: u32,
     point_buffer: Option<wgpu::Buffer>,
@@ -365,7 +384,12 @@ impl ViewportRenderer {
             grid_uniforms,
             surface_uniforms,
             line_uniforms,
-            chunks: Vec::new(),
+            base_chunks: Vec::new(),
+            overlay_chunks: Vec::new(),
+            mesh_chunks: Vec::new(),
+            base_line_vertices: Vec::new(),
+            overlay_line_vertices: Vec::new(),
+            mesh_line_vertices: Vec::new(),
             line_buffer: None,
             line_vertex_count: 0,
             point_buffer: None,
@@ -421,18 +445,19 @@ impl ViewportRenderer {
         self.size
     }
 
-    /// Upload the display-surface scene into GPU chunk buffers.
-    pub fn set_scene(
-        &mut self,
+    /// Build GPU chunk buffers plus raw thick-line vertex floats for one set
+    /// of surfaces. Shared by the base-scene and overlay upload paths so
+    /// rebuilding one side never re-walks or re-uploads the other's.
+    fn build_surfaces(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        scene: &ViewportSurfaceScene,
-    ) {
-        self.chunks.clear();
+        surfaces: &[ViewportSurface],
+    ) -> (Vec<SurfaceChunk>, Vec<f32>) {
+        let mut chunks = Vec::new();
         // Thick-line vertex data for wire-only surfaces (1D objects,
         // outlines), concatenated into one static buffer per scene.
         let mut line_vertices: Vec<f32> = Vec::new();
-        for surface in &scene.surfaces {
+        for surface in surfaces {
             if surface.status == SurfaceStatus::Failed {
                 continue;
             }
@@ -466,13 +491,29 @@ impl ViewportRenderer {
                 bytemuck::cast_slice(&surface.indices),
                 wgpu::BufferUsages::INDEX,
             );
-            self.chunks.push(SurfaceChunk {
+            chunks.push(SurfaceChunk {
                 vertex_buffer,
                 index_buffer,
                 index_count: surface.indices.len() as u32,
                 blended: alpha < 0.999,
             });
         }
+        (chunks, line_vertices)
+    }
+
+    /// Concatenate the base, overlay, and mesh-preview thick-line vertices
+    /// into the one GPU line buffer `render` draws from. Cheap regardless of
+    /// mesh size: only wire-only (1D/outline) surfaces contribute line
+    /// vertices, and the actual mesh preview is drawn as filled chunks.
+    fn rebuild_line_buffer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut line_vertices = Vec::with_capacity(
+            self.base_line_vertices.len()
+                + self.overlay_line_vertices.len()
+                + self.mesh_line_vertices.len(),
+        );
+        line_vertices.extend_from_slice(&self.base_line_vertices);
+        line_vertices.extend_from_slice(&self.overlay_line_vertices);
+        line_vertices.extend_from_slice(&self.mesh_line_vertices);
         self.line_vertex_count = (line_vertices.len() / 11) as u32;
         self.line_buffer = if line_vertices.is_empty() {
             None
@@ -485,6 +526,55 @@ impl ViewportRenderer {
                 wgpu::BufferUsages::VERTEX,
             ))
         };
+    }
+
+    /// Upload the base display-surface scene (the actual mesh + selection
+    /// highlight) into GPU chunk buffers. Call only when the document or
+    /// selection changes — never on zoom or overlay-only updates, see
+    /// `set_overlays`.
+    pub fn set_scene(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &ViewportSurfaceScene,
+    ) {
+        let (chunks, line_vertices) = Self::build_surfaces(device, queue, &scene.surfaces);
+        self.base_chunks = chunks;
+        self.base_line_vertices = line_vertices;
+        self.rebuild_line_buffer(device, queue);
+    }
+
+    /// Upload boundary-tool overlay surfaces (highlight ribbons, create-tool
+    /// ghost) into their own GPU chunk buffers, independent of both the base
+    /// mesh and the meshing preview. This is the path zoom-bucket changes
+    /// should call, so their cost scales only with overlay geometry — never
+    /// with the base mesh or the (potentially much larger) mesh preview.
+    pub fn set_overlays(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surfaces: &[ViewportSurface],
+    ) {
+        let (chunks, line_vertices) = Self::build_surfaces(device, queue, surfaces);
+        self.overlay_chunks = chunks;
+        self.overlay_line_vertices = line_vertices;
+        self.rebuild_line_buffer(device, queue);
+    }
+
+    /// Upload the meshing-workspace preview surfaces (every previewed mesh
+    /// element) into their own GPU chunk buffers. Call only on an actual
+    /// `mesh_preview_revision` change — never on zoom or boundary-overlay
+    /// churn, since this is typically the largest surface set in the scene.
+    pub fn set_mesh_overlays(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surfaces: &[ViewportSurface],
+    ) {
+        let (chunks, line_vertices) = Self::build_surfaces(device, queue, surfaces);
+        self.mesh_chunks = chunks;
+        self.mesh_line_vertices = line_vertices;
+        self.rebuild_line_buffer(device, queue);
     }
 
     /// Replace the point-marker instances (6 floats per point: xyz + rgb),
@@ -579,8 +669,9 @@ impl ViewportRenderer {
             0.0,
         ];
         queue.write_buffer(&self.line_uniforms, 0, bytemuck::cast_slice(&line_data));
-        // Line vertices are uploaded once in set_scene; if per-frame overlay
-        // lines are ever needed, give them their own small buffer here.
+        // Line vertices are uploaded once in set_scene/set_overlays (see
+        // rebuild_line_buffer); if per-frame overlay lines are ever needed,
+        // give them their own small buffer here.
 
         let color_view = self
             .color_texture
@@ -640,14 +731,20 @@ impl ViewportRenderer {
             };
             pass.set_pipeline(surface_pipeline);
             pass.set_bind_group(0, &self.surface_bind_group, &[]);
-            for chunk in self.chunks.iter().filter(|chunk| !chunk.blended) {
+            let all_chunks = || {
+                self.base_chunks
+                    .iter()
+                    .chain(self.overlay_chunks.iter())
+                    .chain(self.mesh_chunks.iter())
+            };
+            for chunk in all_chunks().filter(|chunk| !chunk.blended) {
                 pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
                 pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..chunk.index_count, 0, 0..1);
             }
-            if self.chunks.iter().any(|chunk| chunk.blended) {
+            if all_chunks().any(|chunk| chunk.blended) {
                 pass.set_pipeline(&self.surface_blend_pipeline);
-                for chunk in self.chunks.iter().filter(|chunk| chunk.blended) {
+                for chunk in all_chunks().filter(|chunk| chunk.blended) {
                     pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
                     pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..chunk.index_count, 0, 0..1);

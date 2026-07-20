@@ -387,22 +387,47 @@ impl ViewportPanel {
             });
     }
 
-    fn upload_scene(&mut self, render_state: &RenderState) {
+    /// Upload the base mesh (+ selection highlight) to its own GPU chunks.
+    /// Call only when the document actually rebuilds or selection changes —
+    /// never from zoom or overlay-only updates, see `upload_overlays` and
+    /// `upload_mesh_overlays`.
+    fn upload_base_scene(&mut self, render_state: &RenderState) {
         let Some(base) = &self.base_scene else {
             return;
         };
         let renderer = self
             .renderer
             .get_or_insert_with(|| ViewportRenderer::new(&render_state.device));
-        let mut scene = match self.selection {
+        let scene = match self.selection {
             Some(object_id) => base.with_selected_highlight(object_id),
             None => base.clone(),
         };
-        scene.surfaces.extend(self.overlays.iter().cloned());
-        scene.surfaces.extend(self.mesh_overlays.iter().cloned());
         renderer.set_scene(&render_state.device, &render_state.queue, &scene);
-        renderer.set_points(&render_state.device, &render_state.queue, &self.mesh_points);
         self.applied_selection = self.selection;
+    }
+
+    /// Upload boundary-tool overlays (highlight ribbons, create-ghost) to
+    /// their own GPU chunks, independent of the base mesh AND of the mesh
+    /// preview. This is the path `refresh_boundary_overlays`'s zoom bucket
+    /// drives, so it must exclude `mesh_overlays` — the meshing-workspace
+    /// preview can be arbitrarily large (every mesh element), and re-zooming
+    /// must never re-upload it.
+    fn upload_overlays(&mut self, render_state: &RenderState) {
+        let renderer = self
+            .renderer
+            .get_or_insert_with(|| ViewportRenderer::new(&render_state.device));
+        renderer.set_overlays(&render_state.device, &render_state.queue, &self.overlays);
+    }
+
+    /// Upload the meshing-workspace preview (surfaces + points) to its own
+    /// GPU chunks. Driven solely by `mesh_preview_revision` changes
+    /// (`upload_pending`), never by zoom or boundary-overlay churn.
+    fn upload_mesh_overlays(&mut self, render_state: &RenderState) {
+        let renderer = self
+            .renderer
+            .get_or_insert_with(|| ViewportRenderer::new(&render_state.device));
+        renderer.set_mesh_overlays(&render_state.device, &render_state.queue, &self.mesh_overlays);
+        renderer.set_points(&render_state.device, &render_state.queue, &self.mesh_points);
         self.upload_pending = false;
     }
 
@@ -456,7 +481,7 @@ impl ViewportPanel {
             }
         }
         let Some(base) = self.base_scene.clone() else {
-            self.upload_scene(render_state);
+            self.upload_overlays(render_state);
             return;
         };
         // Every marked domain (fluid, solid, …) exposes its boundary to the
@@ -464,7 +489,7 @@ impl ViewportPanel {
         let roots = crate::boundary_tool::domain_root_nodes(&state.document);
         if roots.is_empty() {
             tools.validation_points.clear();
-            self.upload_scene(render_state);
+            self.upload_overlays(render_state);
             return;
         }
         let selected = state.selected_region.and_then(|region_id| {
@@ -552,7 +577,7 @@ impl ViewportPanel {
                 self.overlays.push(surface);
             }
         }
-        self.upload_scene(render_state);
+        self.upload_overlays(render_state);
     }
 
     /// The scene object under the screen position: nearest ray/triangle hit
@@ -863,7 +888,7 @@ impl ViewportPanel {
             caso_surfaces::build_viewport_surface_scene(&components, document.version, cache);
         self.last_build_ms = scene.build_ms;
         self.base_scene = Some(scene);
-        self.upload_scene(render_state);
+        self.upload_base_scene(render_state);
         // Force the boundary overlays to re-filter against the new surfaces.
         self.overlay_signature = (u64::MAX, u64::MAX, None, i64::MAX);
 
@@ -894,8 +919,11 @@ impl ViewportPanel {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(30));
         }
-        if self.selection != self.applied_selection || self.upload_pending {
-            self.upload_scene(render_state);
+        if self.selection != self.applied_selection {
+            self.upload_base_scene(render_state);
+        }
+        if self.upload_pending {
+            self.upload_mesh_overlays(render_state);
         }
         let available = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
