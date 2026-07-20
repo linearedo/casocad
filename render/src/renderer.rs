@@ -11,6 +11,12 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const LINE_HALF_PX: f32 = 3.0;
 /// Screen-space radius of point markers (sphere impostors).
 const POINT_RADIUS_PX: f32 = 4.0;
+/// Opacity at and above which geometry surfaces write depth and the mesh
+/// preview overlay (lines/points) starts depth-testing against them, so
+/// near-opaque geometry can occlude mesh elements behind it. Below this,
+/// mesh preview stays opacity-independent (x-ray inspection mode); see
+/// `design_docs/mesh_preview_opacity_independence.md`.
+const MESH_PREVIEW_OCCLUDE_OPACITY: f32 = 0.9;
 /// Default viewport background (#241f32).
 pub const DEFAULT_BACKGROUND: [f32; 3] = [0.141, 0.122, 0.196];
 
@@ -53,7 +59,9 @@ pub struct ViewportRenderer {
     surface_pipeline: wgpu::RenderPipeline,
     surface_blend_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    line_pipeline_depth_test: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
+    point_pipeline_depth_test: wgpu::RenderPipeline,
     grid_bind_group: wgpu::BindGroup,
     surface_bind_group: wgpu::BindGroup,
     line_bind_group: wgpu::BindGroup,
@@ -276,27 +284,32 @@ impl ViewportRenderer {
                 },
             ],
         };
-        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("line pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &line_shader,
-                entry_point: Some("vs_main"),
-                buffers: std::slice::from_ref(&line_vertex_layout),
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &line_shader,
-                entry_point: Some("fs_main"),
-                targets: &color_target,
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(depth_disabled.clone()),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_line_pipeline = |label: &str, depth: wgpu::DepthStencilState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &line_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: std::slice::from_ref(&line_vertex_layout),
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &line_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &color_target,
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(depth),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let line_pipeline = make_line_pipeline("line pipeline", depth_disabled.clone());
+        let line_pipeline_depth_test =
+            make_line_pipeline("line pipeline (depth test)", depth_test_no_write.clone());
 
         // Point instance: pos(3) color(3) = 24 bytes, one quad per instance.
         let point_instance_layout = wgpu::VertexBufferLayout {
@@ -315,30 +328,35 @@ impl ViewportRenderer {
                 },
             ],
         };
-        let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("point pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &point_shader,
-                entry_point: Some("vs_main"),
-                buffers: std::slice::from_ref(&point_instance_layout),
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &point_shader,
-                entry_point: Some("fs_main"),
-                targets: &color_target,
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: Some(depth_disabled),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_point_pipeline = |label: &str, depth: wgpu::DepthStencilState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &point_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: std::slice::from_ref(&point_instance_layout),
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &point_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &color_target,
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: Some(depth),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let point_pipeline = make_point_pipeline("point pipeline", depth_disabled);
+        let point_pipeline_depth_test =
+            make_point_pipeline("point pipeline (depth test)", depth_test_no_write);
 
         let grid_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("grid ubo"),
@@ -377,7 +395,9 @@ impl ViewportRenderer {
             surface_pipeline,
             surface_blend_pipeline,
             line_pipeline,
+            line_pipeline_depth_test,
             point_pipeline,
+            point_pipeline_depth_test,
             grid_bind_group,
             surface_bind_group,
             line_bind_group,
@@ -724,7 +744,10 @@ impl ViewportRenderer {
 
             // 2. Surface chunks (opaque or blended per the opacity slider),
             // then per-surface translucent chunks (ghost previews) on top.
-            let surface_pipeline = if options.opacity >= 0.999 {
+            // At/above MESH_PREVIEW_OCCLUDE_OPACITY, surfaces write depth so
+            // the mesh preview overlay (below) can be occluded by geometry.
+            let occlude_mesh_preview = options.opacity >= MESH_PREVIEW_OCCLUDE_OPACITY;
+            let surface_pipeline = if occlude_mesh_preview {
                 &self.surface_pipeline
             } else {
                 &self.surface_blend_pipeline
@@ -751,17 +774,30 @@ impl ViewportRenderer {
                 }
             }
 
-            // 3. Thick lines (wire chunks + overlays, no depth).
+            // 3. Thick lines (wire chunks + overlays). Depth-tested against
+            // geometry once opacity crosses MESH_PREVIEW_OCCLUDE_OPACITY;
+            // otherwise always on top (x-ray mesh inspection).
             if let Some(line_buffer) = &self.line_buffer {
-                pass.set_pipeline(&self.line_pipeline);
+                let line_pipeline = if occlude_mesh_preview {
+                    &self.line_pipeline_depth_test
+                } else {
+                    &self.line_pipeline
+                };
+                pass.set_pipeline(line_pipeline);
                 pass.set_bind_group(0, &self.line_bind_group, &[]);
                 pass.set_vertex_buffer(0, line_buffer.slice(..));
                 pass.draw(0..self.line_vertex_count, 0..1);
             }
 
-            // 4. Point markers (instanced sphere impostors, no depth).
+            // 4. Point markers (instanced sphere impostors). Same depth-test
+            // cutover as thick lines above.
             if let Some(point_buffer) = &self.point_buffer {
-                pass.set_pipeline(&self.point_pipeline);
+                let point_pipeline = if occlude_mesh_preview {
+                    &self.point_pipeline_depth_test
+                } else {
+                    &self.point_pipeline
+                };
+                pass.set_pipeline(point_pipeline);
                 pass.set_bind_group(0, &self.line_bind_group, &[]);
                 pass.set_vertex_buffer(0, point_buffer.slice(..));
                 pass.draw(0..4, 0..self.point_count);

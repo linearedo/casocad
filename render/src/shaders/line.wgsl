@@ -31,16 +31,26 @@ struct VertexOutput {
     @location(0) color: vec3<f32>,
 };
 
+// Depth matching OrbitCamera::matrix (camera.rs): same near/far envelope
+// derived from camera_position/camera_target, so mesh preview elements can
+// be depth-tested against surface-pipeline geometry (see
+// MESH_PREVIEW_OCCLUDE_OPACITY in renderer.rs).
 fn project(p: vec3<f32>) -> vec4<f32> {
     let fwd = normalize(ubo.camera_target - ubo.camera_position);
     let r = normalize(ubo.camera_right);
     let u = normalize(ubo.camera_up);
     let v = p - ubo.camera_position;
+    let clip_w = max(dot(v, fwd), 1.0e-4);
+    let distance = max(length(ubo.camera_target - ubo.camera_position), 0.1);
+    let near = max(distance / 1000.0, 0.001);
+    let far = max(distance * 100.0, 100.0);
+    let depth_scale = far / (far - near);
+    let depth_bias = -(far * near) / (far - near);
     return vec4<f32>(
         ubo.focal * dot(v, r) * ubo.aspect,
         -ubo.focal * dot(v, u),
-        0.0,
-        max(dot(v, fwd), 1.0e-4),
+        depth_scale * clip_w + depth_bias,
+        clip_w,
     );
 }
 

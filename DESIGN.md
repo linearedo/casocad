@@ -150,9 +150,11 @@ grid → surface → line → point passes (`renderer.rs`); four WGSL shaders
 grid/axes, `line.wgsl` screen-space thick lines, `point_marker.wgsl`
 instanced sphere impostors at constant pixel size).
 
-Design invariant: the geometry opacity slider affects display surfaces
-only — the Meshing-workspace preview overlay never fades with it, so
-opacity ~0 doubles as an x-ray mesh-inspection mode. See
+Design invariant: below 90% opacity, the geometry opacity slider affects
+display surfaces only — the Meshing-workspace preview overlay never fades
+with it, so opacity ~0 doubles as an x-ray mesh-inspection mode. At/above
+90% opacity, geometry surfaces occlude the mesh preview instead, so a
+near-opaque view doubles as a mesh-vs-geometry fit check. See
 `design_docs/mesh_preview_opacity_independence.md`.
 
 ### 4.4 `meshing` — FEA/CFD mesh artifacts
