@@ -387,16 +387,52 @@ impl MeshingPanel {
                 }
             }
         } else {
+            // Faces share most of their edges. Select one label per topology
+            // edge (preferring a boundary-face tag) instead of expanding the
+            // same thick line once for every incident face.
+            let edges: BTreeMap<u64, &caso_meshing::MeshEdge> =
+                self.mesh.edges.iter().map(|edge| (edge.id, edge)).collect();
+            let mut selected: BTreeMap<u64, (bool, String)> = BTreeMap::new();
             for face in &self.mesh.faces {
                 if self.is_shown("face", face.id) {
                     let label = face_label(&self.mesh, face);
-                    append_wire(
-                        groups.entry(label).or_default(),
-                        &point_positions,
-                        &face.type_name,
-                        &face.point_ids,
-                    );
+                    let tagged = face
+                        .tag_ids
+                        .first()
+                        .and_then(|id| self.mesh.tag_name(*id))
+                        .is_some();
+                    if face.edge_ids.is_empty() {
+                        append_wire(
+                            groups.entry(label).or_default(),
+                            &point_positions,
+                            &face.type_name,
+                            &face.point_ids,
+                        );
+                        continue;
+                    }
+                    for edge_id in &face.edge_ids {
+                        selected
+                            .entry(*edge_id)
+                            .and_modify(|(existing_tagged, existing_label)| {
+                                if tagged && !*existing_tagged {
+                                    *existing_tagged = true;
+                                    *existing_label = label.clone();
+                                }
+                            })
+                            .or_insert_with(|| (tagged, label.clone()));
+                    }
                 }
+            }
+            for (edge_id, (_, label)) in selected {
+                let Some(edge) = edges.get(&edge_id) else {
+                    continue;
+                };
+                append_wire(
+                    groups.entry(label).or_default(),
+                    &point_positions,
+                    &edge.type_name,
+                    &edge.point_ids,
+                );
             }
         }
 
@@ -523,4 +559,34 @@ fn tag_color_id(tag: &str) -> u32 {
         hash = hash.wrapping_mul(16_777_619);
     }
     (hash % 60_000).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn face_preview_emits_shared_edges_once() {
+        let mut builder = caso_meshing::MeshIrBuilder::new();
+        let p0 = builder.point(0.0, 0.0, 0.0).expect("point");
+        let p1 = builder.point(1.0, 0.0, 0.0).expect("point");
+        let p2 = builder.point(1.0, 1.0, 0.0).expect("point");
+        let p3 = builder.point(0.0, 1.0, 0.0).expect("point");
+        let p4 = builder.point(2.0, 0.0, 0.0).expect("point");
+        let p5 = builder.point(2.0, 1.0, 0.0).expect("point");
+        builder
+            .face("quad4", vec![p0, p1, p2, p3])
+            .expect("face");
+        builder
+            .face("quad4", vec![p1, p4, p5, p2])
+            .expect("face");
+        let panel = MeshingPanel {
+            mesh: builder.build().expect("mesh"),
+            ..MeshingPanel::default()
+        };
+
+        let surfaces = panel.preview_surfaces();
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].wire_indices.len() / 2, 7);
+    }
 }

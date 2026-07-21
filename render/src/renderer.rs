@@ -54,6 +54,11 @@ struct SurfaceChunk {
     blended: bool,
 }
 
+struct LineChunk {
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
+}
+
 pub struct ViewportRenderer {
     grid_pipeline: wgpu::RenderPipeline,
     surface_pipeline: wgpu::RenderPipeline,
@@ -81,15 +86,11 @@ pub struct ViewportRenderer {
     /// `mesh_preview_revision` change, never by zoom or boundary-overlay
     /// churn, since this can be the largest surface set in the scene.
     mesh_chunks: Vec<SurfaceChunk>,
-    /// Raw thick-line vertex floats from the base/overlay/mesh surface sets,
-    /// concatenated into `line_buffer` whenever any one of `set_scene`/
-    /// `set_overlays`/`set_mesh_overlays` runs. Kept separate so rebuilding
-    /// one side doesn't require re-walking the others' wire surfaces.
-    base_line_vertices: Vec<f32>,
-    overlay_line_vertices: Vec<f32>,
-    mesh_line_vertices: Vec<f32>,
-    line_buffer: Option<wgpu::Buffer>,
-    line_vertex_count: u32,
+    /// Independent thick-line buffers. Zoom-driven tool-overlay refreshes
+    /// must not concatenate and re-upload the potentially large mesh preview.
+    base_lines: Option<LineChunk>,
+    overlay_lines: Option<LineChunk>,
+    mesh_lines: Option<LineChunk>,
     point_buffer: Option<wgpu::Buffer>,
     point_count: u32,
     color_texture: Option<wgpu::Texture>,
@@ -407,11 +408,9 @@ impl ViewportRenderer {
             base_chunks: Vec::new(),
             overlay_chunks: Vec::new(),
             mesh_chunks: Vec::new(),
-            base_line_vertices: Vec::new(),
-            overlay_line_vertices: Vec::new(),
-            mesh_line_vertices: Vec::new(),
-            line_buffer: None,
-            line_vertex_count: 0,
+            base_lines: None,
+            overlay_lines: None,
+            mesh_lines: None,
             point_buffer: None,
             point_count: 0,
             color_texture: None,
@@ -521,31 +520,26 @@ impl ViewportRenderer {
         (chunks, line_vertices)
     }
 
-    /// Concatenate the base, overlay, and mesh-preview thick-line vertices
-    /// into the one GPU line buffer `render` draws from. Cheap regardless of
-    /// mesh size: only wire-only (1D/outline) surfaces contribute line
-    /// vertices, and the actual mesh preview is drawn as filled chunks.
-    fn rebuild_line_buffer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let mut line_vertices = Vec::with_capacity(
-            self.base_line_vertices.len()
-                + self.overlay_line_vertices.len()
-                + self.mesh_line_vertices.len(),
-        );
-        line_vertices.extend_from_slice(&self.base_line_vertices);
-        line_vertices.extend_from_slice(&self.overlay_line_vertices);
-        line_vertices.extend_from_slice(&self.mesh_line_vertices);
-        self.line_vertex_count = (line_vertices.len() / 11) as u32;
-        self.line_buffer = if line_vertices.is_empty() {
+    fn upload_lines(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        label: &str,
+        vertices: &[f32],
+    ) -> Option<LineChunk> {
+        if vertices.is_empty() {
             None
         } else {
-            Some(upload_buffer(
-                device,
-                queue,
-                "line vertices",
-                bytemuck::cast_slice(&line_vertices),
-                wgpu::BufferUsages::VERTEX,
-            ))
-        };
+            Some(LineChunk {
+                vertex_buffer: upload_buffer(
+                    device,
+                    queue,
+                    label,
+                    bytemuck::cast_slice(vertices),
+                    wgpu::BufferUsages::VERTEX,
+                ),
+                vertex_count: (vertices.len() / 11) as u32,
+            })
+        }
     }
 
     /// Upload the base display-surface scene (the actual mesh + selection
@@ -560,8 +554,7 @@ impl ViewportRenderer {
     ) {
         let (chunks, line_vertices) = Self::build_surfaces(device, queue, &scene.surfaces);
         self.base_chunks = chunks;
-        self.base_line_vertices = line_vertices;
-        self.rebuild_line_buffer(device, queue);
+        self.base_lines = Self::upload_lines(device, queue, "base line vertices", &line_vertices);
     }
 
     /// Upload boundary-tool overlay surfaces (highlight ribbons, create-tool
@@ -577,8 +570,8 @@ impl ViewportRenderer {
     ) {
         let (chunks, line_vertices) = Self::build_surfaces(device, queue, surfaces);
         self.overlay_chunks = chunks;
-        self.overlay_line_vertices = line_vertices;
-        self.rebuild_line_buffer(device, queue);
+        self.overlay_lines =
+            Self::upload_lines(device, queue, "overlay line vertices", &line_vertices);
     }
 
     /// Upload the meshing-workspace preview surfaces (every previewed mesh
@@ -593,8 +586,8 @@ impl ViewportRenderer {
     ) {
         let (chunks, line_vertices) = Self::build_surfaces(device, queue, surfaces);
         self.mesh_chunks = chunks;
-        self.mesh_line_vertices = line_vertices;
-        self.rebuild_line_buffer(device, queue);
+        self.mesh_lines =
+            Self::upload_lines(device, queue, "mesh line vertices", &line_vertices);
     }
 
     /// Replace the point-marker instances (6 floats per point: xyz + rgb),
@@ -689,9 +682,8 @@ impl ViewportRenderer {
             0.0,
         ];
         queue.write_buffer(&self.line_uniforms, 0, bytemuck::cast_slice(&line_data));
-        // Line vertices are uploaded once in set_scene/set_overlays (see
-        // rebuild_line_buffer); if per-frame overlay lines are ever needed,
-        // give them their own small buffer here.
+        // Line vertices are uploaded only when their respective scene,
+        // tool-overlay, or mesh-preview set changes.
 
         let color_view = self
             .color_texture
@@ -777,7 +769,8 @@ impl ViewportRenderer {
             // 3. Thick lines (wire chunks + overlays). Depth-tested against
             // geometry once opacity crosses MESH_PREVIEW_OCCLUDE_OPACITY;
             // otherwise always on top (x-ray mesh inspection).
-            if let Some(line_buffer) = &self.line_buffer {
+            if self.base_lines.is_some() || self.overlay_lines.is_some() || self.mesh_lines.is_some()
+            {
                 let line_pipeline = if occlude_mesh_preview {
                     &self.line_pipeline_depth_test
                 } else {
@@ -785,8 +778,15 @@ impl ViewportRenderer {
                 };
                 pass.set_pipeline(line_pipeline);
                 pass.set_bind_group(0, &self.line_bind_group, &[]);
-                pass.set_vertex_buffer(0, line_buffer.slice(..));
-                pass.draw(0..self.line_vertex_count, 0..1);
+                for lines in self
+                    .base_lines
+                    .iter()
+                    .chain(self.overlay_lines.iter())
+                    .chain(self.mesh_lines.iter())
+                {
+                    pass.set_vertex_buffer(0, lines.vertex_buffer.slice(..));
+                    pass.draw(0..lines.vertex_count, 0..1);
+                }
             }
 
             // 4. Point markers (instanced sphere impostors). Same depth-test

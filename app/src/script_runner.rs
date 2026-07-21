@@ -601,104 +601,248 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
         .build()
 }
 
-/// The example script preloaded in the Meshing workspace: a conforming
-/// grid mesher over every domain in the document — uniform cells kept
-/// where the domain is, near-wall vertices snapped exactly onto the
-/// boundary (no gap), boundary faces/edges tagged by region. Fully
-/// generic: no scene-specific knobs, and snap failures fall back to the
-/// grid position instead of aborting.
-pub const EXAMPLE_SCRIPT: &str = r#"// casoCAD example mesher (Rhai): a conforming grid mesh on every domain.
+/// The example script preloaded in the Meshing workspace: a general,
+/// boundary-first structured-grid mesher for every 2D and 3D Domain.
+/// Occupancy is established before topology, so every exterior edge/face is
+/// projection-attempted and tagged rather than inferred from distance alone.
+pub const EXAMPLE_SCRIPT: &str = r#"// casoCAD boundary-first example mesher (Rhai)
 //
-// One idea, both dimensions: lay a uniform grid over the domain, keep the
-// cells that are fully inside, and snap every vertex that sits within one
-// cell of the wall exactly onto it (projection of an interior point is
-// exact). The mesh hugs the boundary with no gap; boundary faces (3D) and
-// edges (2D) whose vertices all landed on the wall are tagged with the
-// boundary region that owns them.
+// This is deliberately readable mesher code, not a hidden black box:
+//   1. classify a structured background grid,
+//   2. find its topological exterior from missing neighbour cells,
+//   3. project every shared exterior vertex onto the exact Domain boundary,
+//   4. tag every exterior edge (2D) or face (3D).
+//
+// The retained cells have a closed, consistently tagged exterior on arbitrary
+// declared Domains. Increase these values for a finer boundary approximation.
+let cells_2d = 48;
+let cells_3d = 20;
+let minimum_cross_cells = 6; // preserves thin domains without filling empty space
 
-let cells = 24;         // grid cells along the longest axis
-
-// A cached grid corner: [point id, snapped?, x, y, z]. Corners within one
-// cell of the wall are pulled onto it; if the projection fails (a seam),
-// the corner simply stays where it was - never an error.
-fn corner(mesh, d, ids, key, x, y, z, band) {
-    if key in ids { return ids[key]; }
-    let snapped = false;
-    if d.sdf(x, y, z) > -band {
-        try {
-            let p = d.boundary_projection(x, y, z);
-            x = p[0]; y = p[1]; z = p[2];
-            snapped = true;
-        } catch { }
-    }
-    let rec = [mesh.point(x, y, z), snapped, x, y, z];
-    ids[key] = rec;
-    rec
-}
-
-// Number of grid cells covering an extent at spacing h.
-fn cell_count(extent, h) {
-    let n = 1;
-    while n * h < extent - 1e-12 { n += 1; }
+fn axis_count(extent, target_h, minimum) {
+    let n = minimum;
+    while n * target_h < extent - 1e-12 { n += 1; }
     n
 }
 
-// Tag of a boundary sample: its winning region's tag, else the wall tag.
-fn boundary_tag(d, tags, wall_tag, x, y, z) {
-    let c = d.classify(x, y, z);
-    if c.region != () && c.region in tags { tags[c.region] } else { wall_tag }
+fn key2(i, j) { `${i},${j}` }
+fn key3(i, j, k) { `${i},${j},${k}` }
+
+// Projection starts only from retained (interior) cell corners. At a C0 seam
+// Newton projection may honestly refuse; keeping the original on-grid point
+// preserves connectivity and the exterior entity still receives a wall tag.
+fn project_exterior(d, p) {
+    if d.sdf(p[0], p[1], p[2]) <= 0.0 {
+        try { return d.boundary_projection(p[0], p[1], p[2]); }
+        catch { }
+    }
+    p
 }
 
-fn mesh_domain_3d(mesh, d, zone, tags, wall_tag, cells) {
+// Region classification uses projected vertices, never a curved chord's
+// off-surface midpoint. A transition between regions falls back to the
+// Domain wall tag instead of inventing ownership.
+fn boundary_tag(d, tags, wall_tag, points) {
+    let region = ();
+    for p in points {
+        let c = d.classify(p[1], p[2], p[3]);
+        if !c.on_boundary || c.region == () { return wall_tag; }
+        if region == () { region = c.region; }
+        else if region != c.region { return wall_tag; }
+    }
+    if region in tags { tags[region] } else { wall_tag }
+}
+
+fn mesh_domain_2d(mesh, d, zone, tags, wall_tag, target_cells, minimum) {
+    let space = d.mesh_space();
+    let b = space.bounds();
+    let da = b.a_max - b.a_min;
+    let db = b.b_max - b.b_min;
+    let longest = if da > db { da } else { db };
+    let target_h = longest / target_cells;
+    let na = axis_count(da, target_h, minimum);
+    let nb = axis_count(db, target_h, minimum);
+    let ha = da / na;
+    let hb = db / nb;
+    let offsets = [[0,0],[1,0],[1,1],[0,1]];
+    let edges = [[0,1],[1,2],[2,3],[3,0]];
+    let neighbours = [[0,-1],[1,0],[0,1],[-1,0]];
+    let kept = #{};
+
+    // Pass 1: retain only cells fully inside the exact Domain. Boundary-zero
+    // corners are accepted, so grid-aligned walls do not lose a cell layer.
+    for i in 0..na {
+        for j in 0..nb {
+            let inside = true;
+            for o in offsets {
+                let p = space.point(b.a_min + (i + o[0]) * ha,
+                                    b.b_min + (j + o[1]) * hb);
+                if d.sdf(p[0], p[1], p[2]) > 0.0 { inside = false; break; }
+            }
+            if inside {
+                let p = space.point(b.a_min + (i + 0.5) * ha,
+                                    b.b_min + (j + 0.5) * hb);
+                if d.sdf(p[0], p[1], p[2]) <= 0.0 { kept[key2(i, j)] = true; }
+            }
+        }
+    }
+
+    // Pass 2: an edge is exterior exactly when its neighbour cell is absent.
+    // Mark its vertices before creating any points so sharing remains exact.
+    let exterior = #{};
+    for i in 0..na {
+        for j in 0..nb {
+            if !(key2(i, j) in kept) { continue; }
+            for e in 0..4 {
+                let ni = i + neighbours[e][0];
+                let nj = j + neighbours[e][1];
+                if ni < 0 || ni >= na || nj < 0 || nj >= nb || !(key2(ni, nj) in kept) {
+                    for c in edges[e] {
+                        exterior[key2(i + offsets[c][0], j + offsets[c][1])] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 3: emit cells, then tag every topological exterior edge.
+    // Keep cache mutation in this scope: Rhai map arguments are passed by
+    // value, so a helper cannot persist newly assigned point ids for us.
+    let ids = #{};
+    for i in 0..na {
+        for j in 0..nb {
+            if !(key2(i, j) in kept) { continue; }
+            let corners = [];
+            for o in offsets {
+                let gi = i + o[0];
+                let gj = j + o[1];
+                let key = key2(gi, gj);
+                if key in ids {
+                    corners.push(ids[key]);
+                } else {
+                    let p = space.point(b.a_min + gi * ha, b.b_min + gj * hb);
+                    if key in exterior { p = project_exterior(d, p); }
+                    let record = [mesh.point(p[0], p[1], p[2]), p[0], p[1], p[2]];
+                    ids[key] = record;
+                    corners.push(record);
+                }
+            }
+            let points = [corners[0][0], corners[1][0], corners[2][0], corners[3][0]];
+            mesh.cell("quad4", points, zone);
+            for e in 0..4 {
+                let ni = i + neighbours[e][0];
+                let nj = j + neighbours[e][1];
+                if ni < 0 || ni >= na || nj < 0 || nj >= nb || !(key2(ni, nj) in kept) {
+                    let pair = [corners[edges[e][0]], corners[edges[e][1]]];
+                    mesh.tag_edge([pair[0][0], pair[1][0]],
+                                  boundary_tag(d, tags, wall_tag, pair));
+                }
+            }
+        }
+    }
+}
+
+fn mesh_domain_3d(mesh, d, zone, tags, wall_tag, target_cells, minimum) {
     let b = d.bounds();
-    let h = b.x_max - b.x_min;
-    if b.y_max - b.y_min > h { h = b.y_max - b.y_min; }
-    if b.z_max - b.z_min > h { h = b.z_max - b.z_min; }
-    h = h / cells;
-    let band = 1.05 * h;
-    let nx = cell_count(b.x_max - b.x_min, h);
-    let ny = cell_count(b.y_max - b.y_min, h);
-    let nz = cell_count(b.z_max - b.z_min, h);
-    let off = [[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]];
-    let faces = [[0,3,7,4],[1,2,6,5],[0,1,5,4],[3,2,6,7],[0,1,2,3],[4,5,6,7]];
+    let dx = b.x_max - b.x_min;
+    let dy = b.y_max - b.y_min;
+    let dz = b.z_max - b.z_min;
+    let longest = dx;
+    if dy > longest { longest = dy; }
+    if dz > longest { longest = dz; }
+    let target_h = longest / target_cells;
+    let nx = axis_count(dx, target_h, minimum);
+    let ny = axis_count(dy, target_h, minimum);
+    let nz = axis_count(dz, target_h, minimum);
+    let hx = dx / nx;
+    let hy = dy / ny;
+    let hz = dz / nz;
+    let offsets = [[0,0,0],[1,0,0],[1,1,0],[0,1,0],
+                   [0,0,1],[1,0,1],[1,1,1],[0,1,1]];
+    let faces = [[0,3,7,4],[1,2,6,5],[0,1,5,4],
+                 [3,2,6,7],[0,1,2,3],[4,5,6,7]];
+    let neighbours = [[-1,0,0],[1,0,0],[0,-1,0],
+                      [0,1,0],[0,0,-1],[0,0,1]];
+    let kept = #{};
+
+    for i in 0..nx {
+        for j in 0..ny {
+            for k in 0..nz {
+                let inside = true;
+                for o in offsets {
+                    let x = b.x_min + (i + o[0]) * hx;
+                    let y = b.y_min + (j + o[1]) * hy;
+                    let z = b.z_min + (k + o[2]) * hz;
+                    if d.sdf(x, y, z) > 0.0 { inside = false; break; }
+                }
+                if inside {
+                    let x = b.x_min + (i + 0.5) * hx;
+                    let y = b.y_min + (j + 0.5) * hy;
+                    let z = b.z_min + (k + 0.5) * hz;
+                    if d.sdf(x, y, z) <= 0.0 { kept[key3(i, j, k)] = true; }
+                }
+            }
+        }
+    }
+
+    let exterior = #{};
+    for i in 0..nx {
+        for j in 0..ny {
+            for k in 0..nz {
+                if !(key3(i, j, k) in kept) { continue; }
+                for f in 0..6 {
+                    let ni = i + neighbours[f][0];
+                    let nj = j + neighbours[f][1];
+                    let nk = k + neighbours[f][2];
+                    if ni < 0 || ni >= nx || nj < 0 || nj >= ny || nk < 0 || nk >= nz ||
+                       !(key3(ni, nj, nk) in kept) {
+                        for c in faces[f] {
+                            exterior[key3(i + offsets[c][0], j + offsets[c][1],
+                                          k + offsets[c][2])] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The same in-scope cache makes adjacent hexes share actual MeshIR ids,
+    // not merely equal coordinates.
     let ids = #{};
     for i in 0..nx {
         for j in 0..ny {
             for k in 0..nz {
-                // keep the cell only if all corners and the centre are inside
-                let inside = true;
-                for o in off {
-                    let x = b.x_min + (i + o[0]) * h;
-                    let y = b.y_min + (j + o[1]) * h;
-                    let z = b.z_min + (k + o[2]) * h;
-                    if d.sdf(x, y, z) >= 0.0 { inside = false; break; }
+                if !(key3(i, j, k) in kept) { continue; }
+                let corners = [];
+                for o in offsets {
+                    let gi = i + o[0];
+                    let gj = j + o[1];
+                    let gk = k + o[2];
+                    let key = key3(gi, gj, gk);
+                    if key in ids {
+                        corners.push(ids[key]);
+                    } else {
+                        let p = [b.x_min + gi * hx, b.y_min + gj * hy,
+                                 b.z_min + gk * hz];
+                        if key in exterior { p = project_exterior(d, p); }
+                        let record = [mesh.point(p[0], p[1], p[2]), p[0], p[1], p[2]];
+                        ids[key] = record;
+                        corners.push(record);
+                    }
                 }
-                if !inside { continue; }
-                let cx = b.x_min + (i + 0.5) * h;
-                let cy = b.y_min + (j + 0.5) * h;
-                let cz = b.z_min + (k + 0.5) * h;
-                if d.sdf(cx, cy, cz) >= 0.0 { continue; }
-
-                let cs = [];
-                for o in off {
-                    let x = b.x_min + (i + o[0]) * h;
-                    let y = b.y_min + (j + o[1]) * h;
-                    let z = b.z_min + (k + o[2]) * h;
-                    let key = `${i + o[0]},${j + o[1]},${k + o[2]}`;
-                    cs.push(corner(mesh, d, ids, key, x, y, z, band));
-                }
-                let pts = [cs[0][0], cs[1][0], cs[2][0], cs[3][0],
-                           cs[4][0], cs[5][0], cs[6][0], cs[7][0]];
-                mesh.cell("hex8", pts, zone);
-
-                // a face whose four corners all landed on the wall IS wall
-                for f in faces {
-                    if cs[f[0]][1] && cs[f[1]][1] && cs[f[2]][1] && cs[f[3]][1] {
-                        let mx = (cs[f[0]][2] + cs[f[1]][2] + cs[f[2]][2] + cs[f[3]][2]) / 4.0;
-                        let my = (cs[f[0]][3] + cs[f[1]][3] + cs[f[2]][3] + cs[f[3]][3]) / 4.0;
-                        let mz = (cs[f[0]][4] + cs[f[1]][4] + cs[f[2]][4] + cs[f[3]][4]) / 4.0;
-                        let t = boundary_tag(d, tags, wall_tag, mx, my, mz);
-                        mesh.tag_face([pts[f[0]], pts[f[1]], pts[f[2]], pts[f[3]]], t);
+                let points = [corners[0][0], corners[1][0], corners[2][0], corners[3][0],
+                              corners[4][0], corners[5][0], corners[6][0], corners[7][0]];
+                mesh.cell("hex8", points, zone);
+                for f in 0..6 {
+                    let ni = i + neighbours[f][0];
+                    let nj = j + neighbours[f][1];
+                    let nk = k + neighbours[f][2];
+                    if ni < 0 || ni >= nx || nj < 0 || nj >= ny || nk < 0 || nk >= nz ||
+                       !(key3(ni, nj, nk) in kept) {
+                        let quad = [corners[faces[f][0]], corners[faces[f][1]],
+                                    corners[faces[f][2]], corners[faces[f][3]]];
+                        mesh.tag_face([quad[0][0], quad[1][0], quad[2][0], quad[3][0]],
+                                      boundary_tag(d, tags, wall_tag, quad));
                     }
                 }
             }
@@ -706,64 +850,20 @@ fn mesh_domain_3d(mesh, d, zone, tags, wall_tag, cells) {
     }
 }
 
-fn mesh_domain_2d(mesh, d, zone, tags, wall_tag, cells) {
-    let space = d.mesh_space();
-    let sb = space.bounds();
-    let h = sb.a_max - sb.a_min;
-    if sb.b_max - sb.b_min > h { h = sb.b_max - sb.b_min; }
-    h = h / cells;
-    let band = 1.05 * h;
-    let na = cell_count(sb.a_max - sb.a_min, h);
-    let nb = cell_count(sb.b_max - sb.b_min, h);
-    let off = [[0,0],[1,0],[1,1],[0,1]];
-    let edges = [[0,1],[1,2],[2,3],[3,0]];
-    let ids = #{};
-    for i in 0..na {
-        for j in 0..nb {
-            let inside = true;
-            for o in off {
-                let w = space.point(sb.a_min + (i + o[0]) * h, sb.b_min + (j + o[1]) * h);
-                if d.sdf(w[0], w[1], w[2]) >= 0.0 { inside = false; break; }
-            }
-            if !inside { continue; }
-            let c = space.point(sb.a_min + (i + 0.5) * h, sb.b_min + (j + 0.5) * h);
-            if d.sdf(c[0], c[1], c[2]) >= 0.0 { continue; }
-
-            let cs = [];
-            for o in off {
-                let w = space.point(sb.a_min + (i + o[0]) * h, sb.b_min + (j + o[1]) * h);
-                let key = `${i + o[0]},${j + o[1]}`;
-                cs.push(corner(mesh, d, ids, key, w[0], w[1], w[2], band));
-            }
-            let pts = [cs[0][0], cs[1][0], cs[2][0], cs[3][0]];
-            mesh.cell("quad4", pts, zone);
-
-            for e in edges {
-                if cs[e[0]][1] && cs[e[1]][1] {
-                    let mx = (cs[e[0]][2] + cs[e[1]][2]) * 0.5;
-                    let my = (cs[e[0]][3] + cs[e[1]][3]) * 0.5;
-                    let mz = (cs[e[0]][4] + cs[e[1]][4]) * 0.5;
-                    let t = boundary_tag(d, tags, wall_tag, mx, my, mz);
-                    mesh.tag_edge([pts[e[0]], pts[e[1]]], t);
-                }
-            }
-        }
-    }
-}
-
-// ---------- every domain in the document ----------
-
+// Mesh every declared Domain independently; names and physical kinds are
+// preserved in MeshIR zones and boundary-region metadata travels as tags.
 for name in domains.names() {
     let d = domains.get(name);
     let zone = mesh.zone(d.name, d.kind);
-    let tags = #{};                     // physics tags travel with the mesh
-    for r in d.regions() { tags[r.name] = mesh.tag(r.name, r.tag); }
+    let tags = #{};
+    for region in d.regions() {
+        tags[region.name] = mesh.tag(region.name, region.tag);
+    }
     let wall_tag = mesh.tag(d.name + "_wall", "wall");
-
-    if d.dimension == 3 {
-        mesh_domain_3d(mesh, d, zone, tags, wall_tag, cells);
-    } else {
-        mesh_domain_2d(mesh, d, zone, tags, wall_tag, cells);
+    if d.dimension == 2 {
+        mesh_domain_2d(mesh, d, zone, tags, wall_tag, cells_2d, minimum_cross_cells);
+    } else if d.dimension == 3 {
+        mesh_domain_3d(mesh, d, zone, tags, wall_tag, cells_3d, minimum_cross_cells);
     }
 }
 "#;
@@ -772,10 +872,48 @@ for name in domains.names() {
 mod tests {
     use super::*;
 
-    /// The example at a coarser test grid (the default 24 is an
-    /// interactive-quality setting; debug-build tests use 10).
+    /// The example at coarser grids; debug-build tests exercise the same
+    /// algorithm without paying the interactive preview's full resolution.
     fn example_script_at_test_resolution() -> String {
-        EXAMPLE_SCRIPT.replace("let cells = 24;", "let cells = 10;")
+        EXAMPLE_SCRIPT
+            .replace("let cells_2d = 48;", "let cells_2d = 18;")
+            .replace("let cells_3d = 20;", "let cells_3d = 10;")
+    }
+
+    fn assert_closed_tagged_2d_boundary(mesh: &MeshIr) {
+        let boundary: Vec<_> = mesh
+            .edges
+            .iter()
+            .filter(|edge| edge.owner_cell_id.is_some() && edge.neighbor_cell_id.is_none())
+            .collect();
+        assert!(!boundary.is_empty(), "mesh has a topological boundary");
+        let untagged: Vec<_> = boundary
+            .iter()
+            .filter(|edge| edge.tag_ids.is_empty())
+            .collect();
+        assert!(
+            untagged.is_empty(),
+            "every exterior edge is tagged; first missing: {:?}",
+            untagged.first()
+        );
+        assert!(
+            mesh.edges
+                .iter()
+                .filter(|edge| !edge.tag_ids.is_empty())
+                .all(|edge| edge.neighbor_cell_id.is_none()),
+            "interior edges are not boundary-tagged"
+        );
+
+        let mut degree = std::collections::BTreeMap::<u64, usize>::new();
+        for edge in boundary {
+            for point_id in &edge.point_ids {
+                *degree.entry(*point_id).or_default() += 1;
+            }
+        }
+        assert!(
+            degree.values().all(|count| *count == 2),
+            "boundary edges form closed loops"
+        );
     }
 
     #[test]
@@ -805,10 +943,31 @@ mod tests {
             }
         }
         assert!(snapped > 50, "the mesh hugs the boundary ({snapped} on-wall points)");
-        // Fully-snapped boundary faces carry a tag.
+        // Topological boundary faces carry a tag.
         assert!(
             mesh.faces.iter().any(|face| !face.tag_ids.is_empty()),
             "boundary faces are tagged"
+        );
+        let untagged: Vec<_> = mesh
+            .faces
+            .iter()
+            .filter(|face| {
+                face.owner_cell_id.is_some()
+                    && face.neighbor_cell_id.is_none()
+                    && face.tag_ids.is_empty()
+            })
+            .collect();
+        assert!(
+            untagged.is_empty(),
+            "every exterior face is tagged; first missing: {:?}",
+            untagged.first()
+        );
+        assert!(
+            mesh.faces
+                .iter()
+                .filter(|face| !face.tag_ids.is_empty())
+                .all(|face| face.neighbor_cell_id.is_none()),
+            "interior faces are not boundary-tagged"
         );
     }
 
@@ -857,17 +1016,17 @@ mod tests {
                 1.0,
             )
             .expect("rectangle");
-        let circle = document
-            .add_primitive_from_drag("circle", vec3(0.2, -0.3, 0.0), vec3(0.8, 0.3, 0.0), 1.0)
-            .expect("circle");
+        let ellipse = document
+            .add_primitive_from_drag("ellipse", vec3(0.1, -0.25, 0.0), vec3(0.9, 0.25, 0.0), 1.0)
+            .expect("ellipse");
         let domain = document
-            .combine(rect, circle, "difference")
+            .combine(rect, ellipse, "difference")
             .expect("difference");
         document.rename(domain, "fluid").expect("rename");
         document
             .set_domain_root(domain, DomainKind::Fluid)
             .expect("fluid domain");
-        // A whole-surface region: every snapped boundary edge should carry
+        // A whole-surface region: projected edges on this owner should carry
         // its tag instead of the wall fallback.
         let owner = {
             let domains = meshable_domains_from_document(&document).expect("domains");
@@ -902,9 +1061,16 @@ mod tests {
             mesh.edges.iter().any(|edge| edge.tag_ids.contains(&skin.id)),
             "boundary edges carry the region tag"
         );
+        assert_closed_tagged_2d_boundary(&mesh);
 
         let domains = meshable_domains_from_document(&document).expect("domains");
         let fluid = domains.get("fluid").expect("fluid");
+        let boundary_points: std::collections::BTreeSet<u64> = mesh
+            .edges
+            .iter()
+            .filter(|edge| edge.owner_cell_id.is_some() && edge.neighbor_cell_id.is_none())
+            .flat_map(|edge| edge.point_ids.iter().copied())
+            .collect();
         let mut snapped = 0;
         for point in &mesh.points {
             assert!(
@@ -917,6 +1083,13 @@ mod tests {
                 point.position[2],
             )])[0];
             assert!(value <= 1e-6, "point outside the domain: {value}");
+            if boundary_points.contains(&point.id) {
+                assert!(
+                    value.abs() <= 1e-6,
+                    "exterior point {} missed the exact boundary by {value}",
+                    point.id
+                );
+            }
             if value.abs() <= 1e-6 {
                 snapped += 1;
             }
