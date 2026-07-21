@@ -248,7 +248,10 @@ impl MeshingPanel {
                 .mesh
                 .cells
                 .iter()
-                .filter(|cell| self.cell_visible(cell.id))
+                .filter(|cell| {
+                    self.cell_visible(cell.id)
+                        && (!self.show_boundary_tags || self.cell_has_selected_boundary(cell.id))
+                })
                 .map(|cell| cell.id)
                 .collect();
             let key = (self.mesh_revision, self.quality_metric);
@@ -366,6 +369,23 @@ impl MeshingPanel {
             return false;
         };
         self.is_shown("cell", cell_id) && self.ids_in_z(&cell.point_ids)
+    }
+
+    fn cell_has_selected_boundary(&self, cell_id: u64) -> bool {
+        if self.top_dimension() == Some(3) {
+            self.mesh.faces.iter().any(|face| {
+                (face.owner_cell_id == Some(cell_id) || face.neighbor_cell_id == Some(cell_id))
+                    && entity_has_selected_tag(&face.tag_ids, &self.selected_tags)
+                    && self.is_shown("face", face.id)
+                    && self.ids_in_z(&face.point_ids)
+            })
+        } else {
+            self.mesh.edges.iter().any(|edge| {
+                (edge.owner_cell_id == Some(cell_id) || edge.neighbor_cell_id == Some(cell_id))
+                    && entity_has_selected_tag(&edge.tag_ids, &self.selected_tags)
+                    && self.is_shown("edge", edge.id)
+            })
+        }
     }
 
     fn ids_in_z(&self, ids: &[u64]) -> bool {
@@ -587,27 +607,7 @@ impl MeshingPanel {
     }
 
     pub fn preview_points(&self) -> Vec<f32> {
-        if !self.show_preview
-            || (self.inspector_active && (self.show_quality || self.show_boundary_tags))
-        {
-            return Vec::new();
-        }
-        let mut points = Vec::new();
-        for point in &self.mesh.points {
-            if !self.is_shown("point", point.id) {
-                continue;
-            }
-            let color = mesh_tag_color(tag_color_id(
-                point
-                    .tag_ids
-                    .first()
-                    .and_then(|id| self.mesh.tag_name(*id))
-                    .unwrap_or("mesh_points"),
-            ));
-            points.extend(point.position.map(|coordinate| coordinate as f32));
-            points.extend(color);
-        }
-        points
+        Vec::new()
     }
 
     pub fn preview_surfaces(&self) -> Vec<ViewportSurface> {
@@ -617,14 +617,12 @@ impl MeshingPanel {
         if !self.inspector_active || (!self.show_quality && !self.show_boundary_tags) {
             return self.full_mesh_surfaces();
         }
-        let mut surfaces = Vec::new();
-        if self.show_quality {
-            surfaces.extend(self.quality_surfaces());
+        match (self.show_quality, self.show_boundary_tags) {
+            (true, true) => self.quality_boundary_surfaces(),
+            (true, false) => self.quality_surfaces(),
+            (false, true) => self.tag_surfaces(true),
+            (false, false) => self.full_mesh_surfaces(),
         }
-        if self.show_boundary_tags {
-            surfaces.extend(self.tag_surfaces(!self.show_quality));
-        }
-        surfaces
     }
 
     fn full_mesh_surfaces(&self) -> Vec<ViewportSurface> {
@@ -795,18 +793,74 @@ impl MeshingPanel {
                 }
             }
         }
-        groups
-            .into_iter()
-            .enumerate()
-            .filter_map(|(band, buffers)| {
-                let color = if band == QUALITY_BANDS {
-                    [0.45, 0.47, 0.5]
-                } else {
-                    quality_color((band as f64 + 0.5) / QUALITY_BANDS as f64)
+        quality_group_surfaces(groups, self.preview_revision)
+    }
+
+    fn quality_boundary_surfaces(&self) -> Vec<ViewportSurface> {
+        let Some(report) = self
+            .quality_cache
+            .get(&(self.mesh_revision, self.quality_metric))
+        else {
+            return Vec::new();
+        };
+        let positions: BTreeMap<u64, [f64; 3]> = self
+            .mesh
+            .points
+            .iter()
+            .map(|point| (point.id, point.position))
+            .collect();
+        let scores: BTreeMap<u64, Option<f64>> = report
+            .cells
+            .iter()
+            .map(|entry| (entry.cell_id, entry.score))
+            .collect();
+        let mut groups: Vec<SurfaceBuffers> = (0..=QUALITY_BANDS)
+            .map(|_| SurfaceBuffers::default())
+            .collect();
+
+        if report.top_dimension == Some(3) {
+            for face in &self.mesh.faces {
+                if !entity_has_selected_tag(&face.tag_ids, &self.selected_tags)
+                    || !self.is_shown("face", face.id)
+                    || !self.ids_in_z(&face.point_ids)
+                {
+                    continue;
+                }
+                let Some(cell_id) = face
+                    .owner_cell_id
+                    .filter(|id| scores.contains_key(id))
+                    .or_else(|| face.neighbor_cell_id.filter(|id| scores.contains_key(id)))
+                else {
+                    continue;
                 };
-                surface_from_buffers(buffers, color, self.preview_revision, band as u32)
-            })
-            .collect()
+                let band = quality_band(scores[&cell_id]);
+                if let Some(ids) = face_corner_ids(&face.type_name, &face.point_ids) {
+                    append_polygon(&mut groups[band], &positions, ids, true, true);
+                }
+            }
+        } else if report.top_dimension == Some(2) {
+            for edge in &self.mesh.edges {
+                if !entity_has_selected_tag(&edge.tag_ids, &self.selected_tags)
+                    || !self.is_shown("edge", edge.id)
+                {
+                    continue;
+                }
+                let Some(cell_id) = edge
+                    .owner_cell_id
+                    .filter(|id| scores.contains_key(id))
+                    .or_else(|| edge.neighbor_cell_id.filter(|id| scores.contains_key(id)))
+                else {
+                    continue;
+                };
+                append_element_wire(
+                    &mut groups[quality_band(scores[&cell_id])],
+                    &positions,
+                    &edge.type_name,
+                    &edge.point_ids,
+                );
+            }
+        }
+        quality_group_surfaces(groups, self.preview_revision)
     }
 
     fn tag_surfaces(&self, fill_faces: bool) -> Vec<ViewportSurface> {
@@ -1058,6 +1112,25 @@ fn quality_band(score: Option<f64>) -> usize {
     })
 }
 
+fn entity_has_selected_tag(tag_ids: &[u64], selected_tags: &BTreeSet<u64>) -> bool {
+    tag_ids.iter().any(|id| selected_tags.contains(id))
+}
+
+fn quality_group_surfaces(groups: Vec<SurfaceBuffers>, revision: u64) -> Vec<ViewportSurface> {
+    groups
+        .into_iter()
+        .enumerate()
+        .filter_map(|(band, buffers)| {
+            let color = if band == QUALITY_BANDS {
+                [0.45, 0.47, 0.5]
+            } else {
+                quality_color((band as f64 + 0.5) / QUALITY_BANDS as f64)
+            };
+            surface_from_buffers(buffers, color, revision, band as u32)
+        })
+        .collect()
+}
+
 fn worse_band(a: usize, b: usize) -> usize {
     if a == QUALITY_BANDS || b == QUALITY_BANDS {
         QUALITY_BANDS
@@ -1256,10 +1329,11 @@ mod tests {
         let surfaces = panel.preview_surfaces();
         assert_eq!(surfaces.len(), 1);
         assert_eq!(surfaces[0].wire_indices.len() / 2, 1);
+        assert_eq!(surfaces[0].color, mesh_tag_color(tag_color_id("inlet")));
     }
 
     #[test]
-    fn inspector_is_opt_in_and_quality_can_overlay_boundary_tags() {
+    fn inspector_is_opt_in_and_quality_recolors_only_tagged_boundaries() {
         let mut builder = caso_meshing::MeshIrBuilder::new();
         let zone = builder.zone("zone", "fluid");
         let inlet = builder.tag("inlet", "boundary");
@@ -1277,7 +1351,7 @@ mod tests {
         };
         panel.mesh_replaced();
         assert!(!panel.inspector_active);
-        assert!(!panel.preview_points().is_empty());
+        assert!(panel.preview_points().is_empty());
         assert!(panel
             .preview_surfaces()
             .iter()
@@ -1286,9 +1360,13 @@ mod tests {
         panel.inspector_active = true;
         panel.show_boundary_tags = true;
         let surfaces = panel.preview_surfaces();
-        assert_eq!(surfaces.len(), 2, "quality fill plus tag outline");
-        assert!(surfaces.iter().any(|surface| !surface.indices.is_empty()));
-        assert!(surfaces.iter().any(|surface| surface.indices.is_empty()));
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].wire_indices.len() / 2, 1);
+        assert!(surfaces[0].indices.is_empty());
+        assert_eq!(
+            surfaces[0].color,
+            quality_color((QUALITY_BANDS as f64 - 0.5) / QUALITY_BANDS as f64)
+        );
     }
 
     #[test]

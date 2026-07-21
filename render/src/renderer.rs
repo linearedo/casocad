@@ -436,7 +436,8 @@ impl ViewportRenderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: TARGET_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             }));
             self.depth_texture = Some(device.create_texture(&wgpu::TextureDescriptor {
@@ -480,12 +481,17 @@ impl ViewportRenderer {
             if surface.status == SurfaceStatus::Failed {
                 continue;
             }
-            if surface.indices.is_empty() {
+            // Inspector surfaces intentionally combine colored face fills
+            // with element outlines. Regular display surfaces keep their
+            // historical fill-only behavior so CAD tessellation stays hidden.
+            if surface.indices.is_empty() || surface.object_kind == "mesh_inspector" {
                 for pair in surface.wire_indices.chunks_exact(2) {
                     let a = surface.vertices[pair[0] as usize];
                     let b = surface.vertices[pair[1] as usize];
                     push_line_segment(&mut line_vertices, a, b, surface.color);
                 }
+            }
+            if surface.indices.is_empty() {
                 continue;
             }
             let alpha = surface.alpha.clamp(0.0, 1.0);
@@ -586,8 +592,7 @@ impl ViewportRenderer {
     ) {
         let (chunks, line_vertices) = Self::build_surfaces(device, queue, surfaces);
         self.mesh_chunks = chunks;
-        self.mesh_lines =
-            Self::upload_lines(device, queue, "mesh line vertices", &line_vertices);
+        self.mesh_lines = Self::upload_lines(device, queue, "mesh line vertices", &line_vertices);
     }
 
     /// Replace the point-marker instances (6 floats per point: xyz + rgb),
@@ -656,7 +661,11 @@ impl ViewportRenderer {
         let mut surface_data = [0.0f32; 20];
         surface_data[..16].copy_from_slice(&matrix);
         surface_data[16] = options.opacity;
-        queue.write_buffer(&self.surface_uniforms, 0, bytemuck::cast_slice(&surface_data));
+        queue.write_buffer(
+            &self.surface_uniforms,
+            0,
+            bytemuck::cast_slice(&surface_data),
+        );
 
         // Line uniforms (80 bytes; layout matches line.wgsl; clip_y_sign -1).
         let line_data: [f32; 20] = [
@@ -769,7 +778,9 @@ impl ViewportRenderer {
             // 3. Thick lines (wire chunks + overlays). Depth-tested against
             // geometry once opacity crosses MESH_PREVIEW_OCCLUDE_OPACITY;
             // otherwise always on top (x-ray mesh inspection).
-            if self.base_lines.is_some() || self.overlay_lines.is_some() || self.mesh_lines.is_some()
+            if self.base_lines.is_some()
+                || self.overlay_lines.is_some()
+                || self.mesh_lines.is_some()
             {
                 let line_pipeline = if occlude_mesh_preview {
                     &self.line_pipeline_depth_test
