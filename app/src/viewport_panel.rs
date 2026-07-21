@@ -39,9 +39,21 @@ const VIEW_FLIGHT_SECONDS: f64 = 0.26;
 
 /// Axis triad overlay (bottom-left): world axes with their colors.
 const TRIAD_AXES: [(&str, Vec3, egui::Color32); 3] = [
-    ("X", vec3(1.0, 0.0, 0.0), egui::Color32::from_rgb(255, 86, 65)),
-    ("Y", vec3(0.0, 1.0, 0.0), egui::Color32::from_rgb(85, 235, 105)),
-    ("Z", vec3(0.0, 0.0, 1.0), egui::Color32::from_rgb(92, 145, 255)),
+    (
+        "X",
+        vec3(1.0, 0.0, 0.0),
+        egui::Color32::from_rgb(255, 86, 65),
+    ),
+    (
+        "Y",
+        vec3(0.0, 1.0, 0.0),
+        egui::Color32::from_rgb(85, 235, 105),
+    ),
+    (
+        "Z",
+        vec3(0.0, 0.0, 1.0),
+        egui::Color32::from_rgb(92, 145, 255),
+    ),
 ];
 
 /// In-flight smoothstep camera flight to a reference view.
@@ -172,8 +184,8 @@ impl ViewportPanel {
     fn fly_to_reference_view(&mut self, plane: u32, yaw_deg: f64, pitch_deg: f64, now: f64) {
         self.options.grid_plane = plane;
         let tau = std::f64::consts::TAU;
-        let delta_yaw = (yaw_deg.to_radians() - self.camera.yaw + tau / 2.0).rem_euclid(tau)
-            - tau / 2.0;
+        let delta_yaw =
+            (yaw_deg.to_radians() - self.camera.yaw + tau / 2.0).rem_euclid(tau) - tau / 2.0;
         let delta_pitch = pitch_deg.to_radians() - self.camera.pitch;
         if delta_yaw.abs().max(delta_pitch.abs()) <= 1.0e-6 {
             return;
@@ -275,9 +287,18 @@ impl ViewportPanel {
                 continue;
             };
             let edges = [
-                (vec3(bounds.x_max, bounds.y_min, bounds.z_min), bounds.x_max - bounds.x_min),
-                (vec3(bounds.x_min, bounds.y_max, bounds.z_min), bounds.y_max - bounds.y_min),
-                (vec3(bounds.x_min, bounds.y_min, bounds.z_max), bounds.z_max - bounds.z_min),
+                (
+                    vec3(bounds.x_max, bounds.y_min, bounds.z_min),
+                    bounds.x_max - bounds.x_min,
+                ),
+                (
+                    vec3(bounds.x_min, bounds.y_max, bounds.z_min),
+                    bounds.y_max - bounds.y_min,
+                ),
+                (
+                    vec3(bounds.x_min, bounds.y_min, bounds.z_max),
+                    bounds.z_max - bounds.z_min,
+                ),
             ];
             for (index, ((_, _, color), (end_world, extent))) in
                 TRIAD_AXES.into_iter().zip(edges).enumerate()
@@ -426,7 +447,11 @@ impl ViewportPanel {
         let renderer = self
             .renderer
             .get_or_insert_with(|| ViewportRenderer::new(&render_state.device));
-        renderer.set_mesh_overlays(&render_state.device, &render_state.queue, &self.mesh_overlays);
+        renderer.set_mesh_overlays(
+            &render_state.device,
+            &render_state.queue,
+            &self.mesh_overlays,
+        );
         renderer.set_points(&render_state.device, &render_state.queue, &self.mesh_points);
         self.upload_pending = false;
     }
@@ -447,8 +472,7 @@ impl ViewportPanel {
         // window resizes without rebuilding on every orbit frame. The exact
         // per-workplane pixel size is measured below at build time.
         let physical_height = (rect.height() * pixels_per_point).max(1.0) as f64;
-        let world_per_pixel =
-            2.0 * self.camera.distance / (self.camera.focal * physical_height);
+        let world_per_pixel = 2.0 * self.camera.distance / (self.camera.focal * physical_height);
         let zoom_bucket = (world_per_pixel.max(1.0e-12).ln() * 10.0).round() as i64;
         let signature = (
             self.scene_version,
@@ -524,8 +548,7 @@ impl ViewportPanel {
             (selected, selected_root.as_ref(), &tools.preview_ghost)
         {
             // Split preview supersedes the plain selection highlight.
-            let (inside, outside) =
-                crate::boundary_tool::split_preview_children(region, ghost);
+            let (inside, outside) = crate::boundary_tool::split_preview_children(region, ghost);
             let pixel_size = pixel_size_for(root);
             if let Some(surface) = crate::boundary_tool::region_highlight_surface(
                 root,
@@ -583,14 +606,10 @@ impl ViewportPanel {
     /// The scene object under the screen position: nearest ray/triangle hit
     /// on the built display surfaces, else the nearest wire segment (1D
     /// objects) within a small screen-space radius.
-    fn pick_object(
-        &self,
-        pos: egui::Pos2,
-        rect: egui::Rect,
-        pixels_per_point: f32,
-    ) -> Option<u32> {
+    fn pick_object(&self, pos: egui::Pos2, rect: egui::Rect, pixels_per_point: f32) -> Option<u32> {
         let base = self.base_scene.as_ref()?;
-        let (origin, direction) = crate::tools::screen_ray(&self.camera, pos, rect, pixels_per_point);
+        let (origin, direction) =
+            crate::tools::screen_ray(&self.camera, pos, rect, pixels_per_point);
         let mut nearest: Option<(f64, u32)> = None;
         for surface in &base.surfaces {
             for triangle in surface.indices.chunks_exact(3) {
@@ -939,8 +958,10 @@ impl ViewportPanel {
         let drag = response.drag_delta();
         if !tool_consumed && response.dragged_by(egui::PointerButton::Primary) {
             self.view_flight = None; // manual orbit overrides a view flight
-            self.camera
-                .orbit(drag.x as f64 * pixels_per_point as f64, drag.y as f64 * pixels_per_point as f64);
+            self.camera.orbit(
+                drag.x as f64 * pixels_per_point as f64,
+                drag.y as f64 * pixels_per_point as f64,
+            );
         } else if response.dragged_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Middle)
         {
@@ -1061,12 +1082,7 @@ impl ViewportPanel {
 
 /// Monospace overlay label on a dark backdrop (the triad's palette) so the
 /// text stays readable over any geometry.
-fn label_with_backdrop(
-    painter: &egui::Painter,
-    pos: egui::Pos2,
-    text: &str,
-    color: egui::Color32,
-) {
+fn label_with_backdrop(painter: &egui::Painter, pos: egui::Pos2, text: &str, color: egui::Color32) {
     let galley = painter.layout_no_wrap(text.to_string(), egui::FontId::monospace(11.0), color);
     let rect = egui::Rect::from_min_size(pos, galley.size()).expand(3.0);
     painter.rect_filled(

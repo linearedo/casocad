@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod convert;
+pub mod quality;
 pub mod toolkit;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

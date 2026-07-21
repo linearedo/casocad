@@ -355,8 +355,7 @@ impl ToolState {
         self.gizmo_hover = None;
         self.gizmo_last = None;
         self.gizmo_pivot = None;
-        if self.hover_hit.is_some() || self.preview_ghost.is_some() || self.create_ghost.is_some()
-        {
+        if self.hover_hit.is_some() || self.preview_ghost.is_some() || self.create_ghost.is_some() {
             self.overlay_revision += 1;
         }
         self.hover_hit = None;
@@ -376,9 +375,7 @@ impl ToolState {
     pub fn has_pending(&self) -> bool {
         match self.kind {
             ToolKind::Select | ToolKind::BoundaryRegion => false,
-            ToolKind::CreateDrag(_) => {
-                self.drag_start.is_some() || !self.dimension_text.is_empty()
-            }
+            ToolKind::CreateDrag(_) => self.drag_start.is_some() || !self.dimension_text.is_empty(),
             ToolKind::CreatePoints(_)
             | ToolKind::Measure
             | ToolKind::BoundaryCutter(_)
@@ -494,8 +491,7 @@ impl ToolState {
             }
             ToolKind::BoundaryCutter(knife) => {
                 if self.points.pop().is_some() {
-                    state.status =
-                        format!("{} knife point(s) — Enter splits", self.points.len());
+                    state.status = format!("{} knife point(s) — Enter splits", self.points.len());
                     self.refresh_cutter_ghost(knife, state);
                     true
                 } else {
@@ -527,8 +523,12 @@ impl ToolState {
         }
         let points = std::mem::take(&mut self.points);
         state.push_undo();
-        let result =
-            build_point_shape(&mut state.document, kind, &points, self.regular_polygon_sides);
+        let result = build_point_shape(
+            &mut state.document,
+            kind,
+            &points,
+            self.regular_polygon_sides,
+        );
         if let Some(id) = state.report(result, &format!("Created {kind}")) {
             state.select_only(id);
             self.set_create_ghost(None, None);
@@ -569,11 +569,10 @@ impl ToolState {
             Ok(ghost) => {
                 state.push_undo();
                 let validation = std::mem::take(&mut self.validation_points);
-                let result = state.document.split_boundary_region(
-                    region_id,
-                    &ghost.node,
-                    Some(&validation),
-                );
+                let result =
+                    state
+                        .document
+                        .split_boundary_region(region_id, &ghost.node, Some(&validation));
                 self.validation_points = validation;
                 match result {
                     Ok((inside_id, _outside_id)) => {
@@ -662,9 +661,7 @@ impl ToolState {
             ToolKind::CreatePoints(kind) => {
                 self.handle_create_points(kind, response, ui, camera, rect, pixels_per_point, state)
             }
-            ToolKind::Move => {
-                self.handle_move(response, ui, camera, rect, pixels_per_point, state)
-            }
+            ToolKind::Move => self.handle_move(response, ui, camera, rect, pixels_per_point, state),
             ToolKind::Rotate => {
                 self.handle_rotate(response, ui, camera, rect, pixels_per_point, state)
             }
@@ -720,8 +717,7 @@ impl ToolState {
             for (domain_id, root) in &roots {
                 // 2D domains pick within ~8 px at the workplane — the hover
                 // must feel like a CAD snap, not a fat world-sized band.
-                let radius =
-                    workplane_pixel_radius(camera, pos, rect, pixels_per_point, root, 8.0);
+                let radius = workplane_pixel_radius(camera, pos, rect, pixels_per_point, root, 8.0);
                 let Some(candidate) =
                     boundary_tool::pick_patch_with_radius(root, origin, direction, radius)
                 else {
@@ -771,11 +767,7 @@ impl ToolState {
 
     /// Swap the create ghost, bumping the overlay revision only when the
     /// gesture signature actually changed (mirrors `set_hover`).
-    fn set_create_ghost(
-        &mut self,
-        ghost: Option<Node>,
-        sig: Option<(Vec3, Vec3, usize, String)>,
-    ) {
+    fn set_create_ghost(&mut self, ghost: Option<Node>, sig: Option<(Vec3, Vec3, usize, String)>) {
         if self.create_ghost_sig == sig && self.create_ghost.is_some() == ghost.is_some() {
             return;
         }
@@ -785,9 +777,8 @@ impl ToolState {
     }
 
     fn set_hover(&mut self, hit: Option<BoundaryPatchHit>, domain: Option<u32>) {
-        let signature = |candidate: &BoundaryPatchHit| {
-            (candidate.owner_object_id, candidate.patch_id.clone())
-        };
+        let signature =
+            |candidate: &BoundaryPatchHit| (candidate.owner_object_id, candidate.patch_id.clone());
         if self.hover_hit.as_ref().map(&signature) != hit.as_ref().map(&signature)
             || self.hover_domain != domain
         {
@@ -809,11 +800,12 @@ impl ToolState {
         state: &mut AppState,
     ) -> bool {
         if state.selected_region.is_none() {
-            state.status = "Cutter: select a boundary region first (Boundary Region tool)"
-                .to_string();
+            state.status =
+                "Cutter: select a boundary region first (Boundary Region tool)".to_string();
             return false;
         }
-        let Some(root) = boundary_tool::selected_region_root(&state.document, state.selected_region)
+        let Some(root) =
+            boundary_tool::selected_region_root(&state.document, state.selected_region)
         else {
             state.status = "Cutter: the region's Domain is no longer marked".to_string();
             return false;
@@ -851,8 +843,7 @@ impl ToolState {
                     state.status = "point knife placed — Enter splits".to_string();
                 } else {
                     self.points.push(point);
-                    state.status =
-                        format!("{} knife point(s) — Enter splits", self.points.len());
+                    state.status = format!("{} knife point(s) — Enter splits", self.points.len());
                 }
                 points_changed = true;
             }
@@ -907,13 +898,11 @@ impl ToolState {
         let candidates: Vec<(egui::Pos2, Vec3)> = revolve_snap_points(&frame)
             .into_iter()
             .filter_map(|world| {
-                project_to_screen(camera, world, rect, pixels_per_point)
-                    .map(|pos| (pos, world))
+                project_to_screen(camera, world, rect, pixels_per_point).map(|pos| (pos, world))
             })
             .collect();
-        let snap_hit = pointer.and_then(|pos| {
-            snap_to_candidates(pos, &candidates, REVOLVE_SNAP_THRESHOLD_PX)
-        });
+        let snap_hit =
+            pointer.and_then(|pos| snap_to_candidates(pos, &candidates, REVOLVE_SNAP_THRESHOLD_PX));
         let cursor_point = snap_hit.or_else(|| {
             pointer.and_then(|pos| {
                 let (origin, direction) = screen_ray(camera, pos, rect, pixels_per_point);
@@ -926,16 +915,14 @@ impl ToolState {
                 consumed = true;
                 if self.points.is_empty() {
                     self.points.push(point);
-                    state.status =
-                        "Revolve: click the axis direction — Enter uses the V direction"
-                            .to_string();
+                    state.status = "Revolve: click the axis direction — Enter uses the V direction"
+                        .to_string();
                 } else {
                     let start = self.points[0];
                     let toward = point - start;
                     if toward.length() <= 1e-9 {
                         state.status =
-                            "Revolve: the direction point must differ from the origin"
-                                .to_string();
+                            "Revolve: the direction point must differ from the origin".to_string();
                     } else {
                         let unit = toward / toward.length();
                         let direction = snap_axis_direction(
@@ -951,8 +938,7 @@ impl ToolState {
             }
         }
         // Preview: exactly the axis a commit right now would use.
-        let (axis_origin, axis_direction) = match (self.points.first().copied(), cursor_point)
-        {
+        let (axis_origin, axis_direction) = match (self.points.first().copied(), cursor_point) {
             (Some(start), Some(cursor)) if (cursor - start).length() > 1e-9 => {
                 let unit = (cursor - start) / (cursor - start).length();
                 (
@@ -999,11 +985,7 @@ impl ToolState {
                 if snap_hit.is_some() {
                     painter.circle_filled(pos, 4.5, REVOLVE_AXIS_COLOR);
                 } else {
-                    painter.circle_stroke(
-                        pos,
-                        4.5,
-                        egui::Stroke::new(1.5, REVOLVE_AXIS_COLOR),
-                    );
+                    painter.circle_stroke(pos, 4.5, egui::Stroke::new(1.5, REVOLVE_AXIS_COLOR));
                 }
             }
         }
@@ -1178,8 +1160,7 @@ impl ToolState {
                         // Odd-count kinds can't commit mid-span: say so
                         // instead of promising Enter.
                         state.status = if kind == "regular_polygon" && count == 1 {
-                            "Center placed — click a vertex (sets radius and rotation)"
-                                .to_string()
+                            "Center placed — click a vertex (sets radius and rotation)".to_string()
                         } else if needs_odd_points(kind) && count.is_multiple_of(2) {
                             format!(
                                 "{count} point(s) — click the span's anchor (odd count commits)"
@@ -1268,7 +1249,15 @@ impl ToolState {
         state: &mut AppState,
     ) -> bool {
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
-        self.update_gizmo_hover(GizmoKind::Move, response, pointer, camera, rect, pixels_per_point, state);
+        self.update_gizmo_hover(
+            GizmoKind::Move,
+            response,
+            pointer,
+            camera,
+            rect,
+            pixels_per_point,
+            state,
+        );
         if self.gesture_aborted {
             // Esc aborted this drag: swallow events until the button lifts.
             if response.drag_stopped_by(egui::PointerButton::Primary)
@@ -1363,7 +1352,15 @@ impl ToolState {
         state: &mut AppState,
     ) -> bool {
         let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
-        self.update_gizmo_hover(GizmoKind::Rotate, response, pointer, camera, rect, pixels_per_point, state);
+        self.update_gizmo_hover(
+            GizmoKind::Rotate,
+            response,
+            pointer,
+            camera,
+            rect,
+            pixels_per_point,
+            state,
+        );
         if self.gesture_aborted {
             // Esc aborted this drag: swallow events until the button lifts.
             if response.drag_stopped_by(egui::PointerButton::Primary)
@@ -1477,8 +1474,7 @@ impl ToolState {
             for event in &input.events {
                 if let egui::Event::Text(text) = event {
                     for character in text.chars() {
-                        if character.is_ascii_digit()
-                            || ".,xX;mkcft'\" +-*/()".contains(character)
+                        if character.is_ascii_digit() || ".,xX;mkcft'\" +-*/()".contains(character)
                         {
                             self.dimension_text.push(character);
                         }
@@ -1494,7 +1490,9 @@ impl ToolState {
 /// can never drift from the committed result (any kind, 1D/2D/3D).
 fn ghost_from_drag(kind: &str, start: Vec3, end: Vec3, scale: f64) -> Option<Node> {
     let mut scratch = SceneDocument::new();
-    let id = scratch.add_primitive_from_drag(kind, start, end, scale).ok()?;
+    let id = scratch
+        .add_primitive_from_drag(kind, start, end, scale)
+        .ok()?;
     scratch.build_node(id).ok()
 }
 
@@ -1583,10 +1581,8 @@ pub fn project_to_screen(
     let scale = pixels_per_point as f64;
     let width = rect.width() as f64 * scale;
     let height = rect.height() as f64 * scale;
-    let px =
-        0.5 * width + height * relative.dot(basis.right) * camera.focal / (2.0 * depth);
-    let py =
-        0.5 * height - height * relative.dot(basis.up) * camera.focal / (2.0 * depth);
+    let px = 0.5 * width + height * relative.dot(basis.right) * camera.focal / (2.0 * depth);
+    let py = 0.5 * height - height * relative.dot(basis.up) * camera.focal / (2.0 * depth);
     Some(egui::pos2(
         rect.min.x + (px / scale) as f32,
         rect.min.y + (py / scale) as f32,
@@ -1669,7 +1665,10 @@ pub fn ray_plane_point(
 fn revolve_snap_points(frame: &SectionFrame) -> Vec<Vec3> {
     let outline = profile_outline(&frame.profile, 64);
     let lift = |u: f64, v: f64| frame.origin + frame.axis_u * u + frame.axis_v * v;
-    let mut points: Vec<Vec3> = outline.iter().map(|point| lift(point[0], point[1])).collect();
+    let mut points: Vec<Vec3> = outline
+        .iter()
+        .map(|point| lift(point[0], point[1]))
+        .collect();
     for index in 0..outline.len() {
         let a = outline[index];
         let b = outline[(index + 1) % outline.len()];
@@ -1786,7 +1785,12 @@ pub fn axis_half_length(
 ) -> f64 {
     let (u_min, u_max, v_min, v_max) = bounds;
     let mut farthest: f64 = 0.0;
-    for (u, v) in [(u_min, v_min), (u_min, v_max), (u_max, v_min), (u_max, v_max)] {
+    for (u, v) in [
+        (u_min, v_min),
+        (u_min, v_max),
+        (u_max, v_min),
+        (u_max, v_max),
+    ] {
         let corner = section_origin + axis_u * u + axis_v * v;
         farthest = farthest.max((corner - axis_origin).length());
     }
@@ -2024,7 +2028,11 @@ mod tests {
     #[test]
     fn every_add_kind_builds_and_round_trips() {
         use caso_kernel::serialization::{load_scene_from_str, save_scene_to_string};
-        for (label, kind) in ADD_KINDS_3D.iter().chain(&ADD_KINDS_2D).chain(&ADD_KINDS_1D) {
+        for (label, kind) in ADD_KINDS_3D
+            .iter()
+            .chain(&ADD_KINDS_2D)
+            .chain(&ADD_KINDS_1D)
+        {
             let mut document = SceneDocument::new();
             let id = document
                 .add_primitive(kind, 1.0)
@@ -2034,8 +2042,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{label} node: {error}"));
             let saved = save_scene_to_string(&document)
                 .unwrap_or_else(|error| panic!("{label} save: {error}"));
-            let loaded = load_scene_from_str(&saved)
-                .unwrap_or_else(|error| panic!("{label} load: {error}"));
+            let loaded =
+                load_scene_from_str(&saved).unwrap_or_else(|error| panic!("{label} load: {error}"));
             assert_eq!(
                 loaded.objects.len(),
                 document.objects.len(),
@@ -2104,15 +2112,21 @@ mod tests {
         tools.set_tool(ToolKind::CreatePoints("regular_polygon"), &mut state);
         tools.regular_polygon_sides = 8;
         tools.points = vec![center, vertex];
-        let ghost =
-            ghost_from_points("regular_polygon", &tools.points, 8).expect("polygon ghost");
+        let ghost = ghost_from_points("regular_polygon", &tools.points, 8).expect("polygon ghost");
         assert!(tools.confirm_pending(&mut state), "Enter must commit");
         let id = state.selected_single().expect("committed shape selected");
         match &state.document.object(id).expect("object").payload {
-            ScenePayload::Placed2D { profile, origin, .. } => {
+            ScenePayload::Placed2D {
+                profile, origin, ..
+            } => {
                 assert_eq!(*origin, center);
                 match profile {
-                    Profile2D::RegularPolygon { radius, side_count, rotation, .. } => {
+                    Profile2D::RegularPolygon {
+                        radius,
+                        side_count,
+                        rotation,
+                        ..
+                    } => {
                         assert!((radius - 1.0).abs() < 1e-12);
                         assert_eq!(*side_count, 8);
                         assert!(rotation.abs() < 1e-12);
@@ -2130,7 +2144,10 @@ mod tests {
         // Coincident clicks refuse at Enter: rollback keeps the points so
         // the user can Backspace and re-click.
         tools.points = vec![center, center];
-        assert!(tools.confirm_pending(&mut state), "refusal still consumes Enter");
+        assert!(
+            tools.confirm_pending(&mut state),
+            "refusal still consumes Enter"
+        );
         assert_eq!(tools.points, vec![center, center], "points kept for retry");
     }
 
@@ -2201,13 +2218,23 @@ mod tests {
         assert_eq!(state.document.roots.len(), 1);
         assert_eq!(state.selection, state.document.roots);
         assert!(tools.points.is_empty(), "commit consumes the points");
-        assert_eq!(tools.kind, ToolKind::CreatePoints("polyline"), "stays armed");
+        assert_eq!(
+            tools.kind,
+            ToolKind::CreatePoints("polyline"),
+            "stays armed"
+        );
         assert!(!tools.confirm_pending(&mut state), "nothing pending");
-        assert!(!tools.clear_pending(&mut state), "idle: Esc falls to rung 2");
+        assert!(
+            !tools.clear_pending(&mut state),
+            "idle: Esc falls to rung 2"
+        );
         // A refused commit (below the kind's minimum) keeps the points and
         // leaves no redo entry.
         tools.points = vec![vec3(0.0, 0.0, 0.0)];
-        assert!(tools.confirm_pending(&mut state), "refusal still consumes Enter");
+        assert!(
+            tools.confirm_pending(&mut state),
+            "refusal still consumes Enter"
+        );
         assert_eq!(tools.points.len(), 1, "points kept for adjustment");
         assert_eq!(state.document.roots.len(), 1, "document unchanged");
         assert!(!state.can_redo());
@@ -2268,12 +2295,18 @@ mod tests {
             .document
             .set_domain_root(id, DomainKind::Fluid)
             .unwrap();
-        let region = state.document.add_boundary_region(id, None, None, None).unwrap();
+        let region = state
+            .document
+            .add_boundary_region(id, None, None, None)
+            .unwrap();
         state.selected_region = Some(region);
         let mut tools = ToolState::default();
         tools.set_tool(ToolKind::BoundaryCutter("polygon"), &mut state);
         tools.points = vec![vec3(0.5, 0.0, 0.0), vec3(0.0, 0.5, 0.0)];
-        assert!(tools.confirm_pending(&mut state), "refusal still consumes Enter");
+        assert!(
+            tools.confirm_pending(&mut state),
+            "refusal still consumes Enter"
+        );
         assert_eq!(tools.points.len(), 2, "points kept");
         assert_eq!(state.document.boundary_regions.len(), 1, "no split");
         assert!(!state.can_undo(), "no snapshot for a refused split");
@@ -2301,8 +2334,13 @@ mod tests {
     fn ray_plane_point_hits_oblique_plane() {
         let plane_origin = vec3(1.0, 0.0, 0.0);
         let plane_normal = vec3(1.0, 1.0, 0.0);
-        let hit = ray_plane_point(vec3(3.0, 0.0, 0.0), vec3(-1.0, 0.0, 0.0), plane_origin, plane_normal)
-            .expect("hit");
+        let hit = ray_plane_point(
+            vec3(3.0, 0.0, 0.0),
+            vec3(-1.0, 0.0, 0.0),
+            plane_origin,
+            plane_normal,
+        )
+        .expect("hit");
         assert!((hit - vec3(1.0, 0.0, 0.0)).length() < 1e-12);
         // Parallel ray misses; a plane behind the ray origin misses.
         assert!(ray_plane_point(
@@ -2345,8 +2383,7 @@ mod tests {
         assert_eq!(snap_axis_direction(nearly_u, axis_u, axis_v, 4.0), axis_u);
         let off_u = vec3(10.0f64.to_radians().cos(), 10.0f64.to_radians().sin(), 0.0);
         assert_eq!(snap_axis_direction(off_u, axis_u, axis_v, 4.0), off_u);
-        let nearly_negative_v =
-            vec3(2.0f64.to_radians().sin(), -2.0f64.to_radians().cos(), 0.0);
+        let nearly_negative_v = vec3(2.0f64.to_radians().sin(), -2.0f64.to_radians().cos(), 0.0);
         assert_eq!(
             snap_axis_direction(nearly_negative_v, axis_u, axis_v, 4.0),
             -axis_v
@@ -2360,11 +2397,9 @@ mod tests {
         let normal = vec3(0.0, 0.0, 1.0);
         let axis = vec3(0.0, 1.0, 0.0);
         let origin = vec3(0.0, 0.0, 0.0);
-        let toward_positive_u =
-            radial_toward_centroid(origin, axis, normal, vec3(0.5, 0.0, 0.0));
+        let toward_positive_u = radial_toward_centroid(origin, axis, normal, vec3(0.5, 0.0, 0.0));
         assert!((toward_positive_u - vec3(1.0, 0.0, 0.0)).length() < 1e-12);
-        let toward_negative_u =
-            radial_toward_centroid(origin, axis, normal, vec3(-0.5, 0.2, 0.0));
+        let toward_negative_u = radial_toward_centroid(origin, axis, normal, vec3(-0.5, 0.2, 0.0));
         assert!((toward_negative_u - vec3(-1.0, 0.0, 0.0)).length() < 1e-12);
         let on_axis = radial_toward_centroid(origin, axis, normal, vec3(0.0, 3.0, 0.0));
         assert!((on_axis.length() - 1.0).abs() < 1e-12);
@@ -2376,12 +2411,7 @@ mod tests {
         let mut state = AppState::new(SceneDocument::new());
         let id = state
             .document
-            .add_primitive_from_drag(
-                "rectangle",
-                vec3(-0.3, -0.5, 0.0),
-                vec3(0.3, 0.5, 0.0),
-                1.0,
-            )
+            .add_primitive_from_drag("rectangle", vec3(-0.3, -0.5, 0.0), vec3(0.3, 0.5, 0.0), 1.0)
             .unwrap();
         let frame = section_frame(&state.document, id).expect("section");
         let axis_origin = frame.origin + frame.axis_u * 0.3;
@@ -2403,12 +2433,7 @@ mod tests {
         let mut state = AppState::new(SceneDocument::new());
         let id = state
             .document
-            .add_primitive_from_drag(
-                "rectangle",
-                vec3(-0.3, -0.5, 0.0),
-                vec3(0.3, 0.5, 0.0),
-                1.0,
-            )
+            .add_primitive_from_drag("rectangle", vec3(-0.3, -0.5, 0.0), vec3(0.3, 0.5, 0.0), 1.0)
             .unwrap();
         let frame = section_frame(&state.document, id).expect("section");
         let mut tools = ToolState::default();
@@ -2444,12 +2469,7 @@ mod tests {
         let mut state = AppState::new(SceneDocument::new());
         let id = state
             .document
-            .add_primitive_from_drag(
-                "rectangle",
-                vec3(-0.3, -0.5, 0.0),
-                vec3(0.3, 0.5, 0.0),
-                1.0,
-            )
+            .add_primitive_from_drag("rectangle", vec3(-0.3, -0.5, 0.0), vec3(0.3, 0.5, 0.0), 1.0)
             .unwrap();
         let frame = section_frame(&state.document, id).expect("section");
         // Axis along the rectangle's left edge: classic solid cylinder.
@@ -2476,7 +2496,11 @@ mod tests {
             "radial must point from the axis toward the profile"
         );
         state.undo();
-        assert_eq!(state.document.roots, vec![id], "one undo restores the section");
+        assert_eq!(
+            state.document.roots,
+            vec![id],
+            "one undo restores the section"
+        );
     }
 
     /// Deleting the section mid-tool exits cleanly instead of committing
@@ -2486,12 +2510,7 @@ mod tests {
         let mut state = AppState::new(SceneDocument::new());
         let id = state
             .document
-            .add_primitive_from_drag(
-                "circle",
-                vec3(0.2, -0.2, 0.0),
-                vec3(0.6, 0.2, 0.0),
-                1.0,
-            )
+            .add_primitive_from_drag("circle", vec3(0.2, -0.2, 0.0), vec3(0.6, 0.2, 0.0), 1.0)
             .unwrap();
         let mut tools = ToolState::default();
         tools.set_tool(ToolKind::RevolveAxisPick(id), &mut state);

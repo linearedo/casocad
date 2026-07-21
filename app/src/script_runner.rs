@@ -85,8 +85,8 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
 
     let mut engine = Engine::new();
     engine.set_max_operations(200_000_000); // generous but bounded
-    // Mesher scripts nest loops inside functions; the default per-function
-    // expression depth (32) is too tight for ordinary connectivity code.
+                                            // Mesher scripts nest loops inside functions; the default per-function
+                                            // expression depth (32) is too tight for ordinary connectivity code.
     engine.set_max_expr_depths(128, 128);
 
     engine
@@ -207,10 +207,9 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
              -> Result<Array, Box<rhai::EvalAltResult>> {
                 let projection = handle.0.project_to_owner(&[vec3(x, y, z)])[0];
                 if !projection.converged {
-                    return Err(format!(
-                        "owner projection did not converge from ({x}, {y}, {z})"
-                    )
-                    .into());
+                    return Err(
+                        format!("owner projection did not converge from ({x}, {y}, {z})").into(),
+                    );
                 }
                 Ok(vec3_array(projection.point))
             },
@@ -301,9 +300,8 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
              name: &str,
              npoints: i64|
              -> Result<Array, Box<rhai::EvalAltResult>> {
-                let points =
-                    boundary_marching_sample(&handle.0, name, npoints.max(0) as usize)
-                        .map_err(|error| error.to_string())?;
+                let points = boundary_marching_sample(&handle.0, name, npoints.max(0) as usize)
+                    .map_err(|error| error.to_string())?;
                 Ok(points
                     .into_iter()
                     .map(|point| Dynamic::from(vec3_array(point)))
@@ -397,31 +395,32 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
         )
         .register_fn(
             "sizing",
-            |domain: DomainHandle, spec_map: Map| -> Result<SizingHandle, Box<rhai::EvalAltResult>> {
+            |domain: DomainHandle,
+             spec_map: Map|
+             -> Result<SizingHandle, Box<rhai::EvalAltResult>> {
                 let mut spec = SizingSpec::for_domain(&domain.0);
                 for (key, value) in &spec_map {
                     match key.as_str() {
                         "background" => spec.background = dynamic_to_f64(value)?,
                         "min_size" => spec.min_size = dynamic_to_f64(value)?,
                         "gradation" => spec.gradation = dynamic_to_f64(value)?,
-                        "curvature_factor" => {
-                            spec.curvature_factor = Some(dynamic_to_f64(value)?)
-                        }
+                        "curvature_factor" => spec.curvature_factor = Some(dynamic_to_f64(value)?),
                         "bands" => {
                             let bands: Array = value
                                 .clone()
                                 .try_cast()
                                 .ok_or("sizing bands must be an array of maps")?;
                             for band in bands {
-                                let entry: Map = band
-                                    .try_cast()
-                                    .ok_or("each sizing band must be a map")?;
+                                let entry: Map =
+                                    band.try_cast().ok_or("each sizing band must be a map")?;
                                 let region: String = entry
                                     .get("region")
                                     .and_then(|name| name.clone().try_cast())
                                     .ok_or("sizing band needs a region name")?;
                                 let distance = dynamic_to_f64(
-                                    entry.get("distance").ok_or("sizing band needs a distance")?,
+                                    entry
+                                        .get("distance")
+                                        .ok_or("sizing band needs a distance")?,
                                 )?;
                                 let size = dynamic_to_f64(
                                     entry.get("size").ok_or("sizing band needs a size")?,
@@ -919,8 +918,8 @@ mod tests {
     #[test]
     fn example_script_builds_a_conforming_3d_mesh() {
         let document = SceneDocument::default_scene().expect("default scene");
-        let mesh =
-            run_mesher_script(&document, &example_script_at_test_resolution()).expect("script runs");
+        let mesh = run_mesher_script(&document, &example_script_at_test_resolution())
+            .expect("script runs");
         assert!(!mesh.cells.is_empty());
         assert!(mesh.cells.iter().all(|cell| cell.type_name == "hex8"));
         assert_eq!(mesh.zones.len(), 1);
@@ -942,7 +941,10 @@ mod tests {
                 snapped += 1;
             }
         }
-        assert!(snapped > 50, "the mesh hugs the boundary ({snapped} on-wall points)");
+        assert!(
+            snapped > 50,
+            "the mesh hugs the boundary ({snapped} on-wall points)"
+        );
         // Topological boundary faces carry a tag.
         assert!(
             mesh.faces.iter().any(|face| !face.tag_ids.is_empty()),
@@ -980,8 +982,7 @@ mod tests {
 
         let mut document = SceneDocument::default_scene().expect("default scene");
         let ball = document.add_primitive("sphere", 1.0).expect("ball");
-        if let ScenePayload::Sphere(sphere) =
-            &mut document.object_mut(ball).expect("ball").payload
+        if let ScenePayload::Sphere(sphere) = &mut document.object_mut(ball).expect("ball").payload
         {
             sphere.center = vec3(6.0, 0.0, 0.5);
             sphere.radius = 0.5;
@@ -990,14 +991,11 @@ mod tests {
             .set_domain_root(ball, DomainKind::Solid)
             .expect("solid domain");
 
-        let mesh =
-            run_mesher_script(&document, &example_script_at_test_resolution()).expect("script runs");
+        let mesh = run_mesher_script(&document, &example_script_at_test_resolution())
+            .expect("script runs");
         assert_eq!(mesh.zones.len(), 2, "both domains meshed");
-        let mut zones_with_cells: Vec<u64> = mesh
-            .cells
-            .iter()
-            .filter_map(|cell| cell.zone_id)
-            .collect();
+        let mut zones_with_cells: Vec<u64> =
+            mesh.cells.iter().filter_map(|cell| cell.zone_id).collect();
         zones_with_cells.sort_unstable();
         zones_with_cells.dedup();
         assert_eq!(zones_with_cells.len(), 2, "cells in both zones");
@@ -1009,12 +1007,7 @@ mod tests {
 
         let mut document = SceneDocument::new();
         let rect = document
-            .add_primitive_from_drag(
-                "rectangle",
-                vec3(-2.0, -1.0, 0.0),
-                vec3(2.0, 1.0, 0.0),
-                1.0,
-            )
+            .add_primitive_from_drag("rectangle", vec3(-2.0, -1.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
             .expect("rectangle");
         let ellipse = document
             .add_primitive_from_drag("ellipse", vec3(0.1, -0.25, 0.0), vec3(0.9, 0.25, 0.0), 1.0)
@@ -1047,8 +1040,8 @@ mod tests {
             .expect("region")
             .name = "skin".to_string();
 
-        let mesh =
-            run_mesher_script(&document, &example_script_at_test_resolution()).expect("script runs");
+        let mesh = run_mesher_script(&document, &example_script_at_test_resolution())
+            .expect("script runs");
         assert!(!mesh.cells.is_empty(), "2D cells were built");
         assert!(mesh.cells.iter().all(|cell| cell.type_name == "quad4"));
         assert_eq!(mesh.zones.len(), 1);
@@ -1058,7 +1051,9 @@ mod tests {
             .find(|tag| tag.name == "skin")
             .expect("skin tag");
         assert!(
-            mesh.edges.iter().any(|edge| edge.tag_ids.contains(&skin.id)),
+            mesh.edges
+                .iter()
+                .any(|edge| edge.tag_ids.contains(&skin.id)),
             "boundary edges carry the region tag"
         );
         assert_closed_tagged_2d_boundary(&mesh);
@@ -1094,7 +1089,10 @@ mod tests {
                 snapped += 1;
             }
         }
-        assert!(snapped > 10, "the mesh hugs the outline ({snapped} on-wall points)");
+        assert!(
+            snapped > 10,
+            "the mesh hugs the outline ({snapped} on-wall points)"
+        );
     }
 
     #[test]
@@ -1105,12 +1103,7 @@ mod tests {
         // script must mesh BOTH zones, hole and pin, in the same plane.
         let mut document = SceneDocument::new();
         let rect = document
-            .add_primitive_from_drag(
-                "rectangle",
-                vec3(-2.0, -1.0, 0.0),
-                vec3(2.0, 1.0, 0.0),
-                1.0,
-            )
+            .add_primitive_from_drag("rectangle", vec3(-2.0, -1.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
             .expect("rectangle");
         let circle = document
             .add_primitive_from_drag("circle", vec3(0.2, -0.3, 0.0), vec3(0.8, 0.3, 0.0), 1.0)
@@ -1126,14 +1119,11 @@ mod tests {
             .set_domain_root(domain, DomainKind::Fluid)
             .expect("fluid domain");
 
-        let mesh =
-            run_mesher_script(&document, &example_script_at_test_resolution()).expect("script runs");
+        let mesh = run_mesher_script(&document, &example_script_at_test_resolution())
+            .expect("script runs");
         assert_eq!(mesh.zones.len(), 2, "fluid and pin zones");
-        let mut zones_with_cells: Vec<u64> = mesh
-            .cells
-            .iter()
-            .filter_map(|cell| cell.zone_id)
-            .collect();
+        let mut zones_with_cells: Vec<u64> =
+            mesh.cells.iter().filter_map(|cell| cell.zone_id).collect();
         zones_with_cells.sort_unstable();
         zones_with_cells.dedup();
         assert_eq!(zones_with_cells.len(), 2, "cells in both zones");
@@ -1184,8 +1174,7 @@ mod tests {
         let mut document = SceneDocument::new();
         let boxy = document.add_primitive("box", 4.0).expect("box");
         let ball = document.add_primitive("sphere", 1.0).expect("ball");
-        if let ScenePayload::Sphere(sphere) =
-            &mut document.object_mut(ball).expect("ball").payload
+        if let ScenePayload::Sphere(sphere) = &mut document.object_mut(ball).expect("ball").payload
         {
             sphere.radius = 0.4;
         }
@@ -1236,12 +1225,7 @@ mod tests {
 
         let mut document = SceneDocument::new();
         let rect = document
-            .add_primitive_from_drag(
-                "rectangle",
-                vec3(-2.0, -1.0, 0.0),
-                vec3(2.0, 1.0, 0.0),
-                1.0,
-            )
+            .add_primitive_from_drag("rectangle", vec3(-2.0, -1.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
             .expect("rectangle");
         let circle = document
             .add_primitive_from_drag("circle", vec3(0.2, -0.3, 0.0), vec3(0.8, 0.3, 0.0), 1.0)
@@ -1286,7 +1270,11 @@ mod tests {
             }
         "#;
         let mesh = run_mesher_script(&document, script).expect("script runs");
-        assert_eq!(mesh.points.len(), 4, "keyed sampling delivered to the script");
+        assert_eq!(
+            mesh.points.len(),
+            4,
+            "keyed sampling delivered to the script"
+        );
     }
 
     #[test]

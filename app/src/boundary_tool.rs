@@ -5,14 +5,12 @@
 
 use caso_kernel::boundary::{BoundaryCut, BoundaryRegion, CutSide};
 use caso_kernel::boundary_ops::{
-    boundary_region_base_mask, cut_volume, pick_boundary_patch,
-    pick_boundary_patch_with_radius, pick_outline_point_with_radius, pick_sdf_surface,
-    placed_2d_root, sdf_normal, surface_patches_for_root, BoundaryPatchHit,
-    BoundarySurfacePatch,
+    boundary_region_base_mask, cut_volume, pick_boundary_patch, pick_boundary_patch_with_radius,
+    pick_outline_point_with_radius, pick_sdf_surface, placed_2d_root, sdf_normal,
+    surface_patches_for_root, BoundaryPatchHit, BoundarySurfacePatch,
 };
 use caso_kernel::boundary_paths::{
-    point_knife, stencil_knife, straight_knife, workplane_normal,
-    KNIFE_CURVATURE_WARNING_ALIGNMENT,
+    point_knife, stencil_knife, straight_knife, workplane_normal, KNIFE_CURVATURE_WARNING_ALIGNMENT,
 };
 use caso_kernel::scene::SceneDocument;
 use caso_kernel::sdf::node::Node;
@@ -188,11 +186,8 @@ pub fn region_highlight_mesh(
                     remap[vertex] = mesh.vertices.len() as u32;
                     mesh.vertices.push(points[vertex]);
                     let normal = surface.normals.get(vertex).copied().unwrap_or([0.0; 3]);
-                    mesh.normals.push(vec3(
-                        normal[0] as f64,
-                        normal[1] as f64,
-                        normal[2] as f64,
-                    ));
+                    mesh.normals
+                        .push(vec3(normal[0] as f64, normal[1] as f64, normal[2] as f64));
                 }
                 mapped[slot] = remap[vertex];
             }
@@ -535,8 +530,6 @@ pub struct KnifeGhost {
     pub warnings: Vec<String>,
 }
 
-
-
 /// Build the ghost knife node for a cutter gesture (never a scene object).
 pub fn cutter_ghost(root: &Node, kind: &str, points: &[Vec3]) -> Result<KnifeGhost, String> {
     if root.dimension() == 2 {
@@ -571,8 +564,7 @@ pub fn cutter_ghost(root: &Node, kind: &str, points: &[Vec3]) -> Result<KnifeGho
                         .to_string(),
                 );
             }
-            let node = straight_knife(root, start, end, mean)
-                .map_err(|error| error.to_string())?;
+            let node = straight_knife(root, start, end, mean).map_err(|error| error.to_string())?;
             Ok(KnifeGhost { node, warnings })
         }
         // Point-collected knives: planar stencils on the mean-click-normal
@@ -608,8 +600,13 @@ fn cutter_ghost_2d(root: &Node, kind: &str, points: &[Vec3]) -> Result<KnifeGhos
             if points.len() < 2 {
                 return Err("segment knife needs two points".to_string());
             }
-            straight_knife(root, points[0], *points.last().expect("nonempty"), plane_normal)
-                .map_err(|error| error.to_string())?
+            straight_knife(
+                root,
+                points[0],
+                *points.last().expect("nonempty"),
+                plane_normal,
+            )
+            .map_err(|error| error.to_string())?
         }
         "point" => {
             if points.is_empty() {
@@ -623,8 +620,8 @@ fn cutter_ghost_2d(root: &Node, kind: &str, points: &[Vec3]) -> Result<KnifeGhos
     // number of times — exactly two is a clean two-arc split; more means
     // each side will hold several arcs (non-convex outline). A knife whose
     // zero line runs ALONG an edge is degenerate and refused.
-    let placed = placed_2d_root(root)
-        .ok_or_else(|| "2D domain root is not a placed profile".to_string())?;
+    let placed =
+        placed_2d_root(root).ok_or_else(|| "2D domain root is not a placed profile".to_string())?;
     let diagonal = root
         .bounding_box()
         .map(|bounds| bounds.diagonal())
@@ -745,22 +742,21 @@ mod tests {
     fn minus_x_face_region(root: &Node) -> BoundaryRegion {
         // The ray must miss the cylinder obstacle (y span ±0.7): its
         // cut-surface patch would win the pick outright.
-        let hit = pick_patch(root, vec3(-5.0, 1.0, 0.5), vec3(1.0, 0.0, 0.0))
-            .expect("-X face hit");
-        assert!(hit.patch_id.ends_with("-X"), "unexpected patch {}", hit.patch_id);
+        let hit = pick_patch(root, vec3(-5.0, 1.0, 0.5), vec3(1.0, 0.0, 0.0)).expect("-X face hit");
+        assert!(
+            hit.patch_id.ends_with("-X"),
+            "unexpected patch {}",
+            hit.patch_id
+        );
         candidate_region(&hit)
     }
 
     /// Vertical segment at y=0 across the -X face: the knife volume is the
     /// half-space y >= 0 (within its spans), so Inside = upper half.
     fn face_segment_ghost(root: &Node) -> Node {
-        cutter_ghost(
-            root,
-            "segment",
-            &[vec3(0.0, 0.0, 0.1), vec3(0.0, 0.0, 0.9)],
-        )
-        .expect("segment ghost")
-        .node
+        cutter_ghost(root, "segment", &[vec3(0.0, 0.0, 0.1), vec3(0.0, 0.0, 0.9)])
+            .expect("segment ghost")
+            .node
     }
 
     fn diagonal(root: &Node) -> f64 {
@@ -783,10 +779,8 @@ mod tests {
     fn seam_vertices_lie_exactly_on_the_knife_zero_set() {
         let (root, scene) = fixture();
         let ghost = face_segment_ghost(&root);
-        let (inside, _outside) =
-            split_preview_children(&minus_x_face_region(&root), &ghost);
-        let volume =
-            cut_volume(&root, inside.cuts.last().expect("cut")).expect("cut volume");
+        let (inside, _outside) = split_preview_children(&minus_x_face_region(&root), &ghost);
+        let volume = cut_volume(&root, inside.cuts.last().expect("cut")).expect("cut volume");
         let mesh = region_highlight_mesh(&root, &inside, &scene).expect("highlight");
         let diag = diagonal(&root);
         let mut seam_vertices = 0usize;
@@ -809,10 +803,8 @@ mod tests {
     fn preview_triangles_stay_strictly_on_their_side() {
         let (root, scene) = fixture();
         let ghost = face_segment_ghost(&root);
-        let (inside, outside) =
-            split_preview_children(&minus_x_face_region(&root), &ghost);
-        let volume =
-            cut_volume(&root, inside.cuts.last().expect("cut")).expect("cut volume");
+        let (inside, outside) = split_preview_children(&minus_x_face_region(&root), &ghost);
+        let volume = cut_volume(&root, inside.cuts.last().expect("cut")).expect("cut volume");
         let diag = diagonal(&root);
         let slack = 1.0e-9 * diag;
         for (region, keep_negative) in [(&inside, true), (&outside, false)] {
@@ -845,8 +837,7 @@ mod tests {
         let outside_area =
             mesh_area(&region_highlight_mesh(&root, &outside, &scene).expect("outside"));
         assert!(parent_area > 0.0);
-        let relative_gap =
-            ((inside_area + outside_area) - parent_area).abs() / parent_area;
+        let relative_gap = ((inside_area + outside_area) - parent_area).abs() / parent_area;
         assert!(
             relative_gap <= 1.0e-6,
             "children must partition the parent crack-free (gap {relative_gap})"
@@ -860,8 +851,7 @@ mod tests {
         let mesh = region_highlight_mesh(&root, &region, &scene).expect("highlight");
         // Cut-free path: output vertices are display-mesh vertices, all of
         // which pass the base mask (no clipping ran).
-        let mask = boundary_region_base_mask(&root, &region, &mesh.vertices, None)
-            .expect("mask");
+        let mask = boundary_region_base_mask(&root, &region, &mesh.vertices, None).expect("mask");
         assert!(mask.iter().all(|hit| *hit));
         assert!(!mesh.triangles.is_empty());
     }
@@ -871,14 +861,10 @@ mod tests {
         let (root, _scene) = fixture();
         let first = vec3(0.0, 0.0, 0.1);
         let second = vec3(0.0, 0.0, 0.9);
-        let forward = cutter_ghost(
-            &root,
-            "segment", &[first, second])
+        let forward = cutter_ghost(&root, "segment", &[first, second])
             .expect("forward")
             .node;
-        let backward = cutter_ghost(
-            &root,
-            "segment", &[second, first])
+        let backward = cutter_ghost(&root, "segment", &[second, first])
             .expect("backward")
             .node;
         let cut = |ghost: Node| BoundaryCut {
@@ -1001,8 +987,14 @@ mod tests {
             "obstacle",
             11,
             Shape::PlacedSdf2D(
-                PlacedSdf2D::new(circle_profile.clone(), Vec3::ZERO, axis_u, axis_v, Vec::new())
-                    .expect("circle"),
+                PlacedSdf2D::new(
+                    circle_profile.clone(),
+                    Vec3::ZERO,
+                    axis_u,
+                    axis_v,
+                    Vec::new(),
+                )
+                .expect("circle"),
             ),
         );
         let merged = Profile2D::Binary {
@@ -1049,10 +1041,21 @@ mod tests {
         // Every ribbon vertex hugs the left edge x = -2, y in [-1, 1],
         // lifted off the z = 0 plane by less than the ribbon scale.
         for vertex in &surface.vertices {
-            assert!((vertex[0] as f64 + 2.0).abs() < 0.05, "off-edge x {}", vertex[0]);
-            assert!((vertex[1] as f64).abs() < 1.0 + 0.05, "off-edge y {}", vertex[1]);
+            assert!(
+                (vertex[0] as f64 + 2.0).abs() < 0.05,
+                "off-edge x {}",
+                vertex[0]
+            );
+            assert!(
+                (vertex[1] as f64).abs() < 1.0 + 0.05,
+                "off-edge y {}",
+                vertex[1]
+            );
             assert!((vertex[2] as f64).abs() < 0.05, "off-plane z {}", vertex[2]);
-            assert!(vertex[2] != 0.0, "ribbon must be lifted off the sheet plane");
+            assert!(
+                vertex[2] != 0.0,
+                "ribbon must be lifted off the sheet plane"
+            );
         }
     }
 
@@ -1080,9 +1083,12 @@ mod tests {
         let outside_ys = ys(&outside_surface);
         let max = |values: &[f32]| values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let min = |values: &[f32]| values.iter().cloned().fold(f32::INFINITY, f32::min);
-        let shared_touch = max(&inside_ys) == min(&outside_ys)
-            || max(&outside_ys) == min(&inside_ys);
-        assert!(shared_touch, "children must meet at one bitwise-identical split vertex");
+        let shared_touch =
+            max(&inside_ys) == min(&outside_ys) || max(&outside_ys) == min(&inside_ys);
+        assert!(
+            shared_touch,
+            "children must meet at one bitwise-identical split vertex"
+        );
     }
 
     #[test]
@@ -1096,7 +1102,10 @@ mod tests {
         )
         .expect("ghost");
         assert!(
-            ghost.warnings.iter().any(|warning| warning.contains("4 points")),
+            ghost
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("4 points")),
             "expected the multi-arc warning, got {:?}",
             ghost.warnings
         );
@@ -1113,7 +1122,11 @@ mod tests {
             &[vec3(-2.0, 0.5, 0.0), vec3(-0.5, 1.0, 0.0)],
         )
         .expect("ghost");
-        assert!(ghost.warnings.is_empty(), "unexpected: {:?}", ghost.warnings);
+        assert!(
+            ghost.warnings.is_empty(),
+            "unexpected: {:?}",
+            ghost.warnings
+        );
     }
 
     #[test]
@@ -1125,14 +1138,17 @@ mod tests {
             &[vec3(-2.0, -0.5, 0.0), vec3(-2.0, 0.5, 0.0)],
         )
         .expect_err("collinear cut refused");
-        assert!(error.contains("along the outline"), "unexpected error: {error}");
+        assert!(
+            error.contains("along the outline"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
     fn point_knife_is_refused_on_3d_domains() {
         let (root, _scene) = fixture();
-        let error = cutter_ghost(&root, "point", &[vec3(0.0, 0.0, 0.5)])
-            .expect_err("3D root refused");
+        let error =
+            cutter_ghost(&root, "point", &[vec3(0.0, 0.0, 0.5)]).expect_err("3D root refused");
         assert!(error.contains("2D"), "unexpected error: {error}");
     }
 

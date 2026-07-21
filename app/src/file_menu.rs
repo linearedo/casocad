@@ -51,11 +51,7 @@ impl FileMenu {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn menu_contents(
-        &mut self,
-        ui: &mut egui::Ui,
-        document: &SceneDocument,
-    ) -> Option<FileEvent> {
+    fn menu_contents(&mut self, ui: &mut egui::Ui, document: &SceneDocument) -> Option<FileEvent> {
         let mut event = None;
         if ui.button("Save As…").clicked() {
             ui.close();
@@ -82,11 +78,7 @@ impl FileMenu {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn menu_contents(
-        &mut self,
-        ui: &mut egui::Ui,
-        document: &SceneDocument,
-    ) -> Option<FileEvent> {
+    fn menu_contents(&mut self, ui: &mut egui::Ui, document: &SceneDocument) -> Option<FileEvent> {
         let mut event = None;
         ui.horizontal(|ui| {
             ui.label("Name");
@@ -166,8 +158,7 @@ fn parse_scene(name: String, bytes: &[u8]) -> FileEvent {
     let result = std::str::from_utf8(bytes)
         .map_err(|error| error.to_string())
         .and_then(|text| {
-            caso_kernel::serialization::load_scene_from_str(text)
-                .map_err(|error| error.to_string())
+            caso_kernel::serialization::load_scene_from_str(text).map_err(|error| error.to_string())
         });
     match result {
         Ok(document) => FileEvent::Loaded { name, document },

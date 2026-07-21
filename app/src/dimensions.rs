@@ -147,7 +147,10 @@ fn scan_number(text: &str) -> Option<(usize, f64)> {
             index = cursor;
         }
     }
-    text[..index].parse::<f64>().ok().map(|value| (index, value))
+    text[..index]
+        .parse::<f64>()
+        .ok()
+        .map(|value| (index, value))
 }
 
 /// Tokenize one expression: numbers (with optional trailing unit, spaces
@@ -300,8 +303,8 @@ fn parse_plain_list(text: &str, unit_factor: f64) -> Result<Vec<f64>, String> {
     let mut values = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
-        let trimmed =
-            rest.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | 'x' | 'X'));
+        let trimmed = rest
+            .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | 'x' | 'X'));
         if trimmed.is_empty() {
             break;
         }
@@ -419,12 +422,18 @@ mod tests {
             parse_dimension_entry("10 x 20", 0.01).unwrap(),
             vec![10.0, 20.0]
         );
-        assert_eq!(parse_dimension_entry("1m + 5", 0.001).unwrap(), vec![1005.0]);
+        assert_eq!(
+            parse_dimension_entry("1m + 5", 0.001).unwrap(),
+            vec![1005.0]
+        );
     }
 
     #[test]
     fn unit_registry_is_parseable_and_consistent() {
-        let keys: Vec<&str> = crate::state::LENGTH_UNITS.iter().map(|unit| unit.key).collect();
+        let keys: Vec<&str> = crate::state::LENGTH_UNITS
+            .iter()
+            .map(|unit| unit.key)
+            .collect();
         assert_eq!(keys, vec!["km", "m", "cm", "mm"]);
         for unit in crate::state::LENGTH_UNITS {
             assert_eq!(

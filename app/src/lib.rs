@@ -208,13 +208,7 @@ impl CasoApp {
 
     /// Menu entry that arms a tool — highlighted while active, and clicking
     /// the active entry toggles back to Select, matching `tool_button`.
-    fn tool_menu_entry(
-        &mut self,
-        ui: &mut egui::Ui,
-        label: &str,
-        icon_kind: &str,
-        tool: ToolKind,
-    ) {
+    fn tool_menu_entry(&mut self, ui: &mut egui::Ui, label: &str, icon_kind: &str, tool: ToolKind) {
         if sdf_menu_button(ui, label, icon_kind, self.tools.kind == tool).clicked() {
             if self.tools.kind == tool {
                 self.tools.set_tool(ToolKind::Select, &mut self.state);
@@ -247,7 +241,13 @@ impl CasoApp {
             ui.separator();
 
             ui.checkbox(&mut self.viewport.options.show_grid, "Grid");
-            if ui.button("Validate").on_hover_text("Compile the Model: exactness grammar, preconditions, Domain disjointness").clicked() {
+            if ui
+                .button("Validate")
+                .on_hover_text(
+                    "Compile the Model: exactness grammar, preconditions, Domain disjointness",
+                )
+                .clicked()
+            {
                 self.validate_domains();
             }
 
@@ -272,7 +272,10 @@ impl CasoApp {
                 });
 
             ui.label("Opacity");
-            ui.add(egui::Slider::new(&mut self.viewport.options.opacity, 0.05..=1.0));
+            ui.add(egui::Slider::new(
+                &mut self.viewport.options.opacity,
+                0.05..=1.0,
+            ));
             ui.checkbox(&mut self.viewport.show_bounds, "Bounds")
                 .on_hover_text("Show the selection's bounding extents in the viewport");
             ui.separator();
@@ -409,7 +412,10 @@ impl CasoApp {
     fn solid_from_2d_controls(&mut self, ui: &mut egui::Ui) {
         let section = self.state.selected_single().filter(|id| {
             matches!(
-                self.state.document.object(*id).map(|object| &object.payload),
+                self.state
+                    .document
+                    .object(*id)
+                    .map(|object| &object.payload),
                 Ok(ScenePayload::Placed2D { .. })
             )
         });
@@ -427,8 +433,7 @@ impl CasoApp {
                 );
                 ui.label(self.state.unit.key);
                 if ui.button("Extrude").clicked() {
-                    match parse_dimension_entry(&self.extrude_height_text, self.state.unit.factor)
-                    {
+                    match parse_dimension_entry(&self.extrude_height_text, self.state.unit.factor) {
                         Ok(values) => {
                             let height = values[0] * self.state.unit.factor;
                             self.state.push_undo();
@@ -526,10 +531,7 @@ impl CasoApp {
         // The unified tool grammar (one dispatcher for every tool): Esc
         // clears pending input, a second Esc exits to Select; Enter commits
         // whatever is pending; Backspace pops the last point / typed char.
-        if escape
-            && !self.tools.clear_pending(&mut self.state)
-            && self.tools.is_active()
-        {
+        if escape && !self.tools.clear_pending(&mut self.state) && self.tools.is_active() {
             self.tools.set_tool(ToolKind::Select, &mut self.state);
         }
         if enter {
@@ -671,6 +673,13 @@ impl eframe::App for CasoApp {
                     LeftTab::Meshing => self.meshing_panel.ui(ui, &mut self.state),
                 }
             });
+        if self.left_tab == LeftTab::Meshing && self.meshing_panel.inspector_active() {
+            egui::Panel::bottom("mesh_quality_inspector")
+                .resizable(true)
+                .default_size(180.0)
+                .min_size(92.0)
+                .show(ui, |ui| self.meshing_panel.inspector_ui(ui, &self.state));
+        }
         self.viewport.set_selection(self.state.selected_single());
         if self.viewport.mesh_preview_revision() != self.meshing_panel.preview_revision {
             let surfaces = self.meshing_panel.preview_surfaces();

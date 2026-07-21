@@ -586,8 +586,8 @@ fn profile1d_ui(
         } => {
             let mut start = origin + axis_u * (*center - *half_length);
             let mut end = origin + axis_u * (*center + *half_length);
-            let edited =
-                vec3_field(ui, "Start", &mut start, factor) | vec3_field(ui, "End", &mut end, factor);
+            let edited = vec3_field(ui, "Start", &mut start, factor)
+                | vec3_field(ui, "End", &mut end, factor);
             if edited {
                 let t0 = (start - origin).dot(axis_u);
                 let t1 = (end - origin).dot(axis_u);
@@ -613,7 +613,9 @@ fn profile1d_ui(
                 .inner;
             ui.weak("Right:");
             changed |= ui
-                .indent("right", |ui| profile1d_ui(ui, right, origin, axis_u, factor))
+                .indent("right", |ui| {
+                    profile1d_ui(ui, right, origin, axis_u, factor)
+                })
                 .inner;
         }
     }
@@ -830,8 +832,13 @@ impl PropertiesPanel {
             }
             ScenePayload::Pyramid(shape) => {
                 changed |= vec3_field(ui, "Center", &mut shape.center, factor);
-                changed |=
-                    length_field(ui, "Base half size", &mut shape.base_half_size, factor, true);
+                changed |= length_field(
+                    ui,
+                    "Base half size",
+                    &mut shape.base_half_size,
+                    factor,
+                    true,
+                );
                 changed |= length_field(ui, "Half height", &mut shape.half_height, factor, true);
                 changed |= frame_field(ui, &mut shape.frame);
             }
@@ -850,8 +857,13 @@ impl PropertiesPanel {
             ScenePayload::PolylineTube(tube) => {
                 changed |= length_field(ui, "Radius", &mut tube.radius, factor, true);
                 let max_inner = (tube.radius - MIN_DIMENSION).max(0.0);
-                changed |=
-                    bounded_length_field(ui, "Inner radius", &mut tube.inner_radius, factor, max_inner);
+                changed |= bounded_length_field(
+                    ui,
+                    "Inner radius",
+                    &mut tube.inner_radius,
+                    factor,
+                    max_inner,
+                );
                 changed |= caps_field(ui, &mut tube.caps);
                 changed |= vec3_point_list_ui(
                     ui,
@@ -866,8 +878,13 @@ impl PropertiesPanel {
             ScenePayload::QuadraticBezierTube(tube) => {
                 changed |= length_field(ui, "Radius", &mut tube.radius, factor, true);
                 let max_inner = (tube.radius - MIN_DIMENSION).max(0.0);
-                changed |=
-                    bounded_length_field(ui, "Inner radius", &mut tube.inner_radius, factor, max_inner);
+                changed |= bounded_length_field(
+                    ui,
+                    "Inner radius",
+                    &mut tube.inner_radius,
+                    factor,
+                    max_inner,
+                );
                 changed |= caps_field(ui, &mut tube.caps);
                 changed |= vec3_point_list_ui(
                     ui,
@@ -881,11 +898,9 @@ impl PropertiesPanel {
                 if length_field(ui, "Extent", &mut extent, factor, true) {
                     // Binormals are derived at construction, so edits go
                     // through the validating constructor.
-                    if let Ok(rebuilt) = NormalCurtain::new(
-                        curtain.points.clone(),
-                        curtain.normals.clone(),
-                        extent,
-                    ) {
+                    if let Ok(rebuilt) =
+                        NormalCurtain::new(curtain.points.clone(), curtain.normals.clone(), extent)
+                    {
                         *curtain = rebuilt;
                         changed = true;
                     }
@@ -1432,11 +1447,26 @@ mod tests {
         };
         let mut points = vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0]];
         // Insert after the last corner wraps to the first: midpoint (1, 1).
-        assert!(apply_point_edit(&mut points, PointEdit::InsertAfter(2), policy, lerp2));
+        assert!(apply_point_edit(
+            &mut points,
+            PointEdit::InsertAfter(2),
+            policy,
+            lerp2
+        ));
         assert_eq!(points, vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [1.0, 1.0]]);
-        assert!(apply_point_edit(&mut points, PointEdit::Delete(3), policy, lerp2));
+        assert!(apply_point_edit(
+            &mut points,
+            PointEdit::Delete(3),
+            policy,
+            lerp2
+        ));
         // At the minimum of three corners, delete refuses.
-        assert!(!apply_point_edit(&mut points, PointEdit::Delete(0), policy, lerp2));
+        assert!(!apply_point_edit(
+            &mut points,
+            PointEdit::Delete(0),
+            policy,
+            lerp2
+        ));
         assert_eq!(points.len(), 3);
     }
 
@@ -1447,7 +1477,12 @@ mod tests {
             closed: false,
         };
         let mut points = vec![[0.0, 0.0], [1.0, 1.0]];
-        assert!(apply_point_edit(&mut points, PointEdit::InsertAfter(1), policy, lerp2));
+        assert!(apply_point_edit(
+            &mut points,
+            PointEdit::InsertAfter(1),
+            policy,
+            lerp2
+        ));
         // Tail insert mirrors the last segment instead of wrapping.
         assert_eq!(points, vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]);
     }
@@ -1456,7 +1491,12 @@ mod tests {
     fn bezier_span_insert_splits_without_changing_the_curve() {
         let policy = PointListPolicy::Spans { min: 3 };
         let mut points = vec![[0.0, 0.0], [1.0, 2.0], [2.0, 0.0]];
-        assert!(apply_point_edit(&mut points, PointEdit::InsertAfter(0), policy, lerp2));
+        assert!(apply_point_edit(
+            &mut points,
+            PointEdit::InsertAfter(0),
+            policy,
+            lerp2
+        ));
         // De Casteljau split at t = 0.5: the midpoint anchor lies ON the
         // original curve at (1, 1), and the count stays odd.
         assert_eq!(
@@ -1464,7 +1504,12 @@ mod tests {
             vec![[0.0, 0.0], [0.5, 1.0], [1.0, 1.0], [1.5, 1.0], [2.0, 0.0]]
         );
         // The last anchor splits the span that ends at it.
-        assert!(apply_point_edit(&mut points, PointEdit::InsertAfter(4), policy, lerp2));
+        assert!(apply_point_edit(
+            &mut points,
+            PointEdit::InsertAfter(4),
+            policy,
+            lerp2
+        ));
         assert_eq!(points.len(), 7);
         assert_eq!(points.len() % 2, 1, "span edits must keep the odd count");
     }
@@ -1474,11 +1519,26 @@ mod tests {
         let policy = PointListPolicy::Spans { min: 3 };
         let mut points = vec![[0.0, 0.0], [0.5, 1.0], [1.0, 1.0], [1.5, 1.0], [2.0, 0.0]];
         // Control rows never edit; anchors drop a control+anchor pair.
-        assert!(!apply_point_edit(&mut points, PointEdit::Delete(1), policy, lerp2));
-        assert!(apply_point_edit(&mut points, PointEdit::Delete(2), policy, lerp2));
+        assert!(!apply_point_edit(
+            &mut points,
+            PointEdit::Delete(1),
+            policy,
+            lerp2
+        ));
+        assert!(apply_point_edit(
+            &mut points,
+            PointEdit::Delete(2),
+            policy,
+            lerp2
+        ));
         assert_eq!(points, vec![[0.0, 0.0], [1.5, 1.0], [2.0, 0.0]]);
         // A single span is the floor: delete refuses.
-        assert!(!apply_point_edit(&mut points, PointEdit::Delete(0), policy, lerp2));
+        assert!(!apply_point_edit(
+            &mut points,
+            PointEdit::Delete(0),
+            policy,
+            lerp2
+        ));
         assert_eq!(points.len(), 3);
     }
 
@@ -1486,8 +1546,16 @@ mod tests {
     fn point_row_buttons_follow_the_policy() {
         let spans = PointListPolicy::Spans { min: 3 };
         assert_eq!(point_row_buttons(spans, 0, 5), (true, true));
-        assert_eq!(point_row_buttons(spans, 1, 5), (false, false), "control row");
-        assert_eq!(point_row_buttons(spans, 2, 3), (true, false), "at the span floor");
+        assert_eq!(
+            point_row_buttons(spans, 1, 5),
+            (false, false),
+            "control row"
+        );
+        assert_eq!(
+            point_row_buttons(spans, 2, 3),
+            (true, false),
+            "at the span floor"
+        );
         let polygon = PointListPolicy::Single {
             min: 3,
             closed: true,

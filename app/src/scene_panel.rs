@@ -107,9 +107,7 @@ impl ScenePanel {
             // Inline rename takes over the row until Enter/Esc.
             if let Some((rename_id, buffer)) = &mut self.region_rename {
                 if *rename_id == region_id {
-                    if let Some(outcome) =
-                        Self::rename_editor(ui, buffer, &mut self.rename_focus)
-                    {
+                    if let Some(outcome) = Self::rename_editor(ui, buffer, &mut self.rename_focus) {
                         self.region_rename = None;
                         if let Some(text) = outcome {
                             if !text.is_empty() && text != name {
@@ -154,9 +152,7 @@ impl ScenePanel {
                         .boundary_regions
                         .retain(|region| region.object_id != region_id);
                     if let Some(fluid) = state.document.fluid_domain.as_mut() {
-                        fluid
-                            .tags
-                            .retain(|tag| *tag != TagRef::Region(region_id));
+                        fluid.tags.retain(|tag| *tag != TagRef::Region(region_id));
                     }
                     state.document.mark_changed();
                     state.retain_live_selection();

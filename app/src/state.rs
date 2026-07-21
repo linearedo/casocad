@@ -18,10 +18,26 @@ pub struct LengthUnit {
 }
 
 pub const LENGTH_UNITS: [LengthUnit; 4] = [
-    LengthUnit { key: "km", label: "Kilometers", factor: 1000.0 },
-    LengthUnit { key: "m", label: "Meters", factor: 1.0 },
-    LengthUnit { key: "cm", label: "Centimeters", factor: 0.01 },
-    LengthUnit { key: "mm", label: "Millimeters", factor: 0.001 },
+    LengthUnit {
+        key: "km",
+        label: "Kilometers",
+        factor: 1000.0,
+    },
+    LengthUnit {
+        key: "m",
+        label: "Meters",
+        factor: 1.0,
+    },
+    LengthUnit {
+        key: "cm",
+        label: "Centimeters",
+        factor: 0.01,
+    },
+    LengthUnit {
+        key: "mm",
+        label: "Millimeters",
+        factor: 0.001,
+    },
 ];
 
 pub const DEFAULT_LENGTH_UNIT: LengthUnit = LENGTH_UNITS[1];
@@ -239,11 +255,17 @@ mod tests {
         state.document.add_primitive("box", 1.0).unwrap(); // bumps exactly once
         let before_undo = state.document.version;
         state.undo();
-        assert!(state.document.version > before_undo, "undo must advance the version");
+        assert!(
+            state.document.version > before_undo,
+            "undo must advance the version"
+        );
 
         let before_redo = state.document.version;
         state.redo();
-        assert!(state.document.version > before_redo, "redo must advance the version");
+        assert!(
+            state.document.version > before_redo,
+            "redo must advance the version"
+        );
 
         state.push_undo();
         state.document.add_primitive("sphere", 1.0).unwrap();

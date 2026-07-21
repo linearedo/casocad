@@ -224,8 +224,7 @@ pub fn paint(
                 let active = emphasized == Some(axis);
                 let color = axis_color(axis, active);
                 let tip_world = pivot + direction * radius;
-                let Some(tip) = project_to_screen(camera, tip_world, rect, pixels_per_point)
-                else {
+                let Some(tip) = project_to_screen(camera, tip_world, rect, pixels_per_point) else {
                     continue;
                 };
                 let width = if active { 3.5 } else { 2.0 };
@@ -262,8 +261,10 @@ mod tests {
             .expect("perpendicular ray");
         assert!((t - 2.0).abs() < 1e-12);
         // Ray parallel to the axis has no stable parameter.
-        assert!(axis_drag_parameter(origin, vec3(1.0, 0.0, 0.0), Vec3::ZERO, vec3(1.0, 0.0, 0.0))
-            .is_none());
+        assert!(
+            axis_drag_parameter(origin, vec3(1.0, 0.0, 0.0), Vec3::ZERO, vec3(1.0, 0.0, 0.0))
+                .is_none()
+        );
     }
 
     #[test]
@@ -271,12 +272,13 @@ mod tests {
         // Ray down onto the Z ring plane at (1, 1, 0) → 45 degrees.
         let origin = vec3(1.0, 1.0, 5.0);
         let direction = vec3(0.0, 0.0, -1.0);
-        let angle = ring_drag_angle(origin, direction, Vec3::ZERO, RotationAxis::Z)
-            .expect("plane hit");
+        let angle =
+            ring_drag_angle(origin, direction, Vec3::ZERO, RotationAxis::Z).expect("plane hit");
         assert!((angle - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
         // Grazing ray is rejected.
-        assert!(ring_drag_angle(origin, vec3(1.0, 0.0, 0.0), Vec3::ZERO, RotationAxis::Z)
-            .is_none());
+        assert!(
+            ring_drag_angle(origin, vec3(1.0, 0.0, 0.0), Vec3::ZERO, RotationAxis::Z).is_none()
+        );
     }
 
     #[test]
@@ -297,9 +299,11 @@ mod tests {
         // GIZMO_SCREEN_RADIUS points from the projected pivot.
         let basis = camera.basis();
         let anchor = project_to_screen(&camera, pivot, rect, 1.0).expect("anchor");
-        let tip =
-            project_to_screen(&camera, pivot + basis.right * radius, rect, 1.0).expect("tip");
+        let tip = project_to_screen(&camera, pivot + basis.right * radius, rect, 1.0).expect("tip");
         let spread = (tip - anchor).length();
-        assert!((spread - GIZMO_SCREEN_RADIUS).abs() < 1.0, "spread = {spread}");
+        assert!(
+            (spread - GIZMO_SCREEN_RADIUS).abs() < 1.0,
+            "spread = {spread}"
+        );
     }
 }
