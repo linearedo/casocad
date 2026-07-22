@@ -4,6 +4,8 @@
 #![forbid(unsafe_code)]
 
 mod boundary_tool;
+mod console_draw_runner;
+mod console_panel;
 mod dimensions;
 mod file_menu;
 mod gizmo;
@@ -22,6 +24,7 @@ use caso_kernel::sdf::solid_from_2d::RevolveAxis;
 use caso_kernel::vec3::vec3;
 use eframe::egui;
 
+use console_panel::ConsolePanel;
 use dimensions::{parse_dimension_entry, parse_scalar_entry};
 use file_menu::{FileEvent, FileMenu};
 use meshing_panel::MeshingPanel;
@@ -139,6 +142,7 @@ enum LeftTab {
     Scene,
     Properties,
     Meshing,
+    Console,
 }
 
 pub struct CasoApp {
@@ -148,6 +152,7 @@ pub struct CasoApp {
     scene_panel: ScenePanel,
     properties_panel: PropertiesPanel,
     meshing_panel: MeshingPanel,
+    console_panel: ConsolePanel,
     left_tab: LeftTab,
     log: Vec<String>,
     show_log: bool,
@@ -172,6 +177,7 @@ impl CasoApp {
             scene_panel: ScenePanel::default(),
             properties_panel: PropertiesPanel::default(),
             meshing_panel: MeshingPanel::default(),
+            console_panel: ConsolePanel::default(),
             left_tab: LeftTab::Scene,
             log: Vec::new(),
             show_log: false,
@@ -238,6 +244,9 @@ impl CasoApp {
             ui.separator();
 
             self.show_file_menu(ui);
+            if ui.button("Console Draw").clicked() {
+                self.left_tab = LeftTab::Console;
+            }
             ui.separator();
 
             ui.checkbox(&mut self.viewport.options.show_grid, "Grid");
@@ -665,12 +674,14 @@ impl eframe::App for CasoApp {
                     ui.selectable_value(&mut self.left_tab, LeftTab::Scene, "Scene");
                     ui.selectable_value(&mut self.left_tab, LeftTab::Properties, "Properties");
                     ui.selectable_value(&mut self.left_tab, LeftTab::Meshing, "Meshing");
+                    ui.selectable_value(&mut self.left_tab, LeftTab::Console, "Console");
                 });
                 ui.separator();
                 match self.left_tab {
                     LeftTab::Scene => self.scene_panel.ui(ui, &mut self.state),
                     LeftTab::Properties => self.properties_panel.ui(ui, &mut self.state),
                     LeftTab::Meshing => self.meshing_panel.ui(ui, &mut self.state),
+                    LeftTab::Console => self.console_panel.ui(ui, &mut self.state),
                 }
             });
         if self.left_tab == LeftTab::Meshing && self.meshing_panel.inspector_active() {

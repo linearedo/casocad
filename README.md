@@ -17,9 +17,10 @@ Principles:
 - SDF terminology: boolean operations are *SDF operators* (never "CSG");
   "meshing" is reserved for FEA/CFD — the viewport makes *surfaces*.
 
-See `DESIGN.md` for the architecture and product scope, and
-`docs/mesher_script_api.md` for the mesher scripting reference (the Rhai
-API the Meshing panel exposes).
+See [DESIGN.md](DESIGN.md) for the architecture and product scope,
+[Console Draw scripting](docs/console_draw_api.md) for transactional CAD
+editing, and the [mesher script API](docs/mesher_script_api.md) for the Rhai
+interface exposed by the Meshing panel.
 
 ## Crates
 
@@ -43,4 +44,3 @@ cargo clippy --workspace --all-targets
 cargo run -p caso-app           # native app
 cargo build --target wasm32-unknown-unknown -p caso-app   # web build check
 ```
-

@@ -176,8 +176,8 @@ value is ever consumed as a distance.
 eframe + egui_dock shell (theme ported from `app/assets/theme.qss`; the
 toolbar shows the casoCAD wordmark from the vector
 `app/assets/casocad-wordmark.svg`, rasterized by the `egui_extras` SVG
-loader at the on-screen pixel size so it stays crisp at any DPI): Scene
-and Properties panels tabified left, Log panel, central viewport shown as an
+loader at the on-screen pixel size so it stays crisp at any DPI): Scene,
+Properties, Meshing, and Console panels tabified left, Log panel, central viewport shown as an
 offscreen texture. `state.rs` (selection, 50-snapshot undo/redo, LengthUnit
 registry), `dimensions.rs` (full measurement-entry parser: units incl.
 in/ft/"/', arithmetic expressions, multi-value entry), `tools.rs`
@@ -205,6 +205,12 @@ sheet so closed surfaces never show an antipodal phantom cut; see
 builder, 2D `mesh_space()` helpers; full script reference in
 `docs/mesher_script_api.md`; preview overlay; `.arrow` export and
 MeshIR converter exports such as SU2 — browser export is a Blob download).
+`console_panel.rs` + `console_draw_runner.rs` provide transactional Rhai CAD
+scripting through a bounded `cad` handle: each run edits a document snapshot,
+commits all successful modeling calls as one undo step, and discards document,
+selection, and history changes on any script or kernel error. Console source
+stays in external UTF-8 `.rhai` files and is not part of `scene.json`; the
+public API is documented in `docs/console_draw_api.md`.
 
 **Unified tool-interaction grammar.** Every viewport tool follows one
 lifecycle, enforced by a single dispatcher instead of per-tool key handling:
