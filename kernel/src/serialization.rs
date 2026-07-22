@@ -13,7 +13,8 @@ use crate::error::{GeometryError, GeometryResult};
 use crate::frame::Frame;
 use crate::roles::DomainKind;
 use crate::scene::{
-    FluidDomainRecord, ObjectId, OperatorKind, SceneDocument, ScenePayload, TagRef,
+    FluidDomainRecord, MeshingSceneOptions, MeshingSettings, ObjectId, OperatorKind, SceneDocument,
+    ScenePayload, TagRef,
 };
 use crate::sdf::curtain::NormalCurtain;
 use crate::sdf::node::{Node, RotationAxis, Shape};
@@ -72,9 +73,7 @@ fn parse_vec3(value: &Value) -> GeometryResult<Vec3> {
 }
 
 fn parse_point2(value: &Value) -> GeometryResult<Point2> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| err("expected a 2D point"))?;
+    let items = value.as_array().ok_or_else(|| err("expected a 2D point"))?;
     if items.len() != 2 {
         return Err(err("expected a 2D point"));
     }
@@ -101,6 +100,17 @@ fn parse_points2(value: &Value) -> GeometryResult<Vec<Point2>> {
 
 fn get_str<'a>(record: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     record.get(key).and_then(Value::as_str)
+}
+
+fn meshing_usize(record: &Map<String, Value>, key: &str, default: usize) -> GeometryResult<usize> {
+    match record.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| err(format!("meshing option {key:?} must be a positive integer"))),
+    }
 }
 
 fn require_f64(record: &Map<String, Value>, key: &str) -> GeometryResult<f64> {
@@ -204,7 +214,10 @@ fn profile_2d_to_json(profile: &Profile2D) -> Value {
         Profile2D::Rectangle { center, half_size } => {
             record.insert("type".into(), "rectangle".into());
             record.insert("center".into(), point2_json(*center));
-            record.insert("size".into(), json!([half_size[0] * 2.0, half_size[1] * 2.0]));
+            record.insert(
+                "size".into(),
+                json!([half_size[0] * 2.0, half_size[1] * 2.0]),
+            );
         }
         Profile2D::Square { center, half_size } => {
             record.insert("type".into(), "square".into());
@@ -218,7 +231,10 @@ fn profile_2d_to_json(profile: &Profile2D) -> Value {
         } => {
             record.insert("type".into(), "rounded_rectangle".into());
             record.insert("center".into(), point2_json(*center));
-            record.insert("size".into(), json!([half_size[0] * 2.0, half_size[1] * 2.0]));
+            record.insert(
+                "size".into(),
+                json!([half_size[0] * 2.0, half_size[1] * 2.0]),
+            );
             record.insert("corner_radius".into(), json!(corner_radius));
         }
         Profile2D::Ellipse { center, semi_axes } => {
@@ -268,8 +284,7 @@ fn profile_2d_from_json(value: &Value) -> GeometryResult<Profile2D> {
     let record = value
         .as_object()
         .ok_or_else(|| err("2D profile must be a JSON object"))?;
-    let profile_type = get_str(record, "type")
-        .ok_or_else(|| err("2D profile requires a type"))?;
+    let profile_type = get_str(record, "type").ok_or_else(|| err("2D profile requires a type"))?;
     match profile_type {
         "polyline" => Profile2D::polyline(parse_points2(
             record.get("points").ok_or_else(|| err("missing points"))?,
@@ -302,7 +317,11 @@ fn profile_2d_from_json(value: &Value) -> GeometryResult<Profile2D> {
         ),
         "ellipse" => Profile2D::ellipse(
             parse_point2(record.get("center").ok_or_else(|| err("missing center"))?)?,
-            parse_point2(record.get("semi_axes").ok_or_else(|| err("missing semi_axes"))?)?,
+            parse_point2(
+                record
+                    .get("semi_axes")
+                    .ok_or_else(|| err("missing semi_axes"))?,
+            )?,
         ),
         "regular_polygon" => Profile2D::regular_polygon(
             parse_point2(record.get("center").ok_or_else(|| err("missing center"))?)?,
@@ -327,9 +346,7 @@ fn profile_2d_from_json(value: &Value) -> GeometryResult<Profile2D> {
             right: Box::new(profile_2d_from_json(
                 record.get("right").ok_or_else(|| err("missing right"))?,
             )?),
-            operation: BooleanOp1D::parse(
-                get_str(record, "operation").unwrap_or("union"),
-            )?,
+            operation: BooleanOp1D::parse(get_str(record, "operation").unwrap_or("union"))?,
             smoothing: optional_f64(record, "smoothing", 0.1)?,
         }),
         other => Err(err(format!("unknown 2D profile type: {other}"))),
@@ -384,8 +401,7 @@ fn profile_1d_from_json(value: &Value) -> GeometryResult<Profile1D> {
     let record = value
         .as_object()
         .ok_or_else(|| err("1D profile must be a JSON object"))?;
-    let profile_type = get_str(record, "type")
-        .ok_or_else(|| err("1D profile requires a type"))?;
+    let profile_type = get_str(record, "type").ok_or_else(|| err("1D profile requires a type"))?;
     match profile_type {
         "segment" => {
             let half_length = if record.contains_key("length") {
@@ -514,11 +530,23 @@ pub fn ghost_to_json(node: &Node) -> GeometryResult<Value> {
         }
         Shape::PolylineTube(tube) => {
             record.insert("type".into(), "polyline_tube".into());
-            tube_record(&mut record, &tube.points, tube.radius, tube.inner_radius, tube.caps);
+            tube_record(
+                &mut record,
+                &tube.points,
+                tube.radius,
+                tube.inner_radius,
+                tube.caps,
+            );
         }
         Shape::QuadraticBezierTube(tube) => {
             record.insert("type".into(), "quadratic_bezier_tube".into());
-            tube_record(&mut record, &tube.points, tube.radius, tube.inner_radius, tube.caps);
+            tube_record(
+                &mut record,
+                &tube.points,
+                tube.radius,
+                tube.inner_radius,
+                tube.caps,
+            );
         }
         Shape::NormalCurtain(curtain) => {
             record.insert("type".into(), "normal_curtain".into());
@@ -528,7 +556,9 @@ pub fn ghost_to_json(node: &Node) -> GeometryResult<Value> {
         }
         Shape::PlacedSdf2D(placed) => {
             if !placed.sources.is_empty() {
-                return Err(err("boundary cut ghosts must be self-contained leaf shapes"));
+                return Err(err(
+                    "boundary cut ghosts must be self-contained leaf shapes",
+                ));
             }
             record.insert("type".into(), "placed_sdf_2d".into());
             record.insert("profile".into(), profile_2d_to_json(&placed.profile));
@@ -545,14 +575,20 @@ pub fn ghost_to_json(node: &Node) -> GeometryResult<Value> {
         }
         Shape::PlacedSdf1D(placed) => {
             if !placed.sources.is_empty() {
-                return Err(err("boundary cut ghosts must be self-contained leaf shapes"));
+                return Err(err(
+                    "boundary cut ghosts must be self-contained leaf shapes",
+                ));
             }
             record.insert("type".into(), "placed_sdf_1d".into());
             record.insert("profile".into(), profile_1d_to_json(&placed.profile));
             record.insert("origin".into(), vec3_json(placed.origin));
             record.insert("axis_u".into(), vec3_json(placed.axis_u));
         }
-        _ => return Err(err("boundary cut ghosts must be self-contained leaf shapes")),
+        _ => {
+            return Err(err(
+                "boundary cut ghosts must be self-contained leaf shapes",
+            ))
+        }
     }
     let name = if node.name.is_empty() {
         "ghost"
@@ -600,7 +636,10 @@ fn leaf_shape_from_record(
 ) -> GeometryResult<Option<Shape>> {
     let center = optional_vec3(record, "center", Vec3::ZERO)?;
     let shape = match node_type {
-        "sphere" => Some(Shape::Sphere(Sphere::new(center, require_f64(record, "radius")?)?)),
+        "sphere" => Some(Shape::Sphere(Sphere::new(
+            center,
+            require_f64(record, "radius")?,
+        )?)),
         "box" => Some(Shape::Box3(Box3::new(
             center,
             half_size_3d(record)?,
@@ -664,11 +703,19 @@ fn leaf_shape_from_record(
         )?)),
         "normal_curtain" => Some(Shape::NormalCurtain(NormalCurtain::new(
             parse_points3(record.get("points").ok_or_else(|| err("missing points"))?)?,
-            parse_points3(record.get("normals").ok_or_else(|| err("missing normals"))?)?,
+            parse_points3(
+                record
+                    .get("normals")
+                    .ok_or_else(|| err("missing normals"))?,
+            )?,
             optional_f64(record, "extent", 4.0)?,
         )?)),
         "placed_sdf_2d" => Some(Shape::PlacedSdf2D(crate::sdf::placed::PlacedSdf2D::new(
-            profile_2d_from_json(record.get("profile").ok_or_else(|| err("missing profile"))?)?,
+            profile_2d_from_json(
+                record
+                    .get("profile")
+                    .ok_or_else(|| err("missing profile"))?,
+            )?,
             optional_vec3(record, "origin", Vec3::ZERO)?,
             optional_vec3(record, "axis_u", DEFAULT_AXIS_U)?,
             optional_vec3(record, "axis_v", DEFAULT_AXIS_V)?,
@@ -676,14 +723,22 @@ fn leaf_shape_from_record(
         )?)),
         "placed_polyline_1d" => Some(Shape::PlacedPolyline1D(
             crate::sdf::placed::PlacedPolyline1D::new(
-                profile_2d_from_json(record.get("profile").ok_or_else(|| err("missing profile"))?)?,
+                profile_2d_from_json(
+                    record
+                        .get("profile")
+                        .ok_or_else(|| err("missing profile"))?,
+                )?,
                 optional_vec3(record, "origin", Vec3::ZERO)?,
                 optional_vec3(record, "axis_u", DEFAULT_AXIS_U)?,
                 optional_vec3(record, "axis_v", DEFAULT_AXIS_V)?,
             )?,
         )),
         "placed_sdf_1d" => Some(Shape::PlacedSdf1D(crate::sdf::placed::PlacedSdf1D::new(
-            profile_1d_from_json(record.get("profile").ok_or_else(|| err("missing profile"))?)?,
+            profile_1d_from_json(
+                record
+                    .get("profile")
+                    .ok_or_else(|| err("missing profile"))?,
+            )?,
             optional_vec3(record, "origin", Vec3::ZERO)?,
             optional_vec3(record, "axis_u", DEFAULT_AXIS_U)?,
             Vec::new(),
@@ -929,15 +984,16 @@ fn payload_to_json(
     Ok(Value::Object(record))
 }
 
-fn region_to_json(
-    region: &BoundaryRegion,
-    key: &str,
-    names: &SaveNames,
-) -> GeometryResult<Value> {
+fn region_to_json(region: &BoundaryRegion, key: &str, names: &SaveNames) -> GeometryResult<Value> {
     let owner_key = names
         .node_keys
         .get(&region.owner_object_id)
-        .ok_or_else(|| err(format!("region owner {} not in scene", region.owner_object_id)))?;
+        .ok_or_else(|| {
+            err(format!(
+                "region owner {} not in scene",
+                region.owner_object_id
+            ))
+        })?;
     let mut record = Map::new();
     record.insert("owner".into(), owner_key.clone().into());
     // Which marked domain the region tags (absent in older files, where
@@ -1055,6 +1111,21 @@ pub fn scene_to_value(document: &SceneDocument) -> GeometryResult<Value> {
     if !domains.is_empty() {
         payload.insert("domains".into(), Value::Object(domains));
     }
+    if document.meshing != MeshingSettings::default() {
+        payload.insert(
+            "meshing".into(),
+            json!({
+                "control_script": document.meshing.control_script,
+                "options": {
+                    "cells_2d": document.meshing.options.cells_2d,
+                    "cells_3d": document.meshing.options.cells_3d,
+                    "minimum_cross_cells": document.meshing.options.minimum_cross_cells,
+                    "max_cells": document.meshing.options.max_cells,
+                    "max_adaptive_levels": document.meshing.options.max_adaptive_levels,
+                }
+            }),
+        );
+    }
     Ok(Value::Object(payload))
 }
 
@@ -1113,7 +1184,11 @@ impl<'a> Loader<'a> {
         Ok(object_id)
     }
 
-    fn build_list(&mut self, record: &Map<String, Value>, key: &str) -> GeometryResult<Vec<ObjectId>> {
+    fn build_list(
+        &mut self,
+        record: &Map<String, Value>,
+        key: &str,
+    ) -> GeometryResult<Vec<ObjectId>> {
         let mut ids = Vec::new();
         if let Some(Value::Array(items)) = record.get(key) {
             for item in items {
@@ -1210,8 +1285,8 @@ impl<'a> Loader<'a> {
 
 /// Load a scene.json v1 payload.
 pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
-    let payload: Value = serde_json::from_str(text)
-        .map_err(|error| err(format!("invalid scene JSON: {error}")))?;
+    let payload: Value =
+        serde_json::from_str(text).map_err(|error| err(format!("invalid scene JSON: {error}")))?;
     let payload = payload
         .as_object()
         .ok_or_else(|| err("scene file must be a JSON object"))?;
@@ -1237,6 +1312,40 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
         document: SceneDocument::new(),
         next_object_id: 1,
     };
+    if let Some(raw_meshing) = payload.get("meshing") {
+        let record = raw_meshing
+            .as_object()
+            .ok_or_else(|| err("meshing must be a JSON object"))?;
+        let control_script = match record.get("control_script") {
+            Some(Value::String(script)) => script.clone(),
+            None => String::new(),
+            Some(_) => return Err(err("meshing control_script must be a string")),
+        };
+        let defaults = MeshingSceneOptions::default();
+        let options = match record.get("options") {
+            Some(Value::Object(options)) => MeshingSceneOptions {
+                cells_2d: meshing_usize(options, "cells_2d", defaults.cells_2d)?,
+                cells_3d: meshing_usize(options, "cells_3d", defaults.cells_3d)?,
+                minimum_cross_cells: meshing_usize(
+                    options,
+                    "minimum_cross_cells",
+                    defaults.minimum_cross_cells,
+                )?,
+                max_cells: meshing_usize(options, "max_cells", defaults.max_cells)?,
+                max_adaptive_levels: meshing_usize(
+                    options,
+                    "max_adaptive_levels",
+                    defaults.max_adaptive_levels,
+                )?,
+            },
+            None => defaults,
+            Some(_) => return Err(err("meshing options must be a JSON object")),
+        };
+        loader.document.meshing = MeshingSettings {
+            control_script,
+            options,
+        };
+    }
     let root_names = match payload.get("root_objects") {
         Some(Value::Array(items)) => items.clone(),
         None => Vec::new(),
@@ -1283,8 +1392,8 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
                 .ok_or_else(|| err(format!("domain '{domain_key}' requires a root")))?
                 .to_string();
             let root = loader.build(&root_name)?;
-            let kind = DomainKind::parse(get_str(record, "type").unwrap_or("fluid"))
-                .map_err(|_| {
+            let kind =
+                DomainKind::parse(get_str(record, "type").unwrap_or("fluid")).map_err(|_| {
                     err(format!(
                         "domain '{domain_key}' has unknown type {:?}",
                         record.get("type")

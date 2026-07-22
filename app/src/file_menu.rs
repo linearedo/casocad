@@ -23,7 +23,7 @@ pub enum FileEvent {
     /// A scene file was read and parsed successfully.
     Loaded {
         name: String,
-        document: SceneDocument,
+        document: Box<SceneDocument>,
     },
     /// A save finished or an action failed — a status-bar message.
     Status(String),
@@ -161,7 +161,10 @@ fn parse_scene(name: String, bytes: &[u8]) -> FileEvent {
             caso_kernel::serialization::load_scene_from_str(text).map_err(|error| error.to_string())
         });
     match result {
-        Ok(document) => FileEvent::Loaded { name, document },
+        Ok(document) => FileEvent::Loaded {
+            name,
+            document: Box::new(document),
+        },
         Err(error) => FileEvent::Status(format!("Load failed ({name}): {error}")),
     }
 }

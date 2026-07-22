@@ -5,9 +5,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod controls;
 pub mod convert;
+pub mod generators;
 pub mod quality;
 pub mod toolkit;
+
+pub use controls::{BoundaryLayerControl, ControlRegion, ControlSet, RefinementControl};
+pub use generators::{
+    AdaptiveSimplicialMesher, MeshingOptions, MeshingOutput, MeshingRequest, MeshingStatistics,
+};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -23,6 +30,11 @@ use arrow_schema::{Field, Schema};
 pub use caso_kernel;
 
 pub const MESH_IR_SCHEMA_VERSION: u32 = 1;
+
+/// High-level Arrow artifact wrapper used by the native mesher and panel.
+pub fn mesh_to_arrow(mesh: &MeshIr) -> Result<Vec<u8>, String> {
+    write_mesh_ir(mesh, &serde_json::json!({}))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeshPoint {

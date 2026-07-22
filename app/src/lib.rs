@@ -408,7 +408,7 @@ impl CasoApp {
         match self.file_menu.ui(ui, &self.state.document) {
             Some(FileEvent::Loaded { name, document }) => {
                 self.state.push_undo();
-                self.state.install_document(document);
+                self.state.install_document(*document);
                 self.viewport.request_frame_all();
                 self.state.status = format!("Loaded {name}");
             }

@@ -1,5 +1,5 @@
-//! The Meshing workspace: Rhai MeshIR builder script editor, run/preview,
-//! and Arrow artifact export/load.
+//! Meshing Controls: Rhai refinement controls, native meshing, preview, and
+//! Arrow/SU2 export.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,7 +16,7 @@ use caso_surfaces::types::mesh_tag_color;
 use caso_surfaces::{SurfaceStatus, ViewportSurface, ViewportSurfaceKey};
 use eframe::egui;
 
-use crate::script_runner::{run_mesher_script, EXAMPLE_SCRIPT};
+use crate::script_runner::run_native_mesher;
 use crate::state::AppState;
 
 #[cfg(target_arch = "wasm32")]
@@ -37,7 +37,6 @@ struct SurfaceBuffers {
 }
 
 pub struct MeshingPanel {
-    script: String,
     pub mesh: MeshIr,
     pub show_preview: bool,
     /// Bumped when `mesh` changes (viewport rebuilds the preview overlay).
@@ -69,7 +68,6 @@ pub struct MeshingPanel {
 impl Default for MeshingPanel {
     fn default() -> Self {
         Self {
-            script: EXAMPLE_SCRIPT.to_string(),
             mesh: MeshIr::default(),
             show_preview: true,
             preview_revision: 0,
@@ -99,20 +97,22 @@ impl MeshingPanel {
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         self.take_picked(state);
         ui.horizontal(|ui| {
-            if ui.button("Run Script").clicked() {
-                match run_mesher_script(&state.document, &self.script) {
-                    Ok(mesh) => {
+            if ui.button("Generate Mesh").clicked() {
+                let script = state.document.meshing.control_script.clone();
+                match run_native_mesher(&state.document, &script) {
+                    Ok(output) => {
                         state.status = format!(
-                            "Mesher script: {} point(s), {} cell(s)",
-                            mesh.points.len(),
-                            mesh.cells.len()
+                            "Native mesh: {} domain(s), {} point(s), {} cell(s)",
+                            output.statistics.domains,
+                            output.statistics.points,
+                            output.statistics.cells
                         );
-                        self.mesh = mesh;
+                        self.mesh = output.mesh;
                         self.mesh_replaced();
                         self.update_boundary_distances(&state.document);
                         self.preview_revision += 1;
                     }
-                    Err(error) => state.status = format!("Mesher script error: {error}"),
+                    Err(error) => state.status = format!("Meshing failed: {error}"),
                 }
             }
             if ui
@@ -164,15 +164,64 @@ impl MeshingPanel {
             }
         });
         ui.separator();
+        ui.label("Meshing Controls");
+        ui.weak("Empty script uses deterministic defaults. Scripts may mutate controls only.");
+        ui.collapsing("Mesher options", |ui| {
+            let options = &mut state.document.meshing.options;
+            let mut changed = false;
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut options.cells_2d)
+                        .range(1..=4096)
+                        .prefix("2D cells: "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut options.cells_3d)
+                        .range(1..=512)
+                        .prefix("3D cells: "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut options.minimum_cross_cells)
+                        .range(1..=128)
+                        .prefix("Minimum across: "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut options.max_cells)
+                        .range(1..=1_000_000)
+                        .prefix("Cell limit: "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut options.max_adaptive_levels)
+                        .range(0..=12)
+                        .prefix("Adaptive levels: "),
+                )
+                .changed();
+            if changed {
+                state.document.mark_changed();
+            }
+        });
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.script)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(24),
-                );
+                if ui
+                    .add(
+                        egui::TextEdit::multiline(&mut state.document.meshing.control_script)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(24),
+                    )
+                    .changed()
+                {
+                    state.document.mark_changed();
+                }
             });
     }
 
@@ -185,7 +234,7 @@ impl MeshingPanel {
     /// cached against the independent mesh revision.
     pub fn inspector_ui(&mut self, ui: &mut egui::Ui, state: &AppState) {
         if self.mesh.entity_count() == 0 {
-            ui.weak("Run a mesher script or load a MeshIR artifact to inspect it.");
+            ui.weak("Generate a native mesh or load a MeshIR artifact to inspect it.");
             return;
         }
         let mut changed = false;

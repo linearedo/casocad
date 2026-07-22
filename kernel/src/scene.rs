@@ -45,7 +45,9 @@ impl OperatorKind {
             "intersection" => Ok(Self::Intersection),
             "difference" => Ok(Self::Difference),
             "xor" => Ok(Self::Xor),
-            other => Err(GeometryError::new(format!("unknown SDF operation: {other}"))),
+            other => Err(GeometryError::new(format!(
+                "unknown SDF operation: {other}"
+            ))),
         }
     }
 
@@ -171,6 +173,33 @@ pub struct FluidDomainRecord {
     pub tags: Vec<TagRef>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshingSceneOptions {
+    pub cells_2d: usize,
+    pub cells_3d: usize,
+    pub minimum_cross_cells: usize,
+    pub max_cells: usize,
+    pub max_adaptive_levels: usize,
+}
+
+impl Default for MeshingSceneOptions {
+    fn default() -> Self {
+        Self {
+            cells_2d: 48,
+            cells_3d: 20,
+            minimum_cross_cells: 6,
+            max_cells: 1_000_000,
+            max_adaptive_levels: 12,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MeshingSettings {
+    pub control_script: String,
+    pub options: MeshingSceneOptions,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SceneDocument {
     /// Every scene node by object id (includes nested nodes).
@@ -180,6 +209,7 @@ pub struct SceneDocument {
     pub boundary_regions: Vec<BoundaryRegion>,
     pub domain_kinds: BTreeMap<ObjectId, DomainKind>,
     pub fluid_domain: Option<FluidDomainRecord>,
+    pub meshing: MeshingSettings,
     pub version: u64,
     next_object_id: ObjectId,
 }
@@ -214,7 +244,12 @@ impl SceneDocument {
         )?;
         let obstacle = document.insert_object(
             "cylinder_obstacle",
-            ScenePayload::Cylinder(Cylinder::new(vec3(1.8, 0.0, 0.5), 0.15, 0.7, obstacle_frame)?),
+            ScenePayload::Cylinder(Cylinder::new(
+                vec3(1.8, 0.0, 0.5),
+                0.15,
+                0.7,
+                obstacle_frame,
+            )?),
         )?;
         let root = document.insert_object(
             "von_karman_fluid",
@@ -286,7 +321,9 @@ impl SceneDocument {
         payload: ScenePayload,
     ) -> GeometryResult<ObjectId> {
         if id == 0 || id > MAX_OBJECT_ID {
-            return Err(GeometryError::new("object_id must be in the range 1..65535"));
+            return Err(GeometryError::new(
+                "object_id must be in the range 1..65535",
+            ));
         }
         if self.objects.contains_key(&id) {
             return Err(GeometryError::new(format!("duplicate object_id {id}")));
@@ -436,7 +473,11 @@ impl SceneDocument {
             .live_ids()
             .into_iter()
             .filter_map(|id| self.objects.get(&id).map(|object| object.name.as_str()))
-            .chain(self.boundary_regions.iter().map(|region| region.name.as_str()))
+            .chain(
+                self.boundary_regions
+                    .iter()
+                    .map(|region| region.name.as_str()),
+            )
             .collect();
         let mut index = 1usize;
         loop {
@@ -455,7 +496,11 @@ impl SceneDocument {
         self.build_node_guarded(id, &mut Vec::new())
     }
 
-    fn build_node_guarded(&self, id: ObjectId, visiting: &mut Vec<ObjectId>) -> GeometryResult<Node> {
+    fn build_node_guarded(
+        &self,
+        id: ObjectId,
+        visiting: &mut Vec<ObjectId>,
+    ) -> GeometryResult<Node> {
         if visiting.contains(&id) {
             return Err(GeometryError::new(format!(
                 "scene graph cycle through object {id}"
@@ -705,9 +750,12 @@ impl SceneDocument {
                 vec3(0.5 * scale, 0.5 * scale, 0.5 * scale),
                 IDENTITY_FRAME,
             )?),
-            "cylinder" => {
-                ScenePayload::Cylinder(Cylinder::new(Vec3::ZERO, 0.4 * scale, 0.6 * scale, IDENTITY_FRAME)?)
-            }
+            "cylinder" => ScenePayload::Cylinder(Cylinder::new(
+                Vec3::ZERO,
+                0.4 * scale,
+                0.6 * scale,
+                IDENTITY_FRAME,
+            )?),
             "capped_cone" => ScenePayload::CappedCone(CappedCone::new(
                 Vec3::ZERO,
                 0.45 * scale,
@@ -715,7 +763,12 @@ impl SceneDocument {
                 0.6 * scale,
                 IDENTITY_FRAME,
             )?),
-            "cone" => ScenePayload::Cone(Cone::new(Vec3::ZERO, 0.45 * scale, 0.6 * scale, IDENTITY_FRAME)?),
+            "cone" => ScenePayload::Cone(Cone::new(
+                Vec3::ZERO,
+                0.45 * scale,
+                0.6 * scale,
+                IDENTITY_FRAME,
+            )?),
             "pyramid" => ScenePayload::Pyramid(Pyramid::new(
                 Vec3::ZERO,
                 0.45 * scale,
@@ -728,7 +781,12 @@ impl SceneDocument {
                 0.08 * scale,
                 IDENTITY_FRAME,
             )?),
-            "torus" => ScenePayload::Torus(Torus::new(Vec3::ZERO, 0.5 * scale, 0.15 * scale, IDENTITY_FRAME)?),
+            "torus" => ScenePayload::Torus(Torus::new(
+                Vec3::ZERO,
+                0.5 * scale,
+                0.15 * scale,
+                IDENTITY_FRAME,
+            )?),
             "polyline_tube" => ScenePayload::PolylineTube(PolylineTube::new(
                 vec![
                     vec3(-0.75 * scale, 0.0, 0.0),
@@ -760,16 +818,10 @@ impl SceneDocument {
                 [0.6 * scale, 0.4 * scale],
                 0.1 * scale,
             )?),
-            "ellipse" => placed_2d(Profile2D::ellipse(
-                [0.0, 0.0],
-                [0.6 * scale, 0.35 * scale],
-            )?),
-            "regular_polygon" => placed_2d(Profile2D::regular_polygon(
-                [0.0, 0.0],
-                0.5 * scale,
-                6,
-                0.0,
-            )?),
+            "ellipse" => placed_2d(Profile2D::ellipse([0.0, 0.0], [0.6 * scale, 0.35 * scale])?),
+            "regular_polygon" => {
+                placed_2d(Profile2D::regular_polygon([0.0, 0.0], 0.5 * scale, 6, 0.0)?)
+            }
             "polygon" => {
                 let points = (0..5)
                     .map(|index| {
@@ -824,7 +876,9 @@ impl SceneDocument {
                 [0.75 * scale, 0.0],
             ])?),
             other => {
-                return Err(GeometryError::new(format!("unknown primitive kind: {other}")))
+                return Err(GeometryError::new(format!(
+                    "unknown primitive kind: {other}"
+                )))
             }
         };
         let id = self.insert_object(name, payload)?;
@@ -848,8 +902,9 @@ impl SceneDocument {
                 ScenePayload::Translate { child, .. }
                 | ScenePayload::Rotate { child, .. }
                 | ScenePayload::Scale { child, .. } => *child,
-                ScenePayload::Extrude { section, .. }
-                | ScenePayload::Revolve { section, .. } => *section,
+                ScenePayload::Extrude { section, .. } | ScenePayload::Revolve { section, .. } => {
+                    *section
+                }
                 _ => return false,
             };
             if next == descendant {
@@ -1070,14 +1125,12 @@ impl SceneDocument {
                         *child = new;
                     }
                 }
-                ScenePayload::Extrude { section, .. }
-                | ScenePayload::Revolve { section, .. } => {
+                ScenePayload::Extrude { section, .. } | ScenePayload::Revolve { section, .. } => {
                     if *section == old {
                         *section = new;
                     }
                 }
-                ScenePayload::Placed1D { sources, .. }
-                | ScenePayload::Placed2D { sources, .. } => {
+                ScenePayload::Placed1D { sources, .. } | ScenePayload::Placed2D { sources, .. } => {
                     for source in sources.iter_mut() {
                         if *source == old {
                             *source = new;
@@ -1406,7 +1459,9 @@ impl SceneDocument {
         revolve_angle_degrees: f64,
     ) -> GeometryResult<ObjectId> {
         if !matches!(self.object(section)?.payload, ScenePayload::Placed2D { .. }) {
-            return Err(GeometryError::new("Solid From 2D requires placed 2D objects"));
+            return Err(GeometryError::new(
+                "Solid From 2D requires placed 2D objects",
+            ));
         }
         let name = self.default_name(method);
         let payload = match method {
@@ -1432,7 +1487,11 @@ impl SceneDocument {
                 radial_direction: revolve_radial_direction,
                 angle_degrees: revolve_angle_degrees,
             },
-            other => return Err(GeometryError::new(format!("invalid section count for {other}"))),
+            other => {
+                return Err(GeometryError::new(format!(
+                    "invalid section count for {other}"
+                )))
+            }
         };
         let replaces_fluid_root = self
             .fluid_domain
@@ -1504,7 +1563,10 @@ impl SceneDocument {
             let previous = self.fluid_domain.take();
             self.fluid_domain = Some(FluidDomainRecord {
                 root: id,
-                tags: previous.as_ref().map(|fluid| fluid.tags.clone()).unwrap_or_default(),
+                tags: previous
+                    .as_ref()
+                    .map(|fluid| fluid.tags.clone())
+                    .unwrap_or_default(),
             });
         }
         self.mark_changed();
@@ -1991,16 +2053,16 @@ impl SceneDocument {
         let (axis_a, axis_b) = drag_plane_axes(start, end);
         let axis_u = axis_unit(axis_a);
         let axis_v = axis_unit(axis_b);
-        let extent_a = ((component(end, axis_a) - component(start, axis_a)).abs() * 0.5)
-            .max(minimum_half);
-        let extent_b = ((component(end, axis_b) - component(start, axis_b)).abs() * 0.5)
-            .max(minimum_half);
+        let extent_a =
+            ((component(end, axis_a) - component(start, axis_a)).abs() * 0.5).max(minimum_half);
+        let extent_b =
+            ((component(end, axis_b) - component(start, axis_b)).abs() * 0.5).max(minimum_half);
         let planar = [
             component(end, axis_a) - component(start, axis_a),
             component(end, axis_b) - component(start, axis_b),
         ];
-        let radius = ((planar[0] * planar[0] + planar[1] * planar[1]).sqrt() * 0.5)
-            .max(minimum_half);
+        let radius =
+            ((planar[0] * planar[0] + planar[1] * planar[1]).sqrt() * 0.5).max(minimum_half);
 
         let payload = match kind {
             "segment" | "interval" => {
@@ -2018,10 +2080,7 @@ impl SceneDocument {
                 }
             }
             "polyline" => ScenePayload::PlacedPolyline1D {
-                profile: Profile2D::polyline(vec![
-                    [-extent_a, -extent_b],
-                    [extent_a, extent_b],
-                ])?,
+                profile: Profile2D::polyline(vec![[-extent_a, -extent_b], [extent_a, extent_b]])?,
                 origin: center,
                 axis_u,
                 axis_v,
@@ -2189,12 +2248,12 @@ impl SceneDocument {
         reference_plane: &str,
     ) -> GeometryResult<ObjectId> {
         let (axis_u, axis_v) = reference_plane_axes(reference_plane)?;
-        let minimum_points = if matches!(kind, "segment" | "interval" | "polyline" | "polyline_tube")
-        {
-            2
-        } else {
-            3
-        };
+        let minimum_points =
+            if matches!(kind, "segment" | "interval" | "polyline" | "polyline_tube") {
+                2
+            } else {
+                3
+            };
         if points.len() < minimum_points {
             return Err(GeometryError::new(if minimum_points == 2 {
                 format!("{kind} requires at least two points")
@@ -2227,64 +2286,67 @@ impl SceneDocument {
                 [offset.dot(axis_u), offset.dot(axis_v)]
             })
             .collect();
-        let payload = match kind {
-            // Same Placed1D as the drag path: origin at the midpoint, the
-            // profile spans half the point distance along axis_u.
-            "segment" | "interval" => {
-                let direction = points[1] - points[0];
-                let length = direction.length();
-                ScenePayload::Placed1D {
-                    profile: Profile1D::segment(0.0, 0.5 * length)?,
-                    origin: (points[0] + points[1]) * 0.5,
-                    axis_u: if length > 1e-12 {
-                        direction * (1.0 / length)
-                    } else {
-                        vec3(1.0, 0.0, 0.0)
-                    },
-                    sources: Vec::new(),
+        let payload =
+            match kind {
+                // Same Placed1D as the drag path: origin at the midpoint, the
+                // profile spans half the point distance along axis_u.
+                "segment" | "interval" => {
+                    let direction = points[1] - points[0];
+                    let length = direction.length();
+                    ScenePayload::Placed1D {
+                        profile: Profile1D::segment(0.0, 0.5 * length)?,
+                        origin: (points[0] + points[1]) * 0.5,
+                        axis_u: if length > 1e-12 {
+                            direction * (1.0 / length)
+                        } else {
+                            vec3(1.0, 0.0, 0.0)
+                        },
+                        sources: Vec::new(),
+                    }
                 }
-            }
-            "polyline" => ScenePayload::PlacedPolyline1D {
-                profile: Profile2D::polyline(local)?,
-                origin,
-                axis_u,
-                axis_v,
-            },
-            "quadratic_bezier_curve" | "quadratic_bezier_polycurve" => {
-                ScenePayload::PlacedPolyline1D {
-                    profile: Profile2D::quadratic_bezier_curve(local)?,
+                "polyline" => ScenePayload::PlacedPolyline1D {
+                    profile: Profile2D::polyline(local)?,
                     origin,
                     axis_u,
                     axis_v,
+                },
+                "quadratic_bezier_curve" | "quadratic_bezier_polycurve" => {
+                    ScenePayload::PlacedPolyline1D {
+                        profile: Profile2D::quadratic_bezier_curve(local)?,
+                        origin,
+                        axis_u,
+                        axis_v,
+                    }
                 }
-            }
-            "polyline_tube" => ScenePayload::PolylineTube(PolylineTube::new(
-                points.to_vec(),
-                0.12,
-                0.0,
-                CapStyle::Round,
-            )?),
-            "quadratic_bezier_tube" => ScenePayload::QuadraticBezierTube(
-                QuadraticBezierTube::new(points.to_vec(), 0.12, 0.0, CapStyle::Round)?,
-            ),
-            "quadratic_bezier_surface" => ScenePayload::Placed2D {
-                profile: Profile2D::quadratic_bezier_surface(local)?,
-                origin,
-                axis_u,
-                axis_v,
-                sources: Vec::new(),
-            },
-            "polygon" => ScenePayload::Placed2D {
-                profile: Profile2D::polygon(local)?,
-                origin,
-                axis_u,
-                axis_v,
-                sources: Vec::new(),
-            },
-            other => {
-                return Err(GeometryError::new(format!("unsupported point shape: {other}")))
-            }
-        };
+                "polyline_tube" => ScenePayload::PolylineTube(PolylineTube::new(
+                    points.to_vec(),
+                    0.12,
+                    0.0,
+                    CapStyle::Round,
+                )?),
+                "quadratic_bezier_tube" => ScenePayload::QuadraticBezierTube(
+                    QuadraticBezierTube::new(points.to_vec(), 0.12, 0.0, CapStyle::Round)?,
+                ),
+                "quadratic_bezier_surface" => ScenePayload::Placed2D {
+                    profile: Profile2D::quadratic_bezier_surface(local)?,
+                    origin,
+                    axis_u,
+                    axis_v,
+                    sources: Vec::new(),
+                },
+                "polygon" => ScenePayload::Placed2D {
+                    profile: Profile2D::polygon(local)?,
+                    origin,
+                    axis_u,
+                    axis_v,
+                    sources: Vec::new(),
+                },
+                other => {
+                    return Err(GeometryError::new(format!(
+                        "unsupported point shape: {other}"
+                    )))
+                }
+            };
         let name_key = match kind {
             "quadratic_bezier_polycurve" => "quadratic_bezier_curve",
             other => other,
@@ -2411,7 +2473,9 @@ impl SceneDocument {
         patch_type: Option<&str>,
     ) -> GeometryResult<u32> {
         if !self.domain_kinds.contains_key(&domain_root) {
-            return Err(GeometryError::new("the region's domain root is not a marked Domain"));
+            return Err(GeometryError::new(
+                "the region's domain root is not a marked Domain",
+            ));
         }
         let root = self.build_node(domain_root)?;
         let owners = crate::boundary_ops::boundary_owner_ids(&root);
@@ -2424,9 +2488,7 @@ impl SceneDocument {
         let patch = patch_id.and_then(|wanted| {
             crate::boundary_ops::surface_patches_for_root(&root)
                 .into_iter()
-                .find(|patch| {
-                    patch.owner_object_id == owner_object_id && patch.patch_id == wanted
-                })
+                .find(|patch| patch.owner_object_id == owner_object_id && patch.patch_id == wanted)
         });
         if patch_id.is_some() && patch.is_none() {
             return Err(GeometryError::new(
@@ -2584,7 +2646,9 @@ impl SceneDocument {
         // `domain_root` alone.
         if let Some(fluid) = self.fluid_domain.as_mut() {
             if fluid.root == domain_root {
-                fluid.tags.retain(|tag| *tag != TagRef::Region(region_object_id));
+                fluid
+                    .tags
+                    .retain(|tag| *tag != TagRef::Region(region_object_id));
                 fluid.tags.push(TagRef::Region(child_ids.0));
                 fluid.tags.push(TagRef::Region(child_ids.1));
             }
@@ -2728,7 +2792,9 @@ fn reference_plane_axes(plane: &str) -> GeometryResult<(Vec3, Vec3)> {
         "xy" => Ok((vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0))),
         "xz" => Ok((vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0))),
         "yz" => Ok((vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0))),
-        other => Err(GeometryError::new(format!("unknown reference plane: {other}"))),
+        other => Err(GeometryError::new(format!(
+            "unknown reference plane: {other}"
+        ))),
     }
 }
 

@@ -4,15 +4,22 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use caso_kernel::meshing::{meshable_domains_from_document, MeshableDomain, MeshableDomains};
+#[cfg(test)]
 use caso_kernel::meshing::{
-    meshable_domains_from_document, BoundaryBand, MeshableBoundaryRegion, MeshableDomain,
-    MeshableDomainSpace, MeshableDomains, MeshableInterface,
+    BoundaryBand, MeshableBoundaryRegion, MeshableDomainSpace, MeshableInterface,
 };
 use caso_kernel::scene::SceneDocument;
 use caso_kernel::vec3::{vec3, Vec3};
+use caso_meshing::controls::{ControlRegion, ControlSet};
+use caso_meshing::generators::{
+    AdaptiveSimplicialMesher, MeshingOptions, MeshingOutput, MeshingRequest,
+};
+#[cfg(test)]
 use caso_meshing::toolkit::{
     boundary_marching_sample, boundary_names, SizingBand, SizingField, SizingSpec,
 };
+#[cfg(test)]
 use caso_meshing::{MeshIr, MeshIrBuilder};
 use rhai::{Array, Dynamic, Engine, Map, Scope};
 
@@ -23,20 +30,35 @@ struct DomainsHandle(Rc<MeshableDomains>);
 struct DomainHandle(Rc<MeshableDomain>);
 
 #[derive(Clone)]
+#[cfg(test)]
 struct RegionHandle(Rc<MeshableBoundaryRegion>);
 
 #[derive(Clone)]
+#[cfg(test)]
 struct SpaceHandle(Rc<MeshableDomainSpace>);
 
 #[derive(Clone)]
+#[cfg(test)]
 struct MeshHandle(Rc<RefCell<MeshIrBuilder>>);
 
 #[derive(Clone)]
+#[cfg(test)]
 struct InterfaceHandle(Rc<MeshableInterface>);
 
 #[derive(Clone)]
+#[cfg(test)]
 struct SizingHandle(Rc<SizingField>);
 
+#[derive(Clone)]
+struct ControlsHandle(Rc<RefCell<ControlSet>>);
+
+#[derive(Clone)]
+struct ControlRegionHandle(ControlRegion);
+
+#[derive(Clone, Copy)]
+struct ControlRegionApi;
+
+#[cfg(test)]
 fn vec3_array(value: Vec3) -> Array {
     [value.x, value.y, value.z]
         .into_iter()
@@ -51,6 +73,7 @@ fn dynamic_to_f64(value: &Dynamic) -> Result<f64, Box<rhai::EvalAltResult>> {
         .map_err(|_| "expected a number".to_string().into())
 }
 
+#[cfg(test)]
 fn dynamic_to_id(value: &Dynamic) -> Result<u64, String> {
     let id = value
         .as_int()
@@ -61,10 +84,12 @@ fn dynamic_to_id(value: &Dynamic) -> Result<u64, String> {
     Ok(id as u64)
 }
 
+#[cfg(test)]
 fn array_to_ids(values: Array) -> Result<Vec<u64>, String> {
     values.iter().map(dynamic_to_id).collect()
 }
 
+#[cfg(test)]
 fn int_to_id(id: i64) -> Result<u64, String> {
     if id <= 0 {
         return Err("mesh ids must be positive".to_string());
@@ -72,12 +97,265 @@ fn int_to_id(id: i64) -> Result<u64, String> {
     Ok(id as u64)
 }
 
+#[cfg(test)]
 fn id_to_int(id: u64) -> Result<i64, Box<rhai::EvalAltResult>> {
     i64::try_from(id).map_err(|_| "mesh id exceeded Rhai integer range".to_string().into())
 }
 
+fn map_number(map: &Map, key: &str) -> Result<f64, Box<rhai::EvalAltResult>> {
+    map.get(key)
+        .ok_or_else(|| format!("missing control parameter {key:?}").into())
+        .and_then(dynamic_to_f64)
+}
+
+fn map_number_or(map: &Map, key: &str, default: f64) -> Result<f64, Box<rhai::EvalAltResult>> {
+    map.get(key).map(dynamic_to_f64).unwrap_or(Ok(default))
+}
+
+fn dynamic_vec3(value: &Dynamic) -> Result<Vec3, Box<rhai::EvalAltResult>> {
+    let values = value
+        .clone()
+        .try_cast::<Array>()
+        .ok_or_else(|| "expected a three-number point".to_string())?;
+    if values.len() != 3 {
+        return Err("expected a three-number point".to_string().into());
+    }
+    Ok(vec3(
+        dynamic_to_f64(&values[0])?,
+        dynamic_to_f64(&values[1])?,
+        dynamic_to_f64(&values[2])?,
+    ))
+}
+
+fn map_vec3(map: &Map, key: &str) -> Result<Vec3, Box<rhai::EvalAltResult>> {
+    dynamic_vec3(
+        map.get(key)
+            .ok_or_else(|| format!("missing control parameter {key:?}"))?,
+    )
+}
+
+fn dynamic_points(values: Array) -> Result<Vec<Vec3>, Box<rhai::EvalAltResult>> {
+    values.iter().map(dynamic_vec3).collect()
+}
+
+/// Execute a Rhai control script, validate it against the compiled domains,
+/// and run the native mesher.  No MeshIR mutation functions are registered.
+pub fn run_native_mesher(document: &SceneDocument, script: &str) -> Result<MeshingOutput, String> {
+    let domains = meshable_domains_from_document(document).map_err(|error| error.to_string())?;
+    let controls = ControlsHandle(Rc::new(RefCell::new(ControlSet::default())));
+    let domain_handle = DomainsHandle(Rc::new(domains.clone()));
+    let mut engine = Engine::new();
+    engine.set_max_operations(2_000_000);
+    engine.set_max_expr_depths(64, 64);
+
+    engine
+        .register_type_with_name::<DomainsHandle>("Domains")
+        .register_fn("names", |handle: &mut DomainsHandle| {
+            handle
+                .0
+                .names()
+                .into_iter()
+                .map(Dynamic::from)
+                .collect::<Array>()
+        })
+        .register_fn(
+            "get",
+            |handle: &mut DomainsHandle,
+             name: &str|
+             -> Result<DomainHandle, Box<rhai::EvalAltResult>> {
+                handle
+                    .0
+                    .get(name)
+                    .map(|domain| DomainHandle(Rc::new(domain.clone())))
+                    .map_err(|error| error.to_string().into())
+            },
+        );
+    engine
+        .register_type_with_name::<DomainHandle>("Domain")
+        .register_get("name", |handle: &mut DomainHandle| handle.0.name.clone())
+        .register_get("kind", |handle: &mut DomainHandle| {
+            handle.0.kind.as_str().to_string()
+        })
+        .register_get("dimension", |handle: &mut DomainHandle| {
+            handle.0.dimension as i64
+        })
+        .register_fn("regions", |handle: &mut DomainHandle| {
+            handle
+                .0
+                .boundary_regions
+                .iter()
+                .map(|region| region.name.clone().into())
+                .collect::<Array>()
+        });
+    engine
+        .register_type_with_name::<ControlsHandle>("ControlSet")
+        .register_fn(
+            "boundary_layer",
+            |handle: &mut ControlsHandle,
+             domain: &str,
+             region: &str,
+             spec: Map|
+             -> Result<(), Box<rhai::EvalAltResult>> {
+                let layers = spec
+                    .get("layers")
+                    .and_then(|value| value.as_int().ok())
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        "boundary-layer layers must be a positive integer".to_string()
+                    })?;
+                handle
+                    .0
+                    .borrow_mut()
+                    .boundary_layer(
+                        domain,
+                        region,
+                        map_number(&spec, "first_height")?,
+                        layers,
+                        map_number_or(&spec, "growth", 1.0)?,
+                    )
+                    .map_err(Into::into)
+            },
+        )
+        .register_fn(
+            "refinement",
+            |handle: &mut ControlsHandle,
+             domain: &str,
+             region: ControlRegionHandle,
+             spec: Map|
+             -> Result<(), Box<rhai::EvalAltResult>> {
+                handle
+                    .0
+                    .borrow_mut()
+                    .refinement(
+                        domain,
+                        region.0,
+                        map_number(&spec, "size")?,
+                        map_number_or(&spec, "gradation", 0.2)?,
+                    )
+                    .map_err(Into::into)
+            },
+        )
+        .register_fn(
+            "refinement_box",
+            |handle: &mut ControlsHandle,
+             domain: &str,
+             bounds: Map,
+             spec: Map|
+             -> Result<(), Box<rhai::EvalAltResult>> {
+                let region =
+                    ControlRegion::box_region(map_vec3(&bounds, "min")?, map_vec3(&bounds, "max")?)
+                        .map_err(|error| -> Box<rhai::EvalAltResult> { error.into() })?;
+                handle
+                    .0
+                    .borrow_mut()
+                    .refinement(
+                        domain,
+                        region,
+                        map_number(&spec, "size")?,
+                        map_number_or(&spec, "gradation", 0.2)?,
+                    )
+                    .map_err(Into::into)
+            },
+        );
+    engine
+        .register_type_with_name::<ControlRegionApi>("ControlRegionApi")
+        .register_type_with_name::<ControlRegionHandle>("ControlRegion")
+        .register_fn(
+            "box",
+            |_api: &mut ControlRegionApi,
+             bounds: Map|
+             -> Result<ControlRegionHandle, Box<rhai::EvalAltResult>> {
+                ControlRegion::box_region(map_vec3(&bounds, "min")?, map_vec3(&bounds, "max")?)
+                    .map(ControlRegionHandle)
+                    .map_err(Into::into)
+            },
+        )
+        .register_fn(
+            "sphere",
+            |_api: &mut ControlRegionApi,
+             center: Array,
+             radius: f64|
+             -> Result<ControlRegionHandle, Box<rhai::EvalAltResult>> {
+                ControlRegion::sphere(dynamic_vec3(&Dynamic::from(center))?, radius)
+                    .map(ControlRegionHandle)
+                    .map_err(Into::into)
+            },
+        )
+        .register_fn(
+            "cylinder",
+            |_api: &mut ControlRegionApi,
+             a: Array,
+             b: Array,
+             radius: f64|
+             -> Result<ControlRegionHandle, Box<rhai::EvalAltResult>> {
+                ControlRegion::cylinder(
+                    dynamic_vec3(&Dynamic::from(a))?,
+                    dynamic_vec3(&Dynamic::from(b))?,
+                    radius,
+                )
+                .map(ControlRegionHandle)
+                .map_err(Into::into)
+            },
+        )
+        .register_fn(
+            "polyline_tube",
+            |_api: &mut ControlRegionApi,
+             points: Array,
+             radius: f64|
+             -> Result<ControlRegionHandle, Box<rhai::EvalAltResult>> {
+                ControlRegion::polyline_tube(dynamic_points(points)?, radius)
+                    .map(ControlRegionHandle)
+                    .map_err(Into::into)
+            },
+        )
+        .register_fn(
+            "union",
+            |left: &mut ControlRegionHandle, right: ControlRegionHandle| {
+                ControlRegionHandle(left.0.clone().union(right.0))
+            },
+        )
+        .register_fn(
+            "intersection",
+            |left: &mut ControlRegionHandle, right: ControlRegionHandle| {
+                ControlRegionHandle(left.0.clone().intersection(right.0))
+            },
+        )
+        .register_fn(
+            "difference",
+            |left: &mut ControlRegionHandle, right: ControlRegionHandle| {
+                ControlRegionHandle(left.0.clone().difference(right.0))
+            },
+        );
+
+    let mut scope = Scope::new();
+    scope.push("domains", domain_handle);
+    scope.push("controls", controls.clone());
+    scope.push("control_region", ControlRegionApi);
+    engine
+        .run_with_scope(&mut scope, script)
+        .map_err(|error| error.to_string())?;
+    drop(scope);
+    drop(engine);
+    let controls = Rc::try_unwrap(controls.0)
+        .map_err(|_| "control set is still referenced".to_string())?
+        .into_inner();
+    let stored = document.meshing.options;
+    AdaptiveSimplicialMesher.mesh(MeshingRequest {
+        domains,
+        controls,
+        options: MeshingOptions {
+            cells_2d: stored.cells_2d,
+            cells_3d: stored.cells_3d,
+            minimum_cross_cells: stored.minimum_cross_cells,
+            max_cells: stored.max_cells,
+            max_adaptive_levels: stored.max_adaptive_levels,
+        },
+    })
+}
+
 /// Run a mesher script against the document's declared Domains; returns the
 /// built MeshIR. The exactness compile gate runs before any script code.
+#[cfg(test)]
 pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshIr, String> {
     let domains = meshable_domains_from_document(document).map_err(|error| error.to_string())?;
     let domains = DomainsHandle(Rc::new(domains));
@@ -604,6 +882,7 @@ pub fn run_mesher_script(document: &SceneDocument, script: &str) -> Result<MeshI
 /// boundary-first structured-grid mesher for every 2D and 3D Domain.
 /// Occupancy is established before topology, so every exterior edge/face is
 /// projection-attempted and tagged rather than inferred from distance alone.
+#[cfg(test)]
 pub const EXAMPLE_SCRIPT: &str = r#"// casoCAD boundary-first example mesher (Rhai)
 //
 // This is deliberately readable mesher code, not a hidden black box:
@@ -870,6 +1149,219 @@ for name in domains.names() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_empty_script_meshes_2d_deterministically() {
+        use caso_kernel::roles::DomainKind;
+
+        let mut document = SceneDocument::new();
+        let rectangle = document
+            .add_primitive_from_drag("rectangle", vec3(0.0, 0.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+            .unwrap();
+        document.rename(rectangle, "sea").unwrap();
+        document
+            .set_domain_root(rectangle, DomainKind::Fluid)
+            .unwrap();
+        document.meshing.options.cells_2d = 12;
+        let first = run_native_mesher(&document, "").unwrap();
+        let second = run_native_mesher(&document, "").unwrap();
+        assert_eq!(first.mesh, second.mesh);
+        assert!(!first.mesh.cells.is_empty());
+        assert!(first.mesh.cells.iter().all(|cell| cell.type_name == "tri3"));
+        assert!(first
+            .mesh
+            .edges
+            .iter()
+            .filter(|edge| edge.neighbor_cell_id.is_none())
+            .all(|edge| !edge.tag_ids.is_empty()));
+    }
+
+    #[test]
+    fn native_empty_script_meshes_3d_with_positive_tetrahedra() {
+        let mut document = SceneDocument::default_scene().unwrap();
+        document.meshing.options.cells_3d = 8;
+        let output = run_native_mesher(&document, "").unwrap();
+        assert!(!output.mesh.cells.is_empty());
+        assert!(output
+            .mesh
+            .cells
+            .iter()
+            .all(|cell| cell.type_name == "tet4"));
+        assert!(output
+            .mesh
+            .faces
+            .iter()
+            .filter(|face| face.neighbor_cell_id.is_none())
+            .all(|face| !face.tag_ids.is_empty()));
+        let domains = meshable_domains_from_document(&document).unwrap();
+        let domain = domains.get("von_karman_fluid").unwrap();
+        let max_residual = output
+            .mesh
+            .faces
+            .iter()
+            .filter(|face| face.neighbor_cell_id.is_none())
+            .flat_map(|face| face.point_ids.iter())
+            .filter_map(|id| output.mesh.point(*id))
+            .map(|point| {
+                domain.domain_sdf(&[vec3(
+                    point.position[0],
+                    point.position[1],
+                    point.position[2],
+                )])[0]
+                    .abs()
+            })
+            .fold(0.0, f64::max);
+        assert!(
+            max_residual <= domain.boundary_tolerance(),
+            "boundary residual {max_residual}"
+        );
+        let quality = caso_meshing::quality::analyze(
+            &output.mesh,
+            caso_meshing::quality::QualityMetric::ScaledJacobian,
+        );
+        assert!(quality
+            .cells
+            .iter()
+            .all(|cell| cell.score.is_some_and(|score| score > 0.0)));
+    }
+
+    #[test]
+    fn native_control_errors_do_not_require_mesh_bindings() {
+        let document = SceneDocument::default_scene().unwrap();
+        let error = run_native_mesher(
+            &document,
+            r#"controls.refinement_box("missing", #{ min: [0,0,0], max: [1,1,1] }, #{ size: 0.1 });"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown meshing-control domain"));
+        let error = run_native_mesher(&document, "mesh.point(0, 0, 0);").unwrap_err();
+        assert!(error.contains("mesh"));
+    }
+
+    #[test]
+    fn native_2d_boundary_layer_uses_requested_spacing() {
+        use caso_kernel::roles::DomainKind;
+
+        let mut document = SceneDocument::new();
+        let rectangle = document
+            .add_primitive_from_drag("rectangle", vec3(0.0, 0.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+            .unwrap();
+        document.rename(rectangle, "sea").unwrap();
+        document
+            .set_domain_root(rectangle, DomainKind::Fluid)
+            .unwrap();
+        let region_id = document
+            .add_boundary_region(rectangle, Some(0), None, None)
+            .unwrap();
+        let region = document
+            .boundary_regions
+            .iter()
+            .find(|region| region.object_id == region_id)
+            .unwrap()
+            .name
+            .clone();
+        document.meshing.options.cells_2d = 12;
+        let script = format!(
+            r#"controls.boundary_layer("sea", {region:?}, #{{ first_height: 0.02, layers: 2, growth: 2.0 }});"#
+        );
+        let output = run_native_mesher(&document, &script).unwrap();
+        assert!(output
+            .mesh
+            .cells
+            .iter()
+            .any(|cell| cell.type_name == "quad4"));
+        let mut x: Vec<f64> = output
+            .mesh
+            .points
+            .iter()
+            .map(|point| point.position[0])
+            .filter(|value| *value < 0.1)
+            .collect();
+        x.sort_by(f64::total_cmp);
+        x.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
+        assert!(x.iter().any(|value| (*value - 0.02).abs() < 1.0e-8));
+        assert!(x.iter().any(|value| (*value - 0.06).abs() < 1.0e-8));
+    }
+
+    #[test]
+    fn native_refinement_is_local_to_its_domain_and_selector() {
+        use caso_kernel::roles::DomainKind;
+
+        let mut document = SceneDocument::new();
+        let sea = document
+            .add_primitive_from_drag("rectangle", vec3(0.0, 0.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+            .unwrap();
+        document.rename(sea, "sea").unwrap();
+        document.set_domain_root(sea, DomainKind::Fluid).unwrap();
+        document.meshing.options.cells_2d = 8;
+        let output = run_native_mesher(
+            &document,
+            r#"controls.refinement_box("sea", #{ min: [0.8, 0.0, -1.0], max: [1.2, 1.0, 1.0] }, #{ size: 0.06, gradation: 1.0 });"#,
+        )
+        .unwrap();
+        let point: std::collections::BTreeMap<_, _> = output
+            .mesh
+            .points
+            .iter()
+            .map(|point| (point.id, point.position))
+            .collect();
+        let average = |inside: bool| {
+            let lengths: Vec<f64> = output
+                .mesh
+                .cells
+                .iter()
+                .filter(|cell| cell.type_name == "tri3")
+                .filter_map(|cell| {
+                    let p: Vec<_> = cell.point_ids.iter().map(|id| point[id]).collect();
+                    let x = (p[0][0] + p[1][0] + p[2][0]) / 3.0;
+                    ((0.8..=1.2).contains(&x) == inside)
+                        .then(|| ((p[1][0] - p[0][0]).powi(2) + (p[1][1] - p[0][1]).powi(2)).sqrt())
+                })
+                .collect();
+            lengths.iter().sum::<f64>() / lengths.len() as f64
+        };
+        assert!(average(true) < average(false) * 0.7);
+    }
+
+    #[test]
+    fn native_3d_boundary_layer_emits_prisms_with_requested_spacing() {
+        let mut document = SceneDocument::default_scene().unwrap();
+        document.meshing.options.cells_3d = 8;
+        let output = run_native_mesher(
+            &document,
+            r#"controls.boundary_layer("von_karman_fluid", "inlet", #{ first_height: 0.01, layers: 2, growth: 2.0 });"#,
+        )
+        .unwrap();
+        assert!(output
+            .mesh
+            .cells
+            .iter()
+            .any(|cell| cell.type_name == "prism6"));
+        let quality = caso_meshing::quality::analyze(
+            &output.mesh,
+            caso_meshing::quality::QualityMetric::ScaledJacobian,
+        );
+        assert!(quality
+            .cells
+            .iter()
+            .filter(|cell| {
+                output.mesh.cells.iter().any(|mesh_cell| {
+                    mesh_cell.id == cell.cell_id && mesh_cell.type_name == "prism6"
+                })
+            })
+            .all(|cell| cell.score.is_some_and(|score| score > 0.0)));
+        let mut x: Vec<f64> = output
+            .mesh
+            .points
+            .iter()
+            .map(|point| point.position[0])
+            .filter(|value| *value < 0.1)
+            .collect();
+        x.sort_by(f64::total_cmp);
+        x.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
+        assert!(x.iter().any(|value| (*value - 0.01).abs() < 1.0e-8));
+        assert!(x.iter().any(|value| (*value - 0.03).abs() < 1.0e-8));
+    }
 
     /// The example at coarser grids; debug-build tests exercise the same
     /// algorithm without paying the interactive preview's full resolution.
