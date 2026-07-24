@@ -32,7 +32,9 @@ fn drag_creates_circle_section_with_planar_radius() {
         .add_primitive_from_drag("circle", vec3(0.0, 0.0, 0.0), vec3(0.6, 0.8, 0.0), 1.0)
         .expect("circle from drag");
     match &document.object(id).expect("object").payload {
-        ScenePayload::Placed2D { profile, origin, .. } => {
+        ScenePayload::Placed2D {
+            profile, origin, ..
+        } => {
             assert_eq!(*origin, vec3(0.3, 0.4, 0.0));
             match profile {
                 Profile2D::Circle { radius, .. } => assert!((radius - 0.5).abs() < 1e-12),
@@ -85,7 +87,9 @@ fn point_shape_projects_world_points_to_plane_locals() {
         .add_point_shape_from_world_points("polygon", &points, "xy")
         .expect("polygon from points");
     match &document.object(id).expect("object").payload {
-        ScenePayload::Placed2D { profile, origin, .. } => {
+        ScenePayload::Placed2D {
+            profile, origin, ..
+        } => {
             assert_eq!(*origin, vec3(1.0, 1.0, 0.0));
             match profile {
                 Profile2D::Polygon { points } => {
@@ -115,7 +119,9 @@ fn regular_polygon_from_center_and_vertex_clicks() {
         .add_regular_polygon_from_world_points(&[center, vertex], 5, "xy")
         .expect("regular polygon from points");
     match &document.object(id).expect("object").payload {
-        ScenePayload::Placed2D { profile, origin, .. } => {
+        ScenePayload::Placed2D {
+            profile, origin, ..
+        } => {
             assert_eq!(*origin, center);
             match profile {
                 Profile2D::RegularPolygon {
@@ -179,13 +185,12 @@ fn move_operator_translates_leaves_in_place() {
     let mut document = SceneDocument::default_scene().expect("default scene");
     let root = document.roots[0];
     let children = document.object(root).expect("root").payload.children();
-    let center_of = |document: &SceneDocument, id| {
-        match &document.object(id).expect("child").payload {
+    let center_of =
+        |document: &SceneDocument, id| match &document.object(id).expect("child").payload {
             ScenePayload::Box3(shape) => shape.center,
             ScenePayload::Cylinder(shape) => shape.center,
             other => panic!("unexpected payload: {other:?}"),
-        }
-    };
+        };
     let before: Vec<_> = children
         .iter()
         .map(|id| center_of(&document, *id))
@@ -212,8 +217,12 @@ fn move_operator_translates_leaves_in_place() {
 fn move_rotate_wrapped_subtree_still_wraps() {
     let mut document = SceneDocument::default_scene().expect("default scene");
     let root = document.roots[0];
-    let rotated = document.wrap_transform(root, "rotate").expect("wrap rotate");
-    let moved = document.move_object(rotated, vec3(1.0, 0.0, 0.0)).expect("move");
+    let rotated = document
+        .wrap_transform(root, "rotate")
+        .expect("wrap rotate");
+    let moved = document
+        .move_object(rotated, vec3(1.0, 0.0, 0.0))
+        .expect("move");
     assert_ne!(moved, rotated);
     assert!(matches!(
         document.object(moved).expect("moved").payload,
@@ -229,10 +238,16 @@ fn clipboard_import_copies_across_documents() {
     let imported = target
         .import_subtree(&source, root, vec3(0.2, 0.0, 0.0))
         .expect("import");
-    assert!(target.object(imported).expect("imported").name.ends_with(" copy"));
+    assert!(target
+        .object(imported)
+        .expect("imported")
+        .name
+        .ends_with(" copy"));
     // The imported Difference subtree is offset in place — no wrapper.
     assert_eq!(target.live_ids().len(), source.live_ids().len());
-    target.build_node(imported).expect("imported subtree builds");
+    target
+        .build_node(imported)
+        .expect("imported subtree builds");
 }
 
 /// Phase 5 acceptance gate: draw box, draw cylinder, subtract, set fluid
@@ -244,12 +259,7 @@ fn acceptance_workflow_saves_and_reloads_identically() {
         .add_primitive_from_drag("box", vec3(-2.0, -1.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
         .expect("draw box");
     let cylinder_id = document
-        .add_primitive_from_drag(
-            "cylinder",
-            vec3(-0.3, -0.3, 0.0),
-            vec3(0.3, 0.3, 0.0),
-            1.0,
-        )
+        .add_primitive_from_drag("cylinder", vec3(-0.3, -0.3, 0.0), vec3(0.3, 0.3, 0.0), 1.0)
         .expect("draw cylinder");
     let result = document
         .combine(box_id, cylinder_id, "difference")
@@ -290,7 +300,10 @@ fn subtract_from_fluid_root_keeps_a_single_domain() {
         .combine(fluid_root, sphere, "difference")
         .expect("subtract");
 
-    assert_eq!(document.fluid_domain.as_ref().expect("fluid").root, combined);
+    assert_eq!(
+        document.fluid_domain.as_ref().expect("fluid").root,
+        combined
+    );
     let marks: Vec<_> = document
         .domain_kinds
         .iter()
@@ -311,7 +324,10 @@ fn transform_of_fluid_root_moves_the_domain_mark() {
         .expect("wrap");
     assert_eq!(document.fluid_domain.as_ref().expect("fluid").root, wrapped);
     assert_eq!(document.domain_kinds.len(), 1);
-    assert_eq!(document.domain_kinds.get(&wrapped), Some(&DomainKind::Fluid));
+    assert_eq!(
+        document.domain_kinds.get(&wrapped),
+        Some(&DomainKind::Fluid)
+    );
 }
 
 /// Solid domains follow the same rule as fluid: booleans carry the mark.
@@ -323,9 +339,14 @@ fn difference_inherits_a_solid_domain_mark() {
     document
         .set_domain_root(block, DomainKind::Solid)
         .expect("solid domain");
-    let combined = document.combine(block, hole, "difference").expect("subtract");
+    let combined = document
+        .combine(block, hole, "difference")
+        .expect("subtract");
     assert_eq!(document.domain_kinds.len(), 1);
-    assert_eq!(document.domain_kinds.get(&combined), Some(&DomainKind::Solid));
+    assert_eq!(
+        document.domain_kinds.get(&combined),
+        Some(&DomainKind::Solid)
+    );
 }
 
 /// Domain marks are legal on nested objects: a cutter consumed by a boolean
@@ -423,12 +444,20 @@ fn subtracted_solid_domain_stays_alive() {
     document
         .set_domain_root(pipe, DomainKind::Solid)
         .expect("solid");
-    let combined = document.combine(basin, pipe, "difference").expect("subtract");
+    let combined = document
+        .combine(basin, pipe, "difference")
+        .expect("subtract");
 
     assert_eq!(document.domain_kinds.len(), 2);
-    assert_eq!(document.domain_kinds.get(&combined), Some(&DomainKind::Fluid));
+    assert_eq!(
+        document.domain_kinds.get(&combined),
+        Some(&DomainKind::Fluid)
+    );
     assert_eq!(document.domain_kinds.get(&pipe), Some(&DomainKind::Solid));
-    assert_eq!(document.fluid_domain.as_ref().expect("fluid").root, combined);
+    assert_eq!(
+        document.fluid_domain.as_ref().expect("fluid").root,
+        combined
+    );
     let domains = meshable_domains_from_document(&document).expect("meshable");
     assert_eq!(domains.len(), 2);
 }
@@ -484,9 +513,13 @@ fn nested_domain_follows_ancestor_transform() {
         .set_domain_root(ball, DomainKind::Solid)
         .expect("solid");
     document.rename(ball, "ball").expect("rename");
-    let combined = document.combine(basin, ball, "difference").expect("subtract");
+    let combined = document
+        .combine(basin, ball, "difference")
+        .expect("subtract");
     // Default translate offset is (0.1, 0, 0).
-    document.wrap_transform(combined, "translate").expect("wrap");
+    document
+        .wrap_transform(combined, "translate")
+        .expect("wrap");
 
     let domains = meshable_domains_from_document(&document).expect("meshable");
     assert_eq!(domains.len(), 2);
@@ -512,8 +545,13 @@ fn deleting_the_cutter_devolves_the_mark() {
     let hole = document
         .add_primitive_from_drag("sphere", vec3(-0.3, 0.0, 0.0), vec3(0.3, 0.0, 0.0), 1.0)
         .expect("hole");
-    let combined = document.combine(basin, hole, "difference").expect("subtract");
-    assert_eq!(document.domain_kinds.get(&combined), Some(&DomainKind::Fluid));
+    let combined = document
+        .combine(basin, hole, "difference")
+        .expect("subtract");
+    assert_eq!(
+        document.domain_kinds.get(&combined),
+        Some(&DomainKind::Fluid)
+    );
 
     document.delete(hole);
     assert_eq!(document.roots, vec![basin]);
@@ -540,7 +578,9 @@ fn remarking_the_evolution_base_is_refused() {
     let hole = document
         .add_primitive_from_drag("sphere", vec3(-0.3, 0.0, 0.0), vec3(0.3, 0.0, 0.0), 1.0)
         .expect("hole");
-    document.combine(basin, hole, "difference").expect("subtract");
+    document
+        .combine(basin, hole, "difference")
+        .expect("subtract");
 
     let error = document
         .set_domain_root(basin, DomainKind::Fluid)
@@ -566,7 +606,10 @@ fn marked_cutter_stays_a_root() {
     let ScenePayload::Operator { right, .. } = document.object(sea).expect("sea").payload else {
         panic!("sea must be an operator");
     };
-    assert_eq!(right, pipe, "root entry and chain occurrence are one object");
+    assert_eq!(
+        right, pipe,
+        "root entry and chain occurrence are one object"
+    );
 }
 
 /// Marking an already-nested object promotes it to a top-level root.
@@ -579,13 +622,21 @@ fn marking_a_nested_object_promotes_it_to_root() {
     let hole = document
         .add_primitive_from_drag("sphere", vec3(-0.3, 0.0, 0.0), vec3(0.3, 0.0, 0.0), 1.0)
         .expect("hole");
-    document.combine(basin, hole, "difference").expect("subtract");
-    assert!(!document.roots.contains(&hole), "unmarked cutter is consumed");
+    document
+        .combine(basin, hole, "difference")
+        .expect("subtract");
+    assert!(
+        !document.roots.contains(&hole),
+        "unmarked cutter is consumed"
+    );
 
     document
         .set_domain_root(hole, DomainKind::Solid)
         .expect("mark nested");
-    assert!(document.roots.contains(&hole), "marking exposes it as a root");
+    assert!(
+        document.roots.contains(&hole),
+        "marking exposes it as a root"
+    );
 }
 
 /// Unsetting a shared domain drops only its top-level exposure; a standalone
@@ -642,7 +693,10 @@ fn evolving_a_shared_domain_rewrites_references() {
     assert_eq!(right, wrapped, "sea's chain follows the evolution");
     assert!(document.roots.contains(&wrapped));
     assert!(!document.roots.contains(&pipe));
-    assert_eq!(document.domain_kinds.get(&wrapped), Some(&DomainKind::Solid));
+    assert_eq!(
+        document.domain_kinds.get(&wrapped),
+        Some(&DomainKind::Solid)
+    );
     assert!(!document.domain_kinds.contains_key(&pipe));
     let domains = meshable_domains_from_document(&document).expect("meshable");
     assert_eq!(domains.len(), 3);

@@ -120,11 +120,17 @@ impl ViewportSurfaceScene {
     }
 
     pub fn vertex_count(&self) -> usize {
-        self.surfaces.iter().map(ViewportSurface::vertex_count).sum()
+        self.surfaces
+            .iter()
+            .map(ViewportSurface::vertex_count)
+            .sum()
     }
 
     pub fn triangle_count(&self) -> usize {
-        self.surfaces.iter().map(ViewportSurface::triangle_count).sum()
+        self.surfaces
+            .iter()
+            .map(ViewportSurface::triangle_count)
+            .sum()
     }
 }
 
@@ -162,11 +168,7 @@ fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> [f32; 3] {
     } else {
         (c, 0.0, x)
     };
-    [
-        (rgb.0 + m) as f32,
-        (rgb.1 + m) as f32,
-        (rgb.2 + m) as f32,
-    ]
+    [(rgb.0 + m) as f32, (rgb.1 + m) as f32, (rgb.2 + m) as f32]
 }
 
 fn safe_node_bounds(node: &Node) -> ([f64; 3], [f64; 3]) {

@@ -4,7 +4,7 @@
 //!
 //! `compile_model` is the mesh-time hard gate: invalid role wiring,
 //! generator precondition failures, or overlapping Domains are refused
-//! before a mesher script receives field callables.
+//! before a mesh producer receives field callables.
 
 use crate::boundary::{BoundaryRegion, CutSide};
 use crate::boundary_ops::{
@@ -151,7 +151,7 @@ impl SelectorField {
     }
 }
 
-/// One boundary region, callable from mesher scripts (v2 §6): exact
+/// One boundary region, callable from mesh producers (v2 §6): exact
 /// membership (`contains` — the same classifier the viewport uses), the
 /// owner's exact field, and the combined knife field.
 #[derive(Debug, Clone)]
@@ -211,7 +211,7 @@ impl MeshableBoundaryRegion {
     }
 }
 
-/// A boundary tag exposed to mesher scripts: name + signed field.
+/// A boundary tag exposed to mesh producers: name + signed field.
 #[derive(Debug, Clone)]
 pub struct MeshableBoundaryTag {
     pub name: String,
@@ -265,6 +265,7 @@ pub struct MeshableDomain {
     pub name: String,
     pub kind: DomainKind,
     pub dimension: u8,
+    pub source_object_id: Option<u32>,
     pub bounds: BoundingBox3D,
     region: Node,
     pub boundary_tags: Vec<MeshableBoundaryTag>,
@@ -371,7 +372,13 @@ impl MeshableDomain {
             return Ok(points
                 .iter()
                 .map(|point| {
-                    curvature_2d(&self.region, *point, space.axis_a, space.axis_b, curvature_step)
+                    curvature_2d(
+                        &self.region,
+                        *point,
+                        space.axis_a,
+                        space.axis_b,
+                        curvature_step,
+                    )
                 })
                 .collect());
         }
@@ -906,6 +913,7 @@ pub fn meshable_domains_from_document(document: &SceneDocument) -> GeometryResul
             name: domain.name.clone(),
             kind: domain.kind,
             dimension: domain.region.dimension(),
+            source_object_id: marked_id,
             bounds: domain.region.bounding_box()?,
             region: domain.region.clone(),
             boundary_tags,

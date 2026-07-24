@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use caso_kernel::sdf::node::{Node, Shape};
 use caso_kernel::vec3::{vec3, Vec3};
 
+use crate::contouring::MAX_DUAL_CONTOUR_WIREFRAME_TRIANGLES;
 use crate::geomops::{
     orient_triangles, refine_edge_hermite, split_marked_triangles, wire_indices_from_triangles,
 };
-use crate::contouring::MAX_DUAL_CONTOUR_WIREFRAME_TRIANGLES;
 use crate::types::{SurfaceStatus, ViewportSurface, ViewportSurfaceKey};
 
 /// Analytic operand mesh: f64 vertices/normals plus triangle triples.
@@ -82,7 +82,13 @@ pub fn clip_mesh_to_sdf(
     let sv = clip.eval(&mesh.vertices);
     let keep: Vec<bool> = sv
         .iter()
-        .map(|value| if keep_inside { *value <= 0.0 } else { *value >= 0.0 })
+        .map(|value| {
+            if keep_inside {
+                *value <= 0.0
+            } else {
+                *value >= 0.0
+            }
+        })
         .collect();
 
     let mut vertices = mesh.vertices.clone();
@@ -136,9 +142,7 @@ pub fn clip_mesh_to_sdf(
         let [c01, c12, c20] = cut_index[tri_index];
         match (k0, k1, k2) {
             (true, true, true) => faces.push([v0, v1, v2]),
-            (true, false, false) =>
-
-                faces.push([v0, c01.expect("cut"), c20.expect("cut")]),
+            (true, false, false) => faces.push([v0, c01.expect("cut"), c20.expect("cut")]),
             (false, true, false) => faces.push([v1, c12.expect("cut"), c01.expect("cut")]),
             (false, false, true) => faces.push([v2, c20.expect("cut"), c12.expect("cut")]),
             (true, true, false) => {
@@ -188,18 +192,16 @@ fn uniform_subdivide(mesh: &OperandMesh, max_edge: f64, max_passes: usize) -> Op
         let mut midpoint: HashMap<(u32, u32), u32> = HashMap::new();
         let mut vertices = mesh.vertices.clone();
         let mut normals = mesh.normals.clone();
-        let mut resolve = |a: u32, b: u32,
-                           vertices: &mut Vec<Vec3>,
-                           normals: &mut Vec<Vec3>|
-         -> u32 {
-            let key = if a <= b { (a, b) } else { (b, a) };
-            *midpoint.entry(key).or_insert_with(|| {
-                let id = vertices.len() as u32;
-                vertices.push((vertices[a as usize] + vertices[b as usize]) * 0.5);
-                normals.push(normalize_or_z(normals[a as usize] + normals[b as usize]));
-                id
-            })
-        };
+        let mut resolve =
+            |a: u32, b: u32, vertices: &mut Vec<Vec3>, normals: &mut Vec<Vec3>| -> u32 {
+                let key = if a <= b { (a, b) } else { (b, a) };
+                *midpoint.entry(key).or_insert_with(|| {
+                    let id = vertices.len() as u32;
+                    vertices.push((vertices[a as usize] + vertices[b as usize]) * 0.5);
+                    normals.push(normalize_or_z(normals[a as usize] + normals[b as usize]));
+                    id
+                })
+            };
         let mut triangles = Vec::with_capacity(mesh.triangles.len() * 4);
         for tri in &mesh.triangles {
             let [v0, v1, v2] = *tri;
@@ -227,7 +229,9 @@ fn triangle_min_angle(a: Vec3, b: Vec3, c: Vec3) -> f64 {
         let denom = (u.length() * w.length()).max(1.0e-30);
         (u.dot(w) / denom).clamp(-1.0, 1.0).acos().to_degrees()
     };
-    angle_at(a, b, c).min(angle_at(b, c, a)).min(angle_at(c, a, b))
+    angle_at(a, b, c)
+        .min(angle_at(b, c, a))
+        .min(angle_at(c, a, b))
 }
 
 /// Seed a coarse flat-faced operand mesh so a curved cut through a big
@@ -479,7 +483,9 @@ fn clip_quality_ok(node: &Node, mesh: &OperandMesh) -> bool {
     }
     let extent = node_extent(node);
     let values = node.eval(&mesh.vertices);
-    let surface_error = values.iter().fold(0.0f64, |acc, value| acc.max(value.abs()));
+    let surface_error = values
+        .iter()
+        .fold(0.0f64, |acc, value| acc.max(value.abs()));
     surface_error <= CLIP_MAX_RELATIVE_SURFACE_ERROR * extent
 }
 

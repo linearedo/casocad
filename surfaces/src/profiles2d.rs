@@ -8,9 +8,7 @@ use caso_kernel::sdf::placed::{PlacedPolyline1D, PlacedSdf1D, PlacedSdf2D};
 use caso_kernel::sdf::primitives_2d::{Point2, Profile2D};
 use caso_kernel::vec3::Vec3;
 
-use crate::types::{
-    empty_surface, SurfaceStatus, ViewportSurface, ViewportSurfaceKey,
-};
+use crate::types::{empty_surface, SurfaceStatus, ViewportSurface, ViewportSurfaceKey};
 
 const MAX_CONTOURED_2D_CELLS: u32 = 96;
 const MAX_SAMPLED_2D_CELLS: u32 = 48;
@@ -31,7 +29,9 @@ pub fn profile_outline(profile: &Profile2D, resolution: u32) -> Vec<Point2> {
         Profile2D::Circle { center, radius } => {
             ellipse_outline(*center, [*radius, *radius], resolution)
         }
-        Profile2D::Ellipse { center, semi_axes } => ellipse_outline(*center, *semi_axes, resolution),
+        Profile2D::Ellipse { center, semi_axes } => {
+            ellipse_outline(*center, *semi_axes, resolution)
+        }
         Profile2D::RoundedRectangle {
             center,
             half_size,
@@ -50,7 +50,10 @@ pub fn profile_outline(profile: &Profile2D, resolution: u32) -> Vec<Point2> {
             .map(|index| {
                 let angle =
                     rotation + index as f64 * 2.0 * std::f64::consts::PI / *side_count as f64;
-                [center[0] + radius * angle.cos(), center[1] + radius * angle.sin()]
+                [
+                    center[0] + radius * angle.cos(),
+                    center[1] + radius * angle.sin(),
+                ]
             })
             .collect(),
         Profile2D::Polygon { points } => closed_points(points),
@@ -270,7 +273,9 @@ pub fn triangulate_simple_polygon(points: &[Point2]) -> Vec<[usize; 3]> {
         points
     };
     if polygon_is_convex(polygon) {
-        return (1..polygon.len() - 1).map(|index| [0, index, index + 1]).collect();
+        return (1..polygon.len() - 1)
+            .map(|index| [0, index, index + 1])
+            .collect();
     }
     let mut remaining: Vec<usize> = (0..polygon.len()).collect();
     let mut triangles = Vec::new();
@@ -345,10 +350,7 @@ fn edge_has_crossing(first: f64, second: f64) -> bool {
         && (first - second).abs() > 1.0e-12
 }
 
-fn marching_square_pairs(
-    mask: u8,
-    center_inside: bool,
-) -> &'static [(usize, usize)] {
+fn marching_square_pairs(mask: u8, center_inside: bool) -> &'static [(usize, usize)] {
     match mask {
         1 => &[(3, 0)],
         2 => &[(0, 1)],
@@ -380,11 +382,7 @@ fn marching_square_pairs(
     }
 }
 
-pub fn marching_squares_rings(
-    values: &[f64],
-    us: &[f64],
-    vs: &[f64],
-) -> Vec<Vec<Point2>> {
+pub fn marching_squares_rings(values: &[f64], us: &[f64], vs: &[f64]) -> Vec<Vec<Point2>> {
     let cells_u = us.len() - 1;
     let cells_v = vs.len() - 1;
     let value_at = |i: usize, j: usize| values[i * (cells_v + 1) + j];
@@ -436,12 +434,10 @@ pub fn marching_squares_rings(
             if mask == 0 || mask == 15 {
                 continue;
             }
-            let center_inside = (value_at(i, j)
-                + value_at(i + 1, j)
-                + value_at(i, j + 1)
-                + value_at(i + 1, j + 1))
-                / 4.0
-                <= 0.0;
+            let center_inside =
+                (value_at(i, j) + value_at(i + 1, j) + value_at(i, j + 1) + value_at(i + 1, j + 1))
+                    / 4.0
+                    <= 0.0;
             let edge_vertices = [
                 horizontal[i * (cells_v + 1) + j],
                 vertical[(i + 1) * cells_v + j],
@@ -460,10 +456,7 @@ pub fn marching_squares_rings(
     stitch_contour_rings(&vertices, &segments)
 }
 
-fn stitch_contour_rings(
-    vertices: &[Point2],
-    segments: &[(usize, usize)],
-) -> Vec<Vec<Point2>> {
+fn stitch_contour_rings(vertices: &[Point2], segments: &[(usize, usize)]) -> Vec<Vec<Point2>> {
     use std::collections::{BTreeMap, BTreeSet};
     let mut adjacency: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     let mut unused: BTreeSet<(usize, usize)> = BTreeSet::new();
@@ -606,8 +599,7 @@ fn classify_contour_rings(rings: &[Vec<Point2>]) -> Vec<(Vec<Point2>, Vec<Vec<Po
             .iter()
             .enumerate()
             .filter(|(other_index, other)| {
-                depths[*other_index] == depths[index] - 1
-                    && point_in_polygon_2d(ring[0], other)
+                depths[*other_index] == depths[index] - 1 && point_in_polygon_2d(ring[0], other)
             })
             .min_by(|(_, a), (_, b)| {
                 signed_area_2d(a)
@@ -948,7 +940,9 @@ pub fn placed_polyline_1d(
 ) -> ViewportSurface {
     let local_points: Vec<Point2> = match &placed.profile {
         Profile2D::Polyline { points } => points.clone(),
-        Profile2D::QuadraticBezierCurve { points } => sample_quadratic_curve(points, key.resolution),
+        Profile2D::QuadraticBezierCurve { points } => {
+            sample_quadratic_curve(points, key.resolution)
+        }
         _ => return empty_surface(node, key, color, "unsupported 1D curve profile"),
     };
     if local_points.len() < 2 {
@@ -1310,9 +1304,7 @@ fn sampled_placed_2d_surface(
     // Grid vertices in world space (only used ones are kept below).
     let mut used_map: std::collections::BTreeMap<usize, u32> = std::collections::BTreeMap::new();
     let mut vertices: Vec<[f32; 3]> = Vec::new();
-    let mut resolve = |grid_index: usize,
-                       vertices: &mut Vec<[f32; 3]>|
-     -> u32 {
+    let mut resolve = |grid_index: usize, vertices: &mut Vec<[f32; 3]>| -> u32 {
         *used_map.entry(grid_index).or_insert_with(|| {
             let i = grid_index / vertex_count_per_axis;
             let j = grid_index % vertex_count_per_axis;

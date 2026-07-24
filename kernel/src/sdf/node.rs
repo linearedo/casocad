@@ -46,7 +46,11 @@ impl RotationAxis {
         let c = angle.cos();
         let s = angle.sin();
         match self {
-            Self::X => vec3(vector.x, c * vector.y - s * vector.z, s * vector.y + c * vector.z),
+            Self::X => vec3(
+                vector.x,
+                c * vector.y - s * vector.z,
+                s * vector.y + c * vector.z,
+            ),
             Self::Y => vec3(
                 c * vector.x + s * vector.z,
                 vector.y,
@@ -96,8 +100,14 @@ pub enum Shape {
     Difference(BinaryOperands),
     Xor(BinaryOperands),
     // Exact transforms
-    Translate { child: Box<Node>, offset: Vec3 },
-    Scale { child: Box<Node>, factor: f64 },
+    Translate {
+        child: Box<Node>,
+        offset: Vec3,
+    },
+    Scale {
+        child: Box<Node>,
+        factor: f64,
+    },
     Rotate {
         child: Box<Node>,
         axis: RotationAxis,
@@ -263,7 +273,10 @@ impl Node {
         if children.is_empty() {
             return vec![self];
         }
-        children.into_iter().flat_map(|child| child.leaves()).collect()
+        children
+            .into_iter()
+            .flat_map(|child| child.leaves())
+            .collect()
     }
 
     /// This node followed by all descendants, depth-first.
@@ -353,14 +366,15 @@ impl Node {
                 ];
                 padded_bounds(&endpoints, 0.004)
             }
-            Shape::Union(op) | Shape::Xor(op) => Ok(op
-                .left
-                .bounding_box()?
-                .union(&op.right.bounding_box()?)),
+            Shape::Union(op) | Shape::Xor(op) => {
+                Ok(op.left.bounding_box()?.union(&op.right.bounding_box()?))
+            }
             Shape::Intersection(op) => {
                 let left = op.left.bounding_box()?;
                 let right = op.right.bounding_box()?;
-                Ok(left.intersection(&right).unwrap_or_else(|_| left.union(&right)))
+                Ok(left
+                    .intersection(&right)
+                    .unwrap_or_else(|_| left.union(&right)))
             }
             Shape::Difference(op) => op.left.bounding_box(),
             Shape::Translate { child, offset } => {

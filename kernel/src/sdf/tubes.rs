@@ -31,7 +31,9 @@ impl CapStyle {
 
 fn validate_tube_radius(radius: f64, inner_radius: f64) -> GeometryResult<()> {
     if radius <= 0.0 || !radius.is_finite() {
-        return Err(GeometryError::new("tube radius must be finite and positive"));
+        return Err(GeometryError::new(
+            "tube radius must be finite and positive",
+        ));
     }
     if inner_radius < 0.0 || !inner_radius.is_finite() {
         return Err(GeometryError::new(
@@ -161,11 +163,7 @@ fn quadratic_bezier_endpoint_tangents(points: &[Vec3]) -> GeometryResult<(Vec3, 
 
 fn points_bounds(points: &[Vec3], radius: f64) -> GeometryResult<BoundingBox3D> {
     let padding = vec3(radius, radius, radius);
-    BoundingBox3D::from_points(
-        points
-            .iter()
-            .flat_map(|p| [*p - padding, *p + padding]),
-    )
+    BoundingBox3D::from_points(points.iter().flat_map(|p| [*p - padding, *p + padding]))
 }
 
 #[derive(Debug, Clone, PartialEq)]

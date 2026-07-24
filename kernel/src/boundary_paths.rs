@@ -114,7 +114,9 @@ pub fn straight_knife(root: &Node, start: Vec3, end: Vec3, normal: Vec3) -> Geom
     let line = end - start;
     let line_length = line.length();
     if line_length <= 1.0e-9 {
-        return Err(GeometryError::new("Planar segment cutter length must be nonzero."));
+        return Err(GeometryError::new(
+            "Planar segment cutter length must be nonzero.",
+        ));
     }
     let line_axis = line * (1.0 / line_length);
     let mut side_axis = normal.cross(line_axis);

@@ -37,7 +37,10 @@ fn normals_match_analytic_on_sphere_and_box_faces() {
             vec3(0.5 * angle.cos(), 0.5 * angle.sin(), 0.0)
         })
         .collect();
-    for (point, normal) in surface.iter().zip(batch_normals(&ball, &surface, normal_step)) {
+    for (point, normal) in surface
+        .iter()
+        .zip(batch_normals(&ball, &surface, normal_step))
+    {
         let radial = *point * 2.0; // point / radius
         assert!((normal - radial).length() < 1e-9, "radial on the sphere");
     }
@@ -89,7 +92,10 @@ fn positive_start_is_refused_without_iterating() {
     let outside = vec3(-1.0, 0.0, 0.5);
     let projection = &domain.project_to_boundary(&[outside]).expect("projection")[0];
     assert!(!projection.converged);
-    assert_eq!(projection.distance_moved, 0.0, "no iteration on a positive start");
+    assert_eq!(
+        projection.distance_moved, 0.0,
+        "no iteration on a positive start"
+    );
     assert_eq!(projection.point, outside);
     assert!(projection.residual > 0.0);
 }

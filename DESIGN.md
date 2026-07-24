@@ -74,8 +74,9 @@ Constraints and deliberate rejections:
   `surfaces`. This keeps the kernel dependency-free and the formulas
   literally comparable with the Python source.
 - **No `rayon` / threading in the shared crates**: builds must run on wasm32.
-- Scripting is **Rhai**, not embedded Python — the Python-subprocess model of
-  the desktop Meshing workspace cannot run in WASM.
+- Transactional CAD console scripting is **Rhai**, not embedded Python.
+  Meshing has no in-app scripting backend: the reference producer is fixed,
+  and power meshers exchange the Arrow file contract externally.
 
 ## 4. Workspace Architecture
 
@@ -125,7 +126,7 @@ Port of `core/`. Modules:
   from a saved scene (the FEA/CFD-facing view of the document), plus the
   mesher toolkit queries: total boundary classification with owner
   attribution, and `MeshableInterface` (the exact shared wall between
-  nested marked domains; see `design_docs/meshing_toolkit.md`).
+nested marked domains; see `design_docs/meshing_toolkit.md`).
 - `differential.rs` — batch differential queries on exact fields: normals,
   interior-seeded Newton projection onto the boundary (positive starts are
   refused — the interior-exactness contract), curvature stencils.
@@ -159,17 +160,26 @@ near-opaque view doubles as a mesh-vs-geometry fit check. See
 
 ### 4.4 `meshing` — FEA/CFD mesh artifacts
 
-Arrow IPC MeshIR v1 writer/reader. MeshIR is a single entity table with
-shared `point`, `edge`, `face`, `cell`, `zone`, `tag`, and `attribute`
-rows; cells reference shared topology instead of duplicating coordinates.
-The schema supports point/edge/triangle/quad/polygon/tet/hex/prism/pyramid/
-polyhedron element families, with world-space f64 xyz coordinates in meters.
+The authoritative artifact is one immutable, uncompressed Arrow IPC File
+named `*.casomesh.arrow`, using schema `casocad.casomesh.arrow.v3`. Homogeneous
+batches are ordered as catalogs, exact self-contained chunks, persisted LOD
+previews, quadtree/octree nodes, the batch directory, and one final manifest.
+Connectivity and tags are `LargeList<u64>`; IDs are opaque chunk-owned values.
 
-The `toolkit` module is the mesher-facing base layer
-(`design_docs/meshing_toolkit.md`): exact tagged 2D boundary loops
-(`loops2d`, via `surfaces::boundary_outline`) and the analytic sizing field
-(`sizing`). It obeys the interior-exactness contract: no positive field
-value is ever consumed as a distance.
+Native readers use Arrow's indexed `FileReader` over `File`; WASM uses the
+same reader over `Cursor<Arc<[u8]>>` with a configurable memory cap. Opening
+loads metadata only. Queries and regional quality jobs traverse the persisted
+spatial tree; camera-driven rendering uses internal previews until projected
+nodes exceed 128 pixels, with 128 MiB decoded, 256 MiB GPU, and 16 MiB/frame
+upload defaults.
+
+All generation goes through `run_meshing` and a `MeshSink`. Algorithms emit
+bounded chunks directly to the shared writer. Built-ins are Uniform 2D and
+Advancing Front 2D/3D; the latter accepts typed refinement, gradation, and
+boundary-layer controls authored by bounded Rhai in the app. Native storage
+fsyncs and validates a sibling candidate before atomic replacement; browser
+storage publishes capped memory. The complete contract is in
+`docs/casomesh_arrow_v3.md`.
 
 ### 4.5 `app` — the application
 
@@ -200,11 +210,9 @@ regardless of display tessellation, the cyan/orange split previews share
 a bitwise-identical seam, and every area knife is bounded to the clicked
 sheet so closed surfaces never show an antipodal phantom cut; see
 `design_docs/boundary_cutter_exactness.md`),
-`meshing_panel.rs` + `script_runner.rs`
-(Rhai scripting: `domains`, per-domain SDF/region queries, `mesh` MeshIR
-builder, 2D `mesh_space()` helpers; full script reference in
-`docs/mesher_script_api.md`; preview overlay; `.arrow` export and
-MeshIR converter exports such as SU2 — browser export is a Blob download).
+`meshing_panel.rs` provides registry-driven generation, cancellation,
+progress, file/memory `.casomesh.arrow` loading, camera-driven LOD preview,
+Rhai controls, quality/boundary inspection, audit, and streaming exports.
 `console_panel.rs` + `console_draw_runner.rs` provide transactional Rhai CAD
 scripting through a bounded `cad` handle: each run edits a document snapshot,
 commits all successful modeling calls as one undo step, and discards document,
@@ -267,8 +275,8 @@ casoCAD `.venv`) and replayed by Rust tests:
   **44 golden metric rows** (status / vertex / triangle / wire counts + max
   surface error, at res 12 and 96) match Python exactly.
 - Boundary/meshing: ports of `test_boundary_region_classifier.py`,
-  `test_boundary_split.py`, `test_mesh_api.py`; MeshIR `.arrow` artifacts
-  round-trip through the Rust Arrow reader/writer with shared topology intact.
+  `test_boundary_split.py`, `test_mesh_api.py`; Arrow-native mesh artifacts
+  validate and round-trip with tiled shared topology intact.
 
 The goldens are frozen: regenerating them requires the Python exporters
 (`tools/export_goldens.py` at the `python-final` tag). When adding a node
@@ -316,8 +324,9 @@ interop (scene.json and `.arrow` round-trips).
 6. **Boundary regions + cutter** — classifier, patches, picking, hover tool,
    four knife kinds with split preview, region properties. Gate: classifier
    and split test ports green.
-7. **Meshing workspace** — `MeshableDomain` API, Rhai scripting page, per-tag
-   preview overlay, Arrow IPC export readable by Python.
+7. **Meshing workspace** — Arrow v3 `MeshFile`, shared incremental generators,
+   native-file/WASM-memory storage, worker execution, persisted LOD, spatial
+   queries, quality, audit, per-tag preview, and streaming export.
 
 ## 7. Future View
 

@@ -93,7 +93,9 @@ fn segment_binormals(points: &[Vec3], normals: &[Vec3]) -> GeometryResult<Vec<Ve
 impl NormalCurtain {
     pub fn new(points: Vec<Vec3>, normals: Vec<Vec3>, extent: f64) -> GeometryResult<Self> {
         if points.len() != normals.len() {
-            return Err(GeometryError::new("curtain needs one normal per path point"));
+            return Err(GeometryError::new(
+                "curtain needs one normal per path point",
+            ));
         }
         let (points, normals) = drop_duplicate_path_points(&points, &normals);
         if points.len() < 2 {
@@ -102,7 +104,9 @@ impl NormalCurtain {
             ));
         }
         if !extent.is_finite() || extent <= 0.0 {
-            return Err(GeometryError::new("curtain extent must be finite and positive"));
+            return Err(GeometryError::new(
+                "curtain extent must be finite and positive",
+            ));
         }
         let normals = unit_vectors(&normals, "curtain normals must be nonzero")?;
         let binormals = segment_binormals(&points, &normals)?;

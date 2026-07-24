@@ -170,7 +170,7 @@ one `BoundaryCutter` tool replaces PlanarCutter/SurfaceCutter; splitting
 replaces the parent region with two children that partition it exactly; the
 same classifier (`core/boundary_region.py`) serves viewport highlighting and
 the meshing API (`MeshableBoundaryRegion.contains`/`owner_sdf`). Tags are
-never interpreted by the kernel — physics meaning belongs to mesher scripts.
+never interpreted by the kernel — physics meaning belongs to mesh producers.
 
 **Why.** Three parallel identity systems (patch/direction, intervals, volume
 selectors) made regions ambiguous, non-composable (a second cut silently

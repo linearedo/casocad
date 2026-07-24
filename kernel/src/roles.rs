@@ -190,7 +190,10 @@ fn non_exact_message(node: &Node) -> String {
             node.name
         );
     }
-    format!("{} is not part of the exact-SDF compiler grammar.", node_label(node))
+    format!(
+        "{} is not part of the exact-SDF compiler grammar.",
+        node_label(node)
+    )
 }
 
 /// Human-readable exactness violations in the subtree (empty = OK).
@@ -219,11 +222,7 @@ pub fn exactness_violations(node: &Node, required: Option<Exactness>) -> Vec<Str
         }
     }
 
-    fn visit(
-        n: &Node,
-        violations: &mut Vec<String>,
-        reported_non_exact: &mut Vec<*const Node>,
-    ) {
+    fn visit(n: &Node, violations: &mut Vec<String>, reported_non_exact: &mut Vec<*const Node>) {
         if let Some((want_left, want_right, _)) = kind_signature(n.kind()) {
             let children = n.children();
             if children.len() == 2 {
@@ -280,7 +279,11 @@ pub struct Domain {
 }
 
 impl Domain {
-    pub fn new(name: impl Into<String>, kind: DomainKind, region: Node) -> Result<Self, GeometryError> {
+    pub fn new(
+        name: impl Into<String>,
+        kind: DomainKind,
+        region: Node,
+    ) -> Result<Self, GeometryError> {
         let name = name.into();
         if name.is_empty() {
             return Err(GeometryError::new("Domain requires a non-empty name"));

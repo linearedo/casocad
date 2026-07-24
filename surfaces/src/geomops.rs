@@ -170,11 +170,7 @@ pub fn refine_edge_hermite(
 
 /// Make winding consistent (against averaged vertex normals) and drop
 /// degenerate triangles. Topology-preserving.
-pub fn orient_triangles(
-    vertices: &[[f32; 3]],
-    normals: &[[f32; 3]],
-    indices: &[u32],
-) -> Vec<u32> {
+pub fn orient_triangles(vertices: &[[f32; 3]], normals: &[[f32; 3]], indices: &[u32]) -> Vec<u32> {
     if indices.is_empty() {
         return Vec::new();
     }
@@ -248,8 +244,8 @@ pub fn mesh_normals(vertices: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     normals
         .into_iter()
         .map(|normal| {
-            let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
-                .sqrt();
+            let length =
+                (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
             if length <= 1.0e-12 {
                 [0.0, 0.0, 1.0]
             } else {

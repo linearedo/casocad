@@ -56,7 +56,11 @@ fn mesh_area(surface: &ViewportSurface) -> f64 {
     };
     let mut area = 0.0;
     for triangle in surface.indices.chunks_exact(3) {
-        let (a, b, c) = (vertex(triangle[0]), vertex(triangle[1]), vertex(triangle[2]));
+        let (a, b, c) = (
+            vertex(triangle[0]),
+            vertex(triangle[1]),
+            vertex(triangle[2]),
+        );
         area += 0.5 * (b - a).cross(c - a).length();
     }
     area

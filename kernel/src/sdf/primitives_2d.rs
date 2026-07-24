@@ -138,7 +138,11 @@ fn ellipse_distance(u: f64, v: f64, center: Point2, semi_axes: Point2) -> f64 {
     }
     let x = (u - cu).abs();
     let y = (v - cv).abs();
-    let (px, py, ax, ay) = if x > y { (y, x, av, au) } else { (x, y, au, av) };
+    let (px, py, ax, ay) = if x > y {
+        (y, x, av, au)
+    } else {
+        (x, y, au, av)
+    };
     let length_delta = ay * ay - ax * ax;
     let m = ax * px / length_delta;
     let n = ay * py / length_delta;
@@ -173,7 +177,9 @@ fn ellipse_distance(u: f64, v: f64, center: Point2, semi_axes: Point2) -> f64 {
     distance * py_sign(py - closest_y)
 }
 
-fn quadratic_bezier_spans(points: &[Point2]) -> impl Iterator<Item = (Point2, Point2, Point2)> + '_ {
+fn quadratic_bezier_spans(
+    points: &[Point2],
+) -> impl Iterator<Item = (Point2, Point2, Point2)> + '_ {
     (0..points.len().saturating_sub(2))
         .step_by(2)
         .map(|index| (points[index], points[index + 1], points[index + 2]))
@@ -356,7 +362,9 @@ impl Profile2D {
             return Err(GeometryError::new("corner radius must be positive"));
         }
         if corner_radius > half_size[0].min(half_size[1]) {
-            return Err(GeometryError::new("corner radius exceeds rectangle half size"));
+            return Err(GeometryError::new(
+                "corner radius exceeds rectangle half size",
+            ));
         }
         Ok(Self::RoundedRectangle {
             center,
@@ -444,12 +452,8 @@ impl Profile2D {
                     .fold(f64::INFINITY, f64::min);
                 let closed = quadratic_bezier_surface_closed(points);
                 if !closed {
-                    distance = distance.min(segment_distance(
-                        u,
-                        v,
-                        points[points.len() - 1],
-                        points[0],
-                    ));
+                    distance =
+                        distance.min(segment_distance(u, v, points[points.len() - 1], points[0]));
                 }
                 let mut inside = false;
                 for (start, control, end) in quadratic_bezier_spans(points) {
@@ -464,15 +468,11 @@ impl Profile2D {
                     distance
                 }
             }
-            Self::Polygon { points } => {
-                eval_polygon(u, v, points.len(), |index| points[index])
-            }
+            Self::Polygon { points } => eval_polygon(u, v, points.len(), |index| points[index]),
             Self::Circle { center, radius } => {
                 ((u - center[0]).powi(2) + (v - center[1]).powi(2)).sqrt() - radius
             }
-            Self::Rectangle { center, half_size } => {
-                rectangle_distance(u, v, *center, *half_size)
-            }
+            Self::Rectangle { center, half_size } => rectangle_distance(u, v, *center, *half_size),
             Self::Square { center, half_size } => {
                 rectangle_distance(u, v, *center, [*half_size, *half_size])
             }
@@ -590,12 +590,7 @@ impl Profile2D {
                     return l;
                 }
                 let r = right.bounds();
-                (
-                    l.0.min(r.0),
-                    l.1.max(r.1),
-                    l.2.min(r.2),
-                    l.3.max(r.3),
-                )
+                (l.0.min(r.0), l.1.max(r.1), l.2.min(r.2), l.3.max(r.3))
             }
         }
     }

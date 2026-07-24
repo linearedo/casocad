@@ -100,7 +100,12 @@ fn surface_from_accum(
 // ---------------------------------------------------------------------------
 // 3D primitive meshes
 
-fn sphere_surface(node: &Node, shape: &Sphere, key: ViewportSurfaceKey, color: [f32; 3]) -> ViewportSurface {
+fn sphere_surface(
+    node: &Node,
+    shape: &Sphere,
+    key: ViewportSurfaceKey,
+    color: [f32; 3],
+) -> ViewportSurface {
     let segments = ((key.resolution as usize) * 2).max(64);
     let rings = (key.resolution as usize).max(32);
     let mut accum = MeshAccum::default();
@@ -166,8 +171,7 @@ fn append_oriented_box(accum: &mut MeshAccum, center: Vec3, frame: &Frame, half:
         }
         let base = accum.vertices.len() as u32;
         for corner in local {
-            let world =
-                center + axes[0] * corner[0] + axes[1] * corner[1] + axes[2] * corner[2];
+            let world = center + axes[0] * corner[0] + axes[1] * corner[1] + axes[2] * corner[2];
             accum.push(world, normal);
         }
         if side > 0.0 {
@@ -182,7 +186,12 @@ fn append_oriented_box(accum: &mut MeshAccum, center: Vec3, frame: &Frame, half:
     }
 }
 
-fn box_surface(node: &Node, shape: &Box3, key: ViewportSurfaceKey, color: [f32; 3]) -> ViewportSurface {
+fn box_surface(
+    node: &Node,
+    shape: &Box3,
+    key: ViewportSurfaceKey,
+    color: [f32; 3],
+) -> ViewportSurface {
     let mut accum = MeshAccum::default();
     append_oriented_box(&mut accum, shape.center, &shape.frame, shape.half_size);
     surface_from_accum(node, key, color, accum, true, true)
@@ -208,10 +217,8 @@ fn box_frame_surface(
                 let mut offset = [0.0f64; 3];
                 offset[tangent_axes[0]] = sign_a * (half_axes[tangent_axes[0]] - radius);
                 offset[tangent_axes[1]] = sign_b * (half_axes[tangent_axes[1]] - radius);
-                let beam_center = shape.center
-                    + axes[0] * offset[0]
-                    + axes[1] * offset[1]
-                    + axes[2] * offset[2];
+                let beam_center =
+                    shape.center + axes[0] * offset[0] + axes[1] * offset[1] + axes[2] * offset[2];
                 append_oriented_box(
                     &mut accum,
                     beam_center,
@@ -287,7 +294,10 @@ fn frustum_like_surface(
             } else {
                 normalize_or_z(radial + w * slope)
             };
-            accum.push(center + radial * radius + w * (z_sign * half_height), normal);
+            accum.push(
+                center + radial * radius + w * (z_sign * half_height),
+                normal,
+            );
         }
     }
     let top_center = accum.push(center + w * half_height, w);
@@ -325,7 +335,12 @@ fn frustum_like_surface(
     surface_from_accum(node, key, color, accum, true, true)
 }
 
-fn cone_surface(node: &Node, shape: &Cone, key: ViewportSurfaceKey, color: [f32; 3]) -> ViewportSurface {
+fn cone_surface(
+    node: &Node,
+    shape: &Cone,
+    key: ViewportSurfaceKey,
+    color: [f32; 3],
+) -> ViewportSurface {
     let segments = ((key.resolution as usize) * 2).max(64);
     let (u, v, w) = (shape.frame.u, shape.frame.v, shape.frame.w);
     let mut accum = MeshAccum::default();
@@ -344,11 +359,16 @@ fn cone_surface(node: &Node, shape: &Cone, key: ViewportSurfaceKey, color: [f32;
     for segment in 0..segments {
         let theta = 2.0 * PI * segment as f64 / segments as f64;
         let radial = u * theta.cos() + v * theta.sin();
-        accum.push(shape.center + radial * shape.radius - w * shape.half_height, -w);
+        accum.push(
+            shape.center + radial * shape.radius - w * shape.half_height,
+            -w,
+        );
     }
     for segment in 0..segments as u32 {
         let next_segment = (segment + 1) % segments as u32;
-        accum.indices.extend_from_slice(&[segment, next_segment, apex]);
+        accum
+            .indices
+            .extend_from_slice(&[segment, next_segment, apex]);
         accum.indices.extend_from_slice(&[
             bottom_center,
             bottom_ring + next_segment,
@@ -397,7 +417,12 @@ fn pyramid_surface(
     surface_from_accum(node, key, color, accum, false, true)
 }
 
-fn torus_surface(node: &Node, shape: &Torus, key: ViewportSurfaceKey, color: [f32; 3]) -> ViewportSurface {
+fn torus_surface(
+    node: &Node,
+    shape: &Torus,
+    key: ViewportSurfaceKey,
+    color: [f32; 3],
+) -> ViewportSurface {
     let major_segments = ((key.resolution as usize) * 3).max(96);
     let minor_segments = (key.resolution as usize).max(32);
     let (u, v, w) = (shape.frame.u, shape.frame.v, shape.frame.w);
@@ -510,13 +535,17 @@ fn append_tube_cap(
     for segment in 0..ring_segments as u32 {
         let next_segment = (segment + 1) % ring_segments as u32;
         if flip {
-            accum
-                .indices
-                .extend_from_slice(&[center_index, cap_ring + next_segment, cap_ring + segment]);
+            accum.indices.extend_from_slice(&[
+                center_index,
+                cap_ring + next_segment,
+                cap_ring + segment,
+            ]);
         } else {
-            accum
-                .indices
-                .extend_from_slice(&[center_index, cap_ring + segment, cap_ring + next_segment]);
+            accum.indices.extend_from_slice(&[
+                center_index,
+                cap_ring + segment,
+                cap_ring + next_segment,
+            ]);
         }
     }
 }
@@ -550,7 +579,15 @@ fn tube_centerline_surface(
             accum.indices.extend_from_slice(&[a, b, c, a, c, d]);
         }
     }
-    append_tube_cap(&mut accum, points[0], frames[0], radius, ring_segments, None, true);
+    append_tube_cap(
+        &mut accum,
+        points[0],
+        frames[0],
+        radius,
+        ring_segments,
+        None,
+        true,
+    );
     let end_ring = ((points.len() - 1) * ring_segments) as u32;
     append_tube_cap(
         &mut accum,
@@ -577,7 +614,13 @@ fn polyline_tube_surface(
     if points.len() < 2 {
         return None;
     }
-    Some(tube_centerline_surface(node, key, color, &points, tube.radius))
+    Some(tube_centerline_surface(
+        node,
+        key,
+        color,
+        &points,
+        tube.radius,
+    ))
 }
 
 fn sample_quadratic_points_3d(points: &[Vec3], resolution: u32) -> Vec<Vec3> {
@@ -613,7 +656,13 @@ fn bezier_tube_surface(
     if points.len() < 2 {
         return None;
     }
-    Some(tube_centerline_surface(node, key, color, &points, tube.radius))
+    Some(tube_centerline_surface(
+        node,
+        key,
+        color,
+        &points,
+        tube.radius,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +746,9 @@ fn extrude_profile_surface(
         let top_center = accum.push(top_mean, Vec3::ZERO);
         for index in 0..count {
             let next_index = (index + 1) % count;
-            accum.indices.extend_from_slice(&[bottom_center, next_index, index]);
+            accum
+                .indices
+                .extend_from_slice(&[bottom_center, next_index, index]);
             accum
                 .indices
                 .extend_from_slice(&[top_center, count + index, count + next_index]);
@@ -911,7 +962,11 @@ fn deduplicate_indexed_mesh(vertices: Vec<Vec3>, indices: Vec<u32>) -> (Vec<Vec3
         );
         let next = welded.len() as u32;
         let id = *weld_map.entry(bits).or_insert_with(|| {
-            welded.push(vec3(round12(vertex.x), round12(vertex.y), round12(vertex.z)));
+            welded.push(vec3(
+                round12(vertex.x),
+                round12(vertex.y),
+                round12(vertex.z),
+            ));
             next
         });
         inverse.push(id);
@@ -1063,9 +1118,7 @@ fn translation_anchor(node: &Node) -> Option<Vec3> {
         | Shape::Intersection(operands)
         | Shape::Difference(operands)
         | Shape::Xor(operands) => translation_anchor(&operands.left),
-        Shape::Scale { child, factor } => {
-            translation_anchor(child).map(|anchor| anchor * *factor)
-        }
+        Shape::Scale { child, factor } => translation_anchor(child).map(|anchor| anchor * *factor),
         Shape::Rotate {
             child,
             axis,
@@ -1187,7 +1240,9 @@ fn translation_shape_signature(node: &Node, anchor: Vec3) -> Option<String> {
             Some(format!(
                 "Revolve{section_sig}{:?}{:?}{:?}{:?}{:?}",
                 revolve.axis.as_str(),
-                revolve.axis_origin.map(|origin| sig_vec(origin - section_origin)),
+                revolve
+                    .axis_origin
+                    .map(|origin| sig_vec(origin - section_origin)),
                 revolve.axis_direction.map(sig_vec),
                 revolve.radial_direction.map(sig_vec),
                 sig_float(revolve.angle_degrees)
@@ -1291,7 +1346,13 @@ impl ViewportSurfaceCache {
             if *stored_signature == signature {
                 let mut surface = stored_surface.clone();
                 surface.key = key;
-                self.store(key, signature, translation_signature, anchor, surface.clone());
+                self.store(
+                    key,
+                    signature,
+                    translation_signature,
+                    anchor,
+                    surface.clone(),
+                );
                 return surface;
             }
         }
@@ -1302,13 +1363,25 @@ impl ViewportSurfaceCache {
                 if stored_sig == translation_sig {
                     let surface =
                         translated_surface(stored_surface, key, anchor_point, *stored_anchor);
-                    self.store(key, signature, translation_signature, anchor, surface.clone());
+                    self.store(
+                        key,
+                        signature,
+                        translation_signature,
+                        anchor,
+                        surface.clone(),
+                    );
                     return surface;
                 }
             }
         }
         let surface = build_viewport_surface(node, key);
-        self.store(key, signature, translation_signature, anchor, surface.clone());
+        self.store(
+            key,
+            signature,
+            translation_signature,
+            anchor,
+            surface.clone(),
+        );
         surface
     }
 
@@ -1332,7 +1405,8 @@ impl ViewportSurfaceCache {
     }
 
     pub fn prune_before(&mut self, revision: u64) {
-        self.surfaces.retain(|key, _| key.scene_revision >= revision);
+        self.surfaces
+            .retain(|key, _| key.scene_revision >= revision);
     }
 
     pub fn prune_to_object_ids(&mut self, live: &[u32]) {
@@ -1396,11 +1470,7 @@ mod tests {
     fn union_node(offset: Vec3) -> Node {
         let left = sphere_node(offset, 0.5, 2);
         let right = sphere_node(vec3(0.4, 0.0, 0.0) + offset, 0.5, 3);
-        Node::with_id(
-            "union",
-            1,
-            Shape::union(left, right).expect("union"),
-        )
+        Node::with_id("union", 1, Shape::union(left, right).expect("union"))
     }
 
     fn anchored_signature(node: &Node) -> (Vec3, String) {
@@ -1424,16 +1494,22 @@ mod tests {
         let widened = Node::with_id(
             "union",
             1,
-            Shape::union(sphere_node(Vec3::ZERO, 0.5, 2), sphere_node(vec3(0.9, 0.0, 0.0), 0.5, 3))
-                .expect("union"),
+            Shape::union(
+                sphere_node(Vec3::ZERO, 0.5, 2),
+                sphere_node(vec3(0.9, 0.0, 0.0), 0.5, 3),
+            )
+            .expect("union"),
         );
         let (_, moved_operand) = anchored_signature(&widened);
         assert_ne!(base, moved_operand);
         let resized = Node::with_id(
             "union",
             1,
-            Shape::union(sphere_node(Vec3::ZERO, 0.5, 2), sphere_node(vec3(0.4, 0.0, 0.0), 0.6, 3))
-                .expect("union"),
+            Shape::union(
+                sphere_node(Vec3::ZERO, 0.5, 2),
+                sphere_node(vec3(0.4, 0.0, 0.0), 0.6, 3),
+            )
+            .expect("union"),
         );
         let (_, resized_operand) = anchored_signature(&resized);
         assert_ne!(base, resized_operand);
@@ -1455,11 +1531,7 @@ mod tests {
         // The rotated sphere's center sits at (0, 1, 0); the SDF there is -r.
         assert!((anchor - vec3(0.0, 1.0, 0.0)).length() < 1e-12);
         assert!((rotated.eval_point(anchor) + 0.5).abs() < 1e-9);
-        let scaled = Node::with_id(
-            "scale",
-            1,
-            Shape::scale(child, 2.0).expect("scale"),
-        );
+        let scaled = Node::with_id("scale", 1, Shape::scale(child, 2.0).expect("scale"));
         let anchor = translation_anchor(&scaled).expect("anchor");
         assert!((anchor - vec3(2.0, 0.0, 0.0)).length() < 1e-12);
         assert!((scaled.eval_point(anchor) + 1.0).abs() < 1e-9);

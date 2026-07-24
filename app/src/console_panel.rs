@@ -337,10 +337,13 @@ mod tests {
         assert_eq!(rhai_filename(""), "console_draw.rhai");
         assert_eq!(rhai_filename("part"), "part.rhai");
         assert_eq!(rhai_filename("part.rhai"), "part.rhai");
-        assert_eq!(
-            ensure_rhai_path(PathBuf::from("part.txt")),
-            PathBuf::from("part.rhai")
-        );
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert_eq!(
+                ensure_rhai_path(PathBuf::from("part.txt")),
+                PathBuf::from("part.rhai")
+            );
+        }
     }
 
     #[test]

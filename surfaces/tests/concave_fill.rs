@@ -62,7 +62,11 @@ fn mesh_area(surface: &ViewportSurface) -> f64 {
     };
     let mut area = 0.0;
     for triangle in surface.indices.chunks_exact(3) {
-        let (a, b, c) = (vertex(triangle[0]), vertex(triangle[1]), vertex(triangle[2]));
+        let (a, b, c) = (
+            vertex(triangle[0]),
+            vertex(triangle[1]),
+            vertex(triangle[2]),
+        );
         area += 0.5 * (b - a).cross(c - a).length();
     }
     area
@@ -106,8 +110,15 @@ fn concave_partial_revolve_caps_match_profile_area() {
         "half_revolve",
         9,
         Shape::Revolve(
-            Revolve::new(section(l_shape(0.5)), RevolveAxis::V, None, None, None, 180.0)
-                .expect("revolve"),
+            Revolve::new(
+                section(l_shape(0.5)),
+                RevolveAxis::V,
+                None,
+                None,
+                None,
+                180.0,
+            )
+            .expect("revolve"),
         ),
     );
     let surface = build(&node);

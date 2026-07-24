@@ -35,16 +35,19 @@ fn save_load_save_is_idempotent() {
 }
 
 #[test]
-fn meshing_controls_round_trip_and_old_scenes_default_empty() {
-    let old = save_scene_to_string(&SceneDocument::default_scene().unwrap()).unwrap();
-    let old_loaded = load_scene_from_str(&old).unwrap();
-    assert!(old_loaded.meshing.control_script.is_empty());
-
+fn arrow_meshing_settings_round_trip_and_v1_is_rejected() {
     let mut document = SceneDocument::default_scene().unwrap();
-    document.meshing.control_script = "controls.refinement_box(\"sea\", #{});".into();
-    document.meshing.options.cells_2d = 72;
-    let loaded = load_scene_from_str(&save_scene_to_string(&document).unwrap()).unwrap();
+    document.meshing.algorithm_id = "uniform_2d".into();
+    document.meshing.element_min_size = 0.01;
+    document.meshing.element_max_size = 0.05;
+    document.meshing.control_script = "controls.refinement_box(...);".into();
+    document.meshing.wasm_file_cap_mib = 128;
+    let saved = save_scene_to_string(&document).unwrap();
+    let loaded = load_scene_from_str(&saved).unwrap();
     assert_eq!(loaded.meshing, document.meshing);
+
+    let legacy = saved.replacen("\"version\": 2", "\"version\": 1", 1);
+    assert!(load_scene_from_str(&legacy).is_err());
 }
 
 #[test]

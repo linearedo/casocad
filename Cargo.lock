@@ -726,7 +726,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "caso-kernel",
- "caso-surfaces",
+ "serde",
  "serde_json",
 ]
 
@@ -736,7 +736,9 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "caso-kernel",
+ "caso-meshing",
  "caso-surfaces",
+ "pollster",
  "wgpu",
 ]
 

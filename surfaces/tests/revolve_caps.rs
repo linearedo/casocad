@@ -57,7 +57,11 @@ fn straddling_rectangle_revolve_has_caps() {
     };
     let mut area = 0.0;
     for triangle in surface.indices.chunks_exact(3) {
-        let (a, b, c) = (vertex(triangle[0]), vertex(triangle[1]), vertex(triangle[2]));
+        let (a, b, c) = (
+            vertex(triangle[0]),
+            vertex(triangle[1]),
+            vertex(triangle[2]),
+        );
         area += 0.5 * (b - a).cross(c - a).length();
     }
     let expected = 2.0 * PI * 0.3 * 1.0 + 2.0 * PI * 0.3 * 0.3;

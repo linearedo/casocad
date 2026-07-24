@@ -1,7 +1,7 @@
 # Mesh quality measures
 
-The Meshing panel's Inspector evaluates the quality of the cells in a MeshIR
-mesh. It provides five measures:
+The Meshing panel's Inspector evaluates finalized Arrow cell batches on
+demand. It provides five measures:
 
 - Scaled Jacobian
 - Skewness

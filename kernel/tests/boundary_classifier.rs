@@ -9,12 +9,12 @@ use caso_kernel::boundary_ops::{
     boundary_owner_ids, boundary_region_base_mask, boundary_region_mask, cut_volume,
     owner_active_mask, pick_boundary_patch, region_tolerance, surface_patches_for_root,
 };
+use caso_kernel::frame::IDENTITY_FRAME;
 use caso_kernel::roles::DomainKind;
 use caso_kernel::scene::{ObjectId, SceneDocument, ScenePayload};
 use caso_kernel::sdf::node::{Node, Shape};
 use caso_kernel::sdf::primitives_3d::{Box3, Pyramid, Sphere};
 use caso_kernel::sdf::solid_from_2d::RevolveAxis;
-use caso_kernel::frame::IDENTITY_FRAME;
 use caso_kernel::vec3::{vec3, Vec3};
 
 struct Fixture {
@@ -118,8 +118,8 @@ fn obstacle_owns_the_cut_surface() {
     let cylinder_mask =
         boundary_region_mask(&fixture.root, &region(fixture.cylinder_id), &wall, None)
             .expect("mask");
-    let box_mask = boundary_region_mask(&fixture.root, &region(fixture.box_id), &wall, None)
-        .expect("mask");
+    let box_mask =
+        boundary_region_mask(&fixture.root, &region(fixture.box_id), &wall, None).expect("mask");
     assert!(all(&cylinder_mask));
     assert!(!any(&box_mask));
 }
@@ -133,15 +133,27 @@ fn direction_region_selects_one_face() {
     let plus_x = face_points(4.5, 7);
     let wall = cylinder_wall_points();
 
-    assert!(all(
-        &boundary_region_mask(&fixture.root, &inlet, &minus_x, None).expect("mask")
-    ));
-    assert!(!any(
-        &boundary_region_mask(&fixture.root, &inlet, &plus_x, None).expect("mask")
-    ));
-    assert!(!any(
-        &boundary_region_mask(&fixture.root, &inlet, &wall, None).expect("mask")
-    ));
+    assert!(all(&boundary_region_mask(
+        &fixture.root,
+        &inlet,
+        &minus_x,
+        None
+    )
+    .expect("mask")));
+    assert!(!any(&boundary_region_mask(
+        &fixture.root,
+        &inlet,
+        &plus_x,
+        None
+    )
+    .expect("mask")));
+    assert!(!any(&boundary_region_mask(
+        &fixture.root,
+        &inlet,
+        &wall,
+        None
+    )
+    .expect("mask")));
 }
 
 #[test]
@@ -165,8 +177,7 @@ fn one_cut_partitions_the_parent_exactly() {
 
     let parent_mask = boundary_region_mask(&fixture.root, &parent, &samples, None).expect("mask");
     let inside_mask = boundary_region_mask(&fixture.root, &inside, &samples, None).expect("mask");
-    let outside_mask =
-        boundary_region_mask(&fixture.root, &outside, &samples, None).expect("mask");
+    let outside_mask = boundary_region_mask(&fixture.root, &outside, &samples, None).expect("mask");
 
     assert!(any(&parent_mask) && any(&inside_mask) && any(&outside_mask));
     for i in 0..samples.len() {
@@ -204,15 +215,13 @@ fn cut_chain_is_a_conjunction() {
         side: CutSide::Inside,
         ghost: sphere,
     }];
-    let ring: Vec<bool> =
-        boundary_region_mask(&fixture.root, &inside_sphere, &samples, None)
-            .expect("mask")
-            .into_iter()
-            .map(|hit| !hit)
-            .collect();
+    let ring: Vec<bool> = boundary_region_mask(&fixture.root, &inside_sphere, &samples, None)
+        .expect("mask")
+        .into_iter()
+        .map(|hit| !hit)
+        .collect();
     let parent =
-        boundary_region_mask(&fixture.root, &region(fixture.box_id), &samples, None)
-            .expect("mask");
+        boundary_region_mask(&fixture.root, &region(fixture.box_id), &samples, None).expect("mask");
 
     assert!(any(&mask));
     for i in 0..samples.len() {
@@ -226,12 +235,7 @@ fn lower_dimensional_ghost_extrudes_through_the_scene() {
     let mut fixture = default_scene();
     let handle = fixture
         .document
-        .add_primitive_from_drag(
-            "segment",
-            vec3(0.0, -0.2, 0.5),
-            vec3(0.0, 0.2, 0.5),
-            1.0,
-        )
+        .add_primitive_from_drag("segment", vec3(0.0, -0.2, 0.5), vec3(0.0, 0.2, 0.5), 1.0)
         .expect("segment");
     let segment = fixture.document.build_node(handle).expect("segment node");
     let mut region = region(fixture.box_id);
@@ -264,8 +268,7 @@ fn mask_composes_base_mask_and_cut_chain() {
 
     let plain = region(fixture.box_id);
     let full = boundary_region_mask(&fixture.root, &plain, &samples, None).expect("mask");
-    let base =
-        boundary_region_base_mask(&fixture.root, &plain, &samples, None).expect("mask");
+    let base = boundary_region_base_mask(&fixture.root, &plain, &samples, None).expect("mask");
     assert_eq!(full, base, "cut-free regions: full == base");
 
     let mut with_cut = region(fixture.box_id);
@@ -275,10 +278,8 @@ fn mask_composes_base_mask_and_cut_chain() {
     }];
     let tol = region_tolerance(&fixture.root, &with_cut);
     let volume = cut_volume(&fixture.root, &with_cut.cuts[0]).expect("volume");
-    let full =
-        boundary_region_mask(&fixture.root, &with_cut, &samples, None).expect("mask");
-    let base =
-        boundary_region_base_mask(&fixture.root, &with_cut, &samples, None).expect("mask");
+    let full = boundary_region_mask(&fixture.root, &with_cut, &samples, None).expect("mask");
+    let base = boundary_region_base_mask(&fixture.root, &with_cut, &samples, None).expect("mask");
     for (i, point) in samples.iter().enumerate() {
         let expected = base[i] && volume.eval_point(*point) <= tol;
         assert_eq!(full[i], expected, "composition mismatch at {point:?}");
@@ -310,9 +311,13 @@ fn tolerance_scales_with_owner_size() {
     assert!(all(
         &boundary_region_mask(&owner, &region, &face, None).expect("mask")
     ));
-    assert!(!any(
-        &boundary_region_mask(&owner, &region, &off_surface, None).expect("mask")
-    ));
+    assert!(!any(&boundary_region_mask(
+        &owner,
+        &region,
+        &off_surface,
+        None
+    )
+    .expect("mask")));
 }
 
 #[test]
@@ -345,12 +350,7 @@ fn generic_leaf_patches_make_pyramid_pickable() {
 fn document_with_generator(method: &str) -> (SceneDocument, ObjectId, ObjectId) {
     let mut document = SceneDocument::new();
     let section_id = document
-        .add_primitive_from_drag(
-            "rectangle",
-            vec3(-0.3, -0.5, 0.0),
-            vec3(0.3, 0.5, 0.0),
-            1.0,
-        )
+        .add_primitive_from_drag("rectangle", vec3(-0.3, -0.5, 0.0), vec3(0.3, 0.5, 0.0), 1.0)
         .expect("rectangle");
     let solid_id = document
         .solid_from_2d(
@@ -374,7 +374,10 @@ fn generators_are_boundary_owner_leaves() {
         let root = document.build_node(solid_id).expect("node");
         let owners = boundary_owner_ids(&root);
         assert_eq!(owners, vec![solid_id], "{method} owns its whole surface");
-        assert!(!owners.contains(&section_id), "{method} section stays internal");
+        assert!(
+            !owners.contains(&section_id),
+            "{method} section stays internal"
+        );
     }
 }
 
@@ -391,8 +394,7 @@ fn boundary_region_on_generator_fluid_domain() {
         assert!(document
             .boundary_regions
             .iter()
-            .any(|region| region.object_id == region_id
-                && region.owner_object_id == solid_id));
+            .any(|region| region.object_id == region_id && region.owner_object_id == solid_id));
     }
 }
 
@@ -459,7 +461,11 @@ fn split_replaces_parent_and_keeps_ghost_out_of_scene() {
     assert!(sides.contains(&CutSide::Inside) && sides.contains(&CutSide::Outside));
     assert_eq!(inside.cuts.len(), 1);
     assert_eq!(outside.cuts.len(), 1);
-    assert_eq!(document.live_ids(), objects_before, "ghost never became a node");
+    assert_eq!(
+        document.live_ids(),
+        objects_before,
+        "ghost never became a node"
+    );
     let fluid = document.fluid_domain.as_ref().expect("fluid");
     use caso_kernel::scene::TagRef;
     assert!(!fluid.tags.contains(&TagRef::Region(region_id)));
@@ -492,14 +498,11 @@ fn nested_split_composes_chains_and_partitions() {
     assert_eq!(find(top_id).cuts.len(), 2);
     assert_eq!(find(bottom_id).cuts.len(), 2);
     let samples = face_points(0.0, 9);
-    let inside_mask =
-        boundary_region_mask(&root, find(inside_id), &samples, None).expect("mask");
+    let inside_mask = boundary_region_mask(&root, find(inside_id), &samples, None).expect("mask");
     let top_mask = boundary_region_mask(&root, find(top_id), &samples, None).expect("mask");
-    let bottom_mask =
-        boundary_region_mask(&root, find(bottom_id), &samples, None).expect("mask");
+    let bottom_mask = boundary_region_mask(&root, find(bottom_id), &samples, None).expect("mask");
     for i in 0..samples.len() {
-        let total =
-            inside_mask[i] as usize + top_mask[i] as usize + bottom_mask[i] as usize;
+        let total = inside_mask[i] as usize + top_mask[i] as usize + bottom_mask[i] as usize;
         assert_eq!(total, 1, "the three leaves partition the face samples");
     }
 }

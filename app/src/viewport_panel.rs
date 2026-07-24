@@ -5,7 +5,7 @@
 use caso_kernel::scene::{SceneDocument, ScenePayload};
 use caso_kernel::sdf::node::Shape;
 use caso_kernel::vec3::{vec3, Vec3};
-use caso_render::{OrbitCamera, RenderOptions, ViewportRenderer};
+use caso_render::{OrbitCamera, RenderOptions, ViewportRenderer, MESH_TILE_UPLOAD_BUDGET_BYTES};
 use caso_surfaces::ViewportSurfaceCache;
 use eframe::egui;
 use eframe::egui_wgpu::{wgpu, RenderState};
@@ -37,6 +37,12 @@ const REFERENCE_VIEWS: [(&str, egui::Key, u32, f64, f64); 4] = [
 /// Duration of the camera flight to a reference view, in seconds.
 const VIEW_FLIGHT_SECONDS: f64 = 0.26;
 
+/// Mesh selection and preparation resume after the camera stays still this long.
+const MESH_CAMERA_SETTLE_SECONDS: f64 = 0.075;
+
+/// Primary-pointer travel required before a viewport click becomes an orbit.
+const PRIMARY_ORBIT_THRESHOLD_POINTS: f32 = 2.0;
+
 /// Axis triad overlay (bottom-left): world axes with their colors.
 const TRIAD_AXES: [(&str, Vec3, egui::Color32); 3] = [
     (
@@ -65,6 +71,71 @@ struct ViewFlight {
     delta_pitch: f64,
 }
 
+#[derive(Default)]
+struct ViewportDragState {
+    primary: Option<PrimaryDrag>,
+}
+
+struct PrimaryDrag {
+    start: egui::Pos2,
+    last: egui::Pos2,
+    orbiting: bool,
+}
+
+#[derive(Default)]
+struct PrimaryDragUpdate {
+    orbit_delta: egui::Vec2,
+    suppress_click: bool,
+}
+
+impl ViewportDragState {
+    fn update_primary(
+        &mut self,
+        enabled: bool,
+        pressed_on_viewport: bool,
+        down: bool,
+        released: bool,
+        position: Option<egui::Pos2>,
+        press_origin: Option<egui::Pos2>,
+    ) -> PrimaryDragUpdate {
+        if !enabled {
+            self.primary = None;
+            return PrimaryDragUpdate::default();
+        }
+        if pressed_on_viewport {
+            if let Some(position) = position {
+                let start = press_origin.unwrap_or(position);
+                self.primary = Some(PrimaryDrag {
+                    start,
+                    last: start,
+                    orbiting: false,
+                });
+            }
+        }
+
+        let mut update = PrimaryDragUpdate::default();
+        if let (Some(drag), Some(position)) = (&mut self.primary, position) {
+            if drag.orbiting {
+                update.orbit_delta = position - drag.last;
+            } else {
+                let accumulated = position - drag.start;
+                if accumulated.length() >= PRIMARY_ORBIT_THRESHOLD_POINTS {
+                    drag.orbiting = true;
+                    update.orbit_delta = accumulated;
+                }
+            }
+            drag.last = position;
+        }
+        if released {
+            update.suppress_click = self.primary.as_ref().is_some_and(|drag| drag.orbiting);
+            self.primary = None;
+        } else if !down {
+            self.primary = None;
+        }
+        update
+    }
+}
+
 pub struct ViewportPanel {
     pub camera: OrbitCamera,
     pub options: RenderOptions,
@@ -89,14 +160,19 @@ pub struct ViewportPanel {
     /// the zoom bucket quantizes world-per-pixel in ~10% steps so the
     /// pixel-sized highlight ribbons rebuild on zoom, not every frame.
     overlay_signature: (u64, u64, Option<u32>, i64),
-    /// Meshing-workspace preview surfaces (per-tag lattice/mesh elements).
-    mesh_overlays: Vec<caso_surfaces::ViewportSurface>,
-    /// Meshing-workspace point elements (xyz + rgb per point), drawn as
-    /// sphere-impostor markers.
-    mesh_points: Vec<f32>,
     mesh_preview_revision: u64,
-    upload_pending: bool,
+    mesh_tile_update: Option<caso_meshing::IncrementalLodPreparation>,
+    mesh_tile_reset_pending: bool,
+    mesh_decode_pending: bool,
     view_flight: Option<ViewFlight>,
+    observed_mesh_view: Option<caso_meshing::MeshView>,
+    camera_settle_deadline: Option<f64>,
+    camera_deferred: bool,
+    observed_mesh_focus: Option<[f64; 3]>,
+    settled_mesh_focus: Option<[f64; 3]>,
+    mesh_focus_settle_deadline: Option<f64>,
+    mesh_focus_deferred: bool,
+    drag_state: ViewportDragState,
     /// Draw the bounding-extent tripod on each selected object.
     pub show_bounds: bool,
     /// Committed measure annotations (world points, meters). Session-only —
@@ -126,11 +202,19 @@ impl Default for ViewportPanel {
             applied_selection: None,
             overlays: Vec::new(),
             overlay_signature: (u64::MAX, u64::MAX, None, i64::MAX),
-            mesh_overlays: Vec::new(),
-            mesh_points: Vec::new(),
             mesh_preview_revision: u64::MAX,
-            upload_pending: false,
+            mesh_tile_update: None,
+            mesh_tile_reset_pending: false,
+            mesh_decode_pending: false,
             view_flight: None,
+            observed_mesh_view: None,
+            camera_settle_deadline: None,
+            camera_deferred: true,
+            observed_mesh_focus: None,
+            settled_mesh_focus: None,
+            mesh_focus_settle_deadline: None,
+            mesh_focus_deferred: true,
+            drag_state: ViewportDragState::default(),
             show_bounds: false,
             measurements: Vec::new(),
         }
@@ -154,21 +238,80 @@ impl ViewportPanel {
         self.mark_scene_changed();
     }
 
-    pub fn mesh_preview_revision(&self) -> u64 {
-        self.mesh_preview_revision
-    }
-
-    /// Replace the meshing-workspace preview overlay.
-    pub fn set_mesh_preview(
+    pub fn set_mesh_preview_update(
         &mut self,
         revision: u64,
-        surfaces: Vec<caso_surfaces::ViewportSurface>,
-        points: Vec<f32>,
-    ) {
-        self.mesh_preview_revision = revision;
-        self.mesh_overlays = surfaces;
-        self.mesh_points = points;
-        self.upload_pending = true;
+        update: caso_meshing::IncrementalLodPreparation,
+    ) -> bool {
+        let revision_changed = self.mesh_preview_revision != revision;
+        let repaint =
+            revision_changed || update.stats.pending_tiles != 0 || !update.prepared.is_empty();
+        if revision_changed {
+            self.mesh_preview_revision = revision;
+            self.mesh_tile_reset_pending = true;
+        }
+        self.mesh_decode_pending = update.stats.pending_tiles != 0;
+        self.mesh_tile_update = Some(update);
+        repaint
+    }
+
+    pub(crate) fn mesh_focus_deferred(&self) -> bool {
+        self.mesh_focus_deferred
+    }
+
+    pub(crate) fn camera_deferred(&self) -> bool {
+        self.camera_deferred
+    }
+
+    pub(crate) fn latest_settled_mesh_focus(&self) -> Option<[f64; 3]> {
+        self.settled_mesh_focus
+    }
+
+    fn observe_mesh_view(
+        &mut self,
+        view: caso_meshing::MeshView,
+        now: f64,
+        camera_animating: bool,
+    ) -> bool {
+        let changed = self.observed_mesh_view != Some(view);
+        self.observed_mesh_view = Some(view);
+        if changed || camera_animating {
+            self.camera_settle_deadline = Some(now + MESH_CAMERA_SETTLE_SECONDS);
+            self.camera_deferred = true;
+            return true;
+        }
+        if self
+            .camera_settle_deadline
+            .is_some_and(|deadline| now < deadline)
+        {
+            self.camera_deferred = true;
+        } else {
+            self.camera_settle_deadline = None;
+            self.camera_deferred = false;
+        }
+        false
+    }
+
+    fn observe_mesh_focus(&mut self, focus: [f64; 3], now: f64) -> bool {
+        let changed = self.observed_mesh_focus != Some(focus);
+        self.observed_mesh_focus = Some(focus);
+        if changed {
+            self.mesh_focus_settle_deadline = Some(now + MESH_CAMERA_SETTLE_SECONDS);
+            self.settled_mesh_focus = None;
+            self.mesh_focus_deferred = true;
+            return true;
+        }
+        if self
+            .mesh_focus_settle_deadline
+            .is_some_and(|deadline| now < deadline)
+        {
+            self.mesh_focus_deferred = true;
+        } else {
+            self.mesh_focus_settle_deadline = None;
+            self.settled_mesh_focus = Some(focus);
+            self.mesh_focus_deferred = false;
+        }
+        false
     }
 
     /// Working-unit switch: rescale the camera and snap the grid to one unit;
@@ -401,6 +544,7 @@ impl ViewportPanel {
                                     .on_hover_text(format!("{label} view (key {})", index + 1));
                                 if button.clicked() {
                                     self.fly_to_reference_view(*plane, *yaw, *pitch, now);
+                                    ctx.request_repaint();
                                 }
                             }
                         });
@@ -440,20 +584,21 @@ impl ViewportPanel {
         renderer.set_overlays(&render_state.device, &render_state.queue, &self.overlays);
     }
 
-    /// Upload the meshing-workspace preview (surfaces + points) to its own
-    /// GPU chunks. Driven solely by `mesh_preview_revision` changes
-    /// (`upload_pending`), never by zoom or boundary-overlay churn.
-    fn upload_mesh_overlays(&mut self, render_state: &RenderState) {
+    fn apply_mesh_tile_update(&mut self, render_state: &RenderState) {
         let renderer = self
             .renderer
             .get_or_insert_with(|| ViewportRenderer::new(&render_state.device));
-        renderer.set_mesh_overlays(
-            &render_state.device,
-            &render_state.queue,
-            &self.mesh_overlays,
-        );
-        renderer.set_points(&render_state.device, &render_state.queue, &self.mesh_points);
-        self.upload_pending = false;
+        if self.mesh_tile_reset_pending {
+            renderer.clear_mesh_tiles();
+            self.mesh_tile_reset_pending = false;
+        }
+        let Some(update) = self.mesh_tile_update.take() else {
+            return;
+        };
+        renderer.set_mesh_tile_target(update.selection.generation, update.selection.tiles);
+        for tile in update.prepared {
+            renderer.upsert_mesh_tile(tile.generation, tile.key, tile.lines);
+        }
     }
 
     /// Rebuild the boundary highlight overlays (yellow hover candidate,
@@ -941,9 +1086,6 @@ impl ViewportPanel {
         if self.selection != self.applied_selection {
             self.upload_base_scene(render_state);
         }
-        if self.upload_pending {
-            self.upload_mesh_overlays(render_state);
-        }
         let available = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let pixels_per_point = ui.ctx().pixels_per_point();
@@ -954,20 +1096,38 @@ impl ViewportPanel {
         // (the Boundary Region hover tool leaves navigation available).
         let tool_consumed = tools.blocks_camera();
 
-        // Input: left-drag orbit, right/middle-drag pan, wheel zoom.
-        let drag = response.drag_delta();
-        if !tool_consumed && response.dragged_by(egui::PointerButton::Primary) {
+        // Input: primary orbit starts at two points of travel; right/middle
+        // pan uses raw movement immediately.
+        let pointer = ui.ctx().input(|input| {
+            (
+                input.pointer.interact_pos(),
+                input.pointer.press_origin(),
+                input.pointer.delta(),
+                input.pointer.button_pressed(egui::PointerButton::Primary),
+                input.pointer.button_down(egui::PointerButton::Primary),
+                input.pointer.button_released(egui::PointerButton::Primary),
+                input.pointer.button_down(egui::PointerButton::Secondary),
+                input.pointer.button_down(egui::PointerButton::Middle),
+            )
+        });
+        let primary = self.drag_state.update_primary(
+            !tool_consumed,
+            pointer.3 && response.is_pointer_button_down_on(),
+            pointer.4,
+            pointer.5,
+            pointer.0,
+            pointer.1,
+        );
+        if primary.orbit_delta != egui::Vec2::ZERO {
             self.view_flight = None; // manual orbit overrides a view flight
             self.camera.orbit(
-                drag.x as f64 * pixels_per_point as f64,
-                drag.y as f64 * pixels_per_point as f64,
+                primary.orbit_delta.x as f64 * pixels_per_point as f64,
+                primary.orbit_delta.y as f64 * pixels_per_point as f64,
             );
-        } else if response.dragged_by(egui::PointerButton::Secondary)
-            || response.dragged_by(egui::PointerButton::Middle)
-        {
+        } else if response.is_pointer_button_down_on() && (pointer.6 || pointer.7) {
             self.camera.pan(
-                drag.x as f64 * pixels_per_point as f64,
-                drag.y as f64 * pixels_per_point as f64,
+                pointer.2.x as f64 * pixels_per_point as f64,
+                pointer.2.y as f64 * pixels_per_point as f64,
                 height as f64,
             );
         }
@@ -1008,19 +1168,79 @@ impl ViewportPanel {
             });
         }
 
+        self.view_panel_ui(ui.ctx(), rect, now);
         self.advance_view_flight(ui.ctx(), now);
 
+        let (resized, view) = {
+            let renderer = self
+                .renderer
+                .get_or_insert_with(|| ViewportRenderer::new(&render_state.device));
+            let resized = renderer.size() != (width, height);
+            let view = renderer.resize(&render_state.device, width, height);
+            (resized, view)
+        };
+        let mesh_view =
+            caso_meshing::MeshView::new(self.camera.matrix(width, height), width, height);
+        self.observe_mesh_view(mesh_view, now, self.view_flight.is_some());
+        let focus = [
+            self.camera.target.x,
+            self.camera.target.y,
+            self.camera.target.z,
+        ];
+        let focus_activity = self.observe_mesh_focus(focus, now);
+        if focus_activity {
+            self.mesh_tile_update = None;
+            self.mesh_decode_pending = false;
+            if let Some(renderer) = &mut self.renderer {
+                renderer.defer_mesh_tiles();
+            }
+        }
+        if self.camera_deferred {
+            if let Some(deadline) = self.camera_settle_deadline {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(
+                        (deadline - now).max(0.0),
+                    ));
+            }
+        }
+        if self.mesh_focus_deferred {
+            if let Some(deadline) = self.mesh_focus_settle_deadline {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(
+                        (deadline - now).max(0.0),
+                    ));
+            }
+        } else if !self.camera_deferred
+            && (self.mesh_tile_update.is_some() || self.mesh_tile_reset_pending)
+        {
+            self.apply_mesh_tile_update(render_state);
+        }
+        let upload_budget = if self.camera_deferred || self.mesh_focus_deferred {
+            0
+        } else {
+            MESH_TILE_UPLOAD_BUDGET_BYTES
+        };
         let renderer = self
             .renderer
-            .get_or_insert_with(|| ViewportRenderer::new(&render_state.device));
-        let resized = renderer.size() != (width, height);
-        let view = renderer.resize(&render_state.device, width, height);
+            .as_mut()
+            .expect("viewport renderer was created above");
+        let mesh_upload_pending = renderer.upload_pending_mesh_tiles(
+            &render_state.device,
+            &render_state.queue,
+            upload_budget,
+        );
         renderer.render(
             &render_state.device,
             &render_state.queue,
             &self.camera,
             &self.options,
         );
+        if !self.camera_deferred
+            && !self.mesh_focus_deferred
+            && (self.mesh_decode_pending || mesh_upload_pending)
+        {
+            ui.ctx().request_repaint();
+        }
         if resized || self.texture_id.is_none() {
             let mut egui_renderer = render_state.renderer.write();
             if let Some(old) = self.texture_id.take() {
@@ -1050,14 +1270,15 @@ impl ViewportPanel {
         // Navigation overlays: axis triad (bottom-left) + view buttons
         // (bottom-center).
         self.paint_orientation_triad(ui, rect);
-        self.view_panel_ui(ui.ctx(), rect, now);
         // Tool input + ghost overlays go on top of the rendered image.
-        tools.handle_viewport(&response, ui, &self.camera, rect, pixels_per_point, state);
-        if tools.kind == ToolKind::Select {
-            self.handle_select_click(&response, ui, rect, pixels_per_point, state);
-        }
-        if tools.kind == ToolKind::Measure {
-            self.handle_measure_click(&response, rect, pixels_per_point, state, tools);
+        if !primary.suppress_click {
+            tools.handle_viewport(&response, ui, &self.camera, rect, pixels_per_point, state);
+            if tools.kind == ToolKind::Select {
+                self.handle_select_click(&response, ui, rect, pixels_per_point, state);
+            }
+            if tools.kind == ToolKind::Measure {
+                self.handle_measure_click(&response, rect, pixels_per_point, state, tools);
+            }
         }
         // Annotation overlays: measurements persist across tool switches;
         // the bounds tripod follows the selection while toggled on. The
@@ -1127,6 +1348,181 @@ fn ray_triangle_hit(origin: Vec3, direction: Vec3, a: Vec3, b: Vec3, c: Vec3) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_orbit_applies_threshold_movement_and_suppresses_release_click() {
+        let mut drag = ViewportDragState::default();
+        let start = egui::pos2(10.0, 20.0);
+        assert_eq!(
+            drag.update_primary(true, true, true, false, Some(start), Some(start))
+                .orbit_delta,
+            egui::Vec2::ZERO
+        );
+        assert_eq!(
+            drag.update_primary(
+                true,
+                false,
+                true,
+                false,
+                Some(start + egui::vec2(1.9, 0.0)),
+                None,
+            )
+            .orbit_delta,
+            egui::Vec2::ZERO
+        );
+        assert_eq!(
+            drag.update_primary(
+                true,
+                false,
+                true,
+                false,
+                Some(start + egui::vec2(2.0, 0.0)),
+                None,
+            )
+            .orbit_delta,
+            egui::vec2(2.0, 0.0)
+        );
+        assert_eq!(
+            drag.update_primary(
+                true,
+                false,
+                true,
+                false,
+                Some(start + egui::vec2(3.0, -1.0)),
+                None,
+            )
+            .orbit_delta,
+            egui::vec2(1.0, -1.0)
+        );
+        assert!(
+            drag.update_primary(
+                true,
+                false,
+                false,
+                true,
+                Some(start + egui::vec2(3.0, -1.0)),
+                None,
+            )
+            .suppress_click
+        );
+    }
+
+    #[test]
+    fn subthreshold_primary_movement_remains_a_click_and_tools_disable_orbit() {
+        let mut drag = ViewportDragState::default();
+        let start = egui::pos2(4.0, 5.0);
+        drag.update_primary(true, true, true, false, Some(start), Some(start));
+        let released = drag.update_primary(
+            true,
+            false,
+            false,
+            true,
+            Some(start + egui::vec2(1.0, 1.0)),
+            None,
+        );
+        assert_eq!(released.orbit_delta, egui::Vec2::ZERO);
+        assert!(!released.suppress_click);
+
+        drag.update_primary(true, true, true, false, Some(start), Some(start));
+        let tool_owned = drag.update_primary(
+            false,
+            false,
+            true,
+            false,
+            Some(start + egui::vec2(20.0, 0.0)),
+            None,
+        );
+        assert_eq!(tool_owned.orbit_delta, egui::Vec2::ZERO);
+        assert!(!tool_owned.suppress_click);
+    }
+
+    fn mesh_view(panel: &ViewportPanel, width: u32, height: u32) -> caso_meshing::MeshView {
+        caso_meshing::MeshView::new(panel.camera.matrix(width, height), width, height)
+    }
+
+    fn mesh_focus(panel: &ViewportPanel) -> [f64; 3] {
+        [
+            panel.camera.target.x,
+            panel.camera.target.y,
+            panel.camera.target.z,
+        ]
+    }
+
+    fn settle_initial_view(panel: &mut ViewportPanel) {
+        let view = mesh_view(panel, 800, 600);
+        let focus = mesh_focus(panel);
+        assert!(panel.observe_mesh_view(view, 0.0, false));
+        assert!(panel.observe_mesh_focus(focus, 0.0));
+        assert!(!panel.observe_mesh_view(view, MESH_CAMERA_SETTLE_SECONDS, false));
+        assert!(!panel.observe_mesh_focus(focus, MESH_CAMERA_SETTLE_SECONDS));
+        assert!(!panel.camera_deferred);
+        assert!(!panel.mesh_focus_deferred());
+        assert_eq!(panel.latest_settled_mesh_focus(), Some(focus));
+    }
+
+    fn assert_camera_activity(panel: &mut ViewportPanel, now: f64, width: u32, height: u32) {
+        let view = mesh_view(panel, width, height);
+        let animating = panel.view_flight.is_some();
+        assert!(panel.observe_mesh_view(view, now, animating));
+        assert!(panel.camera_deferred);
+        assert_eq!(
+            panel.camera_settle_deadline,
+            Some(now + MESH_CAMERA_SETTLE_SECONDS)
+        );
+    }
+
+    #[test]
+    fn orbit_zoom_and_resize_pause_upload_without_changing_mesh_focus() {
+        let mut panel = ViewportPanel::default();
+        settle_initial_view(&mut panel);
+        let focus = mesh_focus(&panel);
+
+        panel.camera.orbit(12.0, -4.0);
+        assert_camera_activity(&mut panel, 1.0, 800, 600);
+        assert!(!panel.observe_mesh_focus(focus, 1.0));
+
+        panel.camera.zoom_by(2.0);
+        assert_camera_activity(&mut panel, 2.0, 800, 600);
+        assert!(!panel.observe_mesh_focus(focus, 2.0));
+
+        panel.camera.yaw += 0.1;
+        assert_camera_activity(&mut panel, 3.0, 800, 600);
+        assert!(!panel.observe_mesh_focus(focus, 3.0));
+
+        assert_camera_activity(&mut panel, 4.0, 801, 600);
+        assert!(!panel.observe_mesh_focus(focus, 4.0));
+
+        panel.fly_to_reference_view(1, -90.0, 0.0, 5.0);
+        panel.advance_view_flight(&egui::Context::default(), 5.01);
+        assert_camera_activity(&mut panel, 5.01, 801, 600);
+        assert!(!panel.observe_mesh_focus(focus, 5.01));
+
+        assert!(!panel.mesh_focus_deferred());
+        assert_eq!(panel.latest_settled_mesh_focus(), Some(focus));
+    }
+
+    #[test]
+    fn translated_focus_settles_only_at_the_latest_position() {
+        let mut panel = ViewportPanel::default();
+        settle_initial_view(&mut panel);
+
+        panel.camera.pan(10.0, 0.0, 600.0);
+        let intermediate = mesh_focus(&panel);
+        assert!(panel.observe_mesh_focus(intermediate, 1.0));
+
+        panel.camera.target += vec3(0.5, 0.0, 0.0);
+        let final_focus = mesh_focus(&panel);
+        assert!(panel.observe_mesh_focus(final_focus, 1.04));
+
+        assert!(!panel.observe_mesh_focus(final_focus, 1.08));
+        assert!(panel.mesh_focus_deferred());
+        assert_eq!(panel.latest_settled_mesh_focus(), None);
+
+        assert!(!panel.observe_mesh_focus(final_focus, 1.12));
+        assert!(!panel.mesh_focus_deferred());
+        assert_eq!(panel.latest_settled_mesh_focus(), Some(final_focus));
+        assert_ne!(panel.latest_settled_mesh_focus(), Some(intermediate));
+    }
 
     /// A reference-view switch sets the visualization grid plane and flies
     /// the camera onto the target yaw/pitch by the end of the flight.

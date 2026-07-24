@@ -27,7 +27,10 @@ pub struct Model {
 impl Model {
     pub fn new(domains: Vec<Domain>) -> GeometryResult<Self> {
         for (index, domain) in domains.iter().enumerate() {
-            if domains[..index].iter().any(|other| other.name == domain.name) {
+            if domains[..index]
+                .iter()
+                .any(|other| other.name == domain.name)
+            {
                 return Err(GeometryError::new(
                     "Domain names must be unique within a Model",
                 ));

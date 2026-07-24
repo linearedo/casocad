@@ -173,31 +173,25 @@ pub struct FluidDomainRecord {
     pub tags: Vec<TagRef>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MeshingSceneOptions {
-    pub cells_2d: usize,
-    pub cells_3d: usize,
-    pub minimum_cross_cells: usize,
-    pub max_cells: usize,
-    pub max_adaptive_levels: usize,
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshingSettings {
+    pub algorithm_id: String,
+    pub element_min_size: f64,
+    pub element_max_size: f64,
+    pub control_script: String,
+    pub wasm_file_cap_mib: u16,
 }
 
-impl Default for MeshingSceneOptions {
+impl Default for MeshingSettings {
     fn default() -> Self {
         Self {
-            cells_2d: 48,
-            cells_3d: 20,
-            minimum_cross_cells: 6,
-            max_cells: 1_000_000,
-            max_adaptive_levels: 12,
+            algorithm_id: "advancing_front".into(),
+            element_min_size: 0.025,
+            element_max_size: 0.1,
+            control_script: String::new(),
+            wasm_file_cap_mib: 256,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct MeshingSettings {
-    pub control_script: String,
-    pub options: MeshingSceneOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

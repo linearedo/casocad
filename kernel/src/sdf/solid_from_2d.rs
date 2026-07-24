@@ -11,7 +11,9 @@ use crate::vec3::Vec3;
 fn require_section(section: &Node) -> GeometryResult<&PlacedSdf2D> {
     match &section.shape {
         Shape::PlacedSdf2D(placed) => Ok(placed),
-        _ => Err(GeometryError::new("generator section must be a placed 2D SDF")),
+        _ => Err(GeometryError::new(
+            "generator section must be a placed 2D SDF",
+        )),
     }
 }
 
@@ -126,8 +128,7 @@ impl Revolve {
         angle_degrees: f64,
     ) -> GeometryResult<Self> {
         require_section(&section)?;
-        if !angle_degrees.is_finite() || angle_degrees.abs() <= 0.0 || angle_degrees.abs() > 360.0
-        {
+        if !angle_degrees.is_finite() || angle_degrees.abs() <= 0.0 || angle_degrees.abs() > 360.0 {
             return Err(GeometryError::new(
                 "revolve angle magnitude must be finite and in (0, 360]",
             ));

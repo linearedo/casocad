@@ -1,6 +1,6 @@
 [package]
 name = "caso-meshing"
-description = "casoWASM FEA/CFD meshing artifacts: Arrow IPC mesh export"
+description = "Arrow-native out-of-core mesh storage and meshing for casoCAD"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,9 +10,9 @@ workspace = true
 
 [dependencies]
 caso-kernel = { path = "../kernel" }
-caso-surfaces = { path = "../surfaces" }
 arrow-array = "56"
 arrow-schema = "56"
 arrow-ipc = "56"
 arrow-buffer = "56"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"

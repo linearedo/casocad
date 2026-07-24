@@ -103,7 +103,9 @@ fn moving_a_source_reoffsets_the_boolean() {
     assert!(signed_distance(&document, combined, vec3(-0.5, 0.0, 0.0)) < 0.0);
     assert!(signed_distance(&document, combined, vec3(0.5, 0.0, 0.0)) > 0.0);
 
-    document.move_object(circle, vec3(-1.0, 0.0, 0.0)).expect("move");
+    document
+        .move_object(circle, vec3(-1.0, 0.0, 0.0))
+        .expect("move");
 
     // Hole followed the source to (-0.5, 0).
     assert!(signed_distance(&document, combined, vec3(-0.5, 0.0, 0.0)) > 0.0);
@@ -117,7 +119,9 @@ fn nested_combine_syncs_through_both_levels() {
     let square = document
         .add_primitive_from_drag("square", vec3(-1.8, 0.4, 0.0), vec3(-1.2, 1.0, 0.0), 1.0)
         .expect("square");
-    let outer = document.combine(inner, square, "difference").expect("outer");
+    let outer = document
+        .combine(inner, square, "difference")
+        .expect("outer");
 
     // Move the deepest source; both boolean levels must follow it.
     let rect_before = placed_2d_origin(&document, rect);
@@ -181,5 +185,8 @@ fn segment_boolean_sources_follow_moves() {
     let Profile1D::Offset { offset, .. } = right.as_ref() else {
         panic!("expected the offset-wrapped second operand");
     };
-    assert!((offset - 2.0).abs() < 1.0e-9, "operand spacing preserved, got {offset}");
+    assert!(
+        (offset - 2.0).abs() < 1.0e-9,
+        "operand spacing preserved, got {offset}"
+    );
 }

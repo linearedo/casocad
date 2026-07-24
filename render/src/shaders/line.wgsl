@@ -1,6 +1,6 @@
-// Screen-space thick lines (port of line.vert / line.frag). Each segment is
-// six vertices carrying both endpoints plus (endpoint_sel, side); the vertex
-// shader projects both endpoints and offsets perpendicular in pixel space.
+// Screen-space thick lines (port of line.vert / line.frag). Each instance
+// carries both endpoints and its color; vertex_index selects one of the six
+// quad corners, avoiding six copies of the same line data.
 // clip_y_sign is -1 for wgpu (screen y-down -> NDC y-up).
 
 struct LineUniforms {
@@ -23,7 +23,6 @@ struct VertexInput {
     @location(0) point_a: vec3<f32>,
     @location(1) point_b: vec3<f32>,
     @location(2) color: vec3<f32>,
-    @location(3) param: vec2<f32>,
 };
 
 struct VertexOutput {
@@ -55,7 +54,16 @@ fn project(p: vec3<f32>) -> vec4<f32> {
 }
 
 @vertex
-fn vs_main(input: VertexInput) -> VertexOutput {
+fn vs_main(input: VertexInput, @builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    const params = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, -1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 1.0),
+    );
+    let param = params[vertex_index];
     var out: VertexOutput;
     let ca = project(input.point_a);
     let cb = project(input.point_b);
@@ -71,11 +79,11 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let nrm = vec2<f32>(-dir.y, dir.x);
     var cthis = cb;
     var sthis = sb;
-    if (input.param.x < 0.5) {
+    if (param.x < 0.5) {
         cthis = ca;
         sthis = sa;
     }
-    let soff = sthis + nrm * input.param.y * ubo.half_px;
+    let soff = sthis + nrm * param.y * ubo.half_px;
     let ndc = soff / ubo.resolution * 2.0 - vec2<f32>(1.0);
     out.clip_position = vec4<f32>(
         ndc.x * cthis.w,

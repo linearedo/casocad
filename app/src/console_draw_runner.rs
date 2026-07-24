@@ -21,11 +21,11 @@ pub const EXAMPLE_SCRIPT: &str = r#"// Console Draw edits the current scene atom
 let block = cad.draw(
     "box",
     [0.0, 0.0, 0.0],
-    [mm(80), mm(50), mm(10)],
-    mm(1)
+    [3, 3, 2],
+    1
 );
-let bore = cad.add("cylinder", mm(20));
-let bore = cad.move(bore, [mm(40), mm(25), mm(5)]);
+let bore = cad.add("cylinder", 1);
+let bore = cad.move(bore, [0.1, 0.1, 0.1]);
 let part = cad.boolean(block, bore, "difference");
 cad.rename(part, "Console Part");
 print(`Created Console Part (object ${part})`);

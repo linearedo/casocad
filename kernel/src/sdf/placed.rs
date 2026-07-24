@@ -116,7 +116,9 @@ impl PlacedPolyline1D {
             profile,
             Profile2D::Polyline { .. } | Profile2D::QuadraticBezierCurve { .. }
         ) {
-            return Err(GeometryError::new("PlacedPolyline1D requires a curve profile"));
+            return Err(GeometryError::new(
+                "PlacedPolyline1D requires a curve profile",
+            ));
         }
         let (u, v) = workplane_axes(axis_u, axis_v)?;
         Ok(Self {

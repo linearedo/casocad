@@ -57,7 +57,9 @@ fn disjoint_model_compiles() {
             box_node("flow", Vec3::ZERO, vec3(1.6, 0.7, 0.45)),
             Node::new(
                 "obstacle",
-                Shape::Cylinder(Cylinder::new(Vec3::ZERO, 0.24, 0.55, IDENTITY_FRAME).expect("cyl")),
+                Shape::Cylinder(
+                    Cylinder::new(Vec3::ZERO, 0.24, 0.55, IDENTITY_FRAME).expect("cyl"),
+                ),
             ),
         )
         .expect("difference"),
@@ -69,7 +71,9 @@ fn disjoint_model_compiles() {
     ])
     .expect("model");
     assert!(grammar_violations(&model).is_empty());
-    assert!(disjointness_violations(&model, 32).expect("check").is_empty());
+    assert!(disjointness_violations(&model, 32)
+        .expect("check")
+        .is_empty());
     compile_model(&model, 32).expect("valid model compiles");
 }
 
@@ -79,7 +83,11 @@ fn overlapping_domains_refuse_to_compile() {
     let b = box_node("b", vec3(0.4, 0.0, 0.0), vec3(0.5, 0.5, 0.5));
     let model = Model::new(vec![fluid("a", a), fluid("b", b)]).expect("model");
     let error = compile_model(&model, 32).expect_err("overlap must fail");
-    assert!(error.0.contains("overlap"), "unexpected message: {}", error.0);
+    assert!(
+        error.0.contains("overlap"),
+        "unexpected message: {}",
+        error.0
+    );
 }
 
 #[test]
@@ -124,10 +132,7 @@ fn erosion_past_reach_is_refused() {
 #[test]
 fn revolve_axis_crossing_needs_symmetry() {
     // Asymmetric profile crossing the axis: violation.
-    let asymmetric = revolve_node(
-        "bad",
-        Profile2D::circle([0.05, 0.0], 0.3).expect("circle"),
-    );
+    let asymmetric = revolve_node("bad", Profile2D::circle([0.05, 0.0], 0.3).expect("circle"));
     let violations = precondition_violations(&asymmetric);
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert!(violations[0].contains("crosses the revolution axis"));

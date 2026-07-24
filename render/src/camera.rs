@@ -98,8 +98,8 @@ impl OrbitCamera {
     pub fn pan(&mut self, delta_x: f64, delta_y: f64, viewport_height: f64) {
         let basis = self.basis();
         let world_per_pixel = 2.0 * self.distance / (self.focal * viewport_height.max(1.0));
-        self.target =
-            self.target - basis.right * (delta_x * world_per_pixel) + basis.up * (delta_y * world_per_pixel);
+        self.target = self.target - basis.right * (delta_x * world_per_pixel)
+            + basis.up * (delta_y * world_per_pixel);
     }
 
     pub fn frame_target(&mut self, target: Vec3, distance: f64) {
@@ -157,10 +157,22 @@ impl OrbitCamera {
         let t3 = -basis.forward.dot(eye);
         // Rows above are the matrix rows; emit column-major for WGSL.
         [
-            row0.x as f32, row1.x as f32, row2.x as f32, row3.x as f32,
-            row0.y as f32, row1.y as f32, row2.y as f32, row3.y as f32,
-            row0.z as f32, row1.z as f32, row2.z as f32, row3.z as f32,
-            t0 as f32, t1 as f32, t2 as f32, t3 as f32,
+            row0.x as f32,
+            row1.x as f32,
+            row2.x as f32,
+            row3.x as f32,
+            row0.y as f32,
+            row1.y as f32,
+            row2.y as f32,
+            row3.y as f32,
+            row0.z as f32,
+            row1.z as f32,
+            row2.z as f32,
+            row3.z as f32,
+            t0 as f32,
+            t1 as f32,
+            t2 as f32,
+            t3 as f32,
         ]
     }
 }

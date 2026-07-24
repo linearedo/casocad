@@ -1,6 +1,6 @@
 //! Versioned scene.json read/write, ported from `core/serialization.py`.
 //!
-//! The format is `{"format": "casocad", "version": 1, "unit": "m", ...}` with
+//! The format is `{"format": "casocad", "version": 2, "unit": "m", ...}` with
 //! name-keyed object records referencing each other by key. Boundary regions
 //! carry their knives inline as cut chains; there are no selector nodes.
 
@@ -13,8 +13,7 @@ use crate::error::{GeometryError, GeometryResult};
 use crate::frame::Frame;
 use crate::roles::DomainKind;
 use crate::scene::{
-    FluidDomainRecord, MeshingSceneOptions, MeshingSettings, ObjectId, OperatorKind, SceneDocument,
-    ScenePayload, TagRef,
+    FluidDomainRecord, MeshingSettings, ObjectId, OperatorKind, SceneDocument, ScenePayload, TagRef,
 };
 use crate::sdf::curtain::NormalCurtain;
 use crate::sdf::node::{Node, RotationAxis, Shape};
@@ -27,7 +26,7 @@ use crate::sdf::solid_from_2d::{Extrude, RevolveAxis};
 use crate::sdf::tubes::{CapStyle, PolylineTube, QuadraticBezierTube};
 use crate::vec3::{vec3, Vec3};
 
-pub const SCENE_FORMAT_VERSION: u64 = 1;
+pub const SCENE_FORMAT_VERSION: u64 = 2;
 pub const FORMAT_NAME: &str = "casocad";
 
 const DEFAULT_AXIS_U: Vec3 = vec3(1.0, 0.0, 0.0);
@@ -102,14 +101,17 @@ fn get_str<'a>(record: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     record.get(key).and_then(Value::as_str)
 }
 
-fn meshing_usize(record: &Map<String, Value>, key: &str, default: usize) -> GeometryResult<usize> {
+fn meshing_size(record: &Map<String, Value>, key: &str, default: f64) -> GeometryResult<f64> {
     match record.get(key) {
         None => Ok(default),
-        Some(value) => value
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .ok_or_else(|| err(format!("meshing option {key:?} must be a positive integer"))),
+        Some(value) => {
+            let value = parse_f64(value)?;
+            if value.is_finite() && value > 0.0 {
+                Ok(value)
+            } else {
+                Err(err(format!("meshing option {key:?} must be positive")))
+            }
+        }
     }
 }
 
@@ -1115,14 +1117,11 @@ pub fn scene_to_value(document: &SceneDocument) -> GeometryResult<Value> {
         payload.insert(
             "meshing".into(),
             json!({
+                "algorithm_id": document.meshing.algorithm_id,
+                "element_min_size": document.meshing.element_min_size,
+                "element_max_size": document.meshing.element_max_size,
                 "control_script": document.meshing.control_script,
-                "options": {
-                    "cells_2d": document.meshing.options.cells_2d,
-                    "cells_3d": document.meshing.options.cells_3d,
-                    "minimum_cross_cells": document.meshing.options.minimum_cross_cells,
-                    "max_cells": document.meshing.options.max_cells,
-                    "max_adaptive_levels": document.meshing.options.max_adaptive_levels,
-                }
+                "wasm_file_cap_mib": document.meshing.wasm_file_cap_mib,
             }),
         );
     }
@@ -1316,34 +1315,53 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
         let record = raw_meshing
             .as_object()
             .ok_or_else(|| err("meshing must be a JSON object"))?;
+        let defaults = MeshingSettings::default();
+        let algorithm_id = match record.get("algorithm_id") {
+            None => defaults.algorithm_id,
+            Some(Value::String(value)) if !value.trim().is_empty() => value.clone(),
+            Some(_) => return Err(err("meshing algorithm_id must be a non-empty string")),
+        };
+        let element_max_size = if record.contains_key("element_max_size") {
+            meshing_size(record, "element_max_size", defaults.element_max_size)?
+        } else {
+            meshing_size(record, "cell_size", defaults.element_max_size)?
+        };
+        let default_min = defaults
+            .element_min_size
+            .min(element_max_size)
+            .max(element_max_size * 1.0e-6);
+        let element_min_size = meshing_size(record, "element_min_size", default_min)?;
+        if element_min_size > element_max_size {
+            return Err(err(
+                "meshing element_min_size must not exceed element_max_size",
+            ));
+        }
         let control_script = match record.get("control_script") {
-            Some(Value::String(script)) => script.clone(),
-            None => String::new(),
+            None => defaults.control_script,
+            Some(Value::String(value)) => value.clone(),
             Some(_) => return Err(err("meshing control_script must be a string")),
         };
-        let defaults = MeshingSceneOptions::default();
-        let options = match record.get("options") {
-            Some(Value::Object(options)) => MeshingSceneOptions {
-                cells_2d: meshing_usize(options, "cells_2d", defaults.cells_2d)?,
-                cells_3d: meshing_usize(options, "cells_3d", defaults.cells_3d)?,
-                minimum_cross_cells: meshing_usize(
-                    options,
-                    "minimum_cross_cells",
-                    defaults.minimum_cross_cells,
-                )?,
-                max_cells: meshing_usize(options, "max_cells", defaults.max_cells)?,
-                max_adaptive_levels: meshing_usize(
-                    options,
-                    "max_adaptive_levels",
-                    defaults.max_adaptive_levels,
-                )?,
-            },
-            None => defaults,
-            Some(_) => return Err(err("meshing options must be a JSON object")),
+        let wasm_file_cap_mib = match record.get("wasm_file_cap_mib") {
+            None => defaults.wasm_file_cap_mib,
+            Some(Value::Number(value)) => value
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok())
+                .filter(|value| (64..=512).contains(value))
+                .ok_or_else(|| {
+                    err("meshing wasm_file_cap_mib must be an integer from 64 to 512")
+                })?,
+            Some(_) => {
+                return Err(err(
+                    "meshing wasm_file_cap_mib must be an integer from 64 to 512",
+                ))
+            }
         };
         loader.document.meshing = MeshingSettings {
+            algorithm_id,
+            element_min_size,
+            element_max_size,
             control_script,
-            options,
+            wasm_file_cap_mib,
         };
     }
     let root_names = match payload.get("root_objects") {

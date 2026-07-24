@@ -119,7 +119,10 @@ mod tests {
             let frame = Frame::from_euler_degrees(angles[0], angles[1], angles[2]);
             let recovered = frame.to_euler_degrees();
             for (expected, actual) in angles.iter().zip(recovered.iter()) {
-                assert!((expected - actual).abs() < 1e-9, "{angles:?} -> {recovered:?}");
+                assert!(
+                    (expected - actual).abs() < 1e-9,
+                    "{angles:?} -> {recovered:?}"
+                );
             }
         }
     }
@@ -131,7 +134,10 @@ mod tests {
         Frame::orthonormal(frame.u, frame.v, frame.w).expect("orthonormal");
         let recovered = frame.to_euler_degrees();
         for (expected, actual) in angles.iter().zip(recovered.iter()) {
-            assert!((expected - actual).abs() < 1e-9, "{angles:?} -> {recovered:?}");
+            assert!(
+                (expected - actual).abs() < 1e-9,
+                "{angles:?} -> {recovered:?}"
+            );
         }
     }
 

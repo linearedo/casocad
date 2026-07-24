@@ -9,10 +9,10 @@ mod console_panel;
 mod dimensions;
 mod file_menu;
 mod gizmo;
+mod meshing_controls;
 mod meshing_panel;
 mod properties_panel;
 mod scene_panel;
-mod script_runner;
 mod state;
 mod theme;
 mod tools;
@@ -120,6 +120,10 @@ fn sdf_menu_button(ui: &mut egui::Ui, label: &str, kind: &str, selected: bool) -
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
     use eframe::wasm_bindgen::JsCast;
+    if let Ok(scope) = js_sys::global().dyn_into::<web_sys::DedicatedWorkerGlobalScope>() {
+        install_mesh_worker(scope);
+        return Ok(());
+    }
     let document = web_sys::window()
         .ok_or("no window")?
         .document()
@@ -135,6 +139,140 @@ pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
             Box::new(|creation_context| Ok(Box::new(CasoApp::new(creation_context)))),
         )
         .await
+}
+
+#[cfg(target_arch = "wasm32")]
+fn install_mesh_worker(scope: web_sys::DedicatedWorkerGlobalScope) {
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    let callback_scope = scope.clone();
+    let callback =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+            let result = (|| -> Result<caso_meshing::MeshingOutput, String> {
+                let text = event
+                    .data()
+                    .as_string()
+                    .ok_or_else(|| "mesh worker request must be JSON text".to_string())?;
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|error| error.to_string())?;
+                let scene = value
+                    .get("scene")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "mesh worker request has no scene".to_string())?;
+                let cap_mib = value
+                    .get("cap_mib")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| "mesh worker request has no cap_mib".to_string())?
+                    as usize;
+                let document = caso_kernel::serialization::load_scene_from_str(scene)
+                    .map_err(|error| error.to_string())?;
+                let domains = caso_kernel::meshing::meshable_domains_from_document(&document)
+                    .map_err(|error| error.to_string())?;
+                if !(64..=512).contains(&cap_mib) {
+                    return Err("WASM mesh cap must be 64–512 MiB".into());
+                }
+                let controls = crate::meshing_controls::compile_control_script(
+                    &domains,
+                    &document.meshing.control_script,
+                )?;
+                let progress_scope = callback_scope.clone();
+                let job_control =
+                    caso_meshing::JobControl::default().with_progress(move |progress| {
+                        post_mesh_worker_progress(&progress_scope, progress);
+                    });
+                caso_meshing::run_meshing(
+                    caso_meshing::MeshingRequest {
+                        domains,
+                        algorithm_id: document.meshing.algorithm_id.clone(),
+                        element_min_size: document.meshing.element_min_size,
+                        element_max_size: document.meshing.element_max_size,
+                        controls,
+                        limits: caso_meshing::GenerationLimits::default(),
+                        job_control,
+                    },
+                    caso_meshing::MemoryStorage::new(cap_mib * 1024 * 1024)
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())
+            })();
+
+            let message = js_sys::Object::new();
+            let set = |key: &str, value: &JsValue| {
+                let _ = js_sys::Reflect::set(&message, &JsValue::from_str(key), value);
+            };
+            match result {
+                Ok(output) => {
+                    let caso_meshing::MeshArtifact::Memory(bytes) = output.artifact;
+                    set("kind", &JsValue::from_str("complete"));
+                    set(
+                        "domains",
+                        &JsValue::from_f64(output.statistics.domains as f64),
+                    );
+                    set(
+                        "chunks",
+                        &JsValue::from_f64(output.statistics.chunks as f64),
+                    );
+                    set(
+                        "points",
+                        &JsValue::from_f64(output.statistics.points as f64),
+                    );
+                    set("cells", &JsValue::from_f64(output.statistics.cells as f64));
+                    set(
+                        "batches",
+                        &JsValue::from_f64(output.statistics.committed_batches as f64),
+                    );
+                    set(
+                        "peak_bytes",
+                        &JsValue::from_f64(output.statistics.peak_active_bytes as f64),
+                    );
+                    set(
+                        "elapsed_millis",
+                        &JsValue::from_f64(output.statistics.elapsed_millis as f64),
+                    );
+                    let array = js_sys::Uint8Array::from(bytes.as_ref());
+                    set("bytes", array.as_ref());
+                    let transfer = js_sys::Array::new();
+                    transfer.push(&array.buffer());
+                    let _ = callback_scope
+                        .post_message_with_transfer(message.as_ref(), transfer.as_ref());
+                }
+                Err(error) => {
+                    set("kind", &JsValue::from_str("error"));
+                    set("error", &JsValue::from_str(&error));
+                    let _ = callback_scope.post_message(message.as_ref());
+                }
+            }
+        });
+    scope.set_onmessage(Some(callback.as_ref().unchecked_ref()));
+    callback.forget();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn post_mesh_worker_progress(
+    scope: &web_sys::DedicatedWorkerGlobalScope,
+    progress: caso_meshing::MeshingProgress,
+) {
+    use wasm_bindgen::JsValue;
+
+    let message = js_sys::Object::new();
+    for (key, value) in [
+        ("completed_chunks", progress.completed_chunks),
+        ("cells_committed", progress.cells_committed),
+        ("active_bytes", progress.active_bytes),
+    ] {
+        let _ = js_sys::Reflect::set(
+            &message,
+            &JsValue::from_str(key),
+            &JsValue::from_f64(value as f64),
+        );
+    }
+    let _ = js_sys::Reflect::set(
+        &message,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str("progress"),
+    );
+    let _ = scope.post_message(message.as_ref());
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -225,10 +363,70 @@ impl CasoApp {
         }
     }
 
+    fn add_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Add", |ui| {
+            for (header, kinds) in [
+                ("3D solids", &ADD_KINDS_3D[..]),
+                ("2D sections", &ADD_KINDS_2D[..]),
+                ("1D & curves", &ADD_KINDS_1D[..]),
+            ] {
+                if header != "3D solids" {
+                    ui.separator();
+                }
+                ui.label(egui::RichText::new(header).weak());
+                for (label, kind) in kinds {
+                    if sdf_menu_button(ui, label, kind, false).clicked() {
+                        self.state.push_undo();
+                        let scale = self.state.unit.factor;
+                        let result = self.state.document.add_primitive(kind, scale);
+                        if let Some(id) = self.state.report(result, &format!("Added {label}")) {
+                            self.state.select_only(id);
+                        }
+                        ui.close();
+                    }
+                }
+            }
+        });
+    }
+
+    fn draw_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Draw", |ui| {
+            ui.label(egui::RichText::new("3D (drag on grid)").weak());
+            for (label, kind) in DRAG_KINDS_3D {
+                self.tool_menu_entry(ui, label, kind, ToolKind::CreateDrag(kind));
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("2D sections").weak());
+            for (label, kind) in DRAG_KINDS_2D {
+                self.tool_menu_entry(ui, label, kind, ToolKind::CreateDrag(kind));
+            }
+            // Point-placed 2D kinds live in the same section: Regular
+            // Polygon is two clicks (center, then a vertex) with its
+            // side count set here; Polygon is one click per corner.
+            for (label, kind) in POINT_KINDS_2D {
+                if kind == "regular_polygon" {
+                    ui.horizontal(|ui| {
+                        self.tool_menu_entry(ui, label, kind, ToolKind::CreatePoints(kind));
+                        ui.label("Sides");
+                        ui.add(
+                            egui::DragValue::new(&mut self.tools.regular_polygon_sides)
+                                .range(3..=64),
+                        );
+                    });
+                } else {
+                    self.tool_menu_entry(ui, label, kind, ToolKind::CreatePoints(kind));
+                }
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("1D & point tools (Enter commits)").weak());
+            for (label, kind) in POINT_KINDS {
+                self.tool_menu_entry(ui, label, kind, ToolKind::CreatePoints(kind));
+            }
+        });
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         self.toolbar_row_app(ui);
-        ui.separator();
-        self.toolbar_row_tools(ui);
     }
 
     /// Toolbar row 1: wordmark, File, and the app/view controls.
@@ -244,21 +442,9 @@ impl CasoApp {
             ui.separator();
 
             self.show_file_menu(ui);
-            if ui.button("Console Draw").clicked() {
-                self.left_tab = LeftTab::Console;
-            }
             ui.separator();
 
             ui.checkbox(&mut self.viewport.options.show_grid, "Grid");
-            if ui
-                .button("Validate")
-                .on_hover_text(
-                    "Compile the Model: exactness grammar, preconditions, Domain disjointness",
-                )
-                .clicked()
-            {
-                self.validate_domains();
-            }
 
             // Working unit: display-only — rescales camera and grid, never
             // the committed geometry (model stays in meters).
@@ -293,79 +479,16 @@ impl CasoApp {
         });
     }
 
-    /// Toolbar row 2: the modeling tools.
-    fn toolbar_row_tools(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.menu_button("Add", |ui| {
-                for (header, kinds) in [
-                    ("3D solids", &ADD_KINDS_3D[..]),
-                    ("2D sections", &ADD_KINDS_2D[..]),
-                    ("1D & curves", &ADD_KINDS_1D[..]),
-                ] {
-                    if header != "3D solids" {
-                        ui.separator();
-                    }
-                    ui.label(egui::RichText::new(header).weak());
-                    for (label, kind) in kinds {
-                        if sdf_menu_button(ui, label, kind, false).clicked() {
-                            self.state.push_undo();
-                            let scale = self.state.unit.factor;
-                            let result = self.state.document.add_primitive(kind, scale);
-                            if let Some(id) = self.state.report(result, &format!("Added {label}")) {
-                                self.state.select_only(id);
-                            }
-                            ui.close();
-                        }
-                    }
-                }
-            });
-            ui.menu_button("Draw", |ui| {
-                ui.label(egui::RichText::new("3D (drag on grid)").weak());
-                for (label, kind) in DRAG_KINDS_3D {
-                    self.tool_menu_entry(ui, label, kind, ToolKind::CreateDrag(kind));
-                }
-                ui.separator();
-                ui.label(egui::RichText::new("2D sections").weak());
-                for (label, kind) in DRAG_KINDS_2D {
-                    self.tool_menu_entry(ui, label, kind, ToolKind::CreateDrag(kind));
-                }
-                // Point-placed 2D kinds live in the same section: Regular
-                // Polygon is two clicks (center, then a vertex) with its
-                // side count set here; Polygon is one click per corner.
-                for (label, kind) in POINT_KINDS_2D {
-                    if kind == "regular_polygon" {
-                        ui.horizontal(|ui| {
-                            self.tool_menu_entry(ui, label, kind, ToolKind::CreatePoints(kind));
-                            ui.label("Sides");
-                            ui.add(
-                                egui::DragValue::new(&mut self.tools.regular_polygon_sides)
-                                    .range(3..=64),
-                            );
-                        });
-                    } else {
-                        self.tool_menu_entry(ui, label, kind, ToolKind::CreatePoints(kind));
-                    }
-                }
-                ui.separator();
-                ui.label(egui::RichText::new("1D & point tools (Enter commits)").weak());
-                for (label, kind) in POINT_KINDS {
-                    self.tool_menu_entry(ui, label, kind, ToolKind::CreatePoints(kind));
-                }
-            });
+    /// Geometry and meshing tools shown above the viewport, to the right of
+    /// the workspace panel.
+    fn tools_panel(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.strong("Geometry Tools");
+        });
+        ui.horizontal_wrapped(|ui| {
             self.tool_button(ui, "Move", ToolKind::Move);
             self.tool_button(ui, "Rotate", ToolKind::Rotate);
             self.tool_button(ui, "Measure", ToolKind::Measure);
-            ui.separator();
-
-            self.tool_button(ui, "Boundary Region", ToolKind::BoundaryRegion);
-            ui.menu_button("Cutter", |ui| {
-                if self.state.selected_region.is_none() {
-                    ui.weak("Select a boundary region first.");
-                }
-                for (label, kind) in KNIFE_KINDS {
-                    self.tool_menu_entry(ui, label, kind, ToolKind::BoundaryCutter(kind));
-                }
-            });
             ui.separator();
 
             // SDF operators need exactly two selected operands.
@@ -399,6 +522,30 @@ impl CasoApp {
             if redo {
                 self.state.redo();
             }
+        });
+        ui.separator();
+        ui.vertical_centered(|ui| {
+            ui.strong("Meshing Tools");
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("Validate")
+                .on_hover_text(
+                    "Compile the Model: exactness grammar, preconditions, Domain disjointness",
+                )
+                .clicked()
+            {
+                self.validate_domains();
+            }
+            self.tool_button(ui, "Boundary Region", ToolKind::BoundaryRegion);
+            ui.menu_button("Cutter", |ui| {
+                if self.state.selected_region.is_none() {
+                    ui.weak("Select a boundary region first.");
+                }
+                for (label, kind) in KNIFE_KINDS {
+                    self.tool_menu_entry(ui, label, kind, ToolKind::BoundaryCutter(kind));
+                }
+            });
         });
     }
 
@@ -671,19 +818,37 @@ impl eframe::App for CasoApp {
             .default_size(260.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.left_tab, LeftTab::Scene, "Scene");
-                    ui.selectable_value(&mut self.left_tab, LeftTab::Properties, "Properties");
+                    let geometry_selected = self.left_tab != LeftTab::Meshing;
+                    if ui.selectable_label(geometry_selected, "Geometry").clicked()
+                        && !geometry_selected
+                    {
+                        self.left_tab = LeftTab::Scene;
+                    }
                     ui.selectable_value(&mut self.left_tab, LeftTab::Meshing, "Meshing");
-                    ui.selectable_value(&mut self.left_tab, LeftTab::Console, "Console");
                 });
                 ui.separator();
-                match self.left_tab {
-                    LeftTab::Scene => self.scene_panel.ui(ui, &mut self.state),
-                    LeftTab::Properties => self.properties_panel.ui(ui, &mut self.state),
-                    LeftTab::Meshing => self.meshing_panel.ui(ui, &mut self.state),
-                    LeftTab::Console => self.console_panel.ui(ui, &mut self.state),
+                if self.left_tab == LeftTab::Meshing {
+                    self.meshing_panel.ui(ui, &mut self.state);
+                } else {
+                    ui.horizontal(|ui| {
+                        self.add_menu(ui);
+                        self.draw_menu(ui);
+                        ui.selectable_value(&mut self.left_tab, LeftTab::Console, "Console");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.left_tab, LeftTab::Scene, "Scene");
+                        ui.selectable_value(&mut self.left_tab, LeftTab::Properties, "Properties");
+                    });
+                    ui.separator();
+                    match self.left_tab {
+                        LeftTab::Scene => self.scene_panel.ui(ui, &mut self.state),
+                        LeftTab::Properties => self.properties_panel.ui(ui, &mut self.state),
+                        LeftTab::Console => self.console_panel.ui(ui, &mut self.state),
+                        LeftTab::Meshing => unreachable!(),
+                    }
                 }
             });
+        egui::Panel::top("tools").show(ui, |ui| self.tools_panel(ui));
         if self.left_tab == LeftTab::Meshing && self.meshing_panel.inspector_active() {
             egui::Panel::bottom("mesh_quality_inspector")
                 .resizable(true)
@@ -692,14 +857,23 @@ impl eframe::App for CasoApp {
                 .show(ui, |ui| self.meshing_panel.inspector_ui(ui, &self.state));
         }
         self.viewport.set_selection(self.state.selected_single());
-        if self.viewport.mesh_preview_revision() != self.meshing_panel.preview_revision {
-            let surfaces = self.meshing_panel.preview_surfaces();
-            let points = self.meshing_panel.preview_points();
-            self.viewport
-                .set_mesh_preview(self.meshing_panel.preview_revision, surfaces, points);
-        }
         self.viewport
             .ui(ui, &mut self.state, &mut self.tools, &render_state);
+        let focus_deferred = self.viewport.mesh_focus_deferred();
+        self.meshing_panel.set_focus_deferred(focus_deferred);
+        if !self.viewport.camera_deferred() {
+            if let Some(focus) = self.viewport.latest_settled_mesh_focus() {
+                self.meshing_panel.update_mesh_focus(focus);
+                if let Some(update) = self.meshing_panel.prepare_preview_frame() {
+                    if self
+                        .viewport
+                        .set_mesh_preview_update(self.meshing_panel.preview_revision, update)
+                    {
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+        }
         self.log_status();
     }
 }

@@ -10,7 +10,7 @@ sole codebase. The final Python snapshot is archived at the `python-final` tag
 
 Principles:
 
-- `#![forbid(unsafe_code)]` in every crate (enforced via workspace lints).
+- Unsafe code is denied workspace-wide.
 - Minimal dependencies: the kernel has **zero**; later crates add only what is
   irreplaceable (`wgpu`, `egui`).
 - f64 for all kernel/analysis math; f32 only at GPU upload boundaries.
@@ -19,8 +19,8 @@ Principles:
 
 See [DESIGN.md](DESIGN.md) for the architecture and product scope,
 [Console Draw scripting](docs/console_draw_api.md) for transactional CAD
-editing, and the [mesher script API](docs/mesher_script_api.md) for the Rhai
-interface exposed by the Meshing panel.
+editing, and the [Arrow mesh producer contract](docs/casomesh_arrow_v3.md)
+for external mesh interoperability.
 
 ## Crates
 
@@ -32,7 +32,8 @@ interface exposed by the Meshing panel.
 - `surfaces/` — display-surface builders (exact boolean clipping + dual
   contouring, 2D profiles, 1D wires).
 - `render/` — wgpu renderer (WGSL shaders, native + WebGPU/WebGL).
-- `meshing/` — FEA/CFD meshing workspace.
+- `meshing/` — Arrow-native out-of-core mesh storage, queries, quality,
+  camera-driven LOD, Uniform 2D, and Advancing Front 2D/3D.
 - `app/` — egui application (viewport, tools, panels); native and wasm entry
   points. `web/` holds the browser shell.
 

@@ -8,8 +8,8 @@
 
 use caso_kernel::boundary::{BoundaryCut, BoundaryRegion, CutSide};
 use caso_kernel::boundary_ops::{
-    boundary_region_mask, pick_boundary_patch, pick_boundary_patch_with_radius,
-    pick_outline_point, surface_patches_for_root,
+    boundary_region_mask, pick_boundary_patch, pick_boundary_patch_with_radius, pick_outline_point,
+    surface_patches_for_root,
 };
 use caso_kernel::boundary_paths::{point_knife, straight_knife, workplane_normal};
 use caso_kernel::sdf::node::{Node, Shape};
@@ -45,8 +45,14 @@ fn fixture_root() -> Node {
         "obstacle",
         11,
         Shape::PlacedSdf2D(
-            PlacedSdf2D::new(circle_profile.clone(), Vec3::ZERO, axis_u, axis_v, Vec::new())
-                .expect("circle"),
+            PlacedSdf2D::new(
+                circle_profile.clone(),
+                Vec3::ZERO,
+                axis_u,
+                axis_v,
+                Vec::new(),
+            )
+            .expect("circle"),
         ),
     );
     let merged = Profile2D::Binary {
@@ -100,7 +106,10 @@ fn left_edge_samples(count: usize) -> Vec<Vec3> {
 fn curve_patches_name_edges_and_the_cut_outline() {
     let root = fixture_root();
     let patches = surface_patches_for_root(&root);
-    let ids: Vec<&str> = patches.iter().map(|patch| patch.patch_id.as_str()).collect();
+    let ids: Vec<&str> = patches
+        .iter()
+        .map(|patch| patch.patch_id.as_str())
+        .collect();
     for wanted in [
         "flowbox.-U",
         "flowbox.+U",
@@ -182,23 +191,29 @@ fn point_knife_partitions_an_edge_region_exactly() {
     let points = left_edge_samples(200);
     let parent_mask = boundary_region_mask(&root, &parent, &points, None).expect("mask");
     assert!(parent_mask.iter().all(|hit| *hit));
-    let inside = boundary_region_mask(&root, &child(CutSide::Inside), &points, None)
-        .expect("inside");
-    let outside = boundary_region_mask(&root, &child(CutSide::Outside), &points, None)
-        .expect("outside");
+    let inside =
+        boundary_region_mask(&root, &child(CutSide::Inside), &points, None).expect("inside");
+    let outside =
+        boundary_region_mask(&root, &child(CutSide::Outside), &points, None).expect("outside");
     let mut inside_count = 0;
     let mut outside_count = 0;
     for index in 0..points.len() {
         // Inside/Outside complement each other point-by-point: an exact,
         // crack- and overlap-free partition of the parent arc.
-        assert_ne!(inside[index], outside[index], "point {index} must be in exactly one child");
+        assert_ne!(
+            inside[index], outside[index],
+            "point {index} must be in exactly one child"
+        );
         if inside[index] {
             inside_count += 1;
         } else {
             outside_count += 1;
         }
     }
-    assert!(inside_count > 0 && outside_count > 0, "the click splits the arc");
+    assert!(
+        inside_count > 0 && outside_count > 0,
+        "the click splits the arc"
+    );
     // The split lands at the click: each child is one contiguous y-interval
     // ending within a classifier tolerance of y = 0.25.
     let inside_ys: Vec<f64> = points
@@ -243,11 +258,19 @@ fn segment_knife_2d_is_click_order_independent() {
     ];
     let signs: Vec<(bool, bool)> = probes
         .iter()
-        .map(|p| (forward.eval_point(*p) <= 0.0, backward.eval_point(*p) <= 0.0))
+        .map(|p| {
+            (
+                forward.eval_point(*p) <= 0.0,
+                backward.eval_point(*p) <= 0.0,
+            )
+        })
         .collect();
     let all_equal = signs.iter().all(|(f, b)| f == b);
     let all_flipped = signs.iter().all(|(f, b)| f != b);
-    assert!(all_equal || all_flipped, "click order changed the partition: {signs:?}");
+    assert!(
+        all_equal || all_flipped,
+        "click order changed the partition: {signs:?}"
+    );
 }
 
 #[test]
@@ -258,7 +281,10 @@ fn point_knife_refuses_3d_domains() {
         Shape::Sphere(Sphere::new(Vec3::ZERO, 1.0).expect("sphere")),
     );
     let error = point_knife(&sphere, vec3(1.0, 0.0, 0.0)).expect_err("3D root refused");
-    assert!(error.to_string().contains("2D"), "unexpected error: {error}");
+    assert!(
+        error.to_string().contains("2D"),
+        "unexpected error: {error}"
+    );
 }
 
 /// End to end through the document, on the same call path the UI takes:
@@ -277,7 +303,9 @@ fn document_flow_creates_and_splits_a_2d_region() {
     let circle = document
         .add_primitive_from_drag("circle", vec3(0.2, -0.3, 0.0), vec3(0.8, 0.3, 0.0), 1.0)
         .expect("circle");
-    let domain = document.combine(rect, circle, "difference").expect("difference");
+    let domain = document
+        .combine(rect, circle, "difference")
+        .expect("difference");
     document
         .set_domain_root(domain, DomainKind::Fluid)
         .expect("fluid domain");
@@ -286,7 +314,11 @@ fn document_flow_creates_and_splits_a_2d_region() {
     assert_eq!(root.dimension(), 2, "the merged domain stays 2D");
 
     let hit = pick_down(&root, -2.0, 0.5).expect("left edge hit");
-    assert!(hit.patch_id.ends_with("-U"), "unexpected patch {}", hit.patch_id);
+    assert!(
+        hit.patch_id.ends_with("-U"),
+        "unexpected patch {}",
+        hit.patch_id
+    );
     let region_id = document
         .add_boundary_region(
             hit.owner_object_id,
@@ -325,11 +357,16 @@ fn solid_domain_regions_work_without_any_fluid_domain() {
     let circle = document
         .add_primitive_from_drag("circle", vec3(0.2, -0.3, 0.0), vec3(0.8, 0.3, 0.0), 1.0)
         .expect("circle");
-    let domain = document.combine(rect, circle, "difference").expect("difference");
+    let domain = document
+        .combine(rect, circle, "difference")
+        .expect("difference");
     document
         .set_domain_root(domain, DomainKind::Solid)
         .expect("solid domain");
-    assert!(document.fluid_domain.is_none(), "no fluid domain in this document");
+    assert!(
+        document.fluid_domain.is_none(),
+        "no fluid domain in this document"
+    );
 
     let root = document.build_node(domain).expect("root node");
     let hit = pick_down(&root, -2.0, 0.5).expect("left edge hit");
@@ -377,7 +414,7 @@ fn solid_domain_regions_work_without_any_fluid_domain() {
 fn nested_solid_and_fluid_each_carry_their_own_wall_region() {
     use caso_kernel::meshing::meshable_domains_from_document;
     use caso_kernel::roles::DomainKind;
-    use caso_kernel::scene::{ScenePayload, SceneDocument};
+    use caso_kernel::scene::{SceneDocument, ScenePayload};
 
     let mut document = SceneDocument::default_scene().expect("default scene");
     let fluid_root = document.fluid_domain.as_ref().expect("fluid").root;
@@ -466,8 +503,14 @@ fn fixture_with_near_edge_obstacle() -> Node {
         "obstacle",
         11,
         Shape::PlacedSdf2D(
-            PlacedSdf2D::new(circle_profile.clone(), Vec3::ZERO, axis_u, axis_v, Vec::new())
-                .expect("circle"),
+            PlacedSdf2D::new(
+                circle_profile.clone(),
+                Vec3::ZERO,
+                axis_u,
+                axis_v,
+                Vec::new(),
+            )
+            .expect("circle"),
         ),
     );
     let merged = Profile2D::Binary {
@@ -549,13 +592,13 @@ fn edge_scope_stops_at_the_corner() {
 fn outline_point_pick_snaps_onto_the_outline() {
     let root = fixture_root();
     // A ray slightly inside the left edge snaps onto it.
-    let snapped = pick_outline_point(&root, vec3(-1.95, 0.4, 5.0), vec3(0.0, 0.0, -1.0))
-        .expect("plane hit");
+    let snapped =
+        pick_outline_point(&root, vec3(-1.95, 0.4, 5.0), vec3(0.0, 0.0, -1.0)).expect("plane hit");
     assert!(root.eval_point(snapped).abs() < 1.0e-9);
     assert!((snapped.x + 2.0).abs() < 1.0e-6);
     // Far from the outline the raw in-plane point comes back (forgiving
     // knife endpoints).
-    let raw = pick_outline_point(&root, vec3(1.5, 0.35, 5.0), vec3(0.0, 0.0, -1.0))
-        .expect("plane hit");
+    let raw =
+        pick_outline_point(&root, vec3(1.5, 0.35, 5.0), vec3(0.0, 0.0, -1.0)).expect("plane hit");
     assert!((raw - vec3(1.5, 0.35, 0.0)).length() < 1.0e-9);
 }

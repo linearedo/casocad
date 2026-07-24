@@ -15,9 +15,7 @@ use caso_kernel::vec3::{vec3, Vec3};
 use crate::geomops::{
     analytic_gradient, orient_triangles, refine_edge_hermite, wire_indices_from_triangles,
 };
-use crate::types::{
-    empty_surface, SurfaceStatus, ViewportSurface, ViewportSurfaceKey,
-};
+use crate::types::{empty_surface, SurfaceStatus, ViewportSurface, ViewportSurfaceKey};
 
 pub const MAX_DUAL_CONTOUR_WIREFRAME_TRIANGLES: usize = 3000;
 const QEF_SINGULAR_RATIO: f64 = 0.03;
@@ -109,7 +107,9 @@ fn linspace(minimum: f64, maximum: f64, count: usize) -> Vec<f64> {
         return vec![minimum];
     }
     let step = (maximum - minimum) / (count - 1) as f64;
-    (0..count).map(|index| minimum + step * index as f64).collect()
+    (0..count)
+        .map(|index| minimum + step * index as f64)
+        .collect()
 }
 
 /// One DC vertex + normal per crossing cell from exact Hermite data:
@@ -137,8 +137,8 @@ fn solve_cells_hermite_qef(
         for (slot, (edge_a, edge_b)) in CELL_EDGE_CORNERS.iter().enumerate() {
             let fa = corner[*edge_a];
             let fb = corner[*edge_b];
-            let crossing = ((fa <= 0.0 && fb >= 0.0) || (fb <= 0.0 && fa >= 0.0))
-                && (fa - fb).abs() > 1.0e-12;
+            let crossing =
+                ((fa <= 0.0 && fb >= 0.0) || (fb <= 0.0 && fa >= 0.0)) && (fa - fb).abs() > 1.0e-12;
             if crossing {
                 let offset_a = CORNER_OFFSETS[*edge_a];
                 let offset_b = CORNER_OFFSETS[*edge_b];
@@ -222,9 +222,12 @@ fn solve_cells_hermite_qef(
             atb += n * n.dot(p);
         }
         let rhs = vec3(
-            atb.x - (ata[0][0] * mass_point.x + ata[0][1] * mass_point.y + ata[0][2] * mass_point.z),
-            atb.y - (ata[1][0] * mass_point.x + ata[1][1] * mass_point.y + ata[1][2] * mass_point.z),
-            atb.z - (ata[2][0] * mass_point.x + ata[2][1] * mass_point.y + ata[2][2] * mass_point.z),
+            atb.x
+                - (ata[0][0] * mass_point.x + ata[0][1] * mass_point.y + ata[0][2] * mass_point.z),
+            atb.y
+                - (ata[1][0] * mass_point.x + ata[1][1] * mass_point.y + ata[1][2] * mass_point.z),
+            atb.z
+                - (ata[2][0] * mass_point.x + ata[2][1] * mass_point.y + ata[2][2] * mass_point.z),
         );
         let (eigvals, eigvecs) = symmetric_eigen_3x3(&ata);
         let eig_max = eigvals[2].max(1.0e-30);
@@ -308,7 +311,11 @@ fn symmetric_eigen_3x3(matrix: &[[f64; 3]; 3]) -> ([f64; 3], [Vec3; 3]) {
         (a[1][1], vec3(v[0][1], v[1][1], v[2][1])),
         (a[2][2], vec3(v[0][2], v[1][2], v[2][2])),
     ];
-    pairs.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(std::cmp::Ordering::Equal));
+    pairs.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     (
         [pairs[0].0, pairs[1].0, pairs[2].0],
         [pairs[0].1, pairs[1].1, pairs[2].1],
@@ -353,8 +360,8 @@ struct QuadSink {
 impl QuadSink {
     #[allow(clippy::too_many_arguments)]
     fn emit(&mut self, a: i64, b: i64, c: i64, d: i64, fa: f64, fb: f64, flip: bool) {
-        let crossing = ((fa <= 0.0 && fb >= 0.0) || (fb <= 0.0 && fa >= 0.0))
-            && (fa - fb).abs() > 1.0e-12;
+        let crossing =
+            ((fa <= 0.0 && fb >= 0.0) || (fb <= 0.0 && fa >= 0.0)) && (fa - fb).abs() > 1.0e-12;
         if !crossing || a < 0 || b < 0 || c < 0 || d < 0 {
             return;
         }
@@ -478,7 +485,12 @@ fn dense_dual_contour(
         }
     }
     if bases.is_empty() {
-        return Ok(empty_surface(node, key, color, "dual contour produced no cells"));
+        return Ok(empty_surface(
+            node,
+            key,
+            color,
+            "dual contour produced no cells",
+        ));
     }
     let step = vec3(xs[1] - xs[0], ys[1] - ys[0], zs[1] - zs[0]);
     let (vertices, normals) = solve_cells_hermite_qef(node, &bases, step, &corner_values);
@@ -491,7 +503,9 @@ fn dense_dual_contour(
             cell_vertex[cell_index(i as usize, j as usize, k as usize)]
         }
     };
-    let mut sink = QuadSink { indices: Vec::new() };
+    let mut sink = QuadSink {
+        indices: Vec::new(),
+    };
     // X-parallel edges.
     for i in 0..nx {
         for jj in 0..ny.saturating_sub(1) {
@@ -548,13 +562,26 @@ fn dense_dual_contour(
     }
     let _ = cell_coords;
     Ok(finish_surface(
-        node, key, color, mins, maxs, vertices, normals, step, sink.indices,
+        node,
+        key,
+        color,
+        mins,
+        maxs,
+        vertices,
+        normals,
+        step,
+        sink.indices,
     ))
 }
 
 const DC_EDGE_SPECS: [(usize, usize, [[i64; 3]; 4], bool); 3] = [
     (0, 1, [[0, -1, -1], [0, 0, -1], [0, 0, 0], [0, -1, 0]], true),
-    (0, 2, [[-1, 0, -1], [0, 0, -1], [0, 0, 0], [-1, 0, 0]], false),
+    (
+        0,
+        2,
+        [[-1, 0, -1], [0, 0, -1], [0, 0, 0], [-1, 0, 0]],
+        false,
+    ),
     (0, 4, [[-1, -1, 0], [0, -1, 0], [0, 0, 0], [-1, 0, 0]], true),
 ];
 
@@ -613,7 +640,12 @@ fn narrow_band_dual_contour(
         }
     }
     if coarse_cells.is_empty() {
-        return Ok(empty_surface(node, key, color, "dual contour produced no cells"));
+        return Ok(empty_surface(
+            node,
+            key,
+            color,
+            "dual contour produced no cells",
+        ));
     }
 
     // Dilate by the 18-neighbourhood (|dx|+|dy|+|dz| <= 2).
@@ -678,7 +710,11 @@ fn narrow_band_dual_contour(
     for cell in &fine_cells {
         let mut pids = [0i64; 8];
         for (slot, offset) in CORNER_OFFSETS.iter().enumerate() {
-            let point = [cell[0] + offset[0], cell[1] + offset[1], cell[2] + offset[2]];
+            let point = [
+                cell[0] + offset[0],
+                cell[1] + offset[1],
+                cell[2] + offset[2],
+            ];
             let pid = (point[0] * py + point[1]) * pz + point[2];
             pids[slot] = pid;
             pid_index.entry(pid).or_insert_with(|| {
@@ -710,7 +746,12 @@ fn narrow_band_dual_contour(
         }
     }
     if cells.is_empty() {
-        return Ok(empty_surface(node, key, color, "dual contour produced no cells"));
+        return Ok(empty_surface(
+            node,
+            key,
+            color,
+            "dual contour produced no cells",
+        ));
     }
     let bases: Vec<Vec3> = cells
         .iter()
@@ -744,7 +785,9 @@ fn narrow_band_dual_contour(
         *vid_by_lid.get(&lid).unwrap_or(&-1)
     };
 
-    let mut sink = QuadSink { indices: Vec::new() };
+    let mut sink = QuadSink {
+        indices: Vec::new(),
+    };
     for (corner_a, corner_b, offsets, flip_positive) in DC_EDGE_SPECS {
         for (cell_index, cell) in cells.iter().enumerate() {
             let fa = cell_corner_values[cell_index][corner_a];
@@ -766,6 +809,14 @@ fn narrow_band_dual_contour(
     }
 
     Ok(finish_surface(
-        node, key, color, mins, maxs, vertices, normals, step_f, sink.indices,
+        node,
+        key,
+        color,
+        mins,
+        maxs,
+        vertices,
+        normals,
+        step_f,
+        sink.indices,
     ))
 }

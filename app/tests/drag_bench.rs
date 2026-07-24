@@ -58,11 +58,7 @@ fn polygon_scene() -> (SceneDocument, u32) {
 }
 
 /// One simulated drag: returns (edit_ms, node_ms, surface_ms) totals.
-fn run_drag(
-    document: &mut SceneDocument,
-    mut target: u32,
-    rotate: bool,
-) -> (f64, f64, f64) {
+fn run_drag(document: &mut SceneDocument, mut target: u32, rotate: bool) -> (f64, f64, f64) {
     let mut cache = ViewportSurfaceCache::default();
     cache.resolution = COARSE_TIER;
     let (mut edit_ms, mut node_ms, mut surface_ms) = (0.0, 0.0, 0.0);
@@ -87,13 +83,13 @@ fn run_drag(
         node_ms += start.elapsed().as_secs_f64() * 1000.0;
 
         let start = Instant::now();
-        let scene = caso_surfaces::build_viewport_surface_scene(
-            &components,
-            document.version,
-            &mut cache,
-        );
+        let scene =
+            caso_surfaces::build_viewport_surface_scene(&components, document.version, &mut cache);
         surface_ms += start.elapsed().as_secs_f64() * 1000.0;
-        assert!(!scene.surfaces.is_empty(), "frame {frame} built no surfaces");
+        assert!(
+            !scene.surfaces.is_empty(),
+            "frame {frame} built no surfaces"
+        );
     }
     (edit_ms, node_ms, surface_ms)
 }

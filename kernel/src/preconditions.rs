@@ -28,7 +28,9 @@ fn linspace(minimum: f64, maximum: f64, count: usize) -> Vec<f64> {
         return vec![minimum];
     }
     let step = (maximum - minimum) / (count - 1) as f64;
-    (0..count).map(|index| minimum + step * index as f64).collect()
+    (0..count)
+        .map(|index| minimum + step * index as f64)
+        .collect()
 }
 
 /// Violation when the revolve's interior profile straddles its axis without
@@ -127,7 +129,7 @@ pub fn erosion_violations(child: &Profile2D, offset: f64) -> Vec<String> {
              its field is no longer exact (§6, r < reach). Necessary check only \
              -- true reach can be stricter at concave features.",
             -min_child
-        )]
+        )];
     }
     Vec::new()
 }

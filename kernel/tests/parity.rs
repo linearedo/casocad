@@ -34,7 +34,12 @@ fn node(name: &str, shape: Shape) -> Node {
 }
 
 fn section(profile: Profile2D) -> Node {
-    section_at(profile, vec3(0.15, -0.1, 0.2), vec3(1.0, 0.0, 0.0), vec3(0.0, 0.6, 0.8))
+    section_at(
+        profile,
+        vec3(0.15, -0.1, 0.2),
+        vec3(1.0, 0.0, 0.0),
+        vec3(0.0, 0.6, 0.8),
+    )
 }
 
 fn section_at(profile: Profile2D, origin: Vec3, axis_u: Vec3, axis_v: Vec3) -> Node {
@@ -62,12 +67,9 @@ fn placed2d_profile(key: &str) -> Profile2D {
             [0.5, 0.5],
             [-0.4, 0.4],
         ]),
-        "polyline" => Profile2D::polyline(vec![
-            [-0.6, -0.4],
-            [0.6, -0.4],
-            [0.35, 0.4],
-            [-0.35, 0.4],
-        ]),
+        "polyline" => {
+            Profile2D::polyline(vec![[-0.6, -0.4], [0.6, -0.4], [0.35, 0.4], [-0.35, 0.4]])
+        }
         "bezier_curve" => {
             Profile2D::quadratic_bezier_curve(vec![[-0.6, -0.35], [0.0, 0.55], [0.6, -0.35]])
         }
@@ -190,8 +192,13 @@ fn build_fixture(name: &str) -> Node {
         "boxframe" => node(
             name,
             Shape::BoxFrame(
-                BoxFrame::new(vec3(0.0, 0.1, 0.0), vec3(0.5, 0.4, 0.3), 0.06, IDENTITY_FRAME)
-                    .expect("box frame"),
+                BoxFrame::new(
+                    vec3(0.0, 0.1, 0.0),
+                    vec3(0.5, 0.4, 0.3),
+                    0.06,
+                    IDENTITY_FRAME,
+                )
+                .expect("box frame"),
             ),
         ),
         "torus" => node(
@@ -281,9 +288,7 @@ fn build_fixture(name: &str) -> Node {
             Shape::PlacedSdf1D(
                 PlacedSdf1D::new(
                     Profile1D::Binary {
-                        left: std::boxed::Box::new(
-                            Profile1D::segment(-0.2, 0.4).expect("segment"),
-                        ),
+                        left: std::boxed::Box::new(Profile1D::segment(-0.2, 0.4).expect("segment")),
                         right: std::boxed::Box::new(Profile1D::Offset {
                             child: std::boxed::Box::new(
                                 Profile1D::segment(0.0, 0.3).expect("segment"),
@@ -291,7 +296,7 @@ fn build_fixture(name: &str) -> Node {
                             offset: 0.35,
                         }),
                         operation: BooleanOp1D::Difference,
-            smoothing: 0.1,
+                        smoothing: 0.1,
                     },
                     vec3(0.1, 0.0, 0.0),
                     vec3(0.0, 0.0, 1.0),
@@ -435,7 +440,10 @@ fn build_fixture(name: &str) -> Node {
                 Shape::intersection(op_box(), op_sphere()).expect("intersection"),
             );
             let nested_u = node("nested_u", Shape::union(cyl, torus).expect("union"));
-            node(name, Shape::difference(nested_i, nested_u).expect("difference"))
+            node(
+                name,
+                Shape::difference(nested_i, nested_u).expect("difference"),
+            )
         }
         "transform_translate" => node(
             name,
@@ -537,7 +545,10 @@ struct GoldenFixture {
 }
 
 fn load_goldens() -> Vec<GoldenFixture> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goldens/kernel_goldens.txt");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/goldens/kernel_goldens.txt"
+    );
     let text = std::fs::read_to_string(path).expect(
         "golden file missing — regenerate with `tools/export_goldens.py` \
          at the `python-final` tag (needs the archived Python codebase)",

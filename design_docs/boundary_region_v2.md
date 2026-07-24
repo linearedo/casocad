@@ -115,7 +115,7 @@ diagonal), never absolute meters. Fixes problem 8 and survives mm/km work.
 ## 4. Tags are opaque
 
 - `tag: str | None` on the record. The kernel stores, round-trips, displays —
-  **never interprets**. Physics meaning belongs to the mesher script.
+**never interprets**. Physics meaning belongs to the mesh producer.
 - UI offers per-DomainKind *suggestion lists* (editable combo):
   Fluid → `wall` (pre-filled), `inlet`, `outlet`, `symmetry`;
   Solid → nothing pre-filled, suggest `fixed`, `load`, `contact`.

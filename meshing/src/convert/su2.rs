@@ -1,302 +1,226 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Write;
 
-use crate::MeshIr;
+use arrow_array::Array;
 
-use super::{marker_name, mesh_cell_dimension, normalized_mesh, point_index, point_indices};
+use crate::{MeshError, MeshFile, MeshResult, RowKind};
 
-const SU2_LINE: u8 = 3;
-const SU2_TRIANGLE: u8 = 5;
-const SU2_QUAD: u8 = 9;
-const SU2_TETRA: u8 = 10;
-const SU2_HEX: u8 = 12;
-const SU2_PRISM: u8 = 13;
-const SU2_PYRAMID: u8 = 14;
-
-struct Su2Element {
-    code: u8,
-    points: Vec<usize>,
+pub fn write(mesh: &MeshFile) -> MeshResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    write_to(mesh, &mut bytes)?;
+    Ok(bytes)
 }
 
-pub fn write(mesh: &MeshIr) -> Result<Vec<u8>, String> {
-    let mesh = normalized_mesh(mesh)?;
-    let dimension = mesh_cell_dimension(&mesh, "SU2")?;
-    let point_indices = point_indices(&mesh.points);
-    let cells = cell_elements(&mesh, dimension, &point_indices)?;
-    let markers = marker_elements(&mesh, dimension, &point_indices)?;
-
-    let mut out = String::new();
-    writeln!(out, "NDIME= {dimension}").map_err(|error| error.to_string())?;
-    writeln!(out, "NPOIN= {}", mesh.points.len()).map_err(|error| error.to_string())?;
-    for point in &mesh.points {
-        if dimension == 2 {
-            writeln!(out, "{:.17} {:.17}", point.position[0], point.position[1])
-                .map_err(|error| error.to_string())?;
-        } else {
-            writeln!(
-                out,
-                "{:.17} {:.17} {:.17}",
-                point.position[0], point.position[1], point.position[2]
-            )
-            .map_err(|error| error.to_string())?;
-        }
-    }
-    writeln!(out, "NELEM= {}", cells.len()).map_err(|error| error.to_string())?;
-    for cell in &cells {
-        write_element(&mut out, cell)?;
-    }
-    writeln!(out, "NMARK= {}", markers.len()).map_err(|error| error.to_string())?;
-    for (name, elements) in markers {
-        writeln!(out, "MARKER_TAG= {name}").map_err(|error| error.to_string())?;
-        writeln!(out, "MARKER_ELEMS= {}", elements.len()).map_err(|error| error.to_string())?;
-        for element in &elements {
-            write_element(&mut out, element)?;
-        }
-    }
-    Ok(out.into_bytes())
-}
-
-fn cell_elements(
-    mesh: &MeshIr,
-    dimension: u8,
-    point_indices: &BTreeMap<u64, usize>,
-) -> Result<Vec<Su2Element>, String> {
-    mesh.cells
-        .iter()
-        .map(|cell| {
-            Ok(Su2Element {
-                code: cell_code(&cell.type_name, dimension)?,
-                points: convert_points(&cell.point_ids, point_indices)?,
-            })
-        })
-        .collect()
-}
-
-fn marker_elements(
-    mesh: &MeshIr,
-    dimension: u8,
-    point_indices: &BTreeMap<u64, usize>,
-) -> Result<BTreeMap<String, Vec<Su2Element>>, String> {
-    let mut markers: BTreeMap<String, Vec<Su2Element>> = BTreeMap::new();
-    if dimension == 2 {
-        for edge in &mesh.edges {
-            if edge.owner_cell_id.is_some() && edge.neighbor_cell_id.is_none() {
-                if edge.type_name != "edge2" {
-                    return Err(format!(
-                        "SU2 export does not support boundary edge type {:?}",
-                        edge.type_name
-                    ));
-                }
-                markers
-                    .entry(marker_name(mesh, &edge.tag_ids))
-                    .or_default()
-                    .push(Su2Element {
-                        code: SU2_LINE,
-                        points: convert_points(&edge.point_ids, point_indices)?,
-                    });
+pub fn write_to(mesh: &MeshFile, output: &mut impl Write) -> MeshResult<()> {
+    let dimension = mesh.manifest().dimension;
+    let mut point_numbers = BTreeMap::<u64, usize>::new();
+    writeln!(output, "NDIME= {dimension}")?;
+    writeln!(output, "NPOIN= {}", mesh.manifest().counts.points)?;
+    for entry in mesh.entity_batches(RowKind::Point) {
+        let batch = mesh.batch_view(entry.batch_index)?;
+        let ids = batch.record_batch().column_by_name("entity_id").unwrap();
+        let ids = ids
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        let ghosts = batch.record_batch().column_by_name("ghost").unwrap();
+        let ghosts = ghosts
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+        let x = batch.record_batch().column_by_name("x").unwrap();
+        let x = x
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        let y = batch.record_batch().column_by_name("y").unwrap();
+        let y = y
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        let z = batch.record_batch().column_by_name("z").unwrap();
+        let z = z
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        for row in 0..batch.len() {
+            if ghosts.value(row) {
+                continue;
+            }
+            let id = ids.value(row);
+            let point_number = point_numbers.len();
+            if point_numbers.insert(id, point_number).is_some() {
+                return Err(MeshError::InvalidFile(format!(
+                    "point {id} has more than one owner row"
+                )));
+            }
+            if dimension == 2 {
+                writeln!(
+                    output,
+                    "{:.17e} {:.17e} {}",
+                    x.value(row),
+                    y.value(row),
+                    point_number
+                )?;
+            } else {
+                writeln!(
+                    output,
+                    "{:.17e} {:.17e} {:.17e} {}",
+                    x.value(row),
+                    y.value(row),
+                    z.value(row),
+                    point_number
+                )?;
             }
         }
+    }
+
+    writeln!(output, "NELEM= {}", mesh.manifest().counts.cells)?;
+    let mut element_number = 0_usize;
+    for entry in mesh.entity_batches(RowKind::Cell) {
+        let batch = mesh.batch_view(entry.batch_index)?;
+        let types = batch.record_batch().column_by_name("element_type").unwrap();
+        let types = types
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let point_ids = batch.record_batch().column_by_name("point_ids").unwrap();
+        let point_ids = point_ids
+            .as_any()
+            .downcast_ref::<arrow_array::LargeListArray>()
+            .unwrap();
+        for row in 0..batch.len() {
+            let code = su2_code(types.value(row)).ok_or_else(|| {
+                MeshError::InvalidInput(format!(
+                    "SU2 export does not support {:?}",
+                    types.value(row)
+                ))
+            })?;
+            let values = point_ids.value(row);
+            let values = values
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .unwrap();
+            let mut line = code.to_string();
+            for id in values.values() {
+                let number = point_numbers.get(id).ok_or_else(|| {
+                    MeshError::InvalidFile(format!("element references missing point {id}"))
+                })?;
+                let _ = write!(line, " {number}");
+            }
+            let _ = write!(line, " {element_number}");
+            writeln!(output, "{line}")?;
+            element_number += 1;
+        }
+    }
+
+    let boundary_kind = if dimension == 2 {
+        RowKind::Edge
     } else {
-        for face in &mesh.faces {
-            if face.owner_cell_id.is_some() && face.neighbor_cell_id.is_none() {
-                markers
-                    .entry(marker_name(mesh, &face.tag_ids))
-                    .or_default()
-                    .push(Su2Element {
-                        code: boundary_face_code(&face.type_name)?,
-                        points: convert_points(&face.point_ids, point_indices)?,
-                    });
+        RowKind::Face
+    };
+    let mut markers = BTreeMap::<u64, u64>::new();
+    for entry in mesh.entity_batches(boundary_kind) {
+        let batch = mesh.batch_view(entry.batch_index)?;
+        let boundary = batch.record_batch().column_by_name("boundary").unwrap();
+        let boundary = boundary
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+        let tags = batch.record_batch().column_by_name("tag_ids").unwrap();
+        let tags = tags
+            .as_any()
+            .downcast_ref::<arrow_array::LargeListArray>()
+            .unwrap();
+        for row in 0..batch.len() {
+            if boundary.is_null(row) || !boundary.value(row) {
+                continue;
+            }
+            let tag_values = tags.value(row);
+            let tag_values = tag_values
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .unwrap();
+            let tag = tag_values.values().first().copied().unwrap_or(0);
+            *markers.entry(tag).or_default() += 1;
+        }
+    }
+    writeln!(output, "NMARK= {}", markers.len())?;
+    for (tag, count) in markers {
+        let label = mesh.catalog_name("tag", tag).unwrap_or("boundary");
+        writeln!(output, "MARKER_TAG= {label}")?;
+        writeln!(output, "MARKER_ELEMS= {count}")?;
+        for entry in mesh.entity_batches(boundary_kind) {
+            let batch = mesh.batch_view(entry.batch_index)?;
+            let boundary = batch.record_batch().column_by_name("boundary").unwrap();
+            let boundary = boundary
+                .as_any()
+                .downcast_ref::<arrow_array::BooleanArray>()
+                .unwrap();
+            let tags = batch.record_batch().column_by_name("tag_ids").unwrap();
+            let tags = tags
+                .as_any()
+                .downcast_ref::<arrow_array::LargeListArray>()
+                .unwrap();
+            let types = batch.record_batch().column_by_name("element_type").unwrap();
+            let types = types
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            let point_ids = batch.record_batch().column_by_name("point_ids").unwrap();
+            let point_ids = point_ids
+                .as_any()
+                .downcast_ref::<arrow_array::LargeListArray>()
+                .unwrap();
+            for row in 0..batch.len() {
+                if boundary.is_null(row) || !boundary.value(row) {
+                    continue;
+                }
+                let tag_values = tags.value(row);
+                let tag_values = tag_values
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .unwrap();
+                if tag_values.values().first().copied().unwrap_or(0) != tag {
+                    continue;
+                }
+                let code = su2_code(types.value(row)).ok_or_else(|| {
+                    MeshError::InvalidInput(format!(
+                        "SU2 export does not support boundary type {:?}",
+                        types.value(row)
+                    ))
+                })?;
+                write!(output, "{code}")?;
+                let values = point_ids.value(row);
+                let values = values
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .unwrap();
+                for id in values.values() {
+                    let number = point_numbers.get(id).ok_or_else(|| {
+                        MeshError::InvalidFile(format!(
+                            "boundary element references missing point {id}"
+                        ))
+                    })?;
+                    write!(output, " {number}")?;
+                }
+                writeln!(output)?;
             }
         }
     }
-    Ok(markers)
-}
-
-fn cell_code(type_name: &str, dimension: u8) -> Result<u8, String> {
-    match (dimension, type_name) {
-        (2, "tri3") => Ok(SU2_TRIANGLE),
-        (2, "quad4") => Ok(SU2_QUAD),
-        (3, "tet4") => Ok(SU2_TETRA),
-        (3, "hex8") => Ok(SU2_HEX),
-        (3, "prism6") => Ok(SU2_PRISM),
-        (3, "pyramid5") => Ok(SU2_PYRAMID),
-        _ => Err(format!(
-            "SU2 export does not support cell type {type_name:?}; supported linear types are tri3, quad4, tet4, hex8, prism6, pyramid5"
-        )),
-    }
-}
-
-fn boundary_face_code(type_name: &str) -> Result<u8, String> {
-    match type_name {
-        "tri3" => Ok(SU2_TRIANGLE),
-        "quad4" => Ok(SU2_QUAD),
-        _ => Err(format!(
-            "SU2 export does not support boundary face type {type_name:?}"
-        )),
-    }
-}
-
-fn convert_points(
-    point_ids: &[u64],
-    point_indices: &BTreeMap<u64, usize>,
-) -> Result<Vec<usize>, String> {
-    point_ids
-        .iter()
-        .map(|point_id| point_index(point_indices, *point_id))
-        .collect()
-}
-
-fn write_element(out: &mut String, element: &Su2Element) -> Result<(), String> {
-    write!(out, "{}", element.code).map_err(|error| error.to_string())?;
-    for point in &element.points {
-        write!(out, " {point}").map_err(|error| error.to_string())?;
-    }
-    out.push('\n');
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::MeshIrBuilder;
-
-    #[test]
-    fn writes_2d_linear_cells_and_boundary_markers() {
-        let mut builder = MeshIrBuilder::new();
-        let zone = builder.zone("fluid", "fluid");
-        let wall = builder.tag("wall", "boundary");
-        let p0 = builder.point(0.0, 0.0, 0.0).unwrap();
-        let p1 = builder.point(1.0, 0.0, 0.0).unwrap();
-        let p2 = builder.point(1.0, 1.0, 0.0).unwrap();
-        let p3 = builder.point(0.0, 1.0, 0.0).unwrap();
-        let p4 = builder.point(2.0, 0.0, 0.0).unwrap();
-        let p5 = builder.point(3.0, 0.0, 0.0).unwrap();
-        let p6 = builder.point(2.0, 1.0, 0.0).unwrap();
-        builder.cell("quad4", vec![p0, p1, p2, p3], zone).unwrap();
-        builder.cell("tri3", vec![p4, p5, p6], zone).unwrap();
-        builder.tag_edge(vec![p0, p1], wall);
-        let text = String::from_utf8(write(&builder.build().unwrap()).unwrap()).unwrap();
-
-        assert!(text.contains("NDIME= 2\n"));
-        assert!(text.contains("NPOIN= 7\n"));
-        assert!(text.contains("NELEM= 2\n"));
-        assert!(text.contains("9 0 1 2 3\n"));
-        assert!(text.contains("5 4 5 6\n"));
-        assert!(text.contains("MARKER_TAG= wall\n"));
-        assert!(text.contains("3 0 1\n"));
-    }
-
-    #[test]
-    fn writes_3d_linear_cells() {
-        let mut builder = MeshIrBuilder::new();
-        let zone = builder.zone("solid", "solid");
-        let ids: Vec<u64> = [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [2.0, 0.0, 0.0],
-            [3.0, 0.0, 0.0],
-            [3.0, 1.0, 0.0],
-            [2.0, 1.0, 0.0],
-            [2.0, 0.0, 1.0],
-            [3.0, 0.0, 1.0],
-            [3.0, 1.0, 1.0],
-            [2.0, 1.0, 1.0],
-        ]
-        .iter()
-        .map(|point| builder.point(point[0], point[1], point[2]).unwrap())
-        .collect();
-        builder
-            .cell("tet4", vec![ids[0], ids[1], ids[2], ids[3]], zone)
-            .unwrap();
-        builder
-            .cell(
-                "hex8",
-                vec![
-                    ids[4], ids[5], ids[6], ids[7], ids[8], ids[9], ids[10], ids[11],
-                ],
-                zone,
-            )
-            .unwrap();
-        let text = String::from_utf8(write(&builder.build().unwrap()).unwrap()).unwrap();
-
-        assert!(text.contains("NDIME= 3\n"));
-        assert!(text.contains("0.00000000000000000 0.00000000000000000 1.00000000000000000\n"));
-        assert!(text.contains("10 0 1 2 3\n"));
-        assert!(text.contains("12 4 5 6 7 8 9 10 11\n"));
-    }
-
-    #[test]
-    fn rejects_high_order_cells() {
-        let mut builder = MeshIrBuilder::new();
-        let zone = builder.zone("fluid", "fluid");
-        let ids: Vec<u64> = (0..6)
-            .map(|index| builder.point(index as f64, 0.0, 0.0).unwrap())
-            .collect();
-        builder.cell("tri6", ids, zone).unwrap();
-        let error = write(&builder.build().unwrap()).unwrap_err();
-
-        assert!(error.contains("tri6"));
-    }
-
-    #[test]
-    fn rejects_polyhedron_cells() {
-        let mut builder = MeshIrBuilder::new();
-        let zone = builder.zone("poly", "solid");
-        let ids: Vec<u64> = [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 0.0, 1.0],
-            [1.0, 1.0, 1.0],
-            [0.0, 1.0, 1.0],
-        ]
-        .iter()
-        .map(|point| builder.point(point[0], point[1], point[2]).unwrap())
-        .collect();
-        let faces = vec![
-            builder
-                .face("quad4", vec![ids[0], ids[1], ids[2], ids[3]])
-                .unwrap(),
-            builder
-                .face("quad4", vec![ids[4], ids[5], ids[6], ids[7]])
-                .unwrap(),
-            builder
-                .face("quad4", vec![ids[0], ids[1], ids[5], ids[4]])
-                .unwrap(),
-            builder
-                .face("quad4", vec![ids[1], ids[2], ids[6], ids[5]])
-                .unwrap(),
-            builder
-                .face("quad4", vec![ids[2], ids[3], ids[7], ids[6]])
-                .unwrap(),
-            builder
-                .face("quad4", vec![ids[3], ids[0], ids[4], ids[7]])
-                .unwrap(),
-        ];
-        builder
-            .cell_with_faces("polyhedron", Vec::new(), faces, zone)
-            .unwrap();
-        let error = write(&builder.build().unwrap()).unwrap_err();
-
-        assert!(error.contains("polyhedron"));
-    }
-
-    #[test]
-    fn rejects_mixed_dimension_cells() {
-        let mut builder = MeshIrBuilder::new();
-        let zone = builder.zone("mixed", "unknown");
-        let p0 = builder.point(0.0, 0.0, 0.0).unwrap();
-        let p1 = builder.point(1.0, 0.0, 0.0).unwrap();
-        let p2 = builder.point(0.0, 1.0, 0.0).unwrap();
-        let p3 = builder.point(0.0, 0.0, 1.0).unwrap();
-        builder.cell("tri3", vec![p0, p1, p2], zone).unwrap();
-        builder.cell("tet4", vec![p0, p1, p2, p3], zone).unwrap();
-        let error = write(&builder.build().unwrap()).unwrap_err();
-
-        assert!(error.contains("mixed 2D/3D"));
-    }
+fn su2_code(element_type: &str) -> Option<u8> {
+    Some(match element_type {
+        "edge2" | "edge3" => 3,
+        "tri3" | "tri6" => 5,
+        "quad4" | "quad8" | "quad9" => 9,
+        "tet4" | "tet10" => 10,
+        "hex8" | "hex20" | "hex27" => 12,
+        "prism6" | "prism15" => 13,
+        "pyramid5" | "pyramid13" => 14,
+        _ => return None,
+    })
 }

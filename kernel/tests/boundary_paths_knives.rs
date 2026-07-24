@@ -67,7 +67,10 @@ fn polygon_stencil_on_a_sphere_has_no_antipodal_mirror() {
 
     let (ghost, curved) = stencil_knife(&root, "polygon", &clicks).expect("stencil");
 
-    assert!(curved, "45°-latitude clicks must raise the curved-surface flag");
+    assert!(
+        curved,
+        "45°-latitude clicks must raise the curved-surface flag"
+    );
     // The cap centroid direction is inside the stencil footprint and above
     // the one-sided extrusion's lower bound.
     assert!(ghost.eval_point(vec3(0.0, 0.0, 1.0)) < 0.0);
@@ -178,8 +181,7 @@ fn stencil_ghosts_round_trip_through_json() {
 
     let (ghost, _) = stencil_knife(&root, "polygon", &corners).expect("stencil");
     assert!(matches!(ghost.shape, Shape::Extrude(_)));
-    let round_trip =
-        ghost_from_json(&ghost_to_json(&ghost).expect("to json")).expect("from json");
+    let round_trip = ghost_from_json(&ghost_to_json(&ghost).expect("to json")).expect("from json");
     assert_eq!(
         std::mem::discriminant(&ghost.shape),
         std::mem::discriminant(&round_trip.shape)

@@ -64,7 +64,12 @@ pub struct Projection {
 /// never distances. On the interior the full step is the exact correction;
 /// backtracking only fires at C0 creases (equidistant seams), where honest
 /// non-convergence beats returning a bad point.
-pub fn project_to_zero_set(field: &Node, start: Vec3, normal_step: f64, zero_band: f64) -> Projection {
+pub fn project_to_zero_set(
+    field: &Node,
+    start: Vec3,
+    normal_step: f64,
+    zero_band: f64,
+) -> Projection {
     let value = field.eval_point(start);
     if value > zero_band {
         // Positive start: refused (interior-exactness contract).

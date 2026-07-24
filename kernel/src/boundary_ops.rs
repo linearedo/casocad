@@ -94,9 +94,12 @@ pub fn pick_sdf_surface(
 /// SDF gradient direction via central differences (`_sdf_normal`).
 pub fn sdf_normal(root: &Node, point: Vec3, step: f64) -> Vec3 {
     let gradient = vec3(
-        root.eval_point(point + vec3(step, 0.0, 0.0)) - root.eval_point(point - vec3(step, 0.0, 0.0)),
-        root.eval_point(point + vec3(0.0, step, 0.0)) - root.eval_point(point - vec3(0.0, step, 0.0)),
-        root.eval_point(point + vec3(0.0, 0.0, step)) - root.eval_point(point - vec3(0.0, 0.0, step)),
+        root.eval_point(point + vec3(step, 0.0, 0.0))
+            - root.eval_point(point - vec3(step, 0.0, 0.0)),
+        root.eval_point(point + vec3(0.0, step, 0.0))
+            - root.eval_point(point - vec3(0.0, step, 0.0)),
+        root.eval_point(point + vec3(0.0, 0.0, step))
+            - root.eval_point(point - vec3(0.0, 0.0, step)),
     );
     gradient * (1.0 / gradient.length().max(1.0e-12))
 }
@@ -170,7 +173,13 @@ pub fn pick_boundary_owner(
     hit_tolerance: f64,
     maximum_travel: f64,
 ) -> Option<(Vec3, u32, Vec3)> {
-    let point = pick_sdf_surface(root, ray_origin, ray_direction, hit_tolerance, maximum_travel)?;
+    let point = pick_sdf_surface(
+        root,
+        ray_origin,
+        ray_direction,
+        hit_tolerance,
+        maximum_travel,
+    )?;
     let (_distance, owner_id) = evaluate_with_attribution(root, point);
     let normal = sdf_normal(root, point, hit_tolerance);
     Some((point, owner_id, normal))
@@ -180,9 +189,21 @@ fn rotate_local(point: Vec3, axis: RotationAxis, angle_degrees: f64) -> Vec3 {
     let angle = angle_degrees.to_radians();
     let (s, c) = (angle.sin(), angle.cos());
     match axis {
-        RotationAxis::X => vec3(point.x, c * point.y + s * point.z, -s * point.y + c * point.z),
-        RotationAxis::Y => vec3(c * point.x - s * point.z, point.y, s * point.x + c * point.z),
-        RotationAxis::Z => vec3(c * point.x + s * point.y, -s * point.x + c * point.y, point.z),
+        RotationAxis::X => vec3(
+            point.x,
+            c * point.y + s * point.z,
+            -s * point.y + c * point.z,
+        ),
+        RotationAxis::Y => vec3(
+            c * point.x - s * point.z,
+            point.y,
+            s * point.x + c * point.z,
+        ),
+        RotationAxis::Z => vec3(
+            c * point.x + s * point.y,
+            -s * point.x + c * point.y,
+            point.z,
+        ),
     }
 }
 
@@ -308,8 +329,7 @@ fn bounding_diagonal(node: &Node) -> f64 {
 /// Scale-relative on-surface band: owner extent when resolvable, else the
 /// Domain extent (`region_tolerance`).
 pub fn region_tolerance(root: &Node, region: &BoundaryRegion) -> f64 {
-    let reference =
-        find_node_by_object_id(root, region.owner_object_id).unwrap_or(root);
+    let reference = find_node_by_object_id(root, region.owner_object_id).unwrap_or(root);
     let mut diagonal = bounding_diagonal(reference);
     if !diagonal.is_finite() || diagonal <= 0.0 {
         diagonal = bounding_diagonal(root).max(1.0e-9);
@@ -442,19 +462,14 @@ pub fn owner_outside_direction_vector(owner: &Node, direction: u8) -> Option<Vec
 }
 
 fn frame_directions(frame: &Frame) -> Vec<Vec3> {
-    vec![
-        -frame.u, frame.u, -frame.v, frame.v, -frame.w, frame.w,
-    ]
+    vec![-frame.u, frame.u, -frame.v, frame.v, -frame.w, frame.w]
 }
 
 fn owner_outside_direction_vectors(owner: &Node) -> Vec<Vec3> {
     match &owner.shape {
-        Shape::PlacedSdf2D(placed) => vec![
-            -placed.axis_u,
-            placed.axis_u,
-            -placed.axis_v,
-            placed.axis_v,
-        ],
+        Shape::PlacedSdf2D(placed) => {
+            vec![-placed.axis_u, placed.axis_u, -placed.axis_v, placed.axis_v]
+        }
         Shape::Box3(shape) => frame_directions(&shape.frame),
         Shape::BoxFrame(shape) => frame_directions(&shape.frame),
         Shape::CappedCone(shape) => frame_directions(&shape.frame),
@@ -577,7 +592,12 @@ fn surface_patches_for_node(
             out.push(BoundarySurfacePatch {
                 owner_object_id: node.object_id,
                 patch_id: patch_id("side_wall", cut_surface),
-                patch_type: if cut_surface { "cut_surface" } else { "side_wall" }.to_string(),
+                patch_type: if cut_surface {
+                    "cut_surface"
+                } else {
+                    "side_wall"
+                }
+                .to_string(),
                 owner: node.clone(),
                 normal: None,
                 outside_direction: None,
@@ -624,7 +644,12 @@ fn surface_patches_for_node(
             out.push(BoundarySurfacePatch {
                 owner_object_id: node.object_id,
                 patch_id: patch_id("surface", cut_surface),
-                patch_type: if cut_surface { "cut_surface" } else { "surface" }.to_string(),
+                patch_type: if cut_surface {
+                    "cut_surface"
+                } else {
+                    "surface"
+                }
+                .to_string(),
                 owner: node.clone(),
                 normal: None,
                 outside_direction: None,
@@ -654,12 +679,30 @@ fn curve_patches_for_placed(
         if let Profile2D::Binary { operation, .. } = &placed.profile {
             match operation {
                 BooleanOp1D::Difference => {
-                    curve_patches_for_placed(owner, &placed.sources[0], cut_surface, normal_sign, out);
+                    curve_patches_for_placed(
+                        owner,
+                        &placed.sources[0],
+                        cut_surface,
+                        normal_sign,
+                        out,
+                    );
                     curve_patches_for_placed(owner, &placed.sources[1], true, -normal_sign, out);
                 }
                 _ => {
-                    curve_patches_for_placed(owner, &placed.sources[0], cut_surface, normal_sign, out);
-                    curve_patches_for_placed(owner, &placed.sources[1], cut_surface, normal_sign, out);
+                    curve_patches_for_placed(
+                        owner,
+                        &placed.sources[0],
+                        cut_surface,
+                        normal_sign,
+                        out,
+                    );
+                    curve_patches_for_placed(
+                        owner,
+                        &placed.sources[1],
+                        cut_surface,
+                        normal_sign,
+                        out,
+                    );
                 }
             }
             return;
@@ -676,7 +719,8 @@ fn curve_patches_for_placed(
     let Shape::PlacedSdf2D(owner_placed) = &owner.shape else {
         return;
     };
-    let in_plane = |point: Point2| placed.origin + placed.axis_u * point[0] + placed.axis_v * point[1];
+    let in_plane =
+        |point: Point2| placed.origin + placed.axis_u * point[0] + placed.axis_v * point[1];
     let edges: Option<Vec<ProfileEdge>> = match &placed.profile {
         Profile2D::Rectangle { center, half_size } => Some(rectangle_edges(*center, *half_size)),
         Profile2D::Square { center, half_size } => {
@@ -725,7 +769,12 @@ fn curve_patches_for_placed(
             out.push(BoundarySurfacePatch {
                 owner_object_id: owner.object_id,
                 patch_id: patch_id(&format!("{prefix}outline"), cut_surface),
-                patch_type: if cut_surface { "cut_surface" } else { "outline" }.to_string(),
+                patch_type: if cut_surface {
+                    "cut_surface"
+                } else {
+                    "outline"
+                }
+                .to_string(),
                 owner: node.clone(),
                 normal: None,
                 outside_direction: None,
@@ -742,10 +791,7 @@ type ProfileEdge = (String, Point2, Point2, [f64; 2]);
 
 /// The four edges of an axis-aligned rectangle in profile coordinates:
 /// (name, start, end, outward normal).
-fn rectangle_edges(
-    center: Point2,
-    half_size: Point2,
-) -> Vec<ProfileEdge> {
+fn rectangle_edges(center: Point2, half_size: Point2) -> Vec<ProfileEdge> {
     let (cx, cy) = (center[0], center[1]);
     let (hx, hy) = (half_size[0], half_size[1]);
     vec![
@@ -920,13 +966,13 @@ fn surface_patch_ray_points(
             );
             let face = patch_face(patch);
             if face == "side_wall" {
-                let a = direction_local.x * direction_local.x
-                    + direction_local.y * direction_local.y;
+                let a =
+                    direction_local.x * direction_local.x + direction_local.y * direction_local.y;
                 if a <= 1.0e-12 {
                     return Vec::new();
                 }
-                let b = 2.0
-                    * (origin_local.x * direction_local.x + origin_local.y * direction_local.y);
+                let b =
+                    2.0 * (origin_local.x * direction_local.x + origin_local.y * direction_local.y);
                 let c = origin_local.x * origin_local.x + origin_local.y * origin_local.y
                     - radius * radius;
                 let discriminant = b * b - 4.0 * a * c;
@@ -999,19 +1045,15 @@ fn surface_patch_contains(patch: &BoundarySurfacePatch, point: Vec3, tolerance: 
                 return false;
             };
             let local_components = [local.x, local.y, local.z];
-            let half_components = [
-                shape.half_size.x,
-                shape.half_size.y,
-                shape.half_size.z,
-            ];
+            let half_components = [shape.half_size.x, shape.half_size.y, shape.half_size.z];
             if (local_components[index] - sign * half_components[index]).abs()
                 > (4.0 * tolerance).max(PATCH_TOLERANCE)
             {
                 return false;
             }
-            (0..3).filter(|axis| *axis != index).all(|axis| {
-                local_components[axis].abs() <= half_components[axis] + PATCH_TOLERANCE
-            })
+            (0..3)
+                .filter(|axis| *axis != index)
+                .all(|axis| local_components[axis].abs() <= half_components[axis] + PATCH_TOLERANCE)
         }
         Shape::Cylinder(_) | Shape::Cone(_) | Shape::CappedCone(_) => {
             let owner = &patch.owner;
@@ -1226,9 +1268,8 @@ fn pick_curve_patch(
         let snapped = match curve {
             CurvePatchKind::Edge { start, end, .. } => {
                 let axis = *end - *start;
-                let along = ((plane_point - *start).dot(axis)
-                    / axis.dot(axis).max(1.0e-24))
-                .clamp(0.0, 1.0);
+                let along = ((plane_point - *start).dot(axis) / axis.dot(axis).max(1.0e-24))
+                    .clamp(0.0, 1.0);
                 *start + axis * along
             }
             CurvePatchKind::Outline => {
@@ -1523,11 +1564,15 @@ fn curve_patch_scope_volume(
                 return None;
             };
             let band = |offset: f64| -> Option<Node> {
-                let profile =
-                    Profile2D::distance_offset(placed.profile.clone(), offset).ok()?;
-                let section =
-                    PlacedSdf2D::new(profile, placed.origin, placed.axis_u, placed.axis_v, Vec::new())
-                        .ok()?;
+                let profile = Profile2D::distance_offset(placed.profile.clone(), offset).ok()?;
+                let section = PlacedSdf2D::new(
+                    profile,
+                    placed.origin,
+                    placed.axis_u,
+                    placed.axis_v,
+                    Vec::new(),
+                )
+                .ok()?;
                 Some(Node {
                     name: format!("{}_{}_band", patch.owner.name, patch.patch_id),
                     object_id: 0,
@@ -1580,7 +1625,11 @@ fn patch_preview_volume(patch: &BoundarySurfacePatch, thickness: f64) -> Option<
             let frame = *cylinder_like_frame(owner)?;
             match patch_face(patch) {
                 "-Z_cap" | "+Z_cap" => {
-                    let sign = if patch_face(patch) == "-Z_cap" { -1.0 } else { 1.0 };
+                    let sign = if patch_face(patch) == "-Z_cap" {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     let cap_center =
                         center + frame.w * (sign * half_height) + normal * (thickness * 2.0);
                     Some(Node {
@@ -1673,8 +1722,7 @@ pub fn boundary_region_scope_mask(
             CurvePatchKind::Edge { .. } => thickness,
             CurvePatchKind::Outline => thickness + tolerance.max(PATCH_TOLERANCE),
         };
-        let Some(scope) = curve_patch_scope_volume(root, &patch, &curve, lateral, thickness)
-        else {
+        let Some(scope) = curve_patch_scope_volume(root, &patch, &curve, lateral, thickness) else {
             return Ok(vec![true; points.len()]);
         };
         return Ok(points

@@ -135,7 +135,9 @@ fn clip_to_boundary(
     let (order, wrap): (Vec<usize>, bool) = if closed {
         match mask.iter().position(|m| !*m) {
             Some(start) => (
-                (0..=points.len()).map(|i| (start + i) % points.len()).collect(),
+                (0..=points.len())
+                    .map(|i| (start + i) % points.len())
+                    .collect(),
                 false,
             ),
             None => ((0..points.len()).collect(), true),

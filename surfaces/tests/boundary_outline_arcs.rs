@@ -65,8 +65,14 @@ fn fixture(polygon: Vec<[f64; 2]>) -> Node {
         "domain",
         12,
         Shape::PlacedSdf2D(
-            PlacedSdf2D::new(merged, Vec3::ZERO, axis_u, axis_v, vec![blob_node, poly_node])
-                .expect("merged"),
+            PlacedSdf2D::new(
+                merged,
+                Vec3::ZERO,
+                axis_u,
+                axis_v,
+                vec![blob_node, poly_node],
+            )
+            .expect("merged"),
         ),
     )
 }
@@ -81,7 +87,11 @@ fn arcs_for(root: &Node, patch_id: &str) -> Vec<Vec<Vec3>> {
 
 fn total_length(arcs: &[Vec<Vec3>]) -> f64 {
     arcs.iter()
-        .map(|arc| arc.windows(2).map(|pair| (pair[1] - pair[0]).length()).sum::<f64>())
+        .map(|arc| {
+            arc.windows(2)
+                .map(|pair| (pair[1] - pair[0]).length())
+                .sum::<f64>()
+        })
         .sum()
 }
 
@@ -169,9 +179,15 @@ fn bite_arcs_end_exactly_on_the_junctions() {
     let bottom = arcs_for(&root, "cut_surface.hole.edge_0");
     assert_eq!(bottom.len(), 1);
     let arc = &bottom[0];
-    assert!((arc[0] - vec3(3.0, -1.0, 0.0)).length() < 1.0e-12, "starts at the corner");
+    assert!(
+        (arc[0] - vec3(3.0, -1.0, 0.0)).length() < 1.0e-12,
+        "starts at the corner"
+    );
     let junction = arc[arc.len() - 1];
-    assert!((junction.y + 1.0).abs() < 1.0e-12, "junction stays on the edge line");
+    assert!(
+        (junction.y + 1.0).abs() < 1.0e-12,
+        "junction stays on the edge line"
+    );
     assert!(
         blob.eval_point(junction).abs() < 1.0e-6,
         "junction lies on the blob outline (root-found, not sampled): |blob| = {}",

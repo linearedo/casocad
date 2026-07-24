@@ -32,9 +32,9 @@ fn classification_covers_tagged_and_untagged_boundary() {
     let domain = domains.get("von_karman_fluid").expect("fluid");
 
     let points = [
-        vec3(0.0, 0.0, 0.5),   // -X face centre: the inlet direction region
-        vec3(1.95, 0.0, 0.5),  // cylinder wall: untagged boundary
-        vec3(0.5, 0.0, 0.5),   // interior
+        vec3(0.0, 0.0, 0.5),  // -X face centre: the inlet direction region
+        vec3(1.95, 0.0, 0.5), // cylinder wall: untagged boundary
+        vec3(0.5, 0.0, 0.5),  // interior
     ];
     let classes = domain
         .classify_boundary(&points, BoundaryBand::UnprojectedSamples)
@@ -82,7 +82,10 @@ fn named_bands_select_the_tolerance() {
     );
     // Custom with the same absolute value behaves identically to the name.
     let custom = domain
-        .classify_boundary(&sample, BoundaryBand::Custom(1e-9 * domain.bounds.diagonal()))
+        .classify_boundary(
+            &sample,
+            BoundaryBand::Custom(1e-9 * domain.bounds.diagonal()),
+        )
         .expect("classify");
     assert_eq!(custom[0].on_boundary, tight_band[0].on_boundary);
 
@@ -175,7 +178,11 @@ fn classification_precedence_is_cuts_then_scope_then_creation_order() {
         .classify_boundary(&[minus_x], BoundaryBand::UnprojectedSamples)
         .expect("classify");
     assert!(
-        classes[0].region_name.as_deref().expect("a region wins").contains("inside"),
+        classes[0]
+            .region_name
+            .as_deref()
+            .expect("a region wins")
+            .contains("inside"),
         "the knife-cut region is the most specific"
     );
 }
@@ -400,7 +407,16 @@ fn consumed_extrude_section_reports_a_meshing_error() {
         .expect("circle");
     document.rename(section, "profile").expect("rename");
     document
-        .solid_from_2d(section, "extrude", Some(1.0), RevolveAxis::U, None, None, None, 360.0)
+        .solid_from_2d(
+            section,
+            "extrude",
+            Some(1.0),
+            RevolveAxis::U,
+            None,
+            None,
+            None,
+            360.0,
+        )
         .expect("extrude");
     document
         .set_domain_root(section, DomainKind::Fluid)

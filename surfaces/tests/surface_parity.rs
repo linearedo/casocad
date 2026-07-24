@@ -73,7 +73,9 @@ fn build_fixture(name: &str) -> Node {
         ),
         "box_oriented" => node(
             name,
-            Shape::Box3(Box3::new(vec3(0.0, 0.2, 0.1), vec3(0.4, 0.6, 0.25), orient()).expect("box")),
+            Shape::Box3(
+                Box3::new(vec3(0.0, 0.2, 0.1), vec3(0.4, 0.6, 0.25), orient()).expect("box"),
+            ),
         ),
         "cylinder" => node(
             name,
@@ -105,8 +107,13 @@ fn build_fixture(name: &str) -> Node {
         "boxframe" => node(
             name,
             Shape::BoxFrame(
-                BoxFrame::new(vec3(0.0, 0.1, 0.0), vec3(0.5, 0.4, 0.3), 0.06, IDENTITY_FRAME)
-                    .expect("box frame"),
+                BoxFrame::new(
+                    vec3(0.0, 0.1, 0.0),
+                    vec3(0.5, 0.4, 0.3),
+                    0.06,
+                    IDENTITY_FRAME,
+                )
+                .expect("box frame"),
             ),
         ),
         "polyline_tube_round" => node(
@@ -209,7 +216,8 @@ fn build_fixture(name: &str) -> Node {
             let cyl = node(
                 "op_cyl",
                 Shape::Cylinder(
-                    Cylinder::new(vec3(0.0, 0.2, 0.0), 0.25, 0.6, IDENTITY_FRAME).expect("cylinder"),
+                    Cylinder::new(vec3(0.0, 0.2, 0.0), 0.25, 0.6, IDENTITY_FRAME)
+                        .expect("cylinder"),
                 ),
             );
             let torus = node(
@@ -223,7 +231,10 @@ fn build_fixture(name: &str) -> Node {
                 Shape::intersection(op_box(), op_sphere()).expect("intersection"),
             );
             let nested_u = node("nested_u", Shape::union(cyl, torus).expect("union"));
-            node(name, Shape::difference(nested_i, nested_u).expect("difference"))
+            node(
+                name,
+                Shape::difference(nested_i, nested_u).expect("difference"),
+            )
         }
         "placed2d_circle" => section(Profile2D::circle([0.1, -0.05], 0.45).expect("circle")),
         "placed2d_polygon" => section(
@@ -318,10 +329,7 @@ fn surface_metrics_match_python() {
         let surface = build_viewport_surface(&fixture, key);
         let mut mismatches: Vec<String> = Vec::new();
         if status_str(surface.status) != status {
-            mismatches.push(format!(
-                "status {} != {status}",
-                status_str(surface.status)
-            ));
+            mismatches.push(format!("status {} != {status}", status_str(surface.status)));
         }
         if surface.vertex_count() != vertex_count {
             mismatches.push(format!(
@@ -336,10 +344,7 @@ fn surface_metrics_match_python() {
             ));
         }
         if surface.wire_indices.len() != wire_len {
-            mismatches.push(format!(
-                "wire {} != {wire_len}",
-                surface.wire_indices.len()
-            ));
+            mismatches.push(format!("wire {} != {wire_len}", surface.wire_indices.len()));
         }
         // Max |sdf| at used vertices: same construction should agree closely.
         if !surface.vertices.is_empty() && !surface.indices.is_empty() {
@@ -354,7 +359,9 @@ fn surface_metrics_match_python() {
                 })
                 .collect();
             let values = fixture.eval(&points);
-            let rust_err = values.iter().fold(0.0f64, |acc, value| acc.max(value.abs()));
+            let rust_err = values
+                .iter()
+                .fold(0.0f64, |acc, value| acc.max(value.abs()));
             let tolerance = 1.0e-6_f64.max(max_err * 0.2);
             if (rust_err - max_err).abs() > tolerance {
                 mismatches.push(format!("max_err {rust_err:.6e} != {max_err:.6e}"));
@@ -365,7 +372,10 @@ fn surface_metrics_match_python() {
         }
         checked += 1;
     }
-    assert!(checked >= 40, "expected the full golden set, found {checked}");
+    assert!(
+        checked >= 40,
+        "expected the full golden set, found {checked}"
+    );
     assert!(
         failures.is_empty(),
         "surface parity failures:\n  {}",

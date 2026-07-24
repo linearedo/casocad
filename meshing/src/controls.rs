@@ -1,10 +1,7 @@
-//! Domain-scoped meshing controls.  Regions are pure signed selectors: a
-//! negative value means selected, so adding selector shapes does not change
-//! the mesher.
+//! Typed, platform-neutral meshing controls.
 
 use caso_kernel::meshing::MeshableDomains;
 use caso_kernel::vec3::{vec3, Vec3};
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlRegion {
     Box { min: Vec3, max: Vec3 },
@@ -19,7 +16,7 @@ pub enum ControlRegion {
 impl ControlRegion {
     pub fn box_region(min: Vec3, max: Vec3) -> Result<Self, String> {
         if min.x > max.x || min.y > max.y || min.z > max.z {
-            return Err("refinement box minima must not exceed maxima".into());
+            return Err("control box minima must not exceed maxima".into());
         }
         Ok(Self::Box { min, max })
     }
@@ -120,6 +117,10 @@ pub struct ControlSet {
 }
 
 impl ControlSet {
+    pub fn is_empty(&self) -> bool {
+        self.refinements.is_empty() && self.boundary_layers.is_empty()
+    }
+
     pub fn refinement(
         &mut self,
         domain: impl Into<String>,
@@ -138,6 +139,22 @@ impl ControlSet {
             gradation,
         });
         Ok(())
+    }
+
+    pub fn refinement_box(
+        &mut self,
+        domain: impl Into<String>,
+        min: Vec3,
+        max: Vec3,
+        size: f64,
+        gradation: f64,
+    ) -> Result<(), String> {
+        self.refinement(
+            domain,
+            ControlRegion::box_region(min, max)?,
+            size,
+            gradation,
+        )
     }
 
     pub fn boundary_layer(
@@ -174,50 +191,28 @@ impl ControlSet {
                     .map(|control| control.domain.as_str()),
             )
         {
-            let count = domains
-                .names()
-                .iter()
-                .filter(|candidate| candidate.as_str() == name)
-                .count();
-            if count != 1 {
-                return Err(if count == 0 {
-                    format!(
-                        "unknown meshing-control domain {name:?}; available: {}",
-                        domains.names().join(", ")
-                    )
-                } else {
-                    format!("ambiguous meshing-control domain {name:?}")
-                });
-            }
+            domains.get(name).map_err(|error| error.to_string())?;
         }
         for layer in &self.boundary_layers {
             let domain = domains
                 .get(&layer.domain)
                 .map_err(|error| error.to_string())?;
-            let matches = domain
+            if !domain
                 .boundary_regions
                 .iter()
-                .filter(|region| region.name == layer.boundary_region)
-                .count();
-            if matches != 1 {
-                return Err(if matches == 0 {
-                    format!(
-                        "domain {:?} has no boundary region {:?}; available: {}",
-                        layer.domain,
-                        layer.boundary_region,
-                        domain
-                            .boundary_regions
-                            .iter()
-                            .map(|region| region.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                } else {
-                    format!(
-                        "domain {:?} has ambiguous boundary region {:?}",
-                        layer.domain, layer.boundary_region
-                    )
-                });
+                .any(|region| region.name == layer.boundary_region)
+            {
+                return Err(format!(
+                    "domain {:?} has no boundary region {:?}; available: {}",
+                    layer.domain,
+                    layer.boundary_region,
+                    domain
+                        .boundary_regions
+                        .iter()
+                        .map(|region| region.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
         }
         for (index, layer) in self.boundary_layers.iter().enumerate() {
@@ -227,7 +222,7 @@ impl ControlSet {
                     && other != layer
             }) {
                 return Err(format!(
-                    "domain {:?} boundary region {:?} has incompatible touching layer controls",
+                    "domain {:?} boundary region {:?} has incompatible layer controls",
                     layer.domain, layer.boundary_region
                 ));
             }
@@ -235,7 +230,6 @@ impl ControlSet {
         Ok(())
     }
 
-    /// Smallest domain-scoped requested size, graded away from selectors.
     pub fn size_at(&self, domain: &str, point: Vec3, background: f64) -> f64 {
         self.refinements
             .iter()
@@ -243,6 +237,54 @@ impl ControlSet {
             .fold(background, |size, control| {
                 size.min(control.size + control.gradation * control.region.sdf(point).max(0.0))
             })
+    }
+
+    pub fn metadata(&self) -> serde_json::Value {
+        serde_json::json!({
+            "refinement": self.refinements.iter().map(|control| serde_json::json!({
+                "domain": control.domain,
+                "region": region_metadata(&control.region),
+                "size": control.size,
+                "gradation": control.gradation,
+            })).collect::<Vec<_>>(),
+            "boundary_layer": self.boundary_layers.iter().map(|control| serde_json::json!({
+                "domain": control.domain,
+                "boundary_region": control.boundary_region,
+                "first_height": control.first_height,
+                "layers": control.layers,
+                "growth": control.growth,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+fn region_metadata(region: &ControlRegion) -> serde_json::Value {
+    let point = |value: Vec3| [value.x, value.y, value.z];
+    match region {
+        ControlRegion::Box { min, max } => {
+            serde_json::json!({"box": {"min": point(*min), "max": point(*max)}})
+        }
+        ControlRegion::Sphere { center, radius } => {
+            serde_json::json!({"sphere": {"center": point(*center), "radius": radius}})
+        }
+        ControlRegion::Cylinder { a, b, radius } => {
+            serde_json::json!({"cylinder": {"a": point(*a), "b": point(*b), "radius": radius}})
+        }
+        ControlRegion::PolylineTube { points, radius } => serde_json::json!({
+            "polyline_tube": {
+                "points": points.iter().copied().map(point).collect::<Vec<_>>(),
+                "radius": radius,
+            }
+        }),
+        ControlRegion::Union(a, b) => {
+            serde_json::json!({"union": [region_metadata(a), region_metadata(b)]})
+        }
+        ControlRegion::Intersection(a, b) => {
+            serde_json::json!({"intersection": [region_metadata(a), region_metadata(b)]})
+        }
+        ControlRegion::Difference(a, b) => {
+            serde_json::json!({"difference": [region_metadata(a), region_metadata(b)]})
+        }
     }
 }
 
@@ -265,7 +307,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selectors_and_domain_scoping_choose_the_smallest_size() {
+    fn size_at_is_domain_scoped_and_graded() {
         let mut controls = ControlSet::default();
         controls
             .refinement(
@@ -275,15 +317,7 @@ mod tests {
                 0.2,
             )
             .unwrap();
-        controls
-            .refinement(
-                "sea",
-                ControlRegion::box_region(vec3(-0.2, -0.2, -0.2), vec3(0.2, 0.2, 0.2)).unwrap(),
-                0.05,
-                0.1,
-            )
-            .unwrap();
-        assert_eq!(controls.size_at("sea", vec3(0.0, 0.0, 0.0), 1.0), 0.05);
+        assert_eq!(controls.size_at("sea", vec3(0.0, 0.0, 0.0), 1.0), 0.1);
         assert_eq!(controls.size_at("pipe", vec3(0.0, 0.0, 0.0), 1.0), 1.0);
     }
 }

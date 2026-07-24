@@ -11,5 +11,9 @@ workspace = true
 [dependencies]
 bytemuck = "1.25.0"
 caso-kernel = { path = "../kernel" }
+caso-meshing = { path = "../meshing" }
 caso-surfaces = { path = "../surfaces" }
 wgpu = "29"
+
+[dev-dependencies]
+pollster = "0.4"
