@@ -17,6 +17,7 @@ pub const LOD_EXPAND_PIXELS: f32 = 256.0;
 pub const LOD_COLLAPSE_PIXELS: f32 = 192.0;
 const LINE_INSTANCE_BYTES: usize = 9 * std::mem::size_of::<f32>();
 const FOCUS_TILE_LIMIT: usize = 4;
+pub const QUALITY_BANDS: usize = 32;
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_WORKER_REQUESTS: usize = 4;
 
@@ -115,11 +116,26 @@ impl Default for RendererBudgets {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenderLineColor {
+    Catalog(u64),
+    Quality(Option<f64>),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MeshRenderStyle {
+    #[default]
+    Catalog,
+    Quality,
+    BoundaryTags,
+    SelectedBoundaryQuality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderLine {
     pub edge_id: u64,
     pub a: [f32; 3],
     pub b: [f32; 3],
-    pub color_id: u64,
+    pub color: RenderLineColor,
     pub opacity: f32,
     pub highlighted: bool,
     pub selected: bool,
@@ -199,6 +215,7 @@ struct DecodeRequest {
     key: MeshTileKey,
     entities: Option<Vec<SelectedEntity>>,
     query: MeshQuery,
+    style: MeshRenderStyle,
     selected_ids: BTreeSet<u64>,
     highlighted_ids: BTreeSet<u64>,
     opacity: f32,
@@ -269,6 +286,7 @@ pub struct MeshRendererCache {
     selected_ids: BTreeSet<u64>,
     highlighted_ids: BTreeSet<u64>,
     opacity: f32,
+    style: MeshRenderStyle,
     selection_ms: f32,
     decode_ms: f32,
     line_build_ms: f32,
@@ -307,6 +325,7 @@ impl MeshRendererCache {
             selected_ids: BTreeSet::new(),
             highlighted_ids: BTreeSet::new(),
             opacity: 1.0,
+            style: MeshRenderStyle::Catalog,
             selection_ms: 0.0,
             decode_ms: 0.0,
             line_build_ms: 0.0,
@@ -405,6 +424,23 @@ impl MeshRendererCache {
         highlighted_ids: &BTreeSet<u64>,
         opacity: f32,
     ) -> MeshResult<IncrementalLodPreparation> {
+        self.prepare_lod_incremental_styled(
+            query,
+            MeshRenderStyle::Catalog,
+            selected_ids,
+            highlighted_ids,
+            opacity,
+        )
+    }
+
+    pub fn prepare_lod_incremental_styled(
+        &mut self,
+        query: MeshQuery,
+        style: MeshRenderStyle,
+        selected_ids: &BTreeSet<u64>,
+        highlighted_ids: &BTreeSet<u64>,
+        opacity: f32,
+    ) -> MeshResult<IncrementalLodPreparation> {
         self.tick = self.tick.wrapping_add(1);
         let opacity = opacity.clamp(0.0, 1.0);
         let query_changed = self.query.as_ref() != Some(&query);
@@ -412,11 +448,13 @@ impl MeshRendererCache {
             || &self.selected_ids != selected_ids
             || &self.highlighted_ids != highlighted_ids
             || self.opacity != opacity
+            || self.style != style
         {
             self.query = Some(query.clone());
             self.selected_ids = selected_ids.clone();
             self.highlighted_ids = highlighted_ids.clone();
             self.opacity = opacity;
+            self.style = style;
             self.advance_generation();
             if query_changed {
                 self.decoded.clear();
@@ -479,6 +517,7 @@ impl MeshRendererCache {
                 key,
                 entities,
                 query: query.clone(),
+                style,
                 selected_ids: selected_ids.clone(),
                 highlighted_ids: highlighted_ids.clone(),
                 opacity,
@@ -499,12 +538,20 @@ impl MeshRendererCache {
             let entities = self.take_decoded(key);
             self.pending.pop_front();
             let tile = if let Some(entities) = entities {
-                build_decoded_tile(entities, selected_ids, highlighted_ids, opacity, None)
+                build_decoded_tile(
+                    entities,
+                    style,
+                    selected_ids,
+                    highlighted_ids,
+                    opacity,
+                    None,
+                )
             } else {
                 decode_and_build(
                     &self.service,
                     key,
                     &query,
+                    style,
                     selected_ids,
                     highlighted_ids,
                     opacity,
@@ -767,6 +814,7 @@ fn decode_and_build(
     service: &MeshQueryService,
     key: MeshTileKey,
     query: &MeshQuery,
+    style: MeshRenderStyle,
     selected_ids: &BTreeSet<u64>,
     highlighted_ids: &BTreeSet<u64>,
     opacity: f32,
@@ -776,6 +824,7 @@ fn decode_and_build(
     let decode_ms = elapsed_ms(started);
     Ok(build_decoded_tile(
         entities,
+        style,
         selected_ids,
         highlighted_ids,
         opacity,
@@ -785,13 +834,14 @@ fn decode_and_build(
 
 fn build_decoded_tile(
     entities: Vec<SelectedEntity>,
+    style: MeshRenderStyle,
     selected_ids: &BTreeSet<u64>,
     highlighted_ids: &BTreeSet<u64>,
     opacity: f32,
     decode_ms: Option<f32>,
 ) -> DecodedTile {
     let started = Instant::now();
-    let lines = build_lines(&entities, selected_ids, highlighted_ids, opacity).into();
+    let lines = build_lines(&entities, style, selected_ids, highlighted_ids, opacity).into();
     DecodedTile {
         entities,
         lines,
@@ -805,6 +855,7 @@ fn run_decode_request(service: &MeshQueryService, request: DecodeRequest) -> Dec
     let result = if let Some(entities) = request.entities {
         Ok(build_decoded_tile(
             entities,
+            request.style,
             &request.selected_ids,
             &request.highlighted_ids,
             request.opacity,
@@ -815,6 +866,7 @@ fn run_decode_request(service: &MeshQueryService, request: DecodeRequest) -> Dec
             service,
             request.key,
             &request.query,
+            request.style,
             &request.selected_ids,
             &request.highlighted_ids,
             request.opacity,
@@ -833,6 +885,7 @@ fn load_tile(
     query: &MeshQuery,
 ) -> MeshResult<Vec<SelectedEntity>> {
     match key.detail {
+        MeshTileDetail::Preview if query_requires_exact_analysis(query) => Ok(Vec::new()),
         MeshTileDetail::Preview => load_preview(service.mesh_file(), key.node_id, query),
         MeshTileDetail::Exact => {
             let nodes = BTreeSet::from([key.node_id]);
@@ -844,6 +897,17 @@ fn load_tile(
                 .map_or_else(Vec::new, |tile| tile.entities))
         }
     }
+}
+
+fn query_requires_exact_analysis(query: &MeshQuery) -> bool {
+    query.measures != Default::default()
+        || query.boundary_distance.is_some()
+        || query.quality.is_some()
+        || query.formula.is_some()
+        || query
+            .tag_filter
+            .as_ref()
+            .is_some_and(|filter| filter.scope == crate::query::TagScope::AdjacentBoundary)
 }
 
 fn decoded_bytes(entities: &[SelectedEntity]) -> usize {
@@ -956,9 +1020,12 @@ fn load_preview(file: &MeshFile, node: u64, query: &MeshQuery) -> MeshResult<Vec
                 zone_id,
                 source_id: None,
                 source_object_id: None,
+                owner_cell_id: None,
+                neighbor_cell_id: None,
                 boundary: is_boundary,
                 boundary_distance: None,
                 quality,
+                adjacent_boundary_tag_ids: Vec::new(),
             });
             if result.len() >= query.display_limit {
                 return Ok(result);
@@ -979,6 +1046,7 @@ fn preview_list(array: &LargeListArray, row: usize) -> MeshResult<Vec<u64>> {
 
 fn build_lines(
     entities: &[SelectedEntity],
+    style: MeshRenderStyle,
     selected_ids: &BTreeSet<u64>,
     highlighted_ids: &BTreeSet<u64>,
     opacity: f32,
@@ -986,13 +1054,23 @@ fn build_lines(
     let mut lines = BTreeMap::<u64, RenderLine>::new();
     let mut volume_lines = BTreeMap::<(u64, u64), RenderLine>::new();
     for entity in entities {
-        let color_id = entity
-            .tag_ids
-            .first()
-            .copied()
-            .or(entity.source_object_id)
-            .or(entity.zone_id)
-            .unwrap_or(0);
+        let color = match style {
+            MeshRenderStyle::Catalog => RenderLineColor::Catalog(
+                entity
+                    .tag_ids
+                    .first()
+                    .copied()
+                    .or(entity.source_object_id)
+                    .or(entity.zone_id)
+                    .unwrap_or(0),
+            ),
+            MeshRenderStyle::BoundaryTags => {
+                RenderLineColor::Catalog(entity.tag_ids.first().copied().unwrap_or(0))
+            }
+            MeshRenderStyle::Quality | MeshRenderStyle::SelectedBoundaryQuality => {
+                RenderLineColor::Quality(entity.quality)
+            }
+        };
         let selected = selected_ids.contains(&entity.id);
         let highlighted = highlighted_ids.contains(&entity.id);
         if let Some(edges) = volume_edges(&entity.element_type) {
@@ -1014,7 +1092,7 @@ fn build_lines(
                     synthetic_volume_edge_id(key),
                     a_point,
                     b_point,
-                    color_id,
+                    color,
                     opacity,
                     highlighted,
                     selected,
@@ -1024,6 +1102,7 @@ fn build_lines(
                     .and_modify(|line| {
                         line.highlighted |= highlighted;
                         line.selected |= selected;
+                        line.color = worse_color(line.color, color);
                     })
                     .or_insert(candidate);
             }
@@ -1036,7 +1115,7 @@ fn build_lines(
                         entity.id,
                         entity.points[0],
                         entity.points[1],
-                        color_id,
+                        color,
                         opacity,
                         highlighted,
                         selected,
@@ -1054,7 +1133,7 @@ fn build_lines(
                         edge_id,
                         entity.points[a],
                         entity.points[b],
-                        color_id,
+                        color,
                         opacity,
                         highlighted,
                         selected,
@@ -1064,6 +1143,7 @@ fn build_lines(
                         .and_modify(|line| {
                             line.highlighted |= highlighted;
                             line.selected |= selected;
+                            line.color = worse_color(line.color, color);
                         })
                         .or_insert(candidate);
                 }
@@ -1079,7 +1159,7 @@ fn build_lines(
                         edge_id,
                         entity.points[a],
                         entity.points[b],
-                        color_id,
+                        color,
                         opacity,
                         highlighted,
                         selected,
@@ -1089,6 +1169,7 @@ fn build_lines(
                         .and_modify(|line| {
                             line.highlighted |= highlighted;
                             line.selected |= selected;
+                            line.color = worse_color(line.color, color);
                         })
                         .or_insert(candidate);
                 }
@@ -1151,7 +1232,7 @@ fn line(
     edge_id: u64,
     a: [f64; 3],
     b: [f64; 3],
-    color_id: u64,
+    color: RenderLineColor,
     opacity: f32,
     highlighted: bool,
     selected: bool,
@@ -1160,10 +1241,41 @@ fn line(
         edge_id,
         a: a.map(|value| value as f32),
         b: b.map(|value| value as f32),
-        color_id,
+        color,
         opacity,
         highlighted,
         selected,
+    }
+}
+
+fn worse_color(a: RenderLineColor, b: RenderLineColor) -> RenderLineColor {
+    match (a, b) {
+        (RenderLineColor::Quality(None), _) | (_, RenderLineColor::Quality(None)) => {
+            RenderLineColor::Quality(None)
+        }
+        (RenderLineColor::Quality(Some(a)), RenderLineColor::Quality(Some(b))) => {
+            RenderLineColor::Quality(Some(a.min(b)))
+        }
+        (a, _) => a,
+    }
+}
+
+pub fn quality_band(score: Option<f64>) -> usize {
+    score.map_or(QUALITY_BANDS, |score| {
+        (score.clamp(0.0, 1.0) * (QUALITY_BANDS - 1) as f64).floor() as usize
+    })
+}
+
+pub fn quality_color(score: Option<f64>) -> [f32; 3] {
+    let band = quality_band(score);
+    if band == QUALITY_BANDS {
+        return [0.45, 0.47, 0.5];
+    }
+    let score = band as f64 / (QUALITY_BANDS - 1) as f64;
+    if score <= 0.5 {
+        [1.0, (score * 2.0) as f32, 0.0]
+    } else {
+        [(2.0 - score * 2.0) as f32, 1.0, 0.0]
     }
 }
 
@@ -1236,9 +1348,12 @@ mod tests {
             zone_id: None,
             source_id: None,
             source_object_id: None,
+            owner_cell_id: None,
+            neighbor_cell_id: None,
             boundary: false,
             boundary_distance: None,
             quality: None,
+            adjacent_boundary_tag_ids: Vec::new(),
         }
     }
 
@@ -1258,6 +1373,7 @@ mod tests {
             let point_ids = (100..100 + point_count).collect::<Vec<_>>();
             let lines = build_lines(
                 &[volume_entity(1, element_type, point_ids)],
+                MeshRenderStyle::Catalog,
                 &BTreeSet::new(),
                 &BTreeSet::new(),
                 1.0,
@@ -1279,6 +1395,7 @@ mod tests {
         let second = volume_entity(20, "tet4", vec![1, 2, 5, 6]);
         let lines = build_lines(
             &[first, second],
+            MeshRenderStyle::Catalog,
             &BTreeSet::from([10]),
             &BTreeSet::from([20]),
             1.0,
@@ -1292,6 +1409,58 @@ mod tests {
             .expect("shared edge");
         assert!(shared.selected);
         assert!(shared.highlighted);
+    }
+
+    #[test]
+    fn quality_lines_use_bands_and_the_worse_shared_score() {
+        let mut first = volume_entity(10, "tet4", vec![1, 2, 3, 4]);
+        first.quality = Some(0.8);
+        let mut second = volume_entity(20, "tet4", vec![1, 2, 5, 6]);
+        second.quality = Some(0.2);
+        let lines = build_lines(
+            &[first, second],
+            MeshRenderStyle::Quality,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            1.0,
+        );
+        let shared = lines
+            .iter()
+            .find(|line| {
+                [line.a[0], line.b[0]] == [1.0, 2.0] || [line.a[0], line.b[0]] == [2.0, 1.0]
+            })
+            .expect("shared edge");
+        assert_eq!(shared.color, RenderLineColor::Quality(Some(0.2)));
+
+        let mut unsupported = volume_entity(30, "tet4", vec![1, 2, 7, 8]);
+        unsupported.quality = None;
+        let lines = build_lines(
+            &[volume_entity(10, "tet4", vec![1, 2, 3, 4]), unsupported],
+            MeshRenderStyle::Quality,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            1.0,
+        );
+        assert!(lines.iter().any(|line| {
+            (line.a[0] == 1.0 && line.b[0] == 2.0 || line.a[0] == 2.0 && line.b[0] == 1.0)
+                && line.color == RenderLineColor::Quality(None)
+        }));
+        assert_eq!(quality_band(None), QUALITY_BANDS);
+        assert_eq!(quality_color(None), [0.45, 0.47, 0.5]);
+        assert_ne!(quality_color(Some(0.0)), quality_color(Some(1.0)));
+    }
+
+    #[test]
+    fn derived_measure_queries_never_use_persisted_preview_geometry() {
+        let query = MeshQuery {
+            measures: crate::query::QueryMeasures {
+                quality: Some(crate::quality::QualityMetric::ScaledJacobian),
+                ..Default::default()
+            },
+            ..MeshQuery::default()
+        };
+        assert!(query_requires_exact_analysis(&query));
+        assert!(!query_requires_exact_analysis(&MeshQuery::default()));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

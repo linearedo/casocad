@@ -9,8 +9,9 @@ use caso_kernel::vec3::vec3;
 use caso_meshing::{
     Bounds3, ControlRegion, ControlSet, EntityKind, GenerationLimits, IncrementalLodPreparation,
     JobControl, MemoryStorage, MeshArtifact, MeshChunkBuilder, MeshError, MeshFile, MeshId,
-    MeshQuery, MeshQueryService, MeshRendererCache, MeshTileDetail, MeshView, MeshingRequest,
-    RendererBudgets, RowKind, MESH_SCHEMA_NAME, MESH_SCHEMA_VERSION,
+    MeshQuery, MeshQueryService, MeshRenderStyle, MeshRendererCache, MeshTileDetail, MeshView,
+    MeshingRequest, QueryBudget, QueryMeasures, RenderLineColor, RendererBudgets, RowKind,
+    TagFilter, TagScope, TypedFormula, MESH_SCHEMA_NAME, MESH_SCHEMA_VERSION,
 };
 
 fn rectangle(width: f64, height: f64) -> caso_kernel::meshing::MeshableDomains {
@@ -88,6 +89,148 @@ fn uniform_v3_is_deterministic_lazy_queryable_and_auditable() {
     assert_eq!(result.displayed_count, 3);
     let report = file.full_audit(&JobControl::default()).unwrap();
     assert_eq!(report.entities, file.manifest().counts.entity_count());
+}
+
+#[test]
+fn planned_cursor_measures_statistics_and_adjacent_tags_share_exact_rows() {
+    let file = Arc::new(
+        MeshFile::from_memory(memory(
+            caso_meshing::run_meshing(
+                request("uniform_2d"),
+                MemoryStorage::new(64 * 1024 * 1024).unwrap(),
+            )
+            .unwrap(),
+        ))
+        .unwrap(),
+    );
+    let service = MeshQueryService::new(file.clone());
+    let query = MeshQuery {
+        measures: QueryMeasures {
+            quality: Some(caso_meshing::quality::QualityMetric::ScaledJacobian),
+            boundary_distance: true,
+            adjacent_boundary_tags: true,
+        },
+        display_limit: usize::MAX,
+        ..MeshQuery::default()
+    };
+    let plan = service.plan(query.clone()).unwrap();
+    assert_eq!(plan.measures, query.measures);
+    assert!(plan.candidate_rows > 0);
+    assert!(plan.candidate_batches() > 0);
+
+    let mut cursor = service.cursor(plan);
+    let mut rows = Vec::new();
+    loop {
+        let step = cursor
+            .step(QueryBudget::new(7, Duration::from_secs(1)))
+            .unwrap();
+        assert!(step.progress.scanned_rows <= step.progress.candidate_rows);
+        rows.extend(step.rows);
+        if step.progress.complete {
+            break;
+        }
+    }
+    assert!(rows
+        .iter()
+        .all(|row| { row.quality.is_some() && row.boundary_distance.is_some_and(f64::is_finite) }));
+    assert!(rows
+        .iter()
+        .any(|row| !row.adjacent_boundary_tag_ids.is_empty()));
+    let synchronous = service.execute(query.clone()).unwrap();
+    assert_eq!(synchronous.total_matching_count, rows.len() as u64);
+    assert_eq!(
+        synchronous
+            .selected_entity_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        rows.iter().map(|row| row.id).collect()
+    );
+
+    let statistics = service.statistics(query.clone()).unwrap();
+    assert_eq!(statistics.filtered_cells, rows.len() as u64);
+    assert_eq!(statistics.supported, statistics.filtered_cells);
+    assert_eq!(statistics.unsupported, 0);
+    assert!(statistics.minimum.is_some());
+    assert!(statistics.maximum_boundary_distance.is_some());
+    assert!(statistics.progress.complete);
+
+    let tag = rows
+        .iter()
+        .flat_map(|row| row.adjacent_boundary_tag_ids.iter().copied())
+        .next()
+        .unwrap();
+    let tagged = service
+        .execute(MeshQuery {
+            tag_filter: Some(TagFilter::any([tag], TagScope::AdjacentBoundary)),
+            display_limit: usize::MAX,
+            ..MeshQuery::default()
+        })
+        .unwrap();
+    assert!(tagged.total_matching_count > 0);
+    assert!(tagged.total_matching_count <= rows.len() as u64);
+
+    let mut renderer = MeshRendererCache::new(file.clone(), RendererBudgets::default());
+    renderer
+        .update_lod_focus(file.manifest().bounds.center())
+        .unwrap();
+    let boundary_query = MeshQuery {
+        entity_kind: EntityKind::Edge,
+        tag_filter: Some(TagFilter::any([tag], TagScope::Entity)),
+        measures: QueryMeasures {
+            quality: Some(caso_meshing::quality::QualityMetric::ScaledJacobian),
+            ..Default::default()
+        },
+        display_limit: usize::MAX,
+        ..MeshQuery::default()
+    };
+    let mut colored_lines = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let update = renderer
+            .prepare_lod_incremental_styled(
+                boundary_query.clone(),
+                MeshRenderStyle::SelectedBoundaryQuality,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                1.0,
+            )
+            .unwrap();
+        colored_lines.extend(
+            update
+                .prepared
+                .iter()
+                .flat_map(|tile| tile.lines.iter().copied()),
+        );
+        if update.stats.pending_tiles == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "quality renderer timed out");
+        std::thread::yield_now();
+    }
+    assert!(!colored_lines.is_empty());
+    assert!(colored_lines.iter().all(|line| {
+        matches!(line.color, RenderLineColor::Quality(Some(score)) if (0.0..=1.0).contains(&score))
+    }));
+
+    let formula_plan = service
+        .plan(MeshQuery {
+            formula: Some(TypedFormula::parse("quality >= 0 and boundary_distance >= 0").unwrap()),
+            ..MeshQuery::default()
+        })
+        .unwrap();
+    assert_eq!(
+        formula_plan.measures.quality,
+        Some(caso_meshing::quality::QualityMetric::ScaledJacobian)
+    );
+    assert!(formula_plan.measures.boundary_distance);
+
+    let cancelled = cursor.cancellation();
+    cancelled.cancel();
+    assert!(matches!(
+        cursor.step(QueryBudget::default()),
+        Err(MeshError::Cancelled)
+    ));
 }
 
 #[test]

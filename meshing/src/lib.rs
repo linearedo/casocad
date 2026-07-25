@@ -30,14 +30,17 @@ pub use controls::{BoundaryLayerControl, ControlRegion, ControlSet, RefinementCo
 pub use error::{MeshError, MeshResult};
 pub use file::{BatchView, MeshAuditReport, MeshFile, MeshReadSession, MeshStorageKind};
 pub use query::{
-    EntityKind, Interval, MeshQuery, MeshQueryResult, MeshQueryService, QualityFilter,
-    SelectedEntity, TypedFormula,
+    BoundaryIndex, EntityKind, Interval, MeshQuery, MeshQueryCursor, MeshQueryPlan,
+    MeshQueryResult, MeshQueryService, MeshQueryStatistics, QualityFilter, QueryBudget,
+    QueryCancellation, QueryMeasures, QueryProgress, QueryStatisticsAccumulator, QueryStep,
+    SelectedEntity, TagFilter, TagMatch, TagScope, TypedFormula,
 };
 pub use registry::{algorithm, descriptors};
 pub use renderer::{
-    IncrementalLodPreparation, LodTargetSelection, MeshPreparationStats, MeshRendererCache,
-    MeshTileDetail, MeshTileKey, MeshView, PreparedMeshTile, RenderLine, RendererBudgets,
-    LOD_COLLAPSE_PIXELS, LOD_EXPAND_PIXELS,
+    quality_band, quality_color, IncrementalLodPreparation, LodTargetSelection,
+    MeshPreparationStats, MeshRenderStyle, MeshRendererCache, MeshTileDetail, MeshTileKey,
+    MeshView, PreparedMeshTile, RenderLine, RenderLineColor, RendererBudgets, LOD_COLLAPSE_PIXELS,
+    LOD_EXPAND_PIXELS, QUALITY_BANDS,
 };
 pub use schema::{
     arrow_schema, BatchDirectoryEntry, BatchRange, Bounds3, MeshCounts, MeshManifest, RowKind,

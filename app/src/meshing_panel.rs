@@ -11,7 +11,9 @@ use caso_meshing::quality::QualityMetric;
 #[cfg(not(target_arch = "wasm32"))]
 use caso_meshing::NativeFileStorage;
 use caso_meshing::{
-    EntityKind, Interval, JobControl, MeshArtifact, MeshFile, MeshQuery, MeshingOutput,
+    EntityKind, Interval, JobControl, MeshArtifact, MeshFile, MeshQuery, MeshQueryStatistics,
+    MeshRenderStyle, MeshingOutput, QueryBudget, QueryCancellation, QueryMeasures, QueryProgress,
+    QueryStatisticsAccumulator, TagFilter, TagScope,
 };
 use eframe::egui;
 
@@ -35,6 +37,12 @@ enum JobMessage {
     Finished(Result<MeshingOutput, String>),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+enum AnalysisMessage {
+    Progress(u64, QueryProgress),
+    Finished(u64, Result<MeshQueryStatistics, String>),
+}
+
 pub struct MeshingPanel {
     mesh: Option<Arc<MeshFile>>,
     renderer: Option<caso_meshing::MeshRendererCache>,
@@ -48,6 +56,23 @@ pub struct MeshingPanel {
     selected_tags: BTreeSet<u64>,
     z_lower: f64,
     z_upper: f64,
+    has_boundary_entities: bool,
+    boundary_range: f64,
+    max_boundary_distance: Option<f64>,
+    analysis_generation: u64,
+    analysis_due: Option<f64>,
+    analysis_progress: QueryProgress,
+    analysis_error: Option<String>,
+    statistics: Option<MeshQueryStatistics>,
+    analysis_cancel: Option<QueryCancellation>,
+    #[cfg(not(target_arch = "wasm32"))]
+    analysis_job: Option<Receiver<AnalysisMessage>>,
+    #[cfg(target_arch = "wasm32")]
+    analysis_cursor: Option<(
+        u64,
+        caso_meshing::MeshQueryCursor,
+        QueryStatisticsAccumulator,
+    )>,
     job_control: Option<JobControl>,
     #[cfg(not(target_arch = "wasm32"))]
     job: Option<Receiver<JobMessage>>,
@@ -88,6 +113,19 @@ impl Default for MeshingPanel {
             selected_tags: BTreeSet::new(),
             z_lower: f64::NEG_INFINITY,
             z_upper: f64::INFINITY,
+            has_boundary_entities: false,
+            boundary_range: 0.0,
+            max_boundary_distance: None,
+            analysis_generation: 0,
+            analysis_due: None,
+            analysis_progress: QueryProgress::default(),
+            analysis_error: None,
+            statistics: None,
+            analysis_cancel: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            analysis_job: None,
+            #[cfg(target_arch = "wasm32")]
+            analysis_cursor: None,
             job_control: None,
             #[cfg(not(target_arch = "wasm32"))]
             job: None,
@@ -154,6 +192,13 @@ impl MeshingPanel {
                 .changed()
             {
                 self.preview_revision = self.preview_revision.wrapping_add(1);
+                if self.inspector_active {
+                    self.schedule_analysis(ui.input(|input| input.time));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(150));
+                } else if let Some(cancel) = self.analysis_cancel.take() {
+                    cancel.cancel();
+                }
             }
         });
 
@@ -288,7 +333,12 @@ impl MeshingPanel {
         self.inspector_active
     }
 
-    pub fn inspector_ui(&mut self, ui: &mut egui::Ui, _state: &AppState) {
+    pub fn inspector_ui(&mut self, ui: &mut egui::Ui, state: &AppState) {
+        self.poll_analysis(ui);
+        let now = ui.input(|input| input.time);
+        if self.analysis_due.is_some_and(|due| now >= due) {
+            self.start_analysis(ui);
+        }
         let Some(mesh) = &self.mesh else {
             ui.weak("Generate or load a .casomesh.arrow file to inspect it.");
             return;
@@ -311,23 +361,95 @@ impl MeshingPanel {
                     });
             }
         });
-        if mesh.manifest().dimension == 3 {
+
+        let factor = state.unit.factor;
+        if self.has_boundary_entities {
+            if let Some(maximum) = self.max_boundary_distance {
+                let mut range = self.boundary_range / factor;
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut range, 0.0..=maximum / factor)
+                            .text(format!("Boundary distance ({})", state.unit.key)),
+                    )
+                    .on_hover_text(
+                        "Show cells whose nearest corner is within this exact mesh-boundary distance",
+                    )
+                    .changed();
+                self.boundary_range = range * factor;
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak("Measuring maximum boundary distance…");
+                });
+            }
+        } else {
+            ui.add_enabled(false, egui::Label::new("Boundary distance unavailable"));
+        }
+
+        if mesh.manifest().dimension == 3 && (self.show_quality || self.show_boundary_tags) {
+            let min = mesh.manifest().bounds.min[2] / factor;
+            let max = mesh.manifest().bounds.max[2] / factor;
+            let mut lower = self.z_lower / factor;
+            let mut upper = self.z_upper / factor;
             changed |= ui
                 .add(
-                    egui::DragValue::new(&mut self.z_lower)
-                        .speed(0.01)
-                        .prefix("Z min: "),
+                    egui::Slider::new(&mut lower, min..=upper)
+                        .text(format!("Z lower ({})", state.unit.key)),
                 )
                 .changed();
             changed |= ui
                 .add(
-                    egui::DragValue::new(&mut self.z_upper)
-                        .speed(0.01)
-                        .prefix("Z max: "),
+                    egui::Slider::new(&mut upper, lower..=max)
+                        .text(format!("Z upper ({})", state.unit.key)),
                 )
                 .changed();
+            self.z_lower = lower * factor;
+            self.z_upper = upper * factor;
+        }
+
+        if self.show_quality {
+            ui.separator();
+            ui.horizontal(|ui| {
+                quality_legend(ui);
+                ui.label("0 Poor");
+                ui.label("→");
+                ui.label("1 Ideal");
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                let na = caso_meshing::quality_color(None);
+                ui.painter().rect_filled(
+                    rect,
+                    1.0,
+                    egui::Color32::from_rgb(
+                        (na[0] * 255.0) as u8,
+                        (na[1] * 255.0) as u8,
+                        (na[2] * 255.0) as u8,
+                    ),
+                );
+                ui.label("N/A");
+            });
+            if let Some(statistics) = &self.statistics {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "Visible {}/{}",
+                        statistics.filtered_cells, statistics.total_cells
+                    ));
+                    ui.separator();
+                    ui.label(format!("Min {}", format_score(statistics.minimum)));
+                    ui.label(format!("Mean {}", format_score(statistics.mean)));
+                    ui.label(format!("Max {}", format_score(statistics.maximum)));
+                    ui.label(format!(
+                        "Worst ID {}",
+                        statistics
+                            .worst_cell_id
+                            .map_or_else(|| "N/A".into(), |id| id.to_string())
+                    ));
+                    ui.label(format!("N/A {}", statistics.unsupported));
+                });
+            }
         }
         if self.show_boundary_tags {
+            ui.separator();
             let tags = assigned_tags(mesh);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("All").clicked() {
@@ -351,9 +473,275 @@ impl MeshingPanel {
                 }
             });
         }
+        if !self.analysis_progress.complete && self.analysis_progress.candidate_batches != 0 {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!(
+                    "Query {:.0}% — {}/{} batches",
+                    self.analysis_progress.fraction() * 100.0,
+                    self.analysis_progress.completed_batches,
+                    self.analysis_progress.candidate_batches
+                ));
+            });
+            ui.ctx().request_repaint();
+        }
+        if let Some(error) = &self.analysis_error {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Query failed: {error}"),
+            );
+        }
         if changed {
             self.preview_revision = self.preview_revision.wrapping_add(1);
+            self.schedule_analysis(now);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(150));
         }
+    }
+
+    fn preview_query(&self, mesh: &MeshFile) -> (MeshQuery, MeshRenderStyle) {
+        let boundary_kind = preview_entity_kind(
+            mesh.manifest().dimension,
+            true,
+            mesh.manifest().counts.faces,
+        );
+        let boundary_distance = self
+            .max_boundary_distance
+            .map(|_| Interval::new(0.0, self.boundary_range));
+        match (self.show_quality, self.show_boundary_tags) {
+            (true, false) => (
+                MeshQuery {
+                    entity_kind: EntityKind::Cell,
+                    z: Interval::new(self.z_lower, self.z_upper),
+                    measures: QueryMeasures {
+                        quality: Some(self.quality_metric),
+                        boundary_distance: boundary_distance.is_some(),
+                        adjacent_boundary_tags: false,
+                    },
+                    boundary_distance,
+                    display_limit: usize::MAX,
+                    ..MeshQuery::default()
+                },
+                MeshRenderStyle::Quality,
+            ),
+            (false, true) => (
+                MeshQuery {
+                    entity_kind: boundary_kind,
+                    z: Interval::new(self.z_lower, self.z_upper),
+                    tag_filter: Some(TagFilter::any(
+                        self.selected_tags.iter().copied(),
+                        TagScope::Entity,
+                    )),
+                    display_limit: usize::MAX,
+                    ..MeshQuery::default()
+                },
+                MeshRenderStyle::BoundaryTags,
+            ),
+            (true, true) => (
+                MeshQuery {
+                    entity_kind: boundary_kind,
+                    z: Interval::new(self.z_lower, self.z_upper),
+                    tag_filter: Some(TagFilter::any(
+                        self.selected_tags.iter().copied(),
+                        TagScope::Entity,
+                    )),
+                    measures: QueryMeasures {
+                        quality: Some(self.quality_metric),
+                        boundary_distance: false,
+                        adjacent_boundary_tags: false,
+                    },
+                    display_limit: usize::MAX,
+                    ..MeshQuery::default()
+                },
+                MeshRenderStyle::SelectedBoundaryQuality,
+            ),
+            (false, false) => unreachable!("inspector query requires one display mode"),
+        }
+    }
+
+    fn statistics_query(&self) -> MeshQuery {
+        let boundary_distance = (self.has_boundary_entities
+            && self.max_boundary_distance.is_some())
+        .then(|| Interval::new(0.0, self.boundary_range));
+        MeshQuery {
+            entity_kind: EntityKind::Cell,
+            z: Interval::new(self.z_lower, self.z_upper),
+            tag_filter: self.show_boundary_tags.then(|| {
+                TagFilter::any(
+                    self.selected_tags.iter().copied(),
+                    TagScope::AdjacentBoundary,
+                )
+            }),
+            measures: QueryMeasures {
+                quality: self.show_quality.then_some(self.quality_metric),
+                boundary_distance: self.has_boundary_entities,
+                adjacent_boundary_tags: self.show_boundary_tags,
+            },
+            boundary_distance,
+            display_limit: 0,
+            ..MeshQuery::default()
+        }
+    }
+
+    fn schedule_analysis(&mut self, now: f64) {
+        self.analysis_generation = self.analysis_generation.wrapping_add(1);
+        if let Some(cancel) = self.analysis_cancel.take() {
+            cancel.cancel();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.analysis_job = None;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.analysis_cursor = None;
+        }
+        self.analysis_due = Some(now + 0.15);
+        self.analysis_error = None;
+        self.analysis_progress.complete = false;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_analysis(&mut self, ui: &egui::Ui) {
+        let Some(mesh) = self.mesh.clone() else {
+            return;
+        };
+        self.analysis_due = None;
+        let query = self.statistics_query();
+        let generation = self.analysis_generation;
+        let cancellation = QueryCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
+        let repaint = ui.ctx().clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let service = caso_meshing::MeshQueryService::new(mesh.clone());
+                let plan = service.plan(query).map_err(|error| error.to_string())?;
+                let mut cursor =
+                    service.cursor_with_cancellation(plan, worker_cancellation.clone());
+                let mut accumulator = QueryStatisticsAccumulator::new(mesh.manifest().counts.cells);
+                loop {
+                    let step = cursor
+                        .step(QueryBudget::new(
+                            32_768,
+                            std::time::Duration::from_millis(25),
+                        ))
+                        .map_err(|error| error.to_string())?;
+                    accumulator.extend(step.rows);
+                    let _ = sender.send(AnalysisMessage::Progress(generation, step.progress));
+                    repaint.request_repaint();
+                    if step.progress.complete {
+                        break Ok(accumulator.finish(step.progress));
+                    }
+                }
+            })();
+            let _ = sender.send(AnalysisMessage::Finished(generation, result));
+            repaint.request_repaint();
+        });
+        self.analysis_cancel = Some(cancellation);
+        self.analysis_job = Some(receiver);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn start_analysis(&mut self, _ui: &egui::Ui) {
+        let Some(mesh) = self.mesh.clone() else {
+            return;
+        };
+        self.analysis_due = None;
+        let query = self.statistics_query();
+        let generation = self.analysis_generation;
+        let cancellation = QueryCancellation::default();
+        let service = caso_meshing::MeshQueryService::new(mesh.clone());
+        match service.plan(query) {
+            Ok(plan) => {
+                self.analysis_progress = QueryProgress {
+                    candidate_rows: plan.candidate_rows,
+                    candidate_batches: plan.candidate_batches(),
+                    ..QueryProgress::default()
+                };
+                self.analysis_cursor = Some((
+                    generation,
+                    service.cursor_with_cancellation(plan, cancellation.clone()),
+                    QueryStatisticsAccumulator::new(mesh.manifest().counts.cells),
+                ));
+                self.analysis_cancel = Some(cancellation);
+            }
+            Err(error) => self.analysis_error = Some(error.to_string()),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_analysis(&mut self, _ui: &egui::Ui) {
+        let Some(receiver) = &self.analysis_job else {
+            return;
+        };
+        let messages = receiver.try_iter().collect::<Vec<_>>();
+        for message in messages {
+            match message {
+                AnalysisMessage::Progress(generation, progress)
+                    if generation == self.analysis_generation =>
+                {
+                    self.analysis_progress = progress;
+                }
+                AnalysisMessage::Finished(generation, result)
+                    if generation == self.analysis_generation =>
+                {
+                    self.analysis_job = None;
+                    self.analysis_cancel = None;
+                    match result {
+                        Ok(statistics) => self.accept_statistics(statistics),
+                        Err(error) if error != "meshing cancelled" => {
+                            self.analysis_error = Some(error)
+                        }
+                        Err(_) => {}
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn poll_analysis(&mut self, ui: &egui::Ui) {
+        let Some((generation, mut cursor, mut accumulator)) = self.analysis_cursor.take() else {
+            return;
+        };
+        if generation != self.analysis_generation {
+            return;
+        }
+        match cursor.step(QueryBudget::new(4_096, std::time::Duration::from_millis(4))) {
+            Ok(step) => {
+                accumulator.extend(step.rows);
+                self.analysis_progress = step.progress;
+                if step.progress.complete {
+                    self.analysis_cancel = None;
+                    self.accept_statistics(accumulator.finish(step.progress));
+                } else {
+                    self.analysis_cursor = Some((generation, cursor, accumulator));
+                    ui.ctx().request_repaint();
+                }
+            }
+            Err(error) => {
+                self.analysis_cancel = None;
+                self.analysis_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn accept_statistics(&mut self, statistics: MeshQueryStatistics) {
+        self.analysis_progress = statistics.progress;
+        if self.has_boundary_entities && self.max_boundary_distance.is_none() {
+            if let Some(maximum) = statistics.maximum_boundary_distance {
+                self.max_boundary_distance = Some(maximum);
+                self.boundary_range = maximum;
+            } else {
+                self.has_boundary_entities = false;
+            }
+            self.preview_revision = self.preview_revision.wrapping_add(1);
+        }
+        self.statistics = Some(statistics);
+        self.analysis_error = None;
     }
 
     pub fn update_mesh_focus(&mut self, focus: [f64; 3]) {
@@ -377,26 +765,19 @@ impl MeshingPanel {
         let Some(mesh) = &self.mesh else {
             return None;
         };
-        let entity_kind = if self.show_preview {
-            preview_entity_kind(
-                mesh.manifest().dimension,
-                self.show_boundary_tags,
-                mesh.manifest().counts.faces,
-            )
-        } else {
-            EntityKind::Cell
-        };
-        let query = MeshQuery {
-            entity_kind,
-            z: Interval::new(self.z_lower, self.z_upper),
-            tag_ids: if self.show_boundary_tags && entity_kind != EntityKind::Cell {
-                self.selected_tags.clone()
+        let (query, style) =
+            if self.inspector_active && (self.show_quality || self.show_boundary_tags) {
+                self.preview_query(mesh)
             } else {
-                BTreeSet::new()
-            },
-            display_limit: usize::MAX,
-            ..MeshQuery::default()
-        };
+                (
+                    MeshQuery {
+                        entity_kind: EntityKind::Cell,
+                        display_limit: usize::MAX,
+                        ..MeshQuery::default()
+                    },
+                    MeshRenderStyle::Catalog,
+                )
+            };
         let Some(renderer) = &mut self.renderer else {
             return None;
         };
@@ -404,7 +785,7 @@ impl MeshingPanel {
             renderer.clear_lod_view();
         }
         renderer
-            .prepare_lod_incremental(query, &BTreeSet::new(), &BTreeSet::new(), 1.0)
+            .prepare_lod_incremental_styled(query, style, &BTreeSet::new(), &BTreeSet::new(), 1.0)
             .ok()
     }
 
@@ -691,6 +1072,29 @@ impl MeshingPanel {
 
     fn install_mesh(&mut self, mesh: MeshFile) {
         let mesh = Arc::new(mesh);
+        if let Some(cancel) = self.analysis_cancel.take() {
+            cancel.cancel();
+        }
+        self.analysis_generation = self.analysis_generation.wrapping_add(1);
+        self.analysis_due = Some(0.0);
+        self.analysis_progress = QueryProgress::default();
+        self.analysis_error = None;
+        self.statistics = None;
+        self.max_boundary_distance = None;
+        self.boundary_range = 0.0;
+        self.has_boundary_entities = match mesh.manifest().dimension {
+            2 => mesh.manifest().counts.edges != 0,
+            3 => mesh.manifest().counts.faces != 0,
+            _ => false,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.analysis_job = None;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.analysis_cursor = None;
+        }
         self.selected_tags = assigned_tags(&mesh).into_iter().map(|(id, _)| id).collect();
         self.z_lower = mesh.manifest().bounds.min[2];
         self.z_upper = mesh.manifest().bounds.max[2];
@@ -910,4 +1314,33 @@ fn assigned_tags(mesh: &MeshFile) -> Vec<(u64, String)> {
     tags.into_iter()
         .filter_map(|id| mesh.catalog_name("tag", id).map(|name| (id, name.into())))
         .collect()
+}
+
+fn format_score(score: Option<f64>) -> String {
+    score.map_or_else(|| "N/A".into(), |score| format!("{score:.3}"))
+}
+
+fn quality_legend(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(150.0, 14.0), egui::Sense::hover());
+    for band in 0..caso_meshing::QUALITY_BANDS {
+        let x0 = egui::lerp(
+            rect.x_range(),
+            band as f32 / caso_meshing::QUALITY_BANDS as f32,
+        );
+        let x1 = egui::lerp(
+            rect.x_range(),
+            (band + 1) as f32 / caso_meshing::QUALITY_BANDS as f32,
+        );
+        let score = (band as f64 + 0.5) / caso_meshing::QUALITY_BANDS as f64;
+        let color = caso_meshing::quality_color(Some(score));
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
+            0.0,
+            egui::Color32::from_rgb(
+                (color[0] * 255.0) as u8,
+                (color[1] * 255.0) as u8,
+                (color[2] * 255.0) as u8,
+            ),
+        );
+    }
 }

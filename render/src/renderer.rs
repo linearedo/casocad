@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use caso_meshing::{MeshTileKey, RenderLine};
+use caso_meshing::{quality_color, MeshTileKey, RenderLine, RenderLineColor};
 use caso_surfaces::types::{mesh_tag_color, SurfaceStatus, ViewportSurface, ViewportSurfaceScene};
 use web_time::Instant;
 
@@ -1116,7 +1116,10 @@ fn mesh_upload_instance_count(budget: u64, max_buffer_size: u64, remaining: usiz
 }
 
 fn line_instance(line: &RenderLine) -> [f32; 9] {
-    let color = mesh_tag_color((line.color_id % 60_000).max(1) as u32);
+    let color = match line.color {
+        RenderLineColor::Catalog(id) => mesh_tag_color((id % 60_000).max(1) as u32),
+        RenderLineColor::Quality(score) => quality_color(score),
+    };
     [
         line.a[0], line.a[1], line.a[2], line.b[0], line.b[1], line.b[2], color[0], color[1],
         color[2],
@@ -1150,7 +1153,7 @@ mod tests {
             edge_id,
             a: [0.0, 0.0, 0.0],
             b: [1.0, 0.0, 0.0],
-            color_id: 1,
+            color: RenderLineColor::Catalog(1),
             opacity: 1.0,
             highlighted: false,
             selected: false,
