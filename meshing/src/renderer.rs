@@ -984,6 +984,7 @@ fn build_lines(
     opacity: f32,
 ) -> Vec<RenderLine> {
     let mut lines = BTreeMap::<u64, RenderLine>::new();
+    let mut volume_lines = BTreeMap::<(u64, u64), RenderLine>::new();
     for entity in entities {
         let color_id = entity
             .tag_ids
@@ -994,6 +995,40 @@ fn build_lines(
             .unwrap_or(0);
         let selected = selected_ids.contains(&entity.id);
         let highlighted = highlighted_ids.contains(&entity.id);
+        if let Some(edges) = volume_edges(&entity.element_type) {
+            for &(a, b) in edges {
+                let Some((&a_id, &b_id)) = entity.point_ids.get(a).zip(entity.point_ids.get(b))
+                else {
+                    continue;
+                };
+                let Some((&a_point, &b_point)) = entity.points.get(a).zip(entity.points.get(b))
+                else {
+                    continue;
+                };
+                let key = if a_id < b_id {
+                    (a_id, b_id)
+                } else {
+                    (b_id, a_id)
+                };
+                let candidate = line(
+                    synthetic_volume_edge_id(key),
+                    a_point,
+                    b_point,
+                    color_id,
+                    opacity,
+                    highlighted,
+                    selected,
+                );
+                volume_lines
+                    .entry(key)
+                    .and_modify(|line| {
+                        line.highlighted |= highlighted;
+                        line.selected |= selected;
+                    })
+                    .or_insert(candidate);
+            }
+            continue;
+        }
         match entity.element_type.as_str() {
             "edge2" | "edge3" if entity.points.len() >= 2 => {
                 lines.entry(entity.id).or_insert_with(|| {
@@ -1061,7 +1096,55 @@ fn build_lines(
             _ => {}
         }
     }
-    lines.into_values().collect()
+    let mut result = lines.into_values().collect::<Vec<_>>();
+    result.extend(volume_lines.into_values());
+    result
+}
+
+fn volume_edges(element_type: &str) -> Option<&'static [(usize, usize)]> {
+    const TET: &[(usize, usize)] = &[(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)];
+    const PYRAMID: &[(usize, usize)] = &[
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (0, 4),
+        (1, 4),
+        (2, 4),
+        (3, 4),
+    ];
+    const PRISM: &[(usize, usize)] = &[
+        (0, 1),
+        (1, 2),
+        (2, 0),
+        (3, 4),
+        (4, 5),
+        (5, 3),
+        (0, 3),
+        (1, 4),
+        (2, 5),
+    ];
+    const HEX: &[(usize, usize)] = &[
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    match element_type {
+        "tet4" | "tet10" => Some(TET),
+        "pyramid5" | "pyramid13" => Some(PYRAMID),
+        "prism6" | "prism15" => Some(PRISM),
+        "hex8" | "hex20" | "hex27" => Some(HEX),
+        _ => None,
+    }
 }
 
 fn line(
@@ -1086,6 +1169,10 @@ fn line(
 
 fn synthetic_edge_id(entity_id: u64, local_edge: usize) -> u64 {
     entity_id.rotate_left(17) ^ local_edge as u64 ^ (1u64 << 63)
+}
+
+fn synthetic_volume_edge_id((a, b): (u64, u64)) -> u64 {
+    a.rotate_left(17) ^ b.rotate_right(13) ^ (1u64 << 62)
 }
 
 #[cfg(test)]
@@ -1129,6 +1216,82 @@ mod tests {
             max: [0.5, 0.5, -0.25],
         };
         assert_eq!(view.projected_pixels(behind), None);
+    }
+
+    fn volume_entity(id: u64, element_type: &str, point_ids: Vec<u64>) -> SelectedEntity {
+        let points = point_ids
+            .iter()
+            .map(|point_id| [*point_id as f64, 0.0, 0.0])
+            .collect();
+        SelectedEntity {
+            id,
+            kind: EntityKind::Cell,
+            tile_id: 1,
+            element_type: element_type.into(),
+            point_ids,
+            points,
+            edge_ids: Vec::new(),
+            face_ids: Vec::new(),
+            tag_ids: Vec::new(),
+            zone_id: None,
+            source_id: None,
+            source_object_id: None,
+            boundary: false,
+            boundary_distance: None,
+            quality: None,
+        }
+    }
+
+    #[test]
+    fn volume_families_draw_only_corner_edges() {
+        for (element_type, point_count, corner_count, edge_count) in [
+            ("tet4", 4, 4, 6),
+            ("tet10", 10, 4, 6),
+            ("pyramid5", 5, 5, 8),
+            ("pyramid13", 13, 5, 8),
+            ("prism6", 6, 6, 9),
+            ("prism15", 15, 6, 9),
+            ("hex8", 8, 8, 12),
+            ("hex20", 20, 8, 12),
+            ("hex27", 27, 8, 12),
+        ] {
+            let point_ids = (100..100 + point_count).collect::<Vec<_>>();
+            let lines = build_lines(
+                &[volume_entity(1, element_type, point_ids)],
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                1.0,
+            );
+            assert_eq!(lines.len(), edge_count, "{element_type}");
+            assert!(
+                lines.iter().all(|line| {
+                    line.a[0] < (100 + corner_count) as f32
+                        && line.b[0] < (100 + corner_count) as f32
+                }),
+                "{element_type} used a higher-order point"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_volume_edges_are_deduplicated_and_combine_selection_state() {
+        let first = volume_entity(10, "tet4", vec![1, 2, 3, 4]);
+        let second = volume_entity(20, "tet4", vec![1, 2, 5, 6]);
+        let lines = build_lines(
+            &[first, second],
+            &BTreeSet::from([10]),
+            &BTreeSet::from([20]),
+            1.0,
+        );
+        assert_eq!(lines.len(), 11);
+        let shared = lines
+            .iter()
+            .find(|line| {
+                [line.a[0], line.b[0]] == [1.0, 2.0] || [line.a[0], line.b[0]] == [2.0, 1.0]
+            })
+            .expect("shared edge");
+        assert!(shared.selected);
+        assert!(shared.highlighted);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

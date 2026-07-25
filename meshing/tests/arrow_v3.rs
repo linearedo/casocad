@@ -276,7 +276,7 @@ fn advancing_front_generates_incremental_mixed_3d_chunks() {
         MemoryStorage::new(256 * 1024 * 1024).unwrap(),
     )
     .unwrap();
-    let file = MeshFile::from_memory(memory(output)).unwrap();
+    let file = Arc::new(MeshFile::from_memory(memory(output)).unwrap());
     file.full_audit(&JobControl::default()).unwrap();
     let types = file
         .entity_batches(RowKind::Cell)
@@ -285,6 +285,31 @@ fn advancing_front_generates_incremental_mixed_3d_chunks() {
     assert!(types.contains("tet4"));
     assert!(types.contains("pyramid5"));
     assert!(file.manifest().counts.faces > 0);
+
+    let mut renderer = MeshRendererCache::new(file.clone(), RendererBudgets::default());
+    let target = renderer
+        .update_lod_focus(file.manifest().bounds.min)
+        .expect("focused 3D target");
+    assert!(!target.tiles.is_empty());
+    assert!(target.tiles.len() <= 4);
+    assert!(
+        prepare_all_lines(
+            &mut renderer,
+            &MeshQuery {
+                entity_kind: EntityKind::Cell,
+                ..MeshQuery::default()
+            },
+        ) > 0
+    );
+    assert!(
+        prepare_all_lines(
+            &mut renderer,
+            &MeshQuery {
+                entity_kind: EntityKind::Face,
+                ..MeshQuery::default()
+            },
+        ) > 0
+    );
 }
 
 #[test]
@@ -510,6 +535,27 @@ fn prepare_until_progress(
             .unwrap();
         if !update.prepared.is_empty() || update.stats.pending_tiles == 0 {
             return update;
+        }
+        assert!(Instant::now() < deadline, "mesh preview worker timed out");
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::yield_now();
+    }
+}
+
+fn prepare_all_lines(renderer: &mut MeshRendererCache, query: &MeshQuery) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut line_count = 0;
+    loop {
+        let update = renderer
+            .prepare_lod_incremental(query.clone(), &BTreeSet::new(), &BTreeSet::new(), 1.0)
+            .unwrap();
+        line_count += update
+            .prepared
+            .iter()
+            .map(|tile| tile.lines.len())
+            .sum::<usize>();
+        if update.stats.pending_tiles == 0 {
+            return line_count;
         }
         assert!(Instant::now() < deadline, "mesh preview worker timed out");
         #[cfg(not(target_arch = "wasm32"))]

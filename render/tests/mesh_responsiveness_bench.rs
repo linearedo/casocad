@@ -5,46 +5,40 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caso_kernel::meshing::meshable_domains_from_document;
-use caso_kernel::roles::DomainKind;
 use caso_kernel::scene::SceneDocument;
-use caso_kernel::vec3::vec3;
 use caso_meshing::{
     ControlSet, GenerationLimits, JobControl, MemoryStorage, MeshArtifact, MeshFile, MeshQuery,
     MeshRendererCache, MeshingRequest, RendererBudgets,
 };
 use caso_render::{ViewportRenderer, MESH_TILE_UPLOAD_BUDGET_BYTES};
 
-fn large_mesh() -> Arc<MeshFile> {
-    let mut document = SceneDocument::new();
-    let rectangle = document
-        .add_primitive_from_drag("rectangle", vec3(0.0, 0.0, 0.0), vec3(130.0, 1.0, 0.0), 1.0)
-        .expect("rectangle");
-    document
-        .set_domain_root(rectangle, DomainKind::Fluid)
-        .expect("domain");
+fn volume_mesh() -> Arc<MeshFile> {
+    let document = SceneDocument::default_scene().expect("scene");
     let output = caso_meshing::run_meshing(
         MeshingRequest {
             domains: meshable_domains_from_document(&document).expect("meshable"),
-            algorithm_id: "uniform_2d".into(),
-            element_min_size: 0.1,
+            algorithm_id: "advancing_front".into(),
+            element_min_size: 0.025,
             element_max_size: 0.1,
             controls: ControlSet::default(),
             limits: GenerationLimits::default(),
             job_control: JobControl::default(),
         },
-        MemoryStorage::new(128 * 1024 * 1024).expect("storage"),
+        MemoryStorage::new(256 * 1024 * 1024).expect("storage"),
     )
-    .expect("large mesh");
+    .expect("volume mesh");
     let MeshArtifact::Memory(bytes) = output.artifact else {
         panic!("expected memory mesh");
     };
-    Arc::new(MeshFile::from_memory(bytes).expect("mesh file"))
+    let file = Arc::new(MeshFile::from_memory(bytes).expect("mesh file"));
+    assert_eq!(file.manifest().dimension, 3);
+    file
 }
 
 #[test]
 #[ignore = "manual settle-to-activation benchmark; run with --ignored --nocapture"]
 fn settle_to_activation_breakdown() {
-    let file = large_mesh();
+    let file = volume_mesh();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
@@ -61,12 +55,13 @@ fn settle_to_activation_breakdown() {
     println!(
         "settle_to_activation_ms={:.2} decode_ms={:.2} \
          line_build_ms={:.2} upload_ms={:.2} \
-         frames={} tiles={} upload_budget_mib={} samples=7",
+         frames={} lines={} tiles={} upload_budget_mib={} samples=7",
         median.total_ms,
         median.decode_ms,
         median.line_build_ms,
         median.upload_ms,
         median.frames,
+        median.lines,
         median.tiles,
         MESH_TILE_UPLOAD_BUDGET_BYTES / (1024 * 1024),
     );
@@ -79,6 +74,7 @@ struct Sample {
     line_build_ms: f32,
     upload_ms: f32,
     frames: usize,
+    lines: usize,
     tiles: usize,
 }
 
@@ -100,6 +96,7 @@ fn run_once(file: Arc<MeshFile>, device: &wgpu::Device, queue: &wgpu::Queue) -> 
         line_build_ms: 0.0,
         upload_ms: 0.0,
         frames: 0,
+        lines: 0,
         tiles: target_keys.len(),
     };
     loop {
@@ -125,6 +122,7 @@ fn run_once(file: Arc<MeshFile>, device: &wgpu::Device, queue: &wgpu::Queue) -> 
         sample.upload_ms += renderer.mesh_tile_stats().upload_ms;
         if renderer.active_mesh_tiles() == &target_keys {
             sample.total_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            sample.lines = renderer.mesh_tile_stats().active_lines;
             return sample;
         }
         assert!(Instant::now() < deadline, "preview activation timed out");

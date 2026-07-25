@@ -377,19 +377,19 @@ impl MeshingPanel {
         let Some(mesh) = &self.mesh else {
             return None;
         };
-        let entity_kind = if !self.show_preview {
-            EntityKind::Cell
-        } else if self.show_boundary_tags && mesh.manifest().dimension == 2 {
-            EntityKind::Edge
-        } else if mesh.manifest().dimension == 3 && mesh.manifest().counts.faces > 0 {
-            EntityKind::Face
+        let entity_kind = if self.show_preview {
+            preview_entity_kind(
+                mesh.manifest().dimension,
+                self.show_boundary_tags,
+                mesh.manifest().counts.faces,
+            )
         } else {
             EntityKind::Cell
         };
         let query = MeshQuery {
             entity_kind,
             z: Interval::new(self.z_lower, self.z_upper),
-            tag_ids: if self.show_boundary_tags {
+            tag_ids: if self.show_boundary_tags && entity_kind != EntityKind::Cell {
                 self.selected_tags.clone()
             } else {
                 BTreeSet::new()
@@ -835,6 +835,14 @@ impl MeshingPanel {
     }
 }
 
+fn preview_entity_kind(dimension: u8, show_boundary_tags: bool, faces: u64) -> EntityKind {
+    match (dimension, show_boundary_tags, faces) {
+        (2, true, _) => EntityKind::Edge,
+        (3, true, 1..) => EntityKind::Face,
+        _ => EntityKind::Cell,
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn mesh_dialog() -> rfd::FileDialog {
     rfd::FileDialog::new().add_filter("casoCAD Arrow mesh", &["arrow"])
@@ -866,6 +874,15 @@ fn mesh_generation_reuses_the_first_selected_path() {
         );
     }
     assert_eq!(choices, 1);
+}
+
+#[test]
+fn preview_query_kind_preserves_2d_and_switches_3d_only_for_boundary_faces() {
+    assert_eq!(preview_entity_kind(2, false, 0), EntityKind::Cell);
+    assert_eq!(preview_entity_kind(2, true, 0), EntityKind::Edge);
+    assert_eq!(preview_entity_kind(3, false, 4), EntityKind::Cell);
+    assert_eq!(preview_entity_kind(3, true, 4), EntityKind::Face);
+    assert_eq!(preview_entity_kind(3, true, 0), EntityKind::Cell);
 }
 
 #[cfg(target_arch = "wasm32")]
