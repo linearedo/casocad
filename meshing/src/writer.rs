@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
 
 use arrow_ipc::writer::FileWriter;
+use web_time::Instant;
 
 use crate::algorithm::{
     CatalogEntry, MeshCatalog, MeshSink, MeshingContext, MeshingRequest, MeshingStatistics,
@@ -353,7 +352,6 @@ pub fn run_meshing<S: MeshStorage>(
     request: MeshingRequest,
     mut storage: S,
 ) -> MeshResult<MeshingOutput> {
-    #[cfg(not(target_arch = "wasm32"))]
     let started = Instant::now();
     let dimension = request.validate()?;
     let algorithm = crate::registry::algorithm(&request.algorithm_id).ok_or_else(|| {
@@ -424,10 +422,7 @@ pub fn run_meshing<S: MeshStorage>(
     statistics.peak_active_bytes = statistics
         .peak_active_bytes
         .max(generated.peak_active_bytes);
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        statistics.elapsed_millis = started.elapsed().as_millis() as u64;
-    }
+    statistics.elapsed_millis = started.elapsed().as_millis() as u64;
     Ok(MeshingOutput {
         artifact,
         statistics,

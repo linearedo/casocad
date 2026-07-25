@@ -16,3 +16,4 @@ arrow-ipc = "56"
 arrow-buffer = "56"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+web-time = "1.1"

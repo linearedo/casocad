@@ -728,6 +728,7 @@ dependencies = [
  "caso-kernel",
  "serde",
  "serde_json",
+ "web-time",
 ]
 
 [[package]]
@@ -739,6 +740,7 @@ dependencies = [
  "caso-meshing",
  "caso-surfaces",
  "pollster",
+ "web-time",
  "wgpu",
 ]
 

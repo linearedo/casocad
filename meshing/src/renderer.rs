@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use arrow_array::{Array, LargeListArray, UInt64Array};
+use web_time::Instant;
 
 use crate::query::{EntityKind, MeshQuery, MeshQueryService, SelectedEntity};
 use crate::schema::{element_dimension, Bounds3, RowKind};

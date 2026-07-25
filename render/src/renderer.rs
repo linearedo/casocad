@@ -4,10 +4,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Instant;
 
 use caso_meshing::{MeshTileKey, RenderLine};
 use caso_surfaces::types::{mesh_tag_color, SurfaceStatus, ViewportSurface, ViewportSurfaceScene};
+use web_time::Instant;
 
 use crate::camera::OrbitCamera;
 

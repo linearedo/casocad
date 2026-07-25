@@ -13,6 +13,7 @@ bytemuck = "1.25.0"
 caso-kernel = { path = "../kernel" }
 caso-meshing = { path = "../meshing" }
 caso-surfaces = { path = "../surfaces" }
+web-time = "1.1"
 wgpu = "29"
 
 [dev-dependencies]
