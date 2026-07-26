@@ -3,6 +3,7 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -32,15 +33,25 @@ jobs:
       - name: Build wasm bundle
         run: wasm-pack build app --target web --out-dir ../web/pkg
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Smoke-test mesh worker responsiveness
+        run: node web/tests/run_mesh_worker_smoke.mjs
+
       - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
         with:
           enablement: true
 
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: web
 
   deploy:
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:

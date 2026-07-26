@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::error::{MeshError, MeshResult};
@@ -7,7 +8,52 @@ use crate::error::{MeshError, MeshResult};
 pub enum MeshArtifact {
     #[cfg(not(target_arch = "wasm32"))]
     Native(std::path::PathBuf),
-    Memory(Arc<[u8]>),
+    Memory(MemoryArtifact),
+}
+
+/// Immutable in-memory artifact whose byte allocation is preserved when a
+/// writer publishes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryArtifact(Arc<Vec<u8>>);
+
+impl MemoryArtifact {
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(bytes))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<u8>> for MemoryArtifact {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_vec(bytes)
+    }
+}
+
+impl From<Arc<[u8]>> for MemoryArtifact {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self::from_vec(bytes.as_ref().to_vec())
+    }
+}
+
+impl AsRef<[u8]> for MemoryArtifact {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl Deref for MemoryArtifact {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
 }
 
 pub trait MeshStorage {
@@ -83,6 +129,23 @@ impl MeshStorage for MemoryStorage {
 
     fn publish(self, writer: Self::Writer) -> MeshResult<MeshArtifact> {
         Ok(MeshArtifact::Memory(writer.bytes.into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publishing_preserves_the_vec_allocation() {
+        let mut storage = MemoryStorage::new(1024).unwrap();
+        let mut writer = storage.begin().unwrap();
+        writer.write_all(&[7; 128]).unwrap();
+        let allocation = writer.bytes.as_ptr();
+        let MeshArtifact::Memory(artifact) = storage.publish(writer).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(artifact.as_ptr(), allocation);
     }
 }
 

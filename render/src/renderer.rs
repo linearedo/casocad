@@ -2,7 +2,7 @@
 //! (analytic grid/axes, surface chunks, screen-space thick lines), ported
 //! from the QRhi surface renderer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use caso_meshing::{quality_color, MeshTileKey, RenderLine, RenderLineColor};
@@ -74,9 +74,21 @@ struct MeshTileBuffer {
 }
 
 struct PendingMeshTile {
-    lines: Arc<[RenderLine]>,
-    uploaded: usize,
+    data: PendingMeshTileData,
     chunks: Vec<LineChunk>,
+    line_count: usize,
+}
+
+enum PendingMeshTileData {
+    Lines {
+        lines: Arc<[RenderLine]>,
+        uploaded: usize,
+    },
+    Packed {
+        segments: VecDeque<Vec<f32>>,
+        uploaded_floats: usize,
+        complete: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -688,13 +700,77 @@ impl ViewportRenderer {
             self.pending_mesh_tiles.insert(
                 key,
                 PendingMeshTile {
-                    lines,
-                    uploaded: 0,
+                    line_count: lines.len(),
+                    data: PendingMeshTileData::Lines { lines, uploaded: 0 },
                     chunks: Vec::new(),
                 },
             );
         }
         self.refresh_mesh_tile_stats(0, 0.0);
+    }
+
+    /// Queue a transferred packet of already packed line instances. Packets
+    /// may arrive over several frames; the tile becomes eligible for atomic
+    /// activation only after the final packet is uploaded.
+    pub fn upsert_packed_mesh_tile_segment(
+        &mut self,
+        generation: u64,
+        key: MeshTileKey,
+        floats: Vec<f32>,
+        complete: bool,
+    ) -> bool {
+        if !floats.len().is_multiple_of(9)
+            || self.mesh_tile_generation != Some(generation)
+            || !self.mesh_tile_target.contains(&key)
+            || self.mesh_tile_buffers.contains_key(&key)
+        {
+            return false;
+        }
+        let pending = self
+            .pending_mesh_tiles
+            .entry(key)
+            .or_insert_with(|| PendingMeshTile {
+                data: PendingMeshTileData::Packed {
+                    segments: VecDeque::new(),
+                    uploaded_floats: 0,
+                    complete: false,
+                },
+                chunks: Vec::new(),
+                line_count: 0,
+            });
+        let PendingMeshTileData::Packed {
+            segments,
+            complete: pending_complete,
+            ..
+        } = &mut pending.data
+        else {
+            return false;
+        };
+        if *pending_complete {
+            return false;
+        }
+        pending.line_count += floats.len() / 9;
+        if !floats.is_empty() {
+            segments.push_back(floats);
+        }
+        *pending_complete = complete;
+        if complete && segments.is_empty() {
+            let pending = self
+                .pending_mesh_tiles
+                .remove(&key)
+                .expect("packed tile was just inserted");
+            self.mesh_tile_buffers.insert(
+                key,
+                MeshTileBuffer {
+                    chunks: pending.chunks,
+                    line_count: pending.line_count,
+                    bytes: pending.line_count as u64 * LINE_INSTANCE_BYTES,
+                },
+            );
+            self.try_activate_mesh_tiles();
+        }
+        self.refresh_mesh_tile_stats(0, 0.0);
+        true
     }
 
     /// Upload no more than `budget_bytes` of complete 36-byte line instances.
@@ -720,33 +796,76 @@ impl ViewportRenderer {
                 .pending_mesh_tiles
                 .get_mut(&key)
                 .expect("key came from pending map");
-            let remaining = pending.lines.len() - pending.uploaded;
+            let remaining = match &pending.data {
+                PendingMeshTileData::Lines { lines, uploaded } => lines.len() - uploaded,
+                PendingMeshTileData::Packed {
+                    segments,
+                    uploaded_floats,
+                    ..
+                } => segments
+                    .front()
+                    .map_or(0, |segment| (segment.len() - uploaded_floats) / 9),
+            };
             let count =
                 mesh_upload_instance_count(budget, device.limits().max_buffer_size, remaining);
             if count == 0 {
                 break;
             }
-            let start = pending.uploaded;
-            let instances = pending.lines[start..start + count]
-                .iter()
-                .map(line_instance)
-                .collect::<Vec<_>>();
+            let packed;
+            let bytes = match &mut pending.data {
+                PendingMeshTileData::Lines { lines, uploaded } => {
+                    let start = *uploaded;
+                    packed = lines[start..start + count]
+                        .iter()
+                        .flat_map(mesh_line_instance)
+                        .collect::<Vec<_>>();
+                    *uploaded += count;
+                    packed.as_slice()
+                }
+                PendingMeshTileData::Packed {
+                    segments,
+                    uploaded_floats,
+                    ..
+                } => {
+                    let segment = segments.front().expect("remaining packed lines");
+                    let start = *uploaded_floats;
+                    let end = start + count * 9;
+                    &segment[start..end]
+                }
+            };
             pending.chunks.push(LineChunk {
                 vertex_buffer: upload_buffer(
                     device,
                     queue,
                     "mesh tile line instances",
-                    bytemuck::cast_slice(&instances),
+                    bytemuck::cast_slice(bytes),
                     wgpu::BufferUsages::VERTEX,
                 ),
                 instance_count: count as u32,
             });
-            pending.uploaded += count;
+            if let PendingMeshTileData::Packed {
+                segments,
+                uploaded_floats,
+                ..
+            } = &mut pending.data
+            {
+                *uploaded_floats += count * 9;
+                if *uploaded_floats == segments.front().expect("uploaded segment").len() {
+                    segments.pop_front();
+                    *uploaded_floats = 0;
+                }
+            }
             let bytes = count as u64 * LINE_INSTANCE_BYTES;
             budget -= bytes;
             uploaded_bytes += bytes;
 
-            if pending.uploaded == pending.lines.len() {
+            let finished = match &pending.data {
+                PendingMeshTileData::Lines { lines, uploaded } => *uploaded == lines.len(),
+                PendingMeshTileData::Packed {
+                    segments, complete, ..
+                } => *complete && segments.is_empty(),
+            };
+            if finished {
                 let pending = self
                     .pending_mesh_tiles
                     .remove(&key)
@@ -755,8 +874,8 @@ impl ViewportRenderer {
                     key,
                     MeshTileBuffer {
                         chunks: pending.chunks,
-                        line_count: pending.lines.len(),
-                        bytes: pending.lines.len() as u64 * LINE_INSTANCE_BYTES,
+                        line_count: pending.line_count,
+                        bytes: pending.line_count as u64 * LINE_INSTANCE_BYTES,
                     },
                 );
                 self.try_activate_mesh_tiles();
@@ -1115,7 +1234,7 @@ fn mesh_upload_instance_count(budget: u64, max_buffer_size: u64, remaining: usiz
         .min(remaining as u64) as usize
 }
 
-fn line_instance(line: &RenderLine) -> [f32; 9] {
+pub fn mesh_line_instance(line: &RenderLine) -> [f32; 9] {
     let color = match line.color {
         RenderLineColor::Catalog(id) => mesh_tag_color((id % 60_000).max(1) as u32),
         RenderLineColor::Quality(score) => quality_color(score),
@@ -1275,5 +1394,16 @@ mod tests {
         assert_eq!(renderer.active_mesh_tiles(), &BTreeSet::from([parent]));
         renderer.evict_mesh_tiles([parent]);
         assert_eq!(renderer.mesh_tile_stats().resident_tiles, 1);
+
+        let packed = tile(10);
+        renderer.set_mesh_tile_target(6, [packed]);
+        assert!(!renderer.upsert_packed_mesh_tile_segment(6, packed, vec![0.0; 8], false));
+        assert!(renderer.upsert_packed_mesh_tile_segment(6, packed, vec![0.0; 9], false));
+        assert!(renderer.upload_pending_mesh_tiles(&device, &queue, MESH_TILE_UPLOAD_BUDGET_BYTES));
+        assert_eq!(renderer.active_mesh_tiles(), &BTreeSet::from([parent]));
+        assert!(renderer.upsert_packed_mesh_tile_segment(6, packed, vec![1.0; 9], true));
+        renderer.upload_pending_mesh_tiles(&device, &queue, MESH_TILE_UPLOAD_BUDGET_BYTES);
+        assert_eq!(renderer.active_mesh_tiles(), &BTreeSet::from([packed]));
+        assert_eq!(renderer.mesh_tile_stats().active_lines, 2);
     }
 }

@@ -23,12 +23,15 @@ pub mod quality;
 pub use algorithm::{
     CatalogEntry, CatalogKind, DomainCatalogIds, GenerationLimits, JobControl, MeshAlgorithm,
     MeshAlgorithmCapabilities, MeshAlgorithmDescriptor, MeshCatalog, MeshSink, MeshingContext,
-    MeshingProgress, MeshingRequest, MeshingStatistics,
+    MeshingPhase, MeshingProgress, MeshingRequest, MeshingStatistics,
 };
 pub use chunk::{ChunkElement, ChunkPoint, MeshChunk, MeshChunkBuilder, MeshId};
 pub use controls::{BoundaryLayerControl, ControlRegion, ControlSet, RefinementControl};
 pub use error::{MeshError, MeshResult};
-pub use file::{BatchView, MeshAuditReport, MeshFile, MeshReadSession, MeshStorageKind};
+pub use file::{
+    BatchView, MeshAuditCursor, MeshAuditProgress, MeshAuditReport, MeshAuditStep, MeshFile,
+    MeshReadSession, MeshStorageKind,
+};
 pub use query::{
     BoundaryIndex, EntityKind, Interval, MeshQuery, MeshQueryCursor, MeshQueryPlan,
     MeshQueryResult, MeshQueryService, MeshQueryStatistics, QualityFilter, QueryBudget,
@@ -48,7 +51,7 @@ pub use schema::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use storage::NativeFileStorage;
-pub use storage::{CappedBuffer, MemoryStorage, MeshArtifact, MeshStorage};
+pub use storage::{CappedBuffer, MemoryArtifact, MemoryStorage, MeshArtifact, MeshStorage};
 pub use writer::{run_meshing, MeshingOutput};
 
 pub use caso_kernel;

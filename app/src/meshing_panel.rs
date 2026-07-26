@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
 use caso_kernel::meshing::meshable_domains_from_document;
@@ -11,25 +12,65 @@ use caso_meshing::quality::QualityMetric;
 #[cfg(not(target_arch = "wasm32"))]
 use caso_meshing::NativeFileStorage;
 use caso_meshing::{
-    EntityKind, Interval, JobControl, MeshArtifact, MeshFile, MeshQuery, MeshQueryStatistics,
-    MeshRenderStyle, MeshingOutput, QueryBudget, QueryCancellation, QueryMeasures, QueryProgress,
-    QueryStatisticsAccumulator, TagFilter, TagScope,
+    EntityKind, Interval, JobControl, MeshManifest, MeshQuery, MeshQueryStatistics,
+    MeshRenderStyle, QueryCancellation, QueryMeasures, QueryProgress, TagFilter, TagScope,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use caso_meshing::{
+    MeshArtifact, MeshFile, MeshingOutput, QueryBudget, QueryStatisticsAccumulator,
 };
 use eframe::egui;
 
+#[cfg(target_arch = "wasm32")]
+use crate::mesh_worker::{
+    BrowserMeshSummary, BrowserQuery, PreviewPacketMeta, WorkerCommand, WorkerResponse,
+    WEB_MAX_ARTIFACT_MIB,
+};
 use crate::state::AppState;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{self, Receiver};
 
 #[cfg(target_arch = "wasm32")]
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::{cell::RefCell, rc::Rc};
 
 #[cfg(target_arch = "wasm32")]
-type PickedFile = Rc<RefCell<Option<(String, Vec<u8>)>>>;
+type PickedFile = Rc<RefCell<Option<(String, web_sys::File, egui::Context)>>>;
+
+#[cfg(target_arch = "wasm32")]
+enum PendingWorkerStart {
+    Generate {
+        scene: String,
+        cap_mib: u16,
+    },
+    Load {
+        name: String,
+        file: web_sys::File,
+        cap_mib: u16,
+    },
+}
+
+#[cfg(target_arch = "wasm32")]
+enum BrowserEvent {
+    Response(WorkerResponse),
+    Preview(PreviewPacketMeta, Vec<f32>),
+    Download(u64, u64, web_sys::Blob),
+    Fatal(String),
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) struct BrowserPreviewPacket {
+    pub meta: PreviewPacketMeta,
+    pub floats: Vec<f32>,
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) struct BrowserPreviewUpdate {
+    pub clear: bool,
+    pub selection: Option<caso_meshing::LodTargetSelection>,
+    pub packets: Vec<BrowserPreviewPacket>,
+    pub more: bool,
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 enum JobMessage {
@@ -44,7 +85,11 @@ enum AnalysisMessage {
 }
 
 pub struct MeshingPanel {
+    #[cfg(not(target_arch = "wasm32"))]
     mesh: Option<Arc<MeshFile>>,
+    #[cfg(target_arch = "wasm32")]
+    mesh: Option<BrowserMeshSummary>,
+    #[cfg(not(target_arch = "wasm32"))]
     renderer: Option<caso_meshing::MeshRendererCache>,
     focus_deferred: bool,
     pub show_preview: bool,
@@ -67,12 +112,6 @@ pub struct MeshingPanel {
     analysis_cancel: Option<QueryCancellation>,
     #[cfg(not(target_arch = "wasm32"))]
     analysis_job: Option<Receiver<AnalysisMessage>>,
-    #[cfg(target_arch = "wasm32")]
-    analysis_cursor: Option<(
-        u64,
-        caso_meshing::MeshQueryCursor,
-        QueryStatisticsAccumulator,
-    )>,
     job_control: Option<JobControl>,
     #[cfg(not(target_arch = "wasm32"))]
     job: Option<Receiver<JobMessage>>,
@@ -83,9 +122,7 @@ pub struct MeshingPanel {
     #[cfg(target_arch = "wasm32")]
     picked: PickedFile,
     #[cfg(target_arch = "wasm32")]
-    generated: Rc<RefCell<Option<Result<MeshingOutput, String>>>>,
-    #[cfg(target_arch = "wasm32")]
-    worker_progress: Rc<RefCell<Option<caso_meshing::MeshingProgress>>>,
+    worker_events: Rc<RefCell<Vec<BrowserEvent>>>,
     #[cfg(target_arch = "wasm32")]
     worker: Option<web_sys::Worker>,
     #[cfg(target_arch = "wasm32")]
@@ -93,15 +130,38 @@ pub struct MeshingPanel {
     #[cfg(target_arch = "wasm32")]
     worker_error_callback: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::ErrorEvent)>>,
     #[cfg(target_arch = "wasm32")]
-    worker_ready: Rc<Cell<bool>>,
+    pending_worker_start: Option<PendingWorkerStart>,
     #[cfg(target_arch = "wasm32")]
     worker_started_at: Option<f64>,
+    #[cfg(target_arch = "wasm32")]
+    session_id: u64,
+    #[cfg(target_arch = "wasm32")]
+    request_id: u64,
+    #[cfg(target_arch = "wasm32")]
+    preview_focus: [f64; 3],
+    #[cfg(target_arch = "wasm32")]
+    preview_request_pending: bool,
+    #[cfg(target_arch = "wasm32")]
+    preview_more: bool,
+    #[cfg(target_arch = "wasm32")]
+    preview_selection: Option<caso_meshing::LodTargetSelection>,
+    #[cfg(target_arch = "wasm32")]
+    preview_packets: Vec<BrowserPreviewPacket>,
+    #[cfg(target_arch = "wasm32")]
+    preview_clear_pending: bool,
+    #[cfg(target_arch = "wasm32")]
+    analysis_request_pending: bool,
+    #[cfg(target_arch = "wasm32")]
+    audit_request: Option<u64>,
+    #[cfg(target_arch = "wasm32")]
+    pending_downloads: std::collections::BTreeMap<u64, String>,
 }
 
 impl Default for MeshingPanel {
     fn default() -> Self {
         Self {
             mesh: None,
+            #[cfg(not(target_arch = "wasm32"))]
             renderer: None,
             focus_deferred: false,
             show_preview: true,
@@ -124,8 +184,6 @@ impl Default for MeshingPanel {
             analysis_cancel: None,
             #[cfg(not(target_arch = "wasm32"))]
             analysis_job: None,
-            #[cfg(target_arch = "wasm32")]
-            analysis_cursor: None,
             job_control: None,
             #[cfg(not(target_arch = "wasm32"))]
             job: None,
@@ -136,9 +194,7 @@ impl Default for MeshingPanel {
             #[cfg(target_arch = "wasm32")]
             picked: PickedFile::default(),
             #[cfg(target_arch = "wasm32")]
-            generated: Rc::new(RefCell::new(None)),
-            #[cfg(target_arch = "wasm32")]
-            worker_progress: Rc::new(RefCell::new(None)),
+            worker_events: Rc::new(RefCell::new(Vec::new())),
             #[cfg(target_arch = "wasm32")]
             worker: None,
             #[cfg(target_arch = "wasm32")]
@@ -146,9 +202,31 @@ impl Default for MeshingPanel {
             #[cfg(target_arch = "wasm32")]
             worker_error_callback: None,
             #[cfg(target_arch = "wasm32")]
-            worker_ready: Rc::new(Cell::new(false)),
+            pending_worker_start: None,
             #[cfg(target_arch = "wasm32")]
             worker_started_at: None,
+            #[cfg(target_arch = "wasm32")]
+            session_id: 0,
+            #[cfg(target_arch = "wasm32")]
+            request_id: 0,
+            #[cfg(target_arch = "wasm32")]
+            preview_focus: [0.0; 3],
+            #[cfg(target_arch = "wasm32")]
+            preview_request_pending: false,
+            #[cfg(target_arch = "wasm32")]
+            preview_more: false,
+            #[cfg(target_arch = "wasm32")]
+            preview_selection: None,
+            #[cfg(target_arch = "wasm32")]
+            preview_packets: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            preview_clear_pending: false,
+            #[cfg(target_arch = "wasm32")]
+            analysis_request_pending: false,
+            #[cfg(target_arch = "wasm32")]
+            audit_request: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_downloads: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -185,13 +263,17 @@ impl MeshingPanel {
                 .on_hover_text("Show query-selected Arrow mesh tiles in the viewport")
                 .changed()
             {
-                self.preview_revision = self.preview_revision.wrapping_add(1);
+                self.invalidate_preview();
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.preview_clear_pending = !self.show_preview;
+                }
             }
             if ui
                 .checkbox(&mut self.inspector_active, "Inspector")
                 .changed()
             {
-                self.preview_revision = self.preview_revision.wrapping_add(1);
+                self.invalidate_preview();
                 if self.inspector_active {
                     self.schedule_analysis(ui.input(|input| input.time));
                     ui.ctx()
@@ -225,8 +307,11 @@ impl MeshingPanel {
         {
             changed |= ui
                 .add(
-                    egui::Slider::new(&mut state.document.meshing.wasm_file_cap_mib, 64..=512)
-                        .text("WASM file cap (MiB)"),
+                    egui::Slider::new(
+                        &mut state.document.meshing.wasm_file_cap_mib,
+                        64..=WEB_MAX_ARTIFACT_MIB,
+                    )
+                    .text("WASM file cap (MiB)"),
                 )
                 .changed();
         }
@@ -258,20 +343,7 @@ impl MeshingPanel {
                     }
                 });
                 if ui.button("Full Audit").clicked() {
-                    match self
-                        .mesh
-                        .as_ref()
-                        .expect("button is enabled only with a mesh")
-                        .full_audit(&JobControl::default())
-                    {
-                        Ok(report) => {
-                            state.status = format!(
-                                "Full mesh audit passed: {} batches, {} entities",
-                                report.exact_batches, report.entities
-                            )
-                        }
-                        Err(error) => state.status = format!("Full mesh audit failed: {error}"),
-                    }
+                    self.full_audit(state);
                 }
             });
         });
@@ -300,17 +372,14 @@ impl MeshingPanel {
                 .hint_text("mesh"),
         );
 
-        if let Some(mesh) = &self.mesh {
-            let counts = &mesh.manifest().counts;
+        if let Some(manifest) = self.mesh_manifest() {
+            let counts = &manifest.counts;
             ui.weak(format!(
                 "{}D Arrow mesh — {} points, {} cells, {} tiles",
-                mesh.manifest().dimension,
+                manifest.dimension,
                 counts.points,
                 counts.cells,
-                mesh.entity_batches(caso_meshing::RowKind::Cell)
-                    .filter_map(|entry| entry.spatial_node_id)
-                    .collect::<BTreeSet<_>>()
-                    .len()
+                self.mesh_tile_count()
             ));
         }
         ui.separator();
@@ -339,7 +408,7 @@ impl MeshingPanel {
         if self.analysis_due.is_some_and(|due| now >= due) {
             self.start_analysis(ui);
         }
-        let Some(mesh) = &self.mesh else {
+        let Some(manifest) = self.mesh_manifest().cloned() else {
             ui.weak("Generate or load a .casomesh.arrow file to inspect it.");
             return;
         };
@@ -386,9 +455,9 @@ impl MeshingPanel {
             ui.add_enabled(false, egui::Label::new("Boundary distance unavailable"));
         }
 
-        if mesh.manifest().dimension == 3 && (self.show_quality || self.show_boundary_tags) {
-            let min = mesh.manifest().bounds.min[2] / factor;
-            let max = mesh.manifest().bounds.max[2] / factor;
+        if manifest.dimension == 3 && (self.show_quality || self.show_boundary_tags) {
+            let min = manifest.bounds.min[2] / factor;
+            let max = manifest.bounds.max[2] / factor;
             let mut lower = self.z_lower / factor;
             let mut upper = self.z_upper / factor;
             changed |= ui
@@ -450,7 +519,7 @@ impl MeshingPanel {
         }
         if self.show_boundary_tags {
             ui.separator();
-            let tags = assigned_tags(mesh);
+            let tags = self.assigned_tags();
             ui.horizontal_wrapped(|ui| {
                 if ui.button("All").clicked() {
                     self.selected_tags = tags.iter().map(|(id, _)| *id).collect();
@@ -492,19 +561,15 @@ impl MeshingPanel {
             );
         }
         if changed {
-            self.preview_revision = self.preview_revision.wrapping_add(1);
+            self.invalidate_preview();
             self.schedule_analysis(now);
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(150));
         }
     }
 
-    fn preview_query(&self, mesh: &MeshFile) -> (MeshQuery, MeshRenderStyle) {
-        let boundary_kind = preview_entity_kind(
-            mesh.manifest().dimension,
-            true,
-            mesh.manifest().counts.faces,
-        );
+    fn preview_query(&self, manifest: &MeshManifest) -> (MeshQuery, MeshRenderStyle) {
+        let boundary_kind = preview_entity_kind(manifest.dimension, true, manifest.counts.faces);
         let boundary_distance = self
             .max_boundary_distance
             .map(|_| Interval::new(0.0, self.boundary_range));
@@ -594,7 +659,7 @@ impl MeshingPanel {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            self.analysis_cursor = None;
+            self.analysis_request_pending = false;
         }
         self.analysis_due = Some(now + 0.15);
         self.analysis_error = None;
@@ -643,30 +708,23 @@ impl MeshingPanel {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn start_analysis(&mut self, _ui: &egui::Ui) {
-        let Some(mesh) = self.mesh.clone() else {
+    fn start_analysis(&mut self, ui: &egui::Ui) {
+        if self.mesh.is_none() {
             return;
-        };
+        }
         self.analysis_due = None;
         let query = self.statistics_query();
-        let generation = self.analysis_generation;
-        let cancellation = QueryCancellation::default();
-        let service = caso_meshing::MeshQueryService::new(mesh.clone());
-        match service.plan(query) {
-            Ok(plan) => {
-                self.analysis_progress = QueryProgress {
-                    candidate_rows: plan.candidate_rows,
-                    candidate_batches: plan.candidate_batches(),
-                    ..QueryProgress::default()
-                };
-                self.analysis_cursor = Some((
-                    generation,
-                    service.cursor_with_cancellation(plan, cancellation.clone()),
-                    QueryStatisticsAccumulator::new(mesh.manifest().counts.cells),
-                ));
-                self.analysis_cancel = Some(cancellation);
+        let command = WorkerCommand::AnalysisStart {
+            session_id: self.session_id,
+            request_id: self.analysis_generation,
+            query: BrowserQuery::from(&query),
+        };
+        match self.post_worker_command(&command) {
+            Ok(()) => {
+                self.analysis_request_pending = true;
+                ui.ctx().request_repaint();
             }
-            Err(error) => self.analysis_error = Some(error.to_string()),
+            Err(error) => self.analysis_error = Some(error),
         }
     }
 
@@ -704,28 +762,23 @@ impl MeshingPanel {
 
     #[cfg(target_arch = "wasm32")]
     fn poll_analysis(&mut self, ui: &egui::Ui) {
-        let Some((generation, mut cursor, mut accumulator)) = self.analysis_cursor.take() else {
-            return;
-        };
-        if generation != self.analysis_generation {
+        if self.mesh.is_none()
+            || self.analysis_progress.complete
+            || self.analysis_request_pending
+            || self.analysis_due.is_some()
+        {
             return;
         }
-        match cursor.step(QueryBudget::new(4_096, std::time::Duration::from_millis(4))) {
-            Ok(step) => {
-                accumulator.extend(step.rows);
-                self.analysis_progress = step.progress;
-                if step.progress.complete {
-                    self.analysis_cancel = None;
-                    self.accept_statistics(accumulator.finish(step.progress));
-                } else {
-                    self.analysis_cursor = Some((generation, cursor, accumulator));
-                    ui.ctx().request_repaint();
-                }
+        let command = WorkerCommand::AnalysisStep {
+            session_id: self.session_id,
+            request_id: self.analysis_generation,
+        };
+        match self.post_worker_command(&command) {
+            Ok(()) => {
+                self.analysis_request_pending = true;
+                ui.ctx().request_repaint();
             }
-            Err(error) => {
-                self.analysis_cancel = None;
-                self.analysis_error = Some(error.to_string());
-            }
+            Err(error) => self.analysis_error = Some(error),
         }
     }
 
@@ -738,13 +791,34 @@ impl MeshingPanel {
             } else {
                 self.has_boundary_entities = false;
             }
-            self.preview_revision = self.preview_revision.wrapping_add(1);
+            self.invalidate_preview();
         }
         self.statistics = Some(statistics);
         self.analysis_error = None;
     }
 
+    fn invalidate_preview(&mut self) {
+        self.preview_revision = self.preview_revision.wrapping_add(1);
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Responses for the old revision are ignored, so the new
+            // revision must not remain blocked on an obsolete request.
+            self.preview_request_pending = false;
+            self.preview_more = self.show_preview && self.mesh.is_some();
+            self.preview_selection = None;
+            self.preview_packets.clear();
+        }
+    }
+
     pub fn update_mesh_focus(&mut self, focus: [f64; 3]) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.preview_focus != focus {
+                self.preview_focus = focus;
+                self.preview_more = true;
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         if self.show_preview {
             if let Some(renderer) = &mut self.renderer {
                 renderer.update_lod_focus(focus);
@@ -753,6 +827,7 @@ impl MeshingPanel {
     }
 
     pub fn set_focus_deferred(&mut self, deferred: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
         if deferred && !self.focus_deferred {
             if let Some(renderer) = &mut self.renderer {
                 renderer.defer_lod_view();
@@ -761,13 +836,14 @@ impl MeshingPanel {
         self.focus_deferred = deferred;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn prepare_preview_frame(&mut self) -> Option<caso_meshing::IncrementalLodPreparation> {
         let Some(mesh) = &self.mesh else {
             return None;
         };
         let (query, style) =
             if self.inspector_active && (self.show_quality || self.show_boundary_tags) {
-                self.preview_query(mesh)
+                self.preview_query(mesh.manifest())
             } else {
                 (
                     MeshQuery {
@@ -787,6 +863,52 @@ impl MeshingPanel {
         renderer
             .prepare_lod_incremental_styled(query, style, &BTreeSet::new(), &BTreeSet::new(), 1.0)
             .ok()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn prepare_preview_frame(&mut self) -> Option<BrowserPreviewUpdate> {
+        if !self.show_preview {
+            self.preview_more = false;
+            self.preview_request_pending = false;
+        } else if self.mesh.is_some()
+            && !self.focus_deferred
+            && !self.preview_request_pending
+            && self.preview_more
+        {
+            let manifest = self.mesh_manifest()?.clone();
+            let (query, style) =
+                if self.inspector_active && (self.show_quality || self.show_boundary_tags) {
+                    self.preview_query(&manifest)
+                } else {
+                    (
+                        MeshQuery {
+                            entity_kind: EntityKind::Cell,
+                            display_limit: usize::MAX,
+                            ..MeshQuery::default()
+                        },
+                        MeshRenderStyle::Catalog,
+                    )
+                };
+            let command = WorkerCommand::Preview {
+                session_id: self.session_id,
+                revision: self.preview_revision,
+                focus: self.preview_focus,
+                query: BrowserQuery::from(&query),
+                style,
+            };
+            if self.post_worker_command(&command).is_ok() {
+                self.preview_request_pending = true;
+            }
+        }
+        let clear = std::mem::take(&mut self.preview_clear_pending);
+        let selection = self.preview_selection.take();
+        let packets = std::mem::take(&mut self.preview_packets);
+        (clear || selection.is_some() || !packets.is_empty()).then_some(BrowserPreviewUpdate {
+            clear,
+            selection,
+            packets,
+            more: self.preview_more || self.preview_request_pending,
+        })
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -843,7 +965,6 @@ impl MeshingPanel {
 
     #[cfg(target_arch = "wasm32")]
     fn generate(&mut self, state: &mut AppState, ctx: egui::Context) {
-        use wasm_bindgen::JsCast;
         let domains = match meshable_domains_from_document(&state.document) {
             Ok(domains) => domains,
             Err(error) => {
@@ -859,108 +980,18 @@ impl MeshingPanel {
                 return;
             }
         };
-        let options = web_sys::WorkerOptions::new();
-        options.set_type(web_sys::WorkerType::Module);
-        let worker = match web_sys::Worker::new_with_options("mesh_worker.js", &options) {
-            Ok(worker) => worker,
-            Err(error) => {
-                state.status = format!("Could not start mesh worker: {error:?}");
-                return;
-            }
-        };
-        let request = serde_json::json!({
-            "scene": scene,
-            "cap_mib": state.document.meshing.wasm_file_cap_mib,
-        })
-        .to_string();
-        let generated = self.generated.clone();
-        let worker_progress = self.worker_progress.clone();
-        let worker_ready = self.worker_ready.clone();
-        let callback_worker = worker.clone();
-        let callback_generated = generated.clone();
-        let callback_ctx = ctx.clone();
-        let callback = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-            move |event: web_sys::MessageEvent| {
-                let data = event.data();
-                let get = |key: &str| {
-                    js_sys::Reflect::get(&data, &wasm_bindgen::JsValue::from_str(key))
-                        .unwrap_or(wasm_bindgen::JsValue::UNDEFINED)
-                };
-                let kind = get("kind").as_string().unwrap_or_default();
-                let number = |key: &str| get(key).as_f64().unwrap_or(0.0) as u64;
-                let result = match kind.as_str() {
-                    "ready" => {
-                        if !worker_ready.replace(true) {
-                            if let Err(error) = callback_worker
-                                .post_message(&wasm_bindgen::JsValue::from_str(&request))
-                            {
-                                *callback_generated.borrow_mut() = Some(Err(format!(
-                                    "Could not send mesh worker request: {error:?}"
-                                )));
-                            }
-                        }
-                        callback_ctx.request_repaint();
-                        return;
-                    }
-                    "progress" => {
-                        *worker_progress.borrow_mut() = Some(caso_meshing::MeshingProgress {
-                            completed_chunks: number("completed_chunks"),
-                            cells_committed: number("cells_committed"),
-                            active_bytes: number("active_bytes"),
-                        });
-                        callback_ctx.request_repaint();
-                        return;
-                    }
-                    "complete" => {
-                        let bytes = js_sys::Uint8Array::new(&get("bytes")).to_vec();
-                        Ok(MeshingOutput {
-                            artifact: MeshArtifact::Memory(Arc::from(bytes)),
-                            statistics: caso_meshing::MeshingStatistics {
-                                domains: number("domains"),
-                                chunks: number("chunks"),
-                                points: number("points"),
-                                cells: number("cells"),
-                                committed_batches: number("batches"),
-                                peak_active_bytes: number("peak_bytes"),
-                                elapsed_millis: number("elapsed_millis"),
-                            },
-                        })
-                    }
-                    "error" => Err(get("error")
-                        .as_string()
-                        .unwrap_or_else(|| "mesh worker failed".into())),
-                    _ => Err(format!(
-                        "mesh worker sent unknown message kind: {}",
-                        if kind.is_empty() { "<missing>" } else { &kind }
-                    )),
-                };
-                *generated.borrow_mut() = Some(result);
-                callback_ctx.request_repaint();
-            },
-        );
-        let error_generated = self.generated.clone();
-        let error_ctx = ctx.clone();
-        let error_callback = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(
-            move |event: web_sys::ErrorEvent| {
-                let message = event.message();
-                *error_generated.borrow_mut() = Some(Err(if message.is_empty() {
-                    "mesh worker failed to load".into()
-                } else {
-                    message
-                }));
-                error_ctx.request_repaint();
-            },
-        );
-        worker.set_onmessage(Some(callback.as_ref().unchecked_ref()));
-        worker.set_onerror(Some(error_callback.as_ref().unchecked_ref()));
-        self.worker_ready.set(false);
-        self.worker_started_at = Some(js_sys::Date::now());
-        self.worker = Some(worker);
-        self.worker_callback = Some(callback);
-        self.worker_error_callback = Some(error_callback);
-        self.job_control = Some(JobControl::default());
-        ctx.request_repaint_after(std::time::Duration::from_secs(60));
-        state.status = "Starting mesh worker…".into();
+        let cap_mib = state
+            .document
+            .meshing
+            .wasm_file_cap_mib
+            .min(WEB_MAX_ARTIFACT_MIB);
+        if let Err(error) =
+            self.start_wasm_worker(PendingWorkerStart::Generate { scene, cap_mib }, ctx)
+        {
+            state.status = format!("Could not start mesh worker: {error}");
+        } else {
+            state.status = "Starting mesh worker…".into();
+        }
     }
 
     fn cancel_generation(&mut self, state: &mut AppState) {
@@ -972,6 +1003,8 @@ impl MeshingPanel {
         #[cfg(target_arch = "wasm32")]
         {
             self.cleanup_wasm_worker();
+            self.mesh = None;
+            self.preview_clear_pending = true;
             state.status = "Mesh generation cancelled".into();
         }
     }
@@ -985,10 +1018,7 @@ impl MeshingPanel {
         for message in messages {
             match message {
                 JobMessage::Progress(progress) => {
-                    state.status = format!(
-                        "Meshing chunk {} — {} cells",
-                        progress.completed_chunks, progress.cells_committed
-                    );
+                    state.status = format_progress(progress);
                 }
                 JobMessage::Finished(result) => {
                     self.job = None;
@@ -1005,32 +1035,146 @@ impl MeshingPanel {
 
     #[cfg(target_arch = "wasm32")]
     fn poll(&mut self, state: &mut AppState) {
-        if self.worker_ready.get() && self.worker_started_at.take().is_some() {
-            state.status = "Generating Arrow mesh…".into();
-        }
-        if let Some(progress) = self.worker_progress.borrow_mut().take() {
-            state.status = format!(
-                "Meshing chunk {} — {} cells",
-                progress.completed_chunks, progress.cells_committed
-            );
-        }
-        let generated = { self.generated.borrow_mut().take() };
-        if let Some(result) = generated {
-            self.cleanup_wasm_worker();
-            match result {
-                Ok(output) => self.install_output(state, output),
-                Err(error) => state.status = format!("Meshing failed: {error}"),
+        let picked = { self.picked.borrow_mut().take() };
+        if let Some((name, file, ctx)) = picked {
+            let cap_mib = state
+                .document
+                .meshing
+                .wasm_file_cap_mib
+                .min(WEB_MAX_ARTIFACT_MIB);
+            let start = PendingWorkerStart::Load {
+                name,
+                file,
+                cap_mib,
+            };
+            match self.start_wasm_worker(start, ctx) {
+                Ok(()) => state.status = "Starting mesh loader…".into(),
+                Err(error) => state.status = format!("Could not start mesh worker: {error}"),
             }
-        } else if self
+        }
+
+        let events = std::mem::take(&mut *self.worker_events.borrow_mut());
+        for event in events {
+            match event {
+                BrowserEvent::Response(WorkerResponse::Ready) => {
+                    if let Err(error) = self.send_pending_worker_start() {
+                        self.job_control = None;
+                        state.status = format!("Could not start mesh job: {error}");
+                    } else {
+                        state.status = "Generating or loading Arrow mesh…".into();
+                    }
+                }
+                BrowserEvent::Response(WorkerResponse::Progress {
+                    session_id,
+                    progress,
+                }) if session_id == self.session_id => {
+                    state.status = format_progress(progress);
+                }
+                BrowserEvent::Response(WorkerResponse::Installed {
+                    session_id,
+                    name,
+                    summary,
+                }) if session_id == self.session_id => {
+                    self.job_control = None;
+                    self.worker_started_at = None;
+                    self.install_browser_mesh(state, &name, *summary);
+                }
+                BrowserEvent::Response(WorkerResponse::PreviewState {
+                    session_id,
+                    revision,
+                    selection,
+                    more,
+                }) if session_id == self.session_id && revision == self.preview_revision => {
+                    self.preview_request_pending = false;
+                    self.preview_selection = Some(selection);
+                    self.preview_more = more;
+                }
+                BrowserEvent::Response(WorkerResponse::Analysis {
+                    session_id,
+                    request_id,
+                    progress,
+                    statistics,
+                }) if session_id == self.session_id && request_id == self.analysis_generation => {
+                    self.analysis_request_pending = false;
+                    self.analysis_progress = progress;
+                    if let Some(statistics) = statistics {
+                        self.accept_statistics(statistics);
+                    }
+                }
+                BrowserEvent::Response(WorkerResponse::Audit {
+                    session_id,
+                    request_id,
+                    progress,
+                    report,
+                }) if session_id == self.session_id && self.audit_request == Some(request_id) => {
+                    if let Some(report) = report {
+                        self.audit_request = None;
+                        state.status = format!(
+                            "Full mesh audit passed: {} batches, {} entities",
+                            report.exact_batches, report.entities
+                        );
+                    } else {
+                        state.status = format!(
+                            "Auditing mesh — {}/{} tiles",
+                            progress.completed_leaves, progress.total_leaves
+                        );
+                        let _ = self.post_worker_command(&WorkerCommand::AuditStep {
+                            session_id: self.session_id,
+                            request_id,
+                        });
+                    }
+                }
+                BrowserEvent::Response(WorkerResponse::Error {
+                    session_id,
+                    request_id,
+                    error,
+                    ..
+                }) if session_id == 0 || session_id == self.session_id => {
+                    self.job_control = None;
+                    self.preview_request_pending = false;
+                    self.analysis_request_pending = false;
+                    self.audit_request = None;
+                    if let Some(request_id) = request_id {
+                        self.pending_downloads.remove(&request_id);
+                    }
+                    self.analysis_error = Some(error.clone());
+                    state.status = format!("Mesh worker failed: {error}");
+                }
+                BrowserEvent::Preview(meta, floats)
+                    if meta.session_id == self.session_id
+                        && meta.revision == self.preview_revision =>
+                {
+                    self.preview_packets
+                        .push(BrowserPreviewPacket { meta, floats });
+                }
+                BrowserEvent::Download(session_id, request_id, blob)
+                    if session_id == self.session_id =>
+                {
+                    if let Some(name) = self.pending_downloads.remove(&request_id) {
+                        match crate::web_download_blob(&name, &blob) {
+                            Ok(()) => state.status = format!("Downloaded {name}"),
+                            Err(error) => state.status = format!("Download failed: {error:?}"),
+                        }
+                    }
+                }
+                BrowserEvent::Fatal(error) => {
+                    self.cleanup_wasm_worker();
+                    self.mesh = None;
+                    self.preview_clear_pending = true;
+                    state.status = format!("Mesh worker failed: {error}");
+                }
+                _ => {}
+            }
+        }
+
+        if self
             .worker_started_at
             .is_some_and(|started_at| js_sys::Date::now() - started_at >= 60_000.0)
         {
             self.cleanup_wasm_worker();
+            self.mesh = None;
+            self.preview_clear_pending = true;
             state.status = "Meshing failed: mesh worker did not start within 60 seconds".into();
-        }
-        let picked = { self.picked.borrow_mut().take() };
-        if let Some((name, bytes)) = picked {
-            self.apply_wasm_bytes(state, &name, bytes);
         }
     }
 
@@ -1043,13 +1187,133 @@ impl MeshingPanel {
         }
         self.worker_callback = None;
         self.worker_error_callback = None;
-        self.worker_ready.set(false);
+        self.pending_worker_start = None;
         self.worker_started_at = None;
-        *self.worker_progress.borrow_mut() = None;
-        *self.generated.borrow_mut() = None;
+        self.worker_events.borrow_mut().clear();
         self.job_control = None;
+        self.preview_request_pending = false;
+        self.preview_more = false;
+        self.preview_selection = None;
+        self.preview_packets.clear();
+        self.analysis_request_pending = false;
+        self.audit_request = None;
+        self.pending_downloads.clear();
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn start_wasm_worker(
+        &mut self,
+        start: PendingWorkerStart,
+        ctx: egui::Context,
+    ) -> Result<(), String> {
+        use wasm_bindgen::JsCast;
+
+        self.cleanup_wasm_worker();
+        self.mesh = None;
+        self.preview_clear_pending = true;
+        self.session_id = self.session_id.wrapping_add(1).max(1);
+        let options = web_sys::WorkerOptions::new();
+        options.set_type(web_sys::WorkerType::Module);
+        let worker = web_sys::Worker::new_with_options("mesh_worker.js", &options)
+            .map_err(|error| format!("{error:?}"))?;
+        let events = self.worker_events.clone();
+        let event_ctx = ctx.clone();
+        let callback = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+            move |event: web_sys::MessageEvent| {
+                let data = event.data();
+                let parsed = if let Some(text) = data.as_string() {
+                    serde_json::from_str::<WorkerResponse>(&text)
+                        .map(BrowserEvent::Response)
+                        .map_err(|error| format!("invalid mesh worker response: {error}"))
+                } else {
+                    parse_browser_event(&data)
+                };
+                events
+                    .borrow_mut()
+                    .push(parsed.unwrap_or_else(BrowserEvent::Fatal));
+                event_ctx.request_repaint();
+            },
+        );
+        let error_events = self.worker_events.clone();
+        let error_ctx = ctx.clone();
+        let error_callback = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(
+            move |event: web_sys::ErrorEvent| {
+                let message = event.message();
+                error_events
+                    .borrow_mut()
+                    .push(BrowserEvent::Fatal(if message.is_empty() {
+                        "mesh worker failed to load".into()
+                    } else {
+                        message
+                    }));
+                error_ctx.request_repaint();
+            },
+        );
+        worker.set_onmessage(Some(callback.as_ref().unchecked_ref()));
+        worker.set_onerror(Some(error_callback.as_ref().unchecked_ref()));
+        self.worker = Some(worker);
+        self.worker_callback = Some(callback);
+        self.worker_error_callback = Some(error_callback);
+        self.pending_worker_start = Some(start);
+        self.worker_started_at = Some(js_sys::Date::now());
+        self.job_control = Some(JobControl::default());
+        ctx.request_repaint_after(std::time::Duration::from_secs(60));
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn send_pending_worker_start(&mut self) -> Result<(), String> {
+        use wasm_bindgen::JsValue;
+
+        let start = self
+            .pending_worker_start
+            .take()
+            .ok_or_else(|| "mesh worker became ready without a pending job".to_string())?;
+        self.worker_started_at = None;
+        match start {
+            PendingWorkerStart::Generate { scene, cap_mib } => {
+                self.post_worker_command(&WorkerCommand::Generate {
+                    session_id: self.session_id,
+                    scene,
+                    cap_mib,
+                })
+            }
+            PendingWorkerStart::Load {
+                name,
+                file,
+                cap_mib,
+            } => {
+                let message = js_sys::Object::new();
+                for (key, value) in [
+                    ("kind", JsValue::from_str("load")),
+                    ("session_id", JsValue::from_f64(self.session_id as f64)),
+                    ("cap_mib", JsValue::from_f64(f64::from(cap_mib))),
+                    ("name", JsValue::from_str(&name)),
+                    ("file", file.into()),
+                ] {
+                    js_sys::Reflect::set(&message, &JsValue::from_str(key), &value)
+                        .map_err(|error| format!("{error:?}"))?;
+                }
+                self.worker
+                    .as_ref()
+                    .ok_or_else(|| "mesh worker is not running".to_string())?
+                    .post_message(message.as_ref())
+                    .map_err(|error| format!("{error:?}"))
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn post_worker_command(&self, command: &WorkerCommand) -> Result<(), String> {
+        let text = serde_json::to_string(command).map_err(|error| error.to_string())?;
+        self.worker
+            .as_ref()
+            .ok_or_else(|| "mesh worker is not running".to_string())?
+            .post_message(&wasm_bindgen::JsValue::from_str(&text))
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn install_output(&mut self, state: &mut AppState, output: MeshingOutput) {
         let opened = match output.artifact {
             #[cfg(not(target_arch = "wasm32"))]
@@ -1070,6 +1334,7 @@ impl MeshingPanel {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn install_mesh(&mut self, mesh: MeshFile) {
         let mesh = Arc::new(mesh);
         if let Some(cancel) = self.analysis_cancel.take() {
@@ -1087,14 +1352,7 @@ impl MeshingPanel {
             3 => mesh.manifest().counts.faces != 0,
             _ => false,
         };
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.analysis_job = None;
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.analysis_cursor = None;
-        }
+        self.analysis_job = None;
         self.selected_tags = assigned_tags(&mesh).into_iter().map(|(id, _)| id).collect();
         self.z_lower = mesh.manifest().bounds.min[2];
         self.z_upper = mesh.manifest().bounds.max[2];
@@ -1135,25 +1393,10 @@ impl MeshingPanel {
                 .pick_file()
                 .await
             {
-                *picked.borrow_mut() = Some((file.file_name(), file.read().await));
+                *picked.borrow_mut() = Some((file.file_name(), file.inner().clone(), ctx.clone()));
                 ctx.request_repaint();
             }
         });
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn apply_wasm_bytes(&mut self, state: &mut AppState, name: &str, bytes: Vec<u8>) {
-        match MeshFile::from_wasm_bytes(Arc::from(bytes)) {
-            Ok(mesh) => {
-                state.status = format!(
-                    "Loaded {name}: {} points, {} cells",
-                    mesh.manifest().counts.points,
-                    mesh.manifest().counts.cells
-                );
-                self.install_mesh(mesh);
-            }
-            Err(error) => state.status = format!("Arrow load failed ({name}): {error}"),
-        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1180,13 +1423,21 @@ impl MeshingPanel {
 
     #[cfg(target_arch = "wasm32")]
     fn export(&mut self, state: &mut AppState) {
-        let Some(mesh) = &self.mesh else {
+        if self.mesh.is_none() {
             return;
-        };
+        }
         let name = download_name(&self.download_name, "mesh.casomesh.arrow");
-        match crate::web_download_bytes(&name, mesh.bytes()) {
-            Ok(()) => state.status = format!("Downloaded {name}"),
-            Err(error) => state.status = format!("Download failed: {error:?}"),
+        let request_id = self.next_request_id();
+        self.pending_downloads.insert(request_id, name.clone());
+        match self.post_worker_command(&WorkerCommand::ExportArrow {
+            session_id: self.session_id,
+            request_id,
+        }) {
+            Ok(()) => state.status = format!("Preparing {name}…"),
+            Err(error) => {
+                self.pending_downloads.remove(&request_id);
+                state.status = format!("Export failed: {error}");
+            }
         }
     }
 
@@ -1220,22 +1471,206 @@ impl MeshingPanel {
 
     #[cfg(target_arch = "wasm32")]
     fn convert(&mut self, state: &mut AppState, converter: &MeshConverter) {
+        if self.mesh.is_none() {
+            return;
+        }
+        let default = format!("mesh.{}", converter.extension);
+        let name = download_name(&self.download_name, &default);
+        let request_id = self.next_request_id();
+        self.pending_downloads.insert(request_id, name.clone());
+        match self.post_worker_command(&WorkerCommand::Convert {
+            session_id: self.session_id,
+            request_id,
+            converter_id: converter.id.into(),
+        }) {
+            Ok(()) => state.status = format!("Preparing {name}…"),
+            Err(error) => {
+                self.pending_downloads.remove(&request_id);
+                state.status = format!("{} conversion failed: {error}", converter.label);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn full_audit(&mut self, state: &mut AppState) {
         let Some(mesh) = &self.mesh else {
             return;
         };
-        let bytes = match (converter.write)(mesh) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                state.status = format!("{} conversion failed: {error}", converter.label);
-                return;
+        match mesh.full_audit(&JobControl::default()) {
+            Ok(report) => {
+                state.status = format!(
+                    "Full mesh audit passed: {} batches, {} entities",
+                    report.exact_batches, report.entities
+                )
             }
-        };
-        let default = format!("mesh.{}", converter.extension);
-        let name = download_name(&self.download_name, &default);
-        match crate::web_download_bytes(&name, &bytes) {
-            Ok(()) => state.status = format!("Downloaded {name}"),
-            Err(error) => state.status = format!("Download failed: {error:?}"),
+            Err(error) => state.status = format!("Full mesh audit failed: {error}"),
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn full_audit(&mut self, state: &mut AppState) {
+        if self.mesh.is_none() || self.audit_request.is_some() {
+            return;
+        }
+        let request_id = self.next_request_id();
+        match self.post_worker_command(&WorkerCommand::AuditStart {
+            session_id: self.session_id,
+            request_id,
+        }) {
+            Ok(()) => {
+                self.audit_request = Some(request_id);
+                state.status = "Starting full mesh audit…".into();
+            }
+            Err(error) => state.status = format!("Full mesh audit failed: {error}"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn mesh_manifest(&self) -> Option<&MeshManifest> {
+        self.mesh.as_ref().map(|mesh| mesh.manifest())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn mesh_manifest(&self) -> Option<&MeshManifest> {
+        self.mesh.as_ref().map(|mesh| &mesh.manifest)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn mesh_tile_count(&self) -> usize {
+        self.mesh.as_ref().map_or(0, |mesh| {
+            mesh.entity_batches(caso_meshing::RowKind::Cell)
+                .filter_map(|entry| entry.spatial_node_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn mesh_tile_count(&self) -> usize {
+        self.mesh.as_ref().map_or(0, |mesh| mesh.tile_count)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assigned_tags(&self) -> Vec<(u64, String)> {
+        self.mesh
+            .as_ref()
+            .map_or_else(Vec::new, |mesh| assigned_tags(mesh))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn assigned_tags(&self) -> Vec<(u64, String)> {
+        self.mesh
+            .as_ref()
+            .map_or_else(Vec::new, |mesh| mesh.tags.clone())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn next_request_id(&mut self) -> u64 {
+        self.request_id = self.request_id.wrapping_add(1).max(1);
+        self.request_id
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn install_browser_mesh(
+        &mut self,
+        state: &mut AppState,
+        name: &str,
+        summary: BrowserMeshSummary,
+    ) {
+        if let Some(cancel) = self.analysis_cancel.take() {
+            cancel.cancel();
+        }
+        self.analysis_generation = self.analysis_generation.wrapping_add(1);
+        self.analysis_due = Some(0.0);
+        self.analysis_progress = QueryProgress::default();
+        self.analysis_error = None;
+        self.statistics = None;
+        self.max_boundary_distance = None;
+        self.boundary_range = 0.0;
+        self.has_boundary_entities = match summary.manifest.dimension {
+            2 => summary.manifest.counts.edges != 0,
+            3 => summary.manifest.counts.faces != 0,
+            _ => false,
+        };
+        self.selected_tags = summary.tags.iter().map(|(id, _)| *id).collect();
+        self.z_lower = summary.manifest.bounds.min[2];
+        self.z_upper = summary.manifest.bounds.max[2];
+        self.preview_revision = self.preview_revision.wrapping_add(1);
+        self.preview_more = self.show_preview;
+        self.preview_request_pending = false;
+        self.preview_selection = None;
+        self.preview_packets.clear();
+        self.preview_clear_pending = true;
+        state.status = format!(
+            "Loaded {name}: {} points, {} cells, {:.1} MiB",
+            summary.manifest.counts.points,
+            summary.manifest.counts.cells,
+            summary.artifact_bytes as f64 / 1024.0 / 1024.0
+        );
+        self.mesh = Some(summary);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_browser_event(data: &wasm_bindgen::JsValue) -> Result<BrowserEvent, String> {
+    use wasm_bindgen::JsCast;
+
+    let get = |key: &str| {
+        js_sys::Reflect::get(data, &wasm_bindgen::JsValue::from_str(key))
+            .map_err(|error| format!("could not read worker message {key}: {error:?}"))
+    };
+    match get("kind")?.as_string().as_deref() {
+        Some("preview_packet") => {
+            let meta = get("meta")?
+                .as_string()
+                .ok_or_else(|| "preview packet has no metadata".to_string())
+                .and_then(|value| {
+                    serde_json::from_str::<PreviewPacketMeta>(&value)
+                        .map_err(|error| error.to_string())
+                })?;
+            let floats = js_sys::Float32Array::new(&get("floats")?).to_vec();
+            if floats.len() * size_of::<f32>() > crate::mesh_worker::PREVIEW_PACKET_BYTES {
+                return Err("mesh worker exceeded the preview packet limit".into());
+            }
+            Ok(BrowserEvent::Preview(meta, floats))
+        }
+        Some("download") => {
+            let session_id = get("session_id")?
+                .as_f64()
+                .ok_or_else(|| "download response has no session ID".to_string())?
+                as u64;
+            let request_id = get("request_id")?
+                .as_f64()
+                .ok_or_else(|| "download response has no request ID".to_string())?
+                as u64;
+            let blob = get("blob")?
+                .dyn_into::<web_sys::Blob>()
+                .map_err(|_| "download response has no Blob".to_string())?;
+            Ok(BrowserEvent::Download(session_id, request_id, blob))
+        }
+        _ => Err("mesh worker sent an unknown binary message".into()),
+    }
+}
+
+fn format_progress(progress: caso_meshing::MeshingProgress) -> String {
+    let phase = match progress.phase {
+        caso_meshing::MeshingPhase::Generating => {
+            return format!(
+                "Meshing chunk {} — {} cells",
+                progress.completed_chunks, progress.cells_committed
+            );
+        }
+        caso_meshing::MeshingPhase::BuildingSpatialIndex => "Building spatial index",
+        caso_meshing::MeshingPhase::WritingPreviews => "Writing mesh previews",
+        caso_meshing::MeshingPhase::Finalizing => "Finalizing Arrow mesh",
+    };
+    if progress.phase_total == 0 {
+        phase.into()
+    } else {
+        format!(
+            "{phase} — {}/{}",
+            progress.phase_completed, progress.phase_total
+        )
     }
 }
 
@@ -1304,6 +1739,7 @@ fn download_name(raw: &str, default_name: &str) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn assigned_tags(mesh: &MeshFile) -> Vec<(u64, String)> {
     let mut tags = BTreeSet::new();
     for kind in [caso_meshing::RowKind::Edge, caso_meshing::RowKind::Face] {

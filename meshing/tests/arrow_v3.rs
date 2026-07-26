@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use caso_kernel::meshing::meshable_domains_from_document;
@@ -8,10 +8,11 @@ use caso_kernel::scene::SceneDocument;
 use caso_kernel::vec3::vec3;
 use caso_meshing::{
     Bounds3, ControlRegion, ControlSet, EntityKind, GenerationLimits, IncrementalLodPreparation,
-    JobControl, MemoryStorage, MeshArtifact, MeshChunkBuilder, MeshError, MeshFile, MeshId,
-    MeshQuery, MeshQueryService, MeshRenderStyle, MeshRendererCache, MeshTileDetail, MeshView,
-    MeshingRequest, QueryBudget, QueryMeasures, RenderLineColor, RendererBudgets, RowKind,
-    TagFilter, TagScope, TypedFormula, MESH_SCHEMA_NAME, MESH_SCHEMA_VERSION,
+    JobControl, MemoryArtifact, MemoryStorage, MeshArtifact, MeshChunkBuilder, MeshError, MeshFile,
+    MeshId, MeshQuery, MeshQueryService, MeshRenderStyle, MeshRendererCache, MeshTileDetail,
+    MeshView, MeshingPhase, MeshingRequest, QueryBudget, QueryMeasures, RenderLineColor,
+    RendererBudgets, RowKind, TagFilter, TagScope, TypedFormula, MESH_SCHEMA_NAME,
+    MESH_SCHEMA_VERSION,
 };
 
 fn rectangle(width: f64, height: f64) -> caso_kernel::meshing::MeshableDomains {
@@ -43,7 +44,7 @@ fn request(algorithm: &str) -> MeshingRequest {
     }
 }
 
-fn memory(output: caso_meshing::MeshingOutput) -> Arc<[u8]> {
+fn memory(output: caso_meshing::MeshingOutput) -> MemoryArtifact {
     match output.artifact {
         MeshArtifact::Memory(bytes) => bytes,
         #[cfg(not(target_arch = "wasm32"))]
@@ -89,6 +90,62 @@ fn uniform_v3_is_deterministic_lazy_queryable_and_auditable() {
     assert_eq!(result.displayed_count, 3);
     let report = file.full_audit(&JobControl::default()).unwrap();
     assert_eq!(report.entities, file.manifest().counts.entity_count());
+}
+
+#[test]
+fn audit_steps_match_the_blocking_report_and_generation_reports_finalization() {
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let reported = phases.clone();
+    let mut generation = request("uniform_2d");
+    generation.job_control = JobControl::default().with_progress(move |progress| {
+        let mut phases = reported.lock().unwrap();
+        if phases.last() != Some(&progress.phase) {
+            phases.push(progress.phase);
+        }
+    });
+    let file = Arc::new(
+        MeshFile::from_memory(memory(
+            caso_meshing::run_meshing(generation, MemoryStorage::new(64 * 1024 * 1024).unwrap())
+                .unwrap(),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        *phases.lock().unwrap(),
+        [
+            MeshingPhase::Generating,
+            MeshingPhase::BuildingSpatialIndex,
+            MeshingPhase::WritingPreviews,
+            MeshingPhase::Finalizing,
+        ]
+    );
+
+    let expected = file.full_audit(&JobControl::default()).unwrap();
+    let mut cursor = file.audit_cursor();
+    let actual = loop {
+        let before = cursor.progress().completed_leaves;
+        let step = file
+            .audit_step(&mut cursor, 1, &JobControl::default())
+            .unwrap();
+        assert!(step.progress.completed_leaves <= before + 1);
+        if let Some(report) = step.report {
+            break report;
+        }
+    };
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn decoded_chunk_target_is_enforced() {
+    let mut limited = request("uniform_2d");
+    limited.limits.target_chunk_bytes = 1;
+    assert!(matches!(
+        caso_meshing::run_meshing(
+            limited,
+            MemoryStorage::new(64 * 1024 * 1024).unwrap()
+        ),
+        Err(MeshError::LimitExceeded(message)) if message.contains("chunk target")
+    ));
 }
 
 #[test]

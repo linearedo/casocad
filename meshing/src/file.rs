@@ -12,8 +12,9 @@ use arrow_array::{
 };
 use arrow_ipc::reader::FileReader;
 use arrow_schema::SchemaRef;
+use serde::{Deserialize, Serialize};
 
-use crate::algorithm::{JobControl, MeshingProgress};
+use crate::algorithm::{JobControl, MeshingPhase, MeshingProgress};
 use crate::error::{MeshError, MeshResult};
 use crate::renderer::MeshView;
 use crate::schema::{
@@ -21,6 +22,7 @@ use crate::schema::{
     MeshCounts, MeshManifest, RowKind, MAX_BATCH_BYTES, MAX_BATCH_ROWS, MESH_SCHEMA_NAME,
     MESH_SCHEMA_VERSION,
 };
+use crate::storage::MemoryArtifact;
 
 trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
@@ -47,8 +49,8 @@ impl MeshReadSession {
         Self::new(Box::new(std::fs::File::open(path)?))
     }
 
-    pub fn memory(bytes: Arc<[u8]>) -> MeshResult<Self> {
-        Self::new(Box::new(Cursor::new(bytes)))
+    pub fn memory(bytes: impl Into<MemoryArtifact>) -> MeshResult<Self> {
+        Self::new(Box::new(Cursor::new(bytes.into())))
     }
 
     fn new(reader: Box<dyn ReadSeek>) -> MeshResult<Self> {
@@ -78,7 +80,7 @@ impl MeshReadSession {
 enum MeshSource {
     #[cfg(not(target_arch = "wasm32"))]
     Native(PathBuf),
-    Memory(Arc<[u8]>),
+    Memory(MemoryArtifact),
 }
 
 impl MeshSource {
@@ -177,8 +179,8 @@ impl MeshFile {
         Self::open(MeshSource::Native(path.as_ref().to_path_buf()))
     }
 
-    pub fn from_memory(bytes: Arc<[u8]>) -> MeshResult<Self> {
-        Self::open(MeshSource::Memory(bytes))
+    pub fn from_memory(bytes: impl Into<MemoryArtifact>) -> MeshResult<Self> {
+        Self::open(MeshSource::Memory(bytes.into()))
     }
 
     pub fn from_wasm_bytes(bytes: Arc<[u8]>) -> MeshResult<Self> {
@@ -380,103 +382,158 @@ impl MeshFile {
     }
 
     pub fn full_audit(&self, control: &JobControl) -> MeshResult<MeshAuditReport> {
-        let mut ids = BTreeSet::new();
-        let mut owners = BTreeMap::<u64, (u64, [f64; 3])>::new();
-        let mut counts = MeshCounts::default();
+        let mut cursor = self.audit_cursor();
+        loop {
+            if let Some(report) = self.audit_step(&mut cursor, usize::MAX, control)?.report {
+                return Ok(report);
+            }
+        }
+    }
+
+    pub fn audit_cursor(&self) -> MeshAuditCursor {
         let leaves = self
             .spatial_nodes
             .iter()
             .filter(|(_, node)| node.children.is_empty())
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        for (completed, leaf) in leaves.iter().enumerate() {
+        MeshAuditCursor {
+            ids: BTreeSet::new(),
+            owners: BTreeMap::new(),
+            counts: MeshCounts::default(),
+            leaves,
+            completed: 0,
+            report: None,
+        }
+    }
+
+    pub fn audit_step(
+        &self,
+        cursor: &mut MeshAuditCursor,
+        max_leaves: usize,
+        control: &JobControl,
+    ) -> MeshResult<MeshAuditStep> {
+        if max_leaves == 0 {
+            return Err(MeshError::InvalidInput(
+                "audit step leaf budget must be positive".into(),
+            ));
+        }
+        if let Some(report) = cursor.report {
+            return Ok(MeshAuditStep {
+                progress: cursor.progress(),
+                report: Some(report),
+            });
+        }
+        let end = cursor
+            .completed
+            .saturating_add(max_leaves)
+            .min(cursor.leaves.len());
+        while cursor.completed < end {
             control.check()?;
-            let mut local_points = BTreeSet::new();
-            for entry in self.tile_batches(*leaf, RowKind::Point) {
-                let batch = self.batch_view(entry.batch_index)?;
-                let point_ids = batch.u64s("entity_id")?;
-                let owner_chunks = batch.u64s("owner_chunk_id")?;
-                let ghosts = batch.bools("ghost")?;
-                let x = batch.f64s("x")?;
-                let y = batch.f64s("y")?;
-                let z = batch.f64s("z")?;
-                for row in 0..batch.len() {
-                    let id = point_ids.value(row);
-                    local_points.insert(id);
-                    let position = [x.value(row), y.value(row), z.value(row)];
-                    if !ghosts.value(row) {
-                        if !ids.insert(id)
-                            || owners
-                                .insert(id, (owner_chunks.value(row), position))
-                                .is_some()
-                        {
-                            return Err(MeshError::InvalidFile(format!(
-                                "point {id} has duplicate owner rows"
-                            )));
-                        }
-                        counts.points += 1;
-                    } else if let Some((owner, expected)) = owners.get(&id) {
-                        if *owner != owner_chunks.value(row) || *expected != position {
-                            return Err(MeshError::InvalidFile(format!(
-                                "ghost point {id} disagrees with its owner"
-                            )));
-                        }
-                    }
-                }
-            }
-            for kind in [RowKind::Edge, RowKind::Face, RowKind::Cell] {
-                for entry in self.tile_batches(*leaf, kind) {
-                    let batch = self.batch_view(entry.batch_index)?;
-                    let entity_ids = batch.u64s("entity_id")?;
-                    let connectivity = batch.lists("point_ids")?;
-                    for row in 0..batch.len() {
-                        let id = entity_ids.value(row);
-                        if !ids.insert(id) {
-                            return Err(MeshError::InvalidFile(format!(
-                                "entity ID {id} is not globally unique"
-                            )));
-                        }
-                        if list_u64(connectivity, row)?
-                            .iter()
-                            .any(|point| !local_points.contains(point))
-                        {
-                            return Err(MeshError::InvalidFile(format!(
-                                "entity {id} references a point absent from its exact chunk"
-                            )));
-                        }
-                        match kind {
-                            RowKind::Edge => counts.edges += 1,
-                            RowKind::Face => counts.faces += 1,
-                            RowKind::Cell => counts.cells += 1,
-                            _ => unreachable!(),
-                        }
-                    }
-                }
-            }
+            let leaf = cursor.leaves[cursor.completed];
+            self.audit_leaf(cursor, leaf)?;
+            cursor.completed += 1;
+            let progress = cursor.progress();
             control.report(MeshingProgress {
-                completed_chunks: completed as u64 + 1,
-                cells_committed: counts.cells,
+                phase: MeshingPhase::Finalizing,
+                phase_completed: progress.completed_leaves as u64,
+                phase_total: progress.total_leaves as u64,
+                completed_chunks: progress.completed_leaves as u64,
+                cells_committed: cursor.counts.cells,
                 active_bytes: 0,
             });
         }
-        if counts.points != self.manifest.counts.points
-            || counts.edges != self.manifest.counts.edges
-            || counts.faces != self.manifest.counts.faces
-            || counts.cells != self.manifest.counts.cells
-        {
-            return Err(MeshError::InvalidFile(format!(
-                "full audit counts {counts:?} disagree with manifest {:?}",
-                self.manifest.counts
-            )));
+        if cursor.completed == cursor.leaves.len() {
+            if cursor.counts.points != self.manifest.counts.points
+                || cursor.counts.edges != self.manifest.counts.edges
+                || cursor.counts.faces != self.manifest.counts.faces
+                || cursor.counts.cells != self.manifest.counts.cells
+            {
+                return Err(MeshError::InvalidFile(format!(
+                    "full audit counts {:?} disagree with manifest {:?}",
+                    cursor.counts, self.manifest.counts
+                )));
+            }
+            cursor.report = Some(MeshAuditReport {
+                exact_batches: self
+                    .directory
+                    .iter()
+                    .filter(|entry| entry.row_kind.is_exact())
+                    .count() as u64,
+                entities: cursor.counts.entity_count(),
+            });
         }
-        Ok(MeshAuditReport {
-            exact_batches: self
-                .directory
-                .iter()
-                .filter(|entry| entry.row_kind.is_exact())
-                .count() as u64,
-            entities: counts.entity_count(),
+        Ok(MeshAuditStep {
+            progress: cursor.progress(),
+            report: cursor.report,
         })
+    }
+
+    fn audit_leaf(&self, cursor: &mut MeshAuditCursor, leaf: u64) -> MeshResult<()> {
+        let mut local_points = BTreeSet::new();
+        for entry in self.tile_batches(leaf, RowKind::Point) {
+            let batch = self.batch_view(entry.batch_index)?;
+            let point_ids = batch.u64s("entity_id")?;
+            let owner_chunks = batch.u64s("owner_chunk_id")?;
+            let ghosts = batch.bools("ghost")?;
+            let x = batch.f64s("x")?;
+            let y = batch.f64s("y")?;
+            let z = batch.f64s("z")?;
+            for row in 0..batch.len() {
+                let id = point_ids.value(row);
+                local_points.insert(id);
+                let position = [x.value(row), y.value(row), z.value(row)];
+                if !ghosts.value(row) {
+                    if !cursor.ids.insert(id)
+                        || cursor
+                            .owners
+                            .insert(id, (owner_chunks.value(row), position))
+                            .is_some()
+                    {
+                        return Err(MeshError::InvalidFile(format!(
+                            "point {id} has duplicate owner rows"
+                        )));
+                    }
+                    cursor.counts.points += 1;
+                } else if let Some((owner, expected)) = cursor.owners.get(&id) {
+                    if *owner != owner_chunks.value(row) || *expected != position {
+                        return Err(MeshError::InvalidFile(format!(
+                            "ghost point {id} disagrees with its owner"
+                        )));
+                    }
+                }
+            }
+        }
+        for kind in [RowKind::Edge, RowKind::Face, RowKind::Cell] {
+            for entry in self.tile_batches(leaf, kind) {
+                let batch = self.batch_view(entry.batch_index)?;
+                let entity_ids = batch.u64s("entity_id")?;
+                let connectivity = batch.lists("point_ids")?;
+                for row in 0..batch.len() {
+                    let id = entity_ids.value(row);
+                    if !cursor.ids.insert(id) {
+                        return Err(MeshError::InvalidFile(format!(
+                            "entity ID {id} is not globally unique"
+                        )));
+                    }
+                    if list_u64(connectivity, row)?
+                        .iter()
+                        .any(|point| !local_points.contains(point))
+                    {
+                        return Err(MeshError::InvalidFile(format!(
+                            "entity {id} references a point absent from its exact chunk"
+                        )));
+                    }
+                    match kind {
+                        RowKind::Edge => cursor.counts.edges += 1,
+                        RowKind::Face => cursor.counts.faces += 1,
+                        RowKind::Cell => cursor.counts.cells += 1,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -499,10 +556,43 @@ fn point_distance_squared(a: [f64; 3], b: [f64; 3]) -> f64 {
     (0..3).map(|axis| (a[axis] - b[axis]).powi(2)).sum()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshAuditReport {
     pub exact_batches: u64,
     pub entities: u64,
+}
+
+#[derive(Debug)]
+pub struct MeshAuditCursor {
+    ids: BTreeSet<u64>,
+    owners: BTreeMap<u64, (u64, [f64; 3])>,
+    counts: MeshCounts,
+    leaves: Vec<u64>,
+    completed: usize,
+    report: Option<MeshAuditReport>,
+}
+
+impl MeshAuditCursor {
+    pub fn progress(&self) -> MeshAuditProgress {
+        MeshAuditProgress {
+            completed_leaves: self.completed,
+            total_leaves: self.leaves.len(),
+            complete: self.report.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshAuditProgress {
+    pub completed_leaves: usize,
+    pub total_leaves: usize,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshAuditStep {
+    pub progress: MeshAuditProgress,
+    pub report: Option<MeshAuditReport>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]

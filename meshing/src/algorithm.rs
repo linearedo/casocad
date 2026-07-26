@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use caso_kernel::meshing::{MeshableDomain, MeshableDomainSpace, MeshableDomains};
+use serde::{Deserialize, Serialize};
 
 use crate::chunk::{MeshChunk, MeshChunkBuilder};
 use crate::controls::ControlSet;
@@ -205,8 +206,20 @@ impl Default for GenerationLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeshingPhase {
+    #[default]
+    Generating,
+    BuildingSpatialIndex,
+    WritingPreviews,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshingProgress {
+    pub phase: MeshingPhase,
+    pub phase_completed: u64,
+    pub phase_total: u64,
     pub completed_chunks: u64,
     pub cells_committed: u64,
     pub active_bytes: u64,
@@ -330,6 +343,14 @@ impl MeshingRequest {
         self.controls
             .validate(&self.domains)
             .map_err(MeshError::InvalidInput)?;
+        if self.limits.max_cells == 0
+            || self.limits.max_chunks == 0
+            || self.limits.target_chunk_bytes == 0
+        {
+            return Err(MeshError::InvalidInput(
+                "meshing limits must be positive".into(),
+            ));
+        }
         let dimension = self.domains.iter().next().expect("nonempty").dimension;
         if self
             .domains
@@ -344,7 +365,7 @@ impl MeshingRequest {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshingStatistics {
     pub domains: u64,
     pub chunks: u64,

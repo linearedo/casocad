@@ -16,9 +16,10 @@ caso-meshing = { path = "../meshing" }
 rhai = "1"
 serde_json = "1"
 eframe = { version = "0.35.0", features = ["wgpu"] }
-rfd = "0.15"
+rfd = { version = "0.15", features = ["file-handle-inner"] }
 egui_dock = "0.20.1"
 egui_extras = { version = "0.35.0", default-features = false, features = ["svg"] }
+serde = { version = "1", features = ["derive"] }
 
 [[bin]]
 name = "casowasm"
@@ -37,6 +38,8 @@ web-sys = { version = "0.3", features = [
     "HtmlAnchorElement",
     "Url",
     "Blob",
+    "File",
+    "FileReaderSync",
     "Worker",
     "WorkerOptions",
     "WorkerType",

@@ -1,11 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 
 use arrow_ipc::writer::FileWriter;
 use web_time::Instant;
 
 use crate::algorithm::{
-    CatalogEntry, MeshCatalog, MeshSink, MeshingContext, MeshingRequest, MeshingStatistics,
+    CatalogEntry, MeshCatalog, MeshSink, MeshingContext, MeshingPhase, MeshingProgress,
+    MeshingRequest, MeshingStatistics,
 };
 use crate::chunk::{ChunkElement, MeshChunk};
 use crate::error::{MeshError, MeshResult};
@@ -148,6 +149,7 @@ impl<W: Write> MeshArtifactWriter<W> {
         mut self,
         generator_id: &str,
         settings: serde_json::Value,
+        control: &crate::algorithm::JobControl,
     ) -> MeshResult<(W, MeshingStatistics)> {
         let exact_end = self.batch_index;
         if self.leaves.is_empty() {
@@ -155,7 +157,23 @@ impl<W: Write> MeshArtifactWriter<W> {
                 "meshing produced no spatial chunks".into(),
             ));
         }
+        control.report(MeshingProgress {
+            phase: MeshingPhase::BuildingSpatialIndex,
+            phase_total: self.leaves.len() as u64,
+            completed_chunks: self.leaves.len() as u64,
+            cells_committed: self.counts.cells,
+            active_bytes: self.peak_active_bytes,
+            ..MeshingProgress::default()
+        });
         let (nodes, chunk_nodes, root) = build_spatial_tree(self.dimension, &self.leaves)?;
+        control.report(MeshingProgress {
+            phase: MeshingPhase::BuildingSpatialIndex,
+            phase_completed: self.leaves.len() as u64,
+            phase_total: self.leaves.len() as u64,
+            completed_chunks: self.leaves.len() as u64,
+            cells_committed: self.counts.cells,
+            active_bytes: self.peak_active_bytes,
+        });
         for entry in &mut self.directory {
             if entry.row_kind.is_exact() {
                 let chunk = entry.spatial_node_id.ok_or_else(|| {
@@ -166,8 +184,19 @@ impl<W: Write> MeshArtifactWriter<W> {
         }
 
         let preview_start = self.batch_index;
-        for node in &nodes {
+        for (completed, node) in nodes.iter().enumerate() {
             self.write_preview(node)?;
+            let completed = completed + 1;
+            if completed == nodes.len() || completed % 64 == 0 {
+                control.report(MeshingProgress {
+                    phase: MeshingPhase::WritingPreviews,
+                    phase_completed: completed as u64,
+                    phase_total: nodes.len() as u64,
+                    completed_chunks: self.leaves.len() as u64,
+                    cells_committed: self.counts.cells,
+                    active_bytes: self.peak_active_bytes,
+                });
+            }
         }
         let preview_end = self.batch_index;
 
@@ -180,12 +209,28 @@ impl<W: Write> MeshArtifactWriter<W> {
         let spatial_end = self.batch_index;
 
         let directory_start = self.batch_index;
+        control.report(MeshingProgress {
+            phase: MeshingPhase::Finalizing,
+            phase_total: self.directory.len() as u64,
+            completed_chunks: self.leaves.len() as u64,
+            cells_committed: self.counts.cells,
+            active_bytes: self.peak_active_bytes,
+            ..MeshingProgress::default()
+        });
         let entries = self.directory.clone();
-        for chunk in entries.chunks(MAX_BATCH_ROWS) {
+        for (index, chunk) in entries.chunks(MAX_BATCH_ROWS).enumerate() {
             let rows = chunk.iter().map(directory_row).collect::<Vec<_>>();
             self.writer.write(&rows_to_batch(&rows)?)?;
             self.batch_index += 1;
             self.counts.directory_rows += rows.len() as u64;
+            control.report(MeshingProgress {
+                phase: MeshingPhase::Finalizing,
+                phase_completed: ((index + 1) * MAX_BATCH_ROWS).min(entries.len()) as u64,
+                phase_total: entries.len() as u64,
+                completed_chunks: self.leaves.len() as u64,
+                cells_committed: self.counts.cells,
+                active_bytes: self.peak_active_bytes,
+            });
         }
         let directory_end = self.batch_index;
 
@@ -301,6 +346,12 @@ impl<W: Write> MeshSink for MeshArtifactWriter<W> {
             )));
         }
         let active_bytes = chunk.decoded_bytes() as u64;
+        if active_bytes > self.limits.target_chunk_bytes as u64 {
+            return Err(MeshError::LimitExceeded(format!(
+                "mesh chunk {} requires {active_bytes} decoded bytes, exceeding the configured {} byte chunk target",
+                chunk.id, self.limits.target_chunk_bytes
+            )));
+        }
         self.peak_active_bytes = self.peak_active_bytes.max(active_bytes);
         self.bounds = self.bounds.union(chunk.bounds);
         let preview = sample_chunk(&chunk);
@@ -416,7 +467,7 @@ pub fn run_meshing<S: MeshStorage>(
         "element_max_size": request.element_max_size,
         "controls": request.controls.metadata(),
     });
-    let (output, mut statistics) = writer.finish(descriptor.id, settings)?;
+    let (output, mut statistics) = writer.finish(descriptor.id, settings, &request.job_control)?;
     let artifact = storage.publish(output)?;
     statistics.domains = generated.domains.max(request.domains.len() as u64);
     statistics.peak_active_bytes = statistics
@@ -592,6 +643,7 @@ fn build_spatial_tree(
         dimension,
         leaves,
         nodes: Vec::new(),
+        node_indices: HashMap::new(),
         chunk_nodes: BTreeMap::new(),
         next_id: leaves
             .iter()
@@ -618,6 +670,7 @@ struct TreeBuilder<'a> {
     dimension: u8,
     leaves: &'a [LeafCandidate],
     nodes: Vec<SpatialNode>,
+    node_indices: HashMap<u64, usize>,
     chunk_nodes: BTreeMap<u32, u64>,
     next_id: u64,
 }
@@ -663,10 +716,14 @@ impl TreeBuilder<'_> {
         let preview = bottom_k(
             children
                 .iter()
-                .filter_map(|child| self.nodes.iter().find(|node| node.id == *child))
+                .filter_map(|child| {
+                    self.node_indices
+                        .get(child)
+                        .map(|index| &self.nodes[*index])
+                })
                 .flat_map(|node| node.preview.iter().cloned()),
         );
-        self.nodes.push(SpatialNode {
+        self.push_node(SpatialNode {
             id,
             parent: None,
             children,
@@ -682,7 +739,7 @@ impl TreeBuilder<'_> {
         let leaf = &self.leaves[index];
         let id = u64::from(leaf.chunk_id);
         self.chunk_nodes.insert(leaf.chunk_id, id);
-        self.nodes.push(SpatialNode {
+        self.push_node(SpatialNode {
             id,
             parent: None,
             children: Vec::new(),
@@ -705,7 +762,7 @@ impl TreeBuilder<'_> {
                 .iter()
                 .flat_map(|index| self.leaves[*index].preview.iter().cloned()),
         );
-        self.nodes.push(SpatialNode {
+        self.push_node(SpatialNode {
             id,
             parent: None,
             children,
@@ -715,6 +772,11 @@ impl TreeBuilder<'_> {
             preview,
         });
         id
+    }
+
+    fn push_node(&mut self, node: SpatialNode) {
+        self.node_indices.insert(node.id, self.nodes.len());
+        self.nodes.push(node);
     }
 
     fn allocate_id(&mut self) -> u64 {

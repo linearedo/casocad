@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use arrow_array::{Array, LargeListArray, UInt64Array};
+use serde::{Deserialize, Serialize};
 use web_time::Instant;
 
 use crate::query::{EntityKind, MeshQuery, MeshQueryService, SelectedEntity};
@@ -121,7 +122,7 @@ pub enum RenderLineColor {
     Quality(Option<f64>),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MeshRenderStyle {
     #[default]
     Catalog,
@@ -141,19 +142,19 @@ pub struct RenderLine {
     pub selected: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum MeshTileDetail {
     Preview,
     Exact,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MeshTileKey {
     pub node_id: u64,
     pub detail: MeshTileDetail,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LodTargetSelection {
     pub generation: u64,
     pub tiles: Vec<MeshTileKey>,

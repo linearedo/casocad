@@ -5,7 +5,7 @@ use caso_kernel::vec3::vec3;
 
 use crate::algorithm::{
     MeshAlgorithm, MeshAlgorithmCapabilities, MeshAlgorithmDescriptor, MeshSink, MeshingContext,
-    MeshingProgress, MeshingStatistics,
+    MeshingPhase, MeshingProgress, MeshingStatistics,
 };
 use crate::chunk::{MeshChunkBuilder, MeshId};
 use crate::error::{MeshError, MeshResult};
@@ -210,6 +210,9 @@ fn generate_3d(
                     statistics.cells += cells;
                     statistics.peak_active_bytes = statistics.peak_active_bytes.max(active);
                     context.job_control.report(MeshingProgress {
+                        phase: MeshingPhase::Generating,
+                        phase_completed: statistics.chunks,
+                        phase_total: 0,
                         completed_chunks: statistics.chunks,
                         cells_committed: statistics.cells,
                         active_bytes: active,

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use arrow_array::{Array, LargeListArray, UInt64Array};
+use serde::{Deserialize, Serialize};
 use web_time::Instant;
 
 use crate::error::{MeshError, MeshResult};
@@ -14,7 +15,7 @@ use crate::quality::{
 use crate::schema::{element_dimension, Bounds3, RowKind};
 use crate::{BatchView, MeshFile};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Interval {
     pub min: f64,
     pub max: f64,
@@ -44,7 +45,7 @@ impl Interval {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum EntityKind {
     Point,
     Edge,
@@ -69,7 +70,7 @@ pub struct QualityFilter {
     pub interval: Interval,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryMeasures {
     pub quality: Option<QualityMetric>,
     pub boundary_distance: bool,
@@ -82,7 +83,7 @@ pub enum TagMatch {
     All,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TagScope {
     Entity,
     AdjacentBoundary,
@@ -189,7 +190,7 @@ pub struct MeshQueryResult {
     pub progress: QueryProgress,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct QueryProgress {
     pub scanned_rows: u64,
     pub candidate_rows: u64,
@@ -808,7 +809,7 @@ fn tags_match(values: &[u64], wanted: &BTreeSet<u64>, matching: TagMatch) -> boo
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshQueryStatistics {
     pub total_cells: u64,
     pub filtered_cells: u64,

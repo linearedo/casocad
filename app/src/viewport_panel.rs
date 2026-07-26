@@ -161,7 +161,10 @@ pub struct ViewportPanel {
     /// pixel-sized highlight ribbons rebuild on zoom, not every frame.
     overlay_signature: (u64, u64, Option<u32>, i64),
     mesh_preview_revision: u64,
+    #[cfg(not(target_arch = "wasm32"))]
     mesh_tile_update: Option<caso_meshing::IncrementalLodPreparation>,
+    #[cfg(target_arch = "wasm32")]
+    mesh_tile_update: Option<crate::meshing_panel::BrowserPreviewUpdate>,
     mesh_tile_reset_pending: bool,
     mesh_decode_pending: bool,
     view_flight: Option<ViewFlight>,
@@ -238,6 +241,7 @@ impl ViewportPanel {
         self.mark_scene_changed();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn set_mesh_preview_update(
         &mut self,
         revision: u64,
@@ -251,6 +255,27 @@ impl ViewportPanel {
             self.mesh_tile_reset_pending = true;
         }
         self.mesh_decode_pending = update.stats.pending_tiles != 0;
+        self.mesh_tile_update = Some(update);
+        repaint
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_mesh_preview_update(
+        &mut self,
+        revision: u64,
+        update: crate::meshing_panel::BrowserPreviewUpdate,
+    ) -> bool {
+        let revision_changed = self.mesh_preview_revision != revision;
+        let repaint = revision_changed
+            || update.clear
+            || update.more
+            || update.selection.is_some()
+            || !update.packets.is_empty();
+        if revision_changed {
+            self.mesh_preview_revision = revision;
+            self.mesh_tile_reset_pending = true;
+        }
+        self.mesh_decode_pending = update.more;
         self.mesh_tile_update = Some(update);
         repaint
     }
@@ -595,9 +620,29 @@ impl ViewportPanel {
         let Some(update) = self.mesh_tile_update.take() else {
             return;
         };
-        renderer.set_mesh_tile_target(update.selection.generation, update.selection.tiles);
-        for tile in update.prepared {
-            renderer.upsert_mesh_tile(tile.generation, tile.key, tile.lines);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            renderer.set_mesh_tile_target(update.selection.generation, update.selection.tiles);
+            for tile in update.prepared {
+                renderer.upsert_mesh_tile(tile.generation, tile.key, tile.lines);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            if update.clear {
+                renderer.clear_mesh_tiles();
+            }
+            if let Some(selection) = update.selection {
+                renderer.set_mesh_tile_target(selection.generation, selection.tiles);
+            }
+            for packet in update.packets {
+                renderer.upsert_packed_mesh_tile_segment(
+                    packet.meta.generation,
+                    packet.meta.key,
+                    packet.floats,
+                    packet.meta.complete,
+                );
+            }
         }
     }
 

@@ -9,6 +9,8 @@ mod console_panel;
 mod dimensions;
 mod file_menu;
 mod gizmo;
+#[cfg(target_arch = "wasm32")]
+mod mesh_worker;
 mod meshing_controls;
 mod meshing_panel;
 mod properties_panel;
@@ -121,7 +123,7 @@ fn sdf_menu_button(ui: &mut egui::Ui, label: &str, kind: &str, selected: bool) -
 pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
     use eframe::wasm_bindgen::JsCast;
     if let Ok(scope) = js_sys::global().dyn_into::<web_sys::DedicatedWorkerGlobalScope>() {
-        install_mesh_worker(scope);
+        mesh_worker::install(scope);
         return Ok(());
     }
     let document = web_sys::window()
@@ -139,140 +141,6 @@ pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
             Box::new(|creation_context| Ok(Box::new(CasoApp::new(creation_context)))),
         )
         .await
-}
-
-#[cfg(target_arch = "wasm32")]
-fn install_mesh_worker(scope: web_sys::DedicatedWorkerGlobalScope) {
-    use wasm_bindgen::prelude::*;
-    use wasm_bindgen::JsCast;
-
-    let callback_scope = scope.clone();
-    let callback =
-        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
-            let result = (|| -> Result<caso_meshing::MeshingOutput, String> {
-                let text = event
-                    .data()
-                    .as_string()
-                    .ok_or_else(|| "mesh worker request must be JSON text".to_string())?;
-                let value: serde_json::Value =
-                    serde_json::from_str(&text).map_err(|error| error.to_string())?;
-                let scene = value
-                    .get("scene")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| "mesh worker request has no scene".to_string())?;
-                let cap_mib = value
-                    .get("cap_mib")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or_else(|| "mesh worker request has no cap_mib".to_string())?
-                    as usize;
-                let document = caso_kernel::serialization::load_scene_from_str(scene)
-                    .map_err(|error| error.to_string())?;
-                let domains = caso_kernel::meshing::meshable_domains_from_document(&document)
-                    .map_err(|error| error.to_string())?;
-                if !(64..=512).contains(&cap_mib) {
-                    return Err("WASM mesh cap must be 64–512 MiB".into());
-                }
-                let controls = crate::meshing_controls::compile_control_script(
-                    &domains,
-                    &document.meshing.control_script,
-                )?;
-                let progress_scope = callback_scope.clone();
-                let job_control =
-                    caso_meshing::JobControl::default().with_progress(move |progress| {
-                        post_mesh_worker_progress(&progress_scope, progress);
-                    });
-                caso_meshing::run_meshing(
-                    caso_meshing::MeshingRequest {
-                        domains,
-                        algorithm_id: document.meshing.algorithm_id.clone(),
-                        element_min_size: document.meshing.element_min_size,
-                        element_max_size: document.meshing.element_max_size,
-                        controls,
-                        limits: caso_meshing::GenerationLimits::default(),
-                        job_control,
-                    },
-                    caso_meshing::MemoryStorage::new(cap_mib * 1024 * 1024)
-                        .map_err(|error| error.to_string())?,
-                )
-                .map_err(|error| error.to_string())
-            })();
-
-            let message = js_sys::Object::new();
-            let set = |key: &str, value: &JsValue| {
-                let _ = js_sys::Reflect::set(&message, &JsValue::from_str(key), value);
-            };
-            match result {
-                Ok(output) => {
-                    let caso_meshing::MeshArtifact::Memory(bytes) = output.artifact;
-                    set("kind", &JsValue::from_str("complete"));
-                    set(
-                        "domains",
-                        &JsValue::from_f64(output.statistics.domains as f64),
-                    );
-                    set(
-                        "chunks",
-                        &JsValue::from_f64(output.statistics.chunks as f64),
-                    );
-                    set(
-                        "points",
-                        &JsValue::from_f64(output.statistics.points as f64),
-                    );
-                    set("cells", &JsValue::from_f64(output.statistics.cells as f64));
-                    set(
-                        "batches",
-                        &JsValue::from_f64(output.statistics.committed_batches as f64),
-                    );
-                    set(
-                        "peak_bytes",
-                        &JsValue::from_f64(output.statistics.peak_active_bytes as f64),
-                    );
-                    set(
-                        "elapsed_millis",
-                        &JsValue::from_f64(output.statistics.elapsed_millis as f64),
-                    );
-                    let array = js_sys::Uint8Array::from(bytes.as_ref());
-                    set("bytes", array.as_ref());
-                    let transfer = js_sys::Array::new();
-                    transfer.push(&array.buffer());
-                    let _ = callback_scope
-                        .post_message_with_transfer(message.as_ref(), transfer.as_ref());
-                }
-                Err(error) => {
-                    set("kind", &JsValue::from_str("error"));
-                    set("error", &JsValue::from_str(&error));
-                    let _ = callback_scope.post_message(message.as_ref());
-                }
-            }
-        });
-    scope.set_onmessage(Some(callback.as_ref().unchecked_ref()));
-    callback.forget();
-}
-
-#[cfg(target_arch = "wasm32")]
-fn post_mesh_worker_progress(
-    scope: &web_sys::DedicatedWorkerGlobalScope,
-    progress: caso_meshing::MeshingProgress,
-) {
-    use wasm_bindgen::JsValue;
-
-    let message = js_sys::Object::new();
-    for (key, value) in [
-        ("completed_chunks", progress.completed_chunks),
-        ("cells_committed", progress.cells_committed),
-        ("active_bytes", progress.active_bytes),
-    ] {
-        let _ = js_sys::Reflect::set(
-            &message,
-            &JsValue::from_str(key),
-            &JsValue::from_f64(value as f64),
-        );
-    }
-    let _ = js_sys::Reflect::set(
-        &message,
-        &JsValue::from_str("kind"),
-        &JsValue::from_str("progress"),
-    );
-    let _ = scope.post_message(message.as_ref());
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -762,17 +630,25 @@ pub(crate) fn web_download_bytes(
     filename: &str,
     bytes: &[u8],
 ) -> Result<(), wasm_bindgen::JsValue> {
+    let array = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::new();
+    parts.push(&array.buffer());
+    let blob = web_sys::Blob::new_with_buffer_source_sequence(&parts)?;
+    web_download_blob(filename, &blob)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn web_download_blob(
+    filename: &str,
+    blob: &web_sys::Blob,
+) -> Result<(), wasm_bindgen::JsValue> {
     use eframe::wasm_bindgen::JsCast;
     let document = web_sys::window()
         .ok_or("no window")?
         .document()
         .ok_or("no document")?;
     let anchor: web_sys::HtmlAnchorElement = document.create_element("a")?.dyn_into()?;
-    let array = js_sys::Uint8Array::from(bytes);
-    let parts = js_sys::Array::new();
-    parts.push(&array.buffer());
-    let blob = web_sys::Blob::new_with_buffer_source_sequence(&parts)?;
-    let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+    let url = web_sys::Url::create_object_url_with_blob(blob)?;
     anchor.set_href(&url);
     anchor.set_download(filename);
     anchor.click();

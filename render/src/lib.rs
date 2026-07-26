@@ -12,6 +12,6 @@ pub mod renderer;
 
 pub use camera::{OrbitCamera, DEFAULT_VIEW_DISTANCE};
 pub use renderer::{
-    MeshTileRenderStats, RenderOptions, ViewportRenderer, DEFAULT_BACKGROUND,
+    mesh_line_instance, MeshTileRenderStats, RenderOptions, ViewportRenderer, DEFAULT_BACKGROUND,
     MESH_TILE_UPLOAD_BUDGET_BYTES, TARGET_FORMAT,
 };
