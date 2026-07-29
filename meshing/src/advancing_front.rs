@@ -11,7 +11,7 @@ pub static ADVANCING_FRONT_DESCRIPTOR: MeshAlgorithmDescriptor = MeshAlgorithmDe
     dimensions: &[2, 3],
     capabilities: MeshAlgorithmCapabilities {
         refinement: true,
-        boundary_layers: false,
+        boundary_layers: true,
     },
 };
 
@@ -30,6 +30,9 @@ impl MeshAlgorithm for AdvancingFront {
     ) -> MeshResult<MeshingStatistics> {
         match context.domains.iter().next().map(|domain| domain.dimension) {
             Some(2) => crate::advancing_front_2d::generate(context, sink),
+            Some(3) if !context.controls.boundary_layers.is_empty() => Err(MeshError::Capability(
+                "algorithm \"advancing_front\" supports boundary layers only for 2D domains".into(),
+            )),
             Some(3) => crate::advancing_front_3d::generate(context, sink),
             Some(dimension) => Err(MeshError::UnsupportedDimension {
                 domain: context

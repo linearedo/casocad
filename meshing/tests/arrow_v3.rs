@@ -32,6 +32,22 @@ fn rectangle(width: f64, height: f64) -> caso_kernel::meshing::MeshableDomains {
     meshable_domains_from_document(&document).unwrap()
 }
 
+fn layered_rectangle() -> (caso_kernel::meshing::MeshableDomains, String) {
+    let mut document = SceneDocument::new();
+    let rectangle = document
+        .add_primitive_from_drag("rectangle", vec3(0.0, 0.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+        .unwrap();
+    document.rename(rectangle, "sea").unwrap();
+    document
+        .set_domain_root(rectangle, DomainKind::Fluid)
+        .unwrap();
+    document
+        .add_boundary_region(rectangle, None, None, Some("wall"))
+        .unwrap();
+    let region = document.boundary_regions.last().unwrap().name.clone();
+    (meshable_domains_from_document(&document).unwrap(), region)
+}
+
 fn request(algorithm: &str) -> MeshingRequest {
     MeshingRequest {
         domains: rectangle(2.0, 1.0),
@@ -322,7 +338,7 @@ fn registry_and_capability_errors_use_stable_ids() {
         ["advancing_front"]
     );
     assert!(caso_meshing::descriptors()[0].capabilities.refinement);
-    assert!(!caso_meshing::descriptors()[0].capabilities.boundary_layers);
+    assert!(caso_meshing::descriptors()[0].capabilities.boundary_layers);
     let missing = request("not_installed");
     assert!(matches!(
         caso_meshing::run_meshing(
@@ -408,7 +424,7 @@ fn chunk_builder_supports_mixed_v3_families_and_enforces_local_points() {
 }
 
 #[test]
-fn advancing_front_refines_locally_and_rejects_boundary_layers() {
+fn advancing_front_refines_locally_and_generates_2d_boundary_layers() {
     let coarse = caso_meshing::run_meshing(
         request("advancing_front"),
         MemoryStorage::new(64 * 1024 * 1024).unwrap(),
@@ -428,25 +444,48 @@ fn advancing_front_refines_locally_and_rejects_boundary_layers() {
         caso_meshing::run_meshing(refined, MemoryStorage::new(64 * 1024 * 1024).unwrap()).unwrap();
     assert!(refined.statistics.cells > coarse.statistics.cells);
 
+    let (domains, region) = layered_rectangle();
     let mut layered = request("advancing_front");
-    let region = layered
-        .domains
-        .iter()
-        .next()
+    layered.domains = domains;
+    layered
+        .controls
+        .boundary_layer("sea", region, 0.04, 2, 1.2)
+        .unwrap();
+    let layered =
+        caso_meshing::run_meshing(layered, MemoryStorage::new(64 * 1024 * 1024).unwrap()).unwrap();
+    assert!(layered.statistics.cells > 0);
+    MeshFile::from_memory(memory(layered))
         .unwrap()
-        .boundary_regions
-        .first()
-        .map(|region| region.name.clone());
-    if let Some(region) = region {
-        layered
-            .controls
-            .boundary_layer("sea", region, 0.1, 2, 1.2)
-            .unwrap();
-        assert!(matches!(
-            caso_meshing::run_meshing(layered, MemoryStorage::new(64 * 1024 * 1024).unwrap()),
-            Err(MeshError::Capability(_))
-        ));
-    }
+        .full_audit(&JobControl::default())
+        .unwrap();
+}
+
+#[test]
+fn advancing_front_rejects_3d_boundary_layers_explicitly() {
+    let document = SceneDocument::default_scene().unwrap();
+    let domains = meshable_domains_from_document(&document).unwrap();
+    let domain = domains.iter().next().unwrap();
+    let region = domain.boundary_regions.first().unwrap().name.clone();
+    let mut controls = ControlSet::default();
+    controls
+        .boundary_layer(&domain.name, region, 0.01, 2, 1.2)
+        .unwrap();
+    let result = caso_meshing::run_meshing(
+        MeshingRequest {
+            domains,
+            algorithm_id: "advancing_front".into(),
+            element_min_size: 0.025,
+            element_max_size: 0.1,
+            controls,
+            limits: GenerationLimits::default(),
+            job_control: JobControl::default(),
+        },
+        MemoryStorage::new(64 * 1024 * 1024).unwrap(),
+    );
+    assert!(matches!(
+        result,
+        Err(MeshError::Capability(message)) if message.contains("only for 2D")
+    ));
 }
 
 #[test]
