@@ -480,9 +480,7 @@ impl MeshingPanel {
             ui.separator();
             ui.horizontal(|ui| {
                 quality_legend(ui);
-                ui.label("0 Poor");
-                ui.label("→");
-                ui.label("1 Ideal");
+                ui.label(quality_scale_label(self.quality_metric));
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                 let na = caso_meshing::quality_color(None);
@@ -498,15 +496,16 @@ impl MeshingPanel {
                 ui.label("N/A");
             });
             if let Some(statistics) = &self.statistics {
+                let metric = statistics.quality_metric.unwrap_or(self.quality_metric);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!(
                         "Visible {}/{}",
                         statistics.filtered_cells, statistics.total_cells
                     ));
                     ui.separator();
-                    ui.label(format!("Min {}", format_score(statistics.minimum)));
-                    ui.label(format!("Mean {}", format_score(statistics.mean)));
-                    ui.label(format!("Max {}", format_score(statistics.maximum)));
+                    ui.label(format!("Min {}", format_score(metric, statistics.minimum)));
+                    ui.label(format!("Mean {}", format_score(metric, statistics.mean)));
+                    ui.label(format!("Max {}", format_score(metric, statistics.maximum)));
                     ui.label(format!(
                         "Worst ID {}",
                         statistics
@@ -682,9 +681,13 @@ impl MeshingPanel {
             let result = (|| {
                 let service = caso_meshing::MeshQueryService::new(mesh.clone());
                 let plan = service.plan(query).map_err(|error| error.to_string())?;
+                let quality_metric = plan.measures.quality;
                 let mut cursor =
                     service.cursor_with_cancellation(plan, worker_cancellation.clone());
-                let mut accumulator = QueryStatisticsAccumulator::new(mesh.manifest().counts.cells);
+                let mut accumulator = QueryStatisticsAccumulator::with_quality_metric(
+                    mesh.manifest().counts.cells,
+                    quality_metric,
+                );
                 loop {
                     let step = cursor
                         .step(QueryBudget::new(
@@ -1752,8 +1755,28 @@ fn assigned_tags(mesh: &MeshFile) -> Vec<(u64, String)> {
         .collect()
 }
 
-fn format_score(score: Option<f64>) -> String {
-    score.map_or_else(|| "N/A".into(), |score| format!("{score:.3}"))
+fn format_score(metric: QualityMetric, score: Option<f64>) -> String {
+    score.map_or_else(
+        || "N/A".into(),
+        |score| {
+            if metric == QualityMetric::AspectRatio && score == f64::MAX {
+                "∞".into()
+            } else if metric == QualityMetric::AspectRatio && score >= 10_000.0 {
+                format!("{score:.3e}")
+            } else {
+                format!("{score:.3}")
+            }
+        },
+    )
+}
+
+fn quality_scale_label(metric: QualityMetric) -> &'static str {
+    match metric {
+        QualityMetric::ScaledJacobian => "-1 Inverted · 0 Degenerate → 1 Ideal",
+        QualityMetric::Skewness => "1 Poor → 0 Ideal",
+        QualityMetric::AspectRatio => "∞ Poor → 1 Ideal",
+        QualityMetric::Compactness | QualityMetric::Orthogonality => "0 Poor → 1 Ideal",
+    }
 }
 
 fn quality_legend(ui: &mut egui::Ui) {
@@ -1777,6 +1800,19 @@ fn quality_legend(ui: &mut egui::Ui) {
                 (color[1] * 255.0) as u8,
                 (color[2] * 255.0) as u8,
             ),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapsed_aspect_ratio_is_displayed_as_infinity() {
+        assert_eq!(
+            format_score(QualityMetric::AspectRatio, Some(f64::MAX)),
+            "∞"
         );
     }
 }

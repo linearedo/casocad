@@ -1,31 +1,34 @@
 # Mesh quality measures
 
 The Meshing panel's Inspector evaluates finalized Arrow cell batches on
-demand. It provides five measures:
+demand. Each measure uses its conventional scale:
 
-- Scaled Jacobian
-- Skewness
-- Aspect Ratio
-- Compactness
-- Orthogonality
+| measure | range | ideal | worsening direction |
+| --- | --- | --- | --- |
+| Scaled Jacobian | `[-1, 1]` | `1` | toward `0`; negative values are inverted |
+| Skewness | `[0, 1]` | `0` | increasing toward `1` |
+| Aspect Ratio | `[1, infinity)` | `1` | increasing without bound |
+| Compactness | `[0, 1]` | `1` | decreasing toward `0` |
+| Orthogonality | `[0, 1]` | `1` | decreasing toward `0` |
 
-Every displayed score follows the same convention:
+These directions follow the conventional
+[CUBIT element metrics](https://cubit.sandia.gov/files/cubit/17.02/help_manual/WebHelp/mesh_generation/mesh_quality_assessment/quadrilateral_metrics.htm)
+and [Ansys Skewness](https://ansyshelp.ansys.com/public/Views/Secured/corp/v251/en/wb_msh/msh_skewness.html)
+definitions.
 
-| score | meaning |
-| --- | --- |
-| `1.0` | ideal element for the selected measure |
-| near `0.0` | poor, nearly degenerate, or collapsed element |
-| `0.0` | worst representable quality; invalid or degenerate in measures that detect it |
-| `N/A` | unsupported element type, missing topology, or malformed references |
+`N/A` means that the element type is unsupported, required topology is
+missing, or references are malformed. Values are dimensionless and invariant
+under translation, rotation, and uniform scaling.
 
-Scores are dimensionless, invariant under translation, rotation, and uniform
-scaling, and clamped to the range `[0, 1]`. A value above `1` produced by a
-raw formula is displayed as `1`; a negative value is displayed as `0`.
+There is no universal mesh-quality score. Queries, filters, formulas,
+statistics, and the public `quality_score` API all receive the conventional
+numeric value. In particular, existing thresholds written for the former
+inverted Skewness and Aspect Ratio scales must be updated.
 
 The measures are complementary. A cell can score well under one measure and
 poorly under another. For example, a rhombus can have four equal edges and
-therefore a perfect Aspect Ratio score while still having poor angles and a
-low Skewness score.
+therefore an Aspect Ratio of `1` while still having poor angles and high
+Skewness.
 
 ---
 
@@ -56,8 +59,8 @@ Interpretation:
 - `1`: ideal corner geometry;
 - near `0`: edges are nearly collinear or coplanar and the corner is close to
   collapse;
-- negative raw determinant: inverted orientation; the displayed score is
-  clamped to `0`.
+- `0`: degenerate corner geometry;
+- negative values: inverted orientation, down to `-1`.
 
 Scaled Jacobian is the most useful measure in the Inspector for finding
 inverted and locally collapsed cells. Because it reports the minimum corner
@@ -82,29 +85,23 @@ For a polygon with `n` sides, the ideal internal angle is
 ideal angle = pi (n - 2) / n
 ```
 
-The implementation finds the minimum and maximum corner angles, then computes
+The implementation finds the minimum and maximum corner angles, then returns
 the largest normalized departure from the ideal angle:
 
 ```text
               / max angle - ideal angle    ideal angle - min angle \
-skew = max   |  ------------------------,  -----------------------  |
+skewness = max | ------------------------,  ----------------------- |
               \       pi - ideal angle             ideal angle     /
-
-quality = 1 - skew
 ```
 
 Consequently:
 
-- a regular polygon scores `1`;
-- increasingly acute or obtuse corners reduce the score;
-- a degenerate face scores `0`.
-
-The label requires some care. Many mesh tools report conventional skewness,
-where `0` is ideal and larger values are worse. CasoCAD displays the inverted
-quality form, `1 - skewness`, so **larger is better**.
+- a regular polygon has Skewness `0`;
+- increasingly acute or obtuse corners increase the value;
+- a degenerate face has Skewness `1`.
 
 For a three-dimensional cell, the calculation is performed on every face and
-the cell receives the score of its worst face. It therefore measures the
+the cell receives the maximum Skewness of its faces. It therefore measures the
 quality of the cell's face angles; it does not directly measure volume or
 three-dimensional solid angles.
 
@@ -114,28 +111,28 @@ Implementation: [`skewness`](../meshing/src/quality.rs#L226).
 
 ## Aspect Ratio
 
-Aspect Ratio compares the shortest and longest topological edges of a cell:
+Aspect Ratio compares the longest and shortest topological edges of a cell:
 
 ```text
-          shortest edge length
-quality = --------------------
-           longest edge length
+               longest edge length
+aspect ratio = -------------------
+              shortest edge length
 ```
-
-Although the Inspector calls it Aspect Ratio, the displayed value is the
-reciprocal of the common `longest / shortest` definition. This keeps the
-Inspector's common convention that larger scores are better.
 
 Examples:
 
 - all edge lengths equal: `1`;
-- longest edge ten times the shortest: `0.1`;
-- a zero-length edge: `0`.
+- longest edge ten times the shortest: `10`;
+- a zero-length edge: infinity.
+
+Internally a collapsed edge is represented by finite `f64::MAX`, so statistics
+can cross JSON/WASM boundaries without non-finite numbers. The Inspector
+formats that sentinel as infinity.
 
 Aspect Ratio is useful for detecting stretched elements, but it only examines
 edge lengths. It does not examine angles, orientation, area, or volume. A
 skewed element with equal-length edges can still score `1`, and a nearly flat
-three-dimensional element can retain a moderately good Aspect Ratio score.
+three-dimensional element can retain a moderate Aspect Ratio.
 
 Generic polyhedra return `N/A` because the implementation has no fixed edge
 map for them.
@@ -199,7 +196,7 @@ The reference shapes are:
 
 An ideal reference element scores `1`. Flattening or stretching a cell while
 retaining a large surface relative to its volume reduces its score toward
-`0`. A raw score greater than the chosen reference is clamped to `1`.
+`0`. Compactness is bounded to `[0, 1]`.
 
 The volume calculation uses absolute tetrahedral contributions from the cell
 center to its faces. Compactness can therefore give a plausible positive
@@ -280,34 +277,48 @@ cells. If the highest-dimensional cells are 2D, it scores those cells.
 This prevents boundary entities from being mixed into the statistics for a
 volume mesh.
 
-Implementation: [`analyze`](../meshing/src/quality.rs#L60).
+Implementation: [`statistics`](../meshing/src/query.rs).
 
 ## Inspector display and statistics
 
-The viewport uses 32 color bands:
+The viewport still uses 32 red-to-green color bands:
 
-- red: low quality;
-- yellow: approximately middle quality;
-- green: high quality;
+- red: poor;
+- yellow: intermediate;
+- green: ideal;
 - gray: `N/A`.
+
+Color is the only place where a common goodness scale is derived:
+
+| measure | rendering goodness |
+| --- | --- |
+| Scaled Jacobian | `clamp(value, 0, 1)` |
+| Skewness | `1 - value` |
+| Aspect Ratio | `1 / value` |
+| Compactness | `value` |
+| Orthogonality | `value` |
+
+Negative Scaled Jacobians therefore remain visible in statistics and queries
+but share the poorest red color with degenerate elements.
 
 The Inspector reports:
 
 - **Visible** — the number of analyzed cells that remain after viewport,
   Z-range, boundary-distance, and boundary-tag filtering;
-- **Min** — the worst visible numeric score;
+- **Min** — the minimum conventional value;
 - **Mean** — the arithmetic mean of visible numeric scores;
-- **Max** — the best visible numeric score;
-- **Worst ID** — the cell ID with the lowest visible numeric score;
+- **Max** — the maximum conventional value;
+- **Worst ID** — the cell ID with the maximum Skewness or Aspect Ratio, or
+  the minimum Scaled Jacobian, Compactness, or Orthogonality;
 - **N/A** — visible cells for which the selected measure could not be
   calculated.
 
 `N/A` cells are excluded from Min, Mean, Max, and Worst ID. The application
 does not define solver-specific thresholds for acceptable or unacceptable
-quality; the colors visualize the continuous `[0, 1]` score.
+quality. Equal worst values choose the lowest cell ID.
 
-Inspector implementation: [`inspector_ui`](../app/src/meshing_panel.rs#L186)
-and [`quality_color`](../app/src/meshing_panel.rs#L1142).
+Inspector implementation: [`inspector_ui`](../app/src/meshing_panel.rs) and
+[`quality_color`](../meshing/src/renderer.rs).
 
 ---
 

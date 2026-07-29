@@ -10,7 +10,7 @@ use web_time::Instant;
 use crate::error::{MeshError, MeshResult};
 use crate::quality::{
     corner_count, polyhedron_quality_score, quality_score, quality_score_exact, side_indices,
-    QualityMetric,
+    QualityMetric, QualityValue,
 };
 use crate::schema::{element_dimension, Bounds3, RowKind};
 use crate::{BatchView, MeshFile};
@@ -171,7 +171,7 @@ pub struct SelectedEntity {
     pub neighbor_cell_id: Option<u64>,
     pub boundary: bool,
     pub boundary_distance: Option<f64>,
-    pub quality: Option<f64>,
+    pub quality: Option<QualityValue>,
     pub adjacent_boundary_tag_ids: Vec<u64>,
 }
 
@@ -443,8 +443,10 @@ impl MeshQueryService {
         }
         let plan = self.plan(query)?;
         let total_cells = self.file.manifest().counts.cells;
+        let quality_metric = plan.measures.quality;
         let mut cursor = self.cursor(plan);
-        let mut accumulator = QueryStatisticsAccumulator::new(total_cells);
+        let mut accumulator =
+            QueryStatisticsAccumulator::with_quality_metric(total_cells, quality_metric);
         loop {
             let step = cursor.step(QueryBudget {
                 max_rows: 65_536,
@@ -644,7 +646,7 @@ impl MeshQueryCursor {
                 }
             }
             if let Some(metric) = self.plan.measures.quality {
-                entity.quality = if entity.kind == EntityKind::Cell {
+                let quality = if entity.kind == EntityKind::Cell {
                     if entity.element_type == "polyhedron" {
                         self.ensure_topology()?.cell_quality(entity.id, metric)
                     } else {
@@ -670,10 +672,11 @@ impl MeshQueryCursor {
                 } else {
                     quality_score(&entity.element_type, &entity.points, metric)
                 };
+                entity.quality = quality.map(|value| QualityValue::new(metric, value));
                 if self.plan.query.quality.is_some_and(|filter| {
                     entity
                         .quality
-                        .is_none_or(|quality| !filter.interval.contains(quality))
+                        .is_none_or(|quality| !filter.interval.contains(quality.value))
                 }) {
                     continue;
                 }
@@ -815,6 +818,7 @@ pub struct MeshQueryStatistics {
     pub filtered_cells: u64,
     pub supported: u64,
     pub unsupported: u64,
+    pub quality_metric: Option<QualityMetric>,
     pub minimum: Option<f64>,
     pub mean: Option<f64>,
     pub maximum: Option<f64>,
@@ -829,6 +833,7 @@ pub struct QueryStatisticsAccumulator {
     filtered_cells: u64,
     supported: u64,
     unsupported: u64,
+    quality_metric: Option<QualityMetric>,
     minimum: Option<f64>,
     mean: f64,
     maximum: Option<f64>,
@@ -838,11 +843,16 @@ pub struct QueryStatisticsAccumulator {
 
 impl QueryStatisticsAccumulator {
     pub fn new(total_cells: u64) -> Self {
+        Self::with_quality_metric(total_cells, None)
+    }
+
+    pub fn with_quality_metric(total_cells: u64, quality_metric: Option<QualityMetric>) -> Self {
         Self {
             total_cells,
             filtered_cells: 0,
             supported: 0,
             unsupported: 0,
+            quality_metric,
             minimum: None,
             mean: 0.0,
             maximum: None,
@@ -866,19 +876,30 @@ impl QueryStatisticsAccumulator {
             self.unsupported += 1;
             return;
         };
+        if self
+            .quality_metric
+            .is_some_and(|metric| metric != quality.metric)
+        {
+            self.unsupported += 1;
+            return;
+        }
+        self.quality_metric = Some(quality.metric);
+        let value = quality.value;
+        let previous_worst = if quality.metric.higher_is_worse() {
+            self.maximum
+        } else {
+            self.minimum
+        };
         self.supported += 1;
-        self.mean += (quality - self.mean) / self.supported as f64;
-        self.maximum = Some(self.maximum.map_or(quality, |old| old.max(quality)));
-        match self.minimum {
-            None => {
-                self.minimum = Some(quality);
-                self.worst_cell_id = Some(entity.id);
-            }
+        self.mean += (value - self.mean) / self.supported as f64;
+        self.minimum = Some(self.minimum.map_or(value, |old| old.min(value)));
+        self.maximum = Some(self.maximum.map_or(value, |old| old.max(value)));
+        match previous_worst {
+            None => self.worst_cell_id = Some(entity.id),
             Some(old)
-                if quality < old
-                    || (quality == old && self.worst_cell_id.is_none_or(|id| entity.id < id)) =>
+                if quality.metric.worst(old, value) == value
+                    && (value != old || self.worst_cell_id.is_none_or(|id| entity.id < id)) =>
             {
-                self.minimum = Some(quality);
                 self.worst_cell_id = Some(entity.id);
             }
             _ => {}
@@ -897,6 +918,7 @@ impl QueryStatisticsAccumulator {
             filtered_cells: self.filtered_cells,
             supported: self.supported,
             unsupported: self.unsupported,
+            quality_metric: self.quality_metric,
             minimum: self.minimum,
             mean: (self.supported != 0).then_some(self.mean),
             maximum: self.maximum,
@@ -1517,7 +1539,10 @@ impl TopologyIndex {
         if scores.is_empty() || scores.iter().any(Option::is_none) {
             None
         } else {
-            scores.into_iter().flatten().reduce(f64::min)
+            scores
+                .into_iter()
+                .flatten()
+                .reduce(|a, b| metric.worst(a, b))
         }
     }
 
@@ -1795,7 +1820,7 @@ impl ValueExpr {
                 FieldName::Quality => context
                     .entity
                     .quality
-                    .map(Value::Number)
+                    .map(|quality| Value::Number(quality.value))
                     .unwrap_or(Value::Null),
                 FieldName::BoundaryDistance => context
                     .entity
@@ -2212,6 +2237,29 @@ fn tokenize(source: &str) -> MeshResult<Vec<Token>> {
 mod tests {
     use super::*;
 
+    fn quality_entity(id: u64, metric: QualityMetric, value: f64) -> SelectedEntity {
+        SelectedEntity {
+            id,
+            kind: EntityKind::Cell,
+            tile_id: 1,
+            element_type: "quad4".into(),
+            point_ids: Vec::new(),
+            points: Vec::new(),
+            edge_ids: Vec::new(),
+            face_ids: Vec::new(),
+            tag_ids: Vec::new(),
+            zone_id: None,
+            source_id: None,
+            source_object_id: None,
+            owner_cell_id: None,
+            neighbor_cell_id: None,
+            boundary: false,
+            boundary_distance: None,
+            quality: Some(QualityValue::new(metric, value)),
+            adjacent_boundary_tag_ids: Vec::new(),
+        }
+    }
+
     #[test]
     fn formula_keeps_large_unsigned_literals_exact() {
         let formula = TypedFormula::parse("id == 9007199254740993").expect("formula");
@@ -2251,5 +2299,63 @@ mod tests {
         assert!(!tags_match(&values, &BTreeSet::from([2, 3]), TagMatch::All));
         assert!(!tags_match(&values, &BTreeSet::new(), TagMatch::Any));
         assert!(tags_match(&values, &BTreeSet::new(), TagMatch::All));
+    }
+
+    #[test]
+    fn statistics_choose_metric_aware_worst_values_and_lowest_tied_id() {
+        for (metric, values, expected_worst) in [
+            (QualityMetric::Skewness, [(8, 0.8), (4, 0.2), (2, 0.8)], 2),
+            (
+                QualityMetric::ScaledJacobian,
+                [(8, -0.2), (4, 0.6), (2, -0.2)],
+                2,
+            ),
+        ] {
+            let mut statistics = QueryStatisticsAccumulator::with_quality_metric(3, Some(metric));
+            let expected_min = values.iter().map(|(_, value)| *value).reduce(f64::min);
+            statistics.extend(values.map(|(id, value)| quality_entity(id, metric, value)));
+            let statistics = statistics.finish(QueryProgress::default());
+            assert_eq!(statistics.quality_metric, Some(metric));
+            assert_eq!(statistics.minimum, expected_min);
+            assert_eq!(statistics.worst_cell_id, Some(expected_worst));
+        }
+    }
+
+    #[test]
+    fn boundary_quality_uses_the_worst_owner_value_for_each_metric() {
+        let ideal = vec![[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]];
+        let distorted = vec![[0., 0., 0.], [2., 0., 0.], [2.2, 0.3, 0.], [0., 1., 0.]];
+        let cell = |id, point_ids, points: Vec<[f64; 3]>| IndexedCell {
+            id,
+            element_type: "quad4".into(),
+            point_ids,
+            center: centroid(&points),
+            points,
+            face_ids: Vec::new(),
+        };
+        let topology = TopologyIndex {
+            cells: BTreeMap::from([
+                (1, cell(1, vec![1, 2, 3, 4], ideal)),
+                (2, cell(2, vec![5, 6, 7, 8], distorted)),
+            ]),
+            faces: BTreeMap::new(),
+            side_cells: BTreeMap::new(),
+        };
+        let mut boundary = quality_entity(10, QualityMetric::ScaledJacobian, 0.0);
+        boundary.kind = EntityKind::Edge;
+        boundary.boundary = true;
+        boundary.owner_cell_id = Some(1);
+        boundary.neighbor_cell_id = Some(2);
+
+        for metric in QualityMetric::ALL {
+            let a = topology.cell_quality(1, metric).unwrap();
+            let b = topology.cell_quality(2, metric).unwrap();
+            assert_eq!(
+                topology.boundary_quality(&boundary, metric),
+                Some(metric.worst(a, b)),
+                "{}",
+                metric.label()
+            );
+        }
     }
 }

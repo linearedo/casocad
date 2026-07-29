@@ -1004,6 +1004,7 @@ fn load_preview(file: &MeshFile, node: u64, query: &MeshQuery) -> MeshResult<Vec
             let quality = query.quality.and_then(|filter| {
                 crate::quality::quality_score(element_type, &geometry, filter.metric)
                     .filter(|score| filter.interval.contains(*score))
+                    .map(|value| crate::quality::QualityValue::new(filter.metric, value))
             });
             if query.quality.is_some() && quality.is_none() {
                 continue;
@@ -1069,7 +1070,7 @@ fn build_lines(
                 RenderLineColor::Catalog(entity.tag_ids.first().copied().unwrap_or(0))
             }
             MeshRenderStyle::Quality | MeshRenderStyle::SelectedBoundaryQuality => {
-                RenderLineColor::Quality(entity.quality)
+                RenderLineColor::Quality(entity.quality.map(|quality| quality.rendering_goodness()))
             }
         };
         let selected = selected_ids.contains(&entity.id);
@@ -1413,11 +1414,17 @@ mod tests {
     }
 
     #[test]
-    fn quality_lines_use_bands_and_the_worse_shared_score() {
+    fn quality_lines_use_bands_and_the_worse_shared_metric_value() {
         let mut first = volume_entity(10, "tet4", vec![1, 2, 3, 4]);
-        first.quality = Some(0.8);
+        first.quality = Some(crate::quality::QualityValue::new(
+            crate::quality::QualityMetric::Skewness,
+            0.2,
+        ));
         let mut second = volume_entity(20, "tet4", vec![1, 2, 5, 6]);
-        second.quality = Some(0.2);
+        second.quality = Some(crate::quality::QualityValue::new(
+            crate::quality::QualityMetric::Skewness,
+            0.8,
+        ));
         let lines = build_lines(
             &[first, second],
             MeshRenderStyle::Quality,
@@ -1431,7 +1438,9 @@ mod tests {
                 [line.a[0], line.b[0]] == [1.0, 2.0] || [line.a[0], line.b[0]] == [2.0, 1.0]
             })
             .expect("shared edge");
-        assert_eq!(shared.color, RenderLineColor::Quality(Some(0.2)));
+        assert!(
+            matches!(shared.color, RenderLineColor::Quality(Some(value)) if (value - 0.2).abs() < 1.0e-12)
+        );
 
         let mut unsupported = volume_entity(30, "tet4", vec![1, 2, 7, 8]);
         unsupported.quality = None;

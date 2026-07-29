@@ -597,10 +597,14 @@ impl WorkerState {
             candidate_batches: plan.candidate_batches(),
             ..QueryProgress::default()
         };
+        let quality_metric = plan.measures.quality;
         self.analysis = Some(AnalysisState {
             request_id,
             cursor: service.cursor(plan),
-            accumulator: QueryStatisticsAccumulator::new(mesh.manifest().counts.cells),
+            accumulator: QueryStatisticsAccumulator::with_quality_metric(
+                mesh.manifest().counts.cells,
+                quality_metric,
+            ),
         });
         post_json(
             scope,

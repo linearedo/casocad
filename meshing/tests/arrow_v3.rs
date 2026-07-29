@@ -282,6 +282,28 @@ fn planned_cursor_measures_statistics_and_adjacent_tags_share_exact_rows() {
     );
     assert!(formula_plan.measures.boundary_distance);
 
+    let aspect_ratio = service
+        .execute(MeshQuery {
+            quality: Some(caso_meshing::QualityFilter {
+                metric: caso_meshing::quality::QualityMetric::AspectRatio,
+                interval: caso_meshing::Interval::new(1.0, f64::INFINITY),
+            }),
+            formula: Some(TypedFormula::parse("quality >= 1").unwrap()),
+            display_limit: usize::MAX,
+            ..MeshQuery::default()
+        })
+        .unwrap();
+    let aspect_values = aspect_ratio
+        .render_tiles
+        .iter()
+        .flat_map(|tile| &tile.entities)
+        .filter_map(|entity| entity.quality)
+        .collect::<Vec<_>>();
+    assert!(!aspect_values.is_empty());
+    assert!(aspect_values.iter().all(|quality| {
+        quality.metric == caso_meshing::quality::QualityMetric::AspectRatio && quality.value >= 1.0
+    }));
+
     let cancelled = cursor.cancellation();
     cancelled.cancel();
     assert!(matches!(

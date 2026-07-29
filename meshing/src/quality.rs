@@ -43,6 +43,45 @@ impl QualityMetric {
             _ => return None,
         })
     }
+
+    pub const fn higher_is_worse(self) -> bool {
+        matches!(self, Self::Skewness | Self::AspectRatio)
+    }
+
+    pub fn worst(self, a: f64, b: f64) -> f64 {
+        if self.higher_is_worse() {
+            a.max(b)
+        } else {
+            a.min(b)
+        }
+    }
+
+    /// Convert a conventional metric value to the viewport's `[0, 1]`
+    /// red-to-green goodness scale.
+    pub fn rendering_goodness(self, value: f64) -> f64 {
+        match self {
+            Self::ScaledJacobian => value.clamp(0.0, 1.0),
+            Self::Skewness => (1.0 - value).clamp(0.0, 1.0),
+            Self::AspectRatio => (1.0 / value).clamp(0.0, 1.0),
+            Self::Compactness | Self::Orthogonality => value.clamp(0.0, 1.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct QualityValue {
+    pub metric: QualityMetric,
+    pub value: f64,
+}
+
+impl QualityValue {
+    pub const fn new(metric: QualityMetric, value: f64) -> Self {
+        Self { metric, value }
+    }
+
+    pub fn rendering_goodness(self) -> f64 {
+        self.metric.rendering_goodness(self.value)
+    }
 }
 
 pub fn quality_score(
@@ -66,14 +105,15 @@ pub fn quality_score_with_neighbors(
     neighbors: &BTreeMap<Vec<u64>, [f64; 3]>,
 ) -> Option<f64> {
     let corners = corner_points(element_type, points)?;
-    let raw = match metric {
-        QualityMetric::ScaledJacobian => scaled_jacobian(element_type, corners),
+    match metric {
+        QualityMetric::ScaledJacobian => scaled_jacobian(element_type, corners).map(signed_unit),
         QualityMetric::Skewness => skewness(element_type, corners),
         QualityMetric::AspectRatio => aspect_ratio(element_type, corners),
-        QualityMetric::Compactness => compactness(element_type, corners),
-        QualityMetric::Orthogonality => orthogonality(element_type, corners, None, neighbors),
-    }?;
-    Some(unit(raw))
+        QualityMetric::Compactness => compactness(element_type, corners).map(unit_interval),
+        QualityMetric::Orthogonality => {
+            orthogonality(element_type, corners, None, neighbors).map(unit_interval)
+        }
+    }
 }
 
 /// Topology-aware variant used by Arrow queries. `point_ids` must correspond
@@ -91,16 +131,15 @@ pub(crate) fn quality_score_exact(
     };
     let corners = points.get(..count)?;
     let ids = point_ids.get(..count)?;
-    let raw = match metric {
-        QualityMetric::ScaledJacobian => scaled_jacobian(element_type, corners),
+    match metric {
+        QualityMetric::ScaledJacobian => scaled_jacobian(element_type, corners).map(signed_unit),
         QualityMetric::Skewness => skewness(element_type, corners),
         QualityMetric::AspectRatio => aspect_ratio(element_type, corners),
-        QualityMetric::Compactness => compactness(element_type, corners),
+        QualityMetric::Compactness => compactness(element_type, corners).map(unit_interval),
         QualityMetric::Orthogonality => {
-            orthogonality(element_type, corners, Some(ids), neighbor_centers)
+            orthogonality(element_type, corners, Some(ids), neighbor_centers).map(unit_interval)
         }
-    }?;
-    Some(unit(raw))
+    }
 }
 
 pub(crate) fn polyhedron_quality_score(
@@ -110,13 +149,13 @@ pub(crate) fn polyhedron_quality_score(
     neighbor_centers: &BTreeMap<Vec<u64>, [f64; 3]>,
 ) -> Option<f64> {
     let p = points.iter().copied().map(V).collect::<Vec<_>>();
-    let raw = match metric {
+    match metric {
         QualityMetric::Skewness => faces
             .iter()
             .map(|(_, face)| polygon_skewness(&face.iter().copied().map(V).collect::<Vec<_>>()))
             .collect::<Option<Vec<_>>>()?
             .into_iter()
-            .reduce(f64::min)?,
+            .reduce(f64::max),
         QualityMetric::Orthogonality => {
             if p.is_empty() || faces.is_empty() {
                 return None;
@@ -136,13 +175,12 @@ pub(crate) fn polyhedron_quality_score(
                     - center;
                 result = result.min(normal.dot(target.normalized()?).abs());
             }
-            result
+            Some(unit_interval(result))
         }
         QualityMetric::ScaledJacobian | QualityMetric::AspectRatio | QualityMetric::Compactness => {
-            return None
+            None
         }
-    };
-    Some(unit(raw))
+    }
 }
 
 pub(crate) fn corner_count(element_type: &str) -> Option<usize> {
@@ -324,7 +362,7 @@ fn scaled_jacobian_2d(points: &[V], normalization: f64) -> Option<f64> {
         }
         minimum = minimum.min(-incoming.cross(outgoing).dot(normal) / denominator);
     }
-    Some((minimum * normalization).max(0.0))
+    Some(minimum * normalization)
 }
 
 fn corner_jacobians(
@@ -349,8 +387,7 @@ fn corner_jacobians(
                 )
             })
             .fold(f64::INFINITY, f64::min)
-            .mul_add(scale, 0.0)
-            .max(0.0),
+            .mul_add(scale, 0.0),
     )
 }
 
@@ -362,7 +399,7 @@ fn skewness(element_type: &str, points: &[[f64; 3]]) -> Option<f64> {
             .iter()
             .map(|side| polygon_skewness(&side.iter().map(|&index| p[index]).collect::<Vec<_>>()))
             .collect::<Option<Vec<_>>>()
-            .and_then(|scores| scores.into_iter().reduce(f64::min)),
+            .and_then(|scores| scores.into_iter().reduce(f64::max)),
         _ => None,
     }
 }
@@ -372,7 +409,7 @@ fn polygon_skewness(points: &[V]) -> Option<f64> {
         return None;
     }
     if polygon_normal(points).length() <= EPS {
-        return Some(0.0);
+        return Some(1.0);
     }
     let ideal = std::f64::consts::PI * (points.len() as f64 - 2.0) / points.len() as f64;
     let mut minimum = f64::INFINITY;
@@ -382,14 +419,14 @@ fn polygon_skewness(points: &[V]) -> Option<f64> {
         let b = points[(index + 1) % points.len()] - points[index];
         let denominator = a.length() * b.length();
         if denominator <= EPS {
-            return Some(0.0);
+            return Some(1.0);
         }
         let angle = (a.dot(b) / denominator).clamp(-1.0, 1.0).acos();
         minimum = minimum.min(angle);
         maximum = maximum.max(angle);
     }
     Some(
-        1.0 - ((maximum - ideal) / (std::f64::consts::PI - ideal))
+        ((maximum - ideal) / (std::f64::consts::PI - ideal))
             .max((ideal - minimum) / ideal)
             .max(0.0),
     )
@@ -405,9 +442,14 @@ fn aspect_ratio(element_type: &str, points: &[[f64; 3]]) -> Option<f64> {
     let minimum = lengths.iter().copied().reduce(f64::min)?;
     let maximum = lengths.iter().copied().reduce(f64::max)?;
     Some(if minimum <= EPS || maximum <= EPS {
-        0.0
+        f64::MAX
     } else {
-        minimum / maximum
+        let ratio = maximum / minimum;
+        if ratio.is_finite() {
+            ratio
+        } else {
+            f64::MAX
+        }
     })
 }
 
@@ -625,9 +667,17 @@ fn element_dimension_for_quality(element_type: &str) -> Option<u8> {
     })
 }
 
-fn unit(value: f64) -> f64 {
+fn unit_interval(value: f64) -> f64 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn signed_unit(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
     } else {
         0.0
     }
@@ -644,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn ideal_linear_families_are_normalized() {
+    fn ideal_linear_families_use_conventional_values() {
         let h = 3.0_f64.sqrt() / 2.0;
         let tet_h = (2.0_f64 / 3.0).sqrt();
         let families: [(&str, &[[f64; 3]]); 6] = [
@@ -699,8 +749,14 @@ mod tests {
         ];
         for (element_type, points) in families {
             for metric in QualityMetric::ALL {
+                let expected = if metric == QualityMetric::Skewness {
+                    0.0
+                } else {
+                    1.0
+                };
                 assert!(
-                    score(element_type, points, metric).is_some_and(|value| value > 0.999),
+                    score(element_type, points, metric)
+                        .is_some_and(|value| (value - expected).abs() < 1.0e-12),
                     "{element_type} {}: {:?}",
                     metric.label(),
                     score(element_type, points, metric)
@@ -717,19 +773,38 @@ mod tests {
             Some(0.0)
         );
         let inverted = [[0., 0., 0.], [0., 1., 0.], [1., 0., 0.], [0., 0., 1.]];
-        assert_eq!(
-            score("tet4", &inverted, QualityMetric::ScaledJacobian),
-            Some(0.0)
-        );
+        assert!(score("tet4", &inverted, QualityMetric::ScaledJacobian)
+            .is_some_and(|value| value < 0.0));
         assert_eq!(
             score("polyhedron", &inverted, QualityMetric::AspectRatio),
             None
         );
+        let collapsed = [[0., 0., 0.], [0., 0., 0.], [1., 0., 0.]];
+        let aspect_ratio = score("tri3", &collapsed, QualityMetric::AspectRatio);
+        assert_eq!(aspect_ratio, Some(f64::MAX));
+        assert!(aspect_ratio.is_some_and(f64::is_finite));
+        assert!(serde_json::to_string(&aspect_ratio).is_ok());
+        assert_eq!(score("tri3", &flat, QualityMetric::Skewness), Some(1.0));
 
         let mut higher = vec![[0., 0., 0.], [1., 0., 0.], [0.5, 3.0_f64.sqrt() / 2.0, 0.]];
         higher.extend([[50., 20., 2.], [-20., 9., 4.], [7., -30., 3.]]);
         assert!(score("tri6", &higher, QualityMetric::ScaledJacobian)
             .is_some_and(|value| value > 0.999));
+    }
+
+    #[test]
+    fn distortion_moves_each_metric_in_its_conventional_direction() {
+        let ideal = [[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]];
+        let distorted = [[0., 0., 0.], [2., 0., 0.], [2.2, 0.3, 0.], [0., 1., 0.]];
+        for metric in QualityMetric::ALL {
+            let ideal = score("quad4", &ideal, metric).unwrap();
+            let distorted = score("quad4", &distorted, metric).unwrap();
+            if metric.higher_is_worse() {
+                assert!(distorted > ideal, "{}", metric.label());
+            } else {
+                assert!(distorted < ideal, "{}", metric.label());
+            }
+        }
     }
 
     #[test]
@@ -822,15 +897,73 @@ mod tests {
             )
         })
         .collect::<Vec<_>>();
-        for metric in [QualityMetric::Skewness, QualityMetric::Orthogonality] {
-            assert!(
-                polyhedron_quality_score(&cube, &faces, metric, &BTreeMap::new())
-                    .is_some_and(|value| value > 0.999)
-            );
-        }
+        assert!(
+            polyhedron_quality_score(&cube, &faces, QualityMetric::Skewness, &BTreeMap::new())
+                .is_some_and(|value| value < 1.0e-12)
+        );
+        assert!(polyhedron_quality_score(
+            &cube,
+            &faces,
+            QualityMetric::Orthogonality,
+            &BTreeMap::new()
+        )
+        .is_some_and(|value| value > 0.999));
         assert_eq!(
             polyhedron_quality_score(&cube, &faces, QualityMetric::Compactness, &BTreeMap::new()),
             None
         );
+    }
+
+    #[test]
+    fn polyhedron_skewness_uses_its_worst_face() {
+        let ideal = vec![[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]];
+        let distorted = vec![[0., 0., 0.], [2., 0., 0.], [2.2, 0.3, 0.], [0., 1., 0.]];
+        let distorted_score =
+            polygon_skewness(&distorted.iter().copied().map(V).collect::<Vec<_>>()).unwrap();
+        let faces = vec![(vec![1, 2, 3, 4], ideal), (vec![5, 6, 7, 8], distorted)];
+        assert_eq!(
+            polyhedron_quality_score(&[], &faces, QualityMetric::Skewness, &BTreeMap::new()),
+            Some(distorted_score)
+        );
+    }
+
+    #[test]
+    fn named_3d_skewness_uses_its_worst_face() {
+        let points = [
+            [0., 0., 0.],
+            [1., 0., 0.],
+            [1., 1., 0.],
+            [0., 1., 0.],
+            [0., 0., 1.],
+            [1., 0., 1.],
+            [1.8, 1., 1.],
+            [0., 1., 1.],
+        ];
+        let p = points.iter().copied().map(V).collect::<Vec<_>>();
+        let expected = side_indices("hex8", p.len())
+            .unwrap()
+            .into_iter()
+            .map(|side| {
+                polygon_skewness(&side.into_iter().map(|index| p[index]).collect::<Vec<_>>())
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .reduce(f64::max);
+        assert_eq!(score("hex8", &points, QualityMetric::Skewness), expected);
+    }
+
+    #[test]
+    fn rendering_goodness_keeps_red_poor_and_green_ideal() {
+        for (metric, ideal, poor) in [
+            (QualityMetric::ScaledJacobian, 1.0, -0.5),
+            (QualityMetric::Skewness, 0.0, 1.0),
+            (QualityMetric::AspectRatio, 1.0, f64::MAX),
+            (QualityMetric::Compactness, 1.0, 0.0),
+            (QualityMetric::Orthogonality, 1.0, 0.0),
+        ] {
+            assert_eq!(metric.rendering_goodness(ideal), 1.0);
+            assert!(metric.rendering_goodness(poor) < 1.0e-12);
+        }
     }
 }
