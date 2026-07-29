@@ -3,6 +3,10 @@
 #![deny(unsafe_code)]
 
 mod advancing_front;
+#[path = "advancing_front_2D.rs"]
+mod advancing_front_2d;
+#[path = "advancing_front_3D.rs"]
+mod advancing_front_3d;
 mod algorithm;
 mod chunk;
 mod error;
@@ -13,7 +17,6 @@ mod renderer;
 mod row;
 mod schema;
 mod storage;
-mod uniform;
 mod writer;
 
 pub mod controls;

@@ -53,17 +53,17 @@ fn memory(output: caso_meshing::MeshingOutput) -> MemoryArtifact {
 }
 
 #[test]
-fn uniform_v3_is_deterministic_lazy_queryable_and_auditable() {
+fn advancing_front_v3_is_deterministic_lazy_queryable_and_auditable() {
     let first = memory(
         caso_meshing::run_meshing(
-            request("uniform_2d"),
+            request("advancing_front"),
             MemoryStorage::new(64 * 1024 * 1024).unwrap(),
         )
         .unwrap(),
     );
     let second = memory(
         caso_meshing::run_meshing(
-            request("uniform_2d"),
+            request("advancing_front"),
             MemoryStorage::new(64 * 1024 * 1024).unwrap(),
         )
         .unwrap(),
@@ -96,7 +96,7 @@ fn uniform_v3_is_deterministic_lazy_queryable_and_auditable() {
 fn audit_steps_match_the_blocking_report_and_generation_reports_finalization() {
     let phases = Arc::new(Mutex::new(Vec::new()));
     let reported = phases.clone();
-    let mut generation = request("uniform_2d");
+    let mut generation = request("advancing_front");
     generation.job_control = JobControl::default().with_progress(move |progress| {
         let mut phases = reported.lock().unwrap();
         if phases.last() != Some(&progress.phase) {
@@ -137,7 +137,7 @@ fn audit_steps_match_the_blocking_report_and_generation_reports_finalization() {
 
 #[test]
 fn decoded_chunk_target_is_enforced() {
-    let mut limited = request("uniform_2d");
+    let mut limited = request("advancing_front");
     limited.limits.target_chunk_bytes = 1;
     assert!(matches!(
         caso_meshing::run_meshing(
@@ -153,7 +153,7 @@ fn planned_cursor_measures_statistics_and_adjacent_tags_share_exact_rows() {
     let file = Arc::new(
         MeshFile::from_memory(memory(
             caso_meshing::run_meshing(
-                request("uniform_2d"),
+                request("advancing_front"),
                 MemoryStorage::new(64 * 1024 * 1024).unwrap(),
             )
             .unwrap(),
@@ -297,29 +297,17 @@ fn registry_and_capability_errors_use_stable_ids() {
             .iter()
             .map(|descriptor| descriptor.id)
             .collect::<Vec<_>>(),
-        ["advancing_front", "uniform_2d"]
+        ["advancing_front"]
     );
-    let mut missing = request("not_installed");
+    assert!(caso_meshing::descriptors()[0].capabilities.refinement);
+    assert!(!caso_meshing::descriptors()[0].capabilities.boundary_layers);
+    let missing = request("not_installed");
     assert!(matches!(
         caso_meshing::run_meshing(
             missing.clone(),
             MemoryStorage::new(8 * 1024 * 1024).unwrap()
         ),
         Err(MeshError::InvalidInput(message)) if message.contains("not compiled in")
-    ));
-    missing.algorithm_id = "uniform_2d".into();
-    missing
-        .controls
-        .refinement(
-            "sea",
-            ControlRegion::sphere(vec3(1.0, 0.5, 0.0), 0.2).unwrap(),
-            0.1,
-            0.2,
-        )
-        .unwrap();
-    assert!(matches!(
-        caso_meshing::run_meshing(missing, MemoryStorage::new(8 * 1024 * 1024).unwrap()),
-        Err(MeshError::Capability(_))
     ));
 }
 
@@ -329,15 +317,17 @@ fn cancellation_and_memory_cap_fail_without_artifacts() {
     control.cancel();
     let cancelled = MeshingRequest {
         job_control: control,
-        ..request("uniform_2d")
+        ..request("advancing_front")
     };
     assert!(matches!(
         caso_meshing::run_meshing(cancelled, MemoryStorage::new(8 * 1024 * 1024).unwrap()),
         Err(MeshError::Cancelled)
     ));
-    assert!(
-        caso_meshing::run_meshing(request("uniform_2d"), MemoryStorage::new(128).unwrap()).is_err()
-    );
+    assert!(caso_meshing::run_meshing(
+        request("advancing_front"),
+        MemoryStorage::new(128).unwrap()
+    )
+    .is_err());
 }
 
 #[test]
@@ -396,7 +386,7 @@ fn chunk_builder_supports_mixed_v3_families_and_enforces_local_points() {
 }
 
 #[test]
-fn advancing_front_refinement_increases_resolution_and_layers_emit_quads() {
+fn advancing_front_refines_locally_and_rejects_boundary_layers() {
     let coarse = caso_meshing::run_meshing(
         request("advancing_front"),
         MemoryStorage::new(64 * 1024 * 1024).unwrap(),
@@ -430,15 +420,10 @@ fn advancing_front_refinement_increases_resolution_and_layers_emit_quads() {
             .controls
             .boundary_layer("sea", region, 0.1, 2, 1.2)
             .unwrap();
-        let file = MeshFile::from_memory(memory(
-            caso_meshing::run_meshing(layered, MemoryStorage::new(64 * 1024 * 1024).unwrap())
-                .unwrap(),
-        ))
-        .unwrap();
-        assert!(file
-            .entity_batches(RowKind::Cell)
-            .flat_map(|entry| &entry.element_types)
-            .any(|kind| kind == "quad4"));
+        assert!(matches!(
+            caso_meshing::run_meshing(layered, MemoryStorage::new(64 * 1024 * 1024).unwrap()),
+            Err(MeshError::Capability(_))
+        ));
     }
 }
 
@@ -447,7 +432,7 @@ fn declared_large_rectangle_never_succeeds_with_zero_cells() {
     let output = caso_meshing::run_meshing(
         MeshingRequest {
             domains: rectangle(200.0, 200.0),
-            algorithm_id: "uniform_2d".into(),
+            algorithm_id: "advancing_front".into(),
             element_min_size: 10.0,
             element_max_size: 20.0,
             controls: ControlSet::default(),
@@ -517,7 +502,7 @@ fn lod_uses_internal_previews_when_zoomed_out_and_exact_leaves_when_close() {
     let output = caso_meshing::run_meshing(
         MeshingRequest {
             domains: rectangle(130.0, 1.0),
-            algorithm_id: "uniform_2d".into(),
+            algorithm_id: "advancing_front".into(),
             element_min_size: 0.1,
             element_max_size: 0.1,
             controls: ControlSet::default(),
@@ -811,13 +796,13 @@ fn native_and_memory_storage_are_byte_identical_and_replace_atomically() {
     ));
     let memory = memory(
         caso_meshing::run_meshing(
-            request("uniform_2d"),
+            request("advancing_front"),
             MemoryStorage::new(64 * 1024 * 1024).unwrap(),
         )
         .unwrap(),
     );
     let native = caso_meshing::run_meshing(
-        request("uniform_2d"),
+        request("advancing_front"),
         caso_meshing::NativeFileStorage::new(&path).unwrap(),
     )
     .unwrap();
@@ -831,7 +816,7 @@ fn native_and_memory_storage_are_byte_identical_and_replace_atomically() {
     assert!(caso_meshing::run_meshing(
         MeshingRequest {
             job_control: control,
-            ..request("uniform_2d")
+            ..request("advancing_front")
         },
         caso_meshing::NativeFileStorage::new(&path).unwrap(),
     )
@@ -852,7 +837,7 @@ fn native_20_gib_scale_probe() {
     let output = caso_meshing::run_meshing(
         MeshingRequest {
             domains: rectangle(200.0, 200.0),
-            algorithm_id: "uniform_2d".into(),
+            algorithm_id: "advancing_front".into(),
             element_min_size: size,
             element_max_size: size,
             controls: ControlSet::default(),

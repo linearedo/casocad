@@ -1495,7 +1495,7 @@ mod tests {
                 let output = crate::run_meshing(
                     MeshingRequest {
                         domains: meshable_domains_from_document(&document).expect("meshable"),
-                        algorithm_id: "uniform_2d".into(),
+                        algorithm_id: "advancing_front".into(),
                         element_min_size: 0.1,
                         element_max_size: 0.25,
                         controls: ControlSet::default(),

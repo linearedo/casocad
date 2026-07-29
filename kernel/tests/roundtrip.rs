@@ -37,7 +37,7 @@ fn save_load_save_is_idempotent() {
 #[test]
 fn arrow_meshing_settings_round_trip_and_v1_is_rejected() {
     let mut document = SceneDocument::default_scene().unwrap();
-    document.meshing.algorithm_id = "uniform_2d".into();
+    document.meshing.algorithm_id = "advancing_front".into();
     document.meshing.element_min_size = 0.01;
     document.meshing.element_max_size = 0.05;
     document.meshing.control_script = "controls.refinement_box(...);".into();
