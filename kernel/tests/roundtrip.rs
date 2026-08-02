@@ -37,10 +37,8 @@ fn save_load_save_is_idempotent() {
 #[test]
 fn arrow_meshing_settings_round_trip_and_v1_is_rejected() {
     let mut document = SceneDocument::default_scene().unwrap();
-    document.meshing.algorithm_id = "advancing_front".into();
-    document.meshing.element_min_size = 0.01;
-    document.meshing.element_max_size = 0.05;
-    document.meshing.control_script = "controls.refinement_box(...);".into();
+    document.meshing.algorithm_id = "distmesh".into();
+    document.meshing.control_script = "controls.target_size(0.05);".into();
     document.meshing.wasm_file_cap_mib = 128;
     let saved = save_scene_to_string(&document).unwrap();
     let loaded = load_scene_from_str(&saved).unwrap();

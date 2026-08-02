@@ -13,7 +13,8 @@ use caso_meshing::quality::QualityMetric;
 use caso_meshing::NativeFileStorage;
 use caso_meshing::{
     EntityKind, Interval, JobControl, MeshManifest, MeshQuery, MeshQueryStatistics,
-    MeshRenderStyle, QueryCancellation, QueryMeasures, QueryProgress, TagFilter, TagScope,
+    MeshRenderStyle, QualityTermination, QueryCancellation, QueryMeasures, QueryProgress,
+    TagFilter, TagScope,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use caso_meshing::{
@@ -284,37 +285,19 @@ impl MeshingPanel {
             }
         });
 
-        let mut changed = false;
-        ui.horizontal(|ui| {
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut state.document.meshing.element_min_size)
-                        .range(1.0e-9..=state.document.meshing.element_max_size)
-                        .speed(0.001)
-                        .prefix("Element Min: "),
-                )
-                .changed();
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut state.document.meshing.element_max_size)
-                        .range(state.document.meshing.element_min_size..=1.0e9)
-                        .speed(0.001)
-                        .prefix("Element Max: "),
-                )
-                .changed();
-        });
         #[cfg(target_arch = "wasm32")]
-        {
-            changed |= ui
-                .add(
-                    egui::Slider::new(
-                        &mut state.document.meshing.wasm_file_cap_mib,
-                        64..=WEB_MAX_ARTIFACT_MIB,
-                    )
-                    .text("WASM file cap (MiB)"),
+        let changed = {
+            ui.add(
+                egui::Slider::new(
+                    &mut state.document.meshing.wasm_file_cap_mib,
+                    64..=WEB_MAX_ARTIFACT_MIB,
                 )
-                .changed();
-        }
+                .text("WASM file cap (MiB)"),
+            )
+            .changed()
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let changed = false;
         if changed {
             state.document.mark_changed();
         }
@@ -384,7 +367,9 @@ impl MeshingPanel {
         }
         ui.separator();
         ui.label("Rhai Meshing Controls");
-        ui.weak("Scripts can create typed refinement and boundary-layer controls only.");
+        ui.weak(
+            "Exactly one controls.target_size(...) call is required. Boundary layers use exact hwall_n and ratio, soft target hwall_t, and maximum thickness; the layer count is derived.",
+        );
         if ui
             .add(
                 egui::TextEdit::multiline(&mut state.document.meshing.control_script)
@@ -949,8 +934,6 @@ impl MeshingPanel {
         let request = caso_meshing::MeshingRequest {
             domains,
             algorithm_id: state.document.meshing.algorithm_id.clone(),
-            element_min_size: state.document.meshing.element_min_size,
-            element_max_size: state.document.meshing.element_max_size,
             controls,
             limits: caso_meshing::GenerationLimits::default(),
             job_control: control.clone(),
@@ -1326,10 +1309,14 @@ impl MeshingPanel {
         match opened {
             Ok(mesh) => {
                 state.status = format!(
-                    "Mesh complete: {} chunks, {} points, {} cells",
+                    "Mesh complete: {} chunks, {} points, {} cells{}",
                     output.statistics.chunks,
                     mesh.manifest().counts.points,
-                    mesh.manifest().counts.cells
+                    mesh.manifest().counts.cells,
+                    quality_status(
+                        output.statistics.quality_termination,
+                        output.statistics.quality_passes,
+                    ),
                 );
                 self.install_mesh(mesh);
             }
@@ -1605,10 +1592,14 @@ impl MeshingPanel {
         self.preview_packets.clear();
         self.preview_clear_pending = true;
         state.status = format!(
-            "Loaded {name}: {} points, {} cells, {:.1} MiB",
+            "Loaded {name}: {} points, {} cells, {:.1} MiB{}",
             summary.manifest.counts.points,
             summary.manifest.counts.cells,
-            summary.artifact_bytes as f64 / 1024.0 / 1024.0
+            summary.artifact_bytes as f64 / 1024.0 / 1024.0,
+            quality_status(
+                summary.statistics.quality_termination,
+                summary.statistics.quality_passes,
+            ),
         );
         self.mesh = Some(summary);
     }
@@ -1674,6 +1665,14 @@ fn format_progress(progress: caso_meshing::MeshingProgress) -> String {
             "{phase} — {}/{}",
             progress.phase_completed, progress.phase_total
         )
+    }
+}
+
+fn quality_status(termination: QualityTermination, passes: u64) -> String {
+    if termination == QualityTermination::NotRun {
+        String::new()
+    } else {
+        format!(", quality {termination} after {passes} passes")
     }
 }
 

@@ -26,29 +26,38 @@ pub fn compile_control_script(
     engine
         .register_type_with_name::<ControlsHandle>("ControlSet")
         .register_fn(
+            "target_size",
+            |handle: &mut ControlsHandle, size: f64| -> Result<(), Box<rhai::EvalAltResult>> {
+                handle.0.borrow_mut().target_size(size).map_err(Into::into)
+            },
+        )
+        .register_fn(
+            "target_size",
+            |handle: &mut ControlsHandle, size: i64| -> Result<(), Box<rhai::EvalAltResult>> {
+                handle
+                    .0
+                    .borrow_mut()
+                    .target_size(size as f64)
+                    .map_err(Into::into)
+            },
+        )
+        .register_fn(
             "boundary_layer",
             |handle: &mut ControlsHandle,
              domain: &str,
              region: &str,
              spec: Map|
              -> Result<(), Box<rhai::EvalAltResult>> {
-                let layers = spec
-                    .get("layers")
-                    .and_then(|value| value.as_int().ok())
-                    .and_then(|value| usize::try_from(value).ok())
-                    .filter(|value| *value > 0)
-                    .ok_or_else(|| {
-                        "boundary-layer layers must be a positive integer".to_string()
-                    })?;
                 handle
                     .0
                     .borrow_mut()
                     .boundary_layer(
                         domain,
                         region,
-                        map_number(&spec, "first_height")?,
-                        layers,
-                        map_number_or(&spec, "growth", 1.0)?,
+                        map_number(&spec, "hwall_n")?,
+                        map_number(&spec, "hwall_t")?,
+                        map_number(&spec, "ratio")?,
+                        map_number(&spec, "thickness")?,
                     )
                     .map_err(Into::into)
             },
@@ -241,9 +250,76 @@ mod tests {
         let domains = meshable_domains_from_document(&document).unwrap();
         let controls = compile_control_script(
             &domains,
-            r#"controls.refinement_box("sea", #{min:[0,0,-1],max:[1,1,1]}, #{size:0.1});"#,
+            r#"controls.target_size(0.2);
+controls.refinement_box("sea", #{min:[0,0,-1],max:[1,1,1]}, #{size:0.1});
+let region = control_region.sphere([1, 0.5, 0], 0.25);
+controls.refinement("sea", region, #{size:0.08, gradation:0.3});"#,
         )
         .unwrap();
-        assert_eq!(controls.refinements.len(), 1);
+        assert_eq!(controls.target_size, Some(0.2));
+        assert_eq!(controls.refinements.len(), 2);
+    }
+
+    #[test]
+    fn boundary_layer_script_uses_gmsh_style_sizes_and_maximum_thickness() {
+        let mut document = SceneDocument::new();
+        let rectangle = document
+            .add_primitive_from_drag("rectangle", vec3(0.0, 0.0, 0.0), vec3(2.0, 1.0, 0.0), 1.0)
+            .unwrap();
+        document.rename(rectangle, "sea").unwrap();
+        document
+            .set_domain_root(rectangle, DomainKind::Fluid)
+            .unwrap();
+        document
+            .add_boundary_region(rectangle, None, None, Some("wall"))
+            .unwrap();
+        let domains = meshable_domains_from_document(&document).unwrap();
+        let region = domains
+            .iter()
+            .next()
+            .unwrap()
+            .boundary_regions
+            .first()
+            .unwrap()
+            .name
+            .clone();
+        let controls = compile_control_script(
+            &domains,
+            &format!(
+                r#"controls.target_size(0.2);
+controls.boundary_layer("sea", "{region}", #{{hwall_n:0.01, hwall_t:0.05, ratio:1.2, thickness:0.05}});"#
+            ),
+        )
+        .unwrap();
+        let layer = &controls.boundary_layers[0];
+        assert_eq!(layer.layers, 3);
+        assert_eq!(layer.hwall_t, 0.05);
+        assert!(layer.total_height() <= layer.thickness);
+    }
+
+    #[test]
+    fn target_size_is_required_once_and_must_be_positive_and_finite() {
+        let document = SceneDocument::new();
+        let domains = meshable_domains_from_document(&document).unwrap();
+        for script in [
+            "",
+            "controls.target_size(0.0);",
+            "controls.target_size(-1.0);",
+            "controls.target_size(1.0 / 0.0);",
+            "controls.target_size(0.1); controls.target_size(0.2);",
+        ] {
+            assert!(
+                compile_control_script(&domains, script).is_err(),
+                "{script}"
+            );
+        }
+
+        let mut controls = ControlSet {
+            target_size: Some(f64::NAN),
+            ..ControlSet::default()
+        };
+        assert!(controls.require_target_size().is_err());
+        controls.target_size = Some(f64::INFINITY);
+        assert!(controls.require_target_size().is_err());
     }
 }

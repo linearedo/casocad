@@ -174,11 +174,17 @@ nodes exceed 128 pixels, with 128 MiB decoded, 256 MiB GPU, and 16 MiB/frame
 upload defaults.
 
 All generation goes through `run_meshing` and a `MeshSink`. Algorithms emit
-bounded chunks directly to the shared writer. Built-ins are Uniform 2D and
-Advancing Front 2D/3D; the latter accepts typed refinement, gradation, and
-boundary-layer controls authored by bounded Rhai in the app. Native storage
-fsyncs and validates a sibling candidate before atomic replacement; browser
-storage publishes capped memory. The complete contract is in
+bounded chunks directly to the shared writer. The built-in generator is
+out-of-core 2D DistMesh with one required uniform `controls.target_size(...)`
+and optional quad boundary layers authored by bounded Rhai in the app. Boundary-layer
+controls use `hwall_n`, `hwall_t`, `ratio`, and a maximum `thickness`; complete normal
+layers are added geometrically until the next one would exceed that thickness. Controlled
+contours are rediscretized toward the soft `hwall_t` arc-length target, with fixed stations
+at CAD corners and region transitions; inability to match that tangential target exactly is
+not a meshing error. Quad rows then advance from those stations at the exact derived normal
+distances. Native storage fsyncs and validates
+a sibling candidate before atomic replacement; browser storage publishes capped
+memory. The complete contract is in
 `docs/casomesh_arrow_v3.md`.
 
 ### 4.5 `app` — the application

@@ -95,30 +95,50 @@ pub struct RefinementControl {
 pub struct BoundaryLayerControl {
     pub domain: String,
     pub boundary_region: String,
-    pub first_height: f64,
+    pub hwall_n: f64,
+    pub hwall_t: f64,
+    pub ratio: f64,
+    pub thickness: f64,
     pub layers: usize,
-    pub growth: f64,
 }
 
 impl BoundaryLayerControl {
     pub fn total_height(&self) -> f64 {
-        if (self.growth - 1.0).abs() < 1.0e-12 {
-            self.first_height * self.layers as f64
+        if (self.ratio - 1.0).abs() < 1.0e-12 {
+            self.hwall_n * self.layers as f64
         } else {
-            self.first_height * (self.growth.powi(self.layers as i32) - 1.0) / (self.growth - 1.0)
+            self.hwall_n * (self.ratio.powi(self.layers as i32) - 1.0) / (self.ratio - 1.0)
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ControlSet {
+    pub target_size: Option<f64>,
     pub refinements: Vec<RefinementControl>,
     pub boundary_layers: Vec<BoundaryLayerControl>,
 }
 
 impl ControlSet {
     pub fn is_empty(&self) -> bool {
-        self.refinements.is_empty() && self.boundary_layers.is_empty()
+        self.target_size.is_none() && self.refinements.is_empty() && self.boundary_layers.is_empty()
+    }
+
+    pub fn target_size(&mut self, size: f64) -> Result<(), String> {
+        positive_finite(size, "target size")?;
+        if self.target_size.is_some() {
+            return Err("controls.target_size(...) must be called exactly once".into());
+        }
+        self.target_size = Some(size);
+        Ok(())
+    }
+
+    pub fn require_target_size(&self) -> Result<f64, String> {
+        let size = self
+            .target_size
+            .ok_or_else(|| "controls.target_size(...) is required exactly once".to_string())?;
+        positive_finite(size, "target size")?;
+        Ok(size)
     }
 
     pub fn refinement(
@@ -161,26 +181,48 @@ impl ControlSet {
         &mut self,
         domain: impl Into<String>,
         boundary_region: impl Into<String>,
-        first_height: f64,
-        layers: usize,
-        growth: f64,
+        hwall_n: f64,
+        hwall_t: f64,
+        ratio: f64,
+        thickness: f64,
     ) -> Result<(), String> {
-        positive_finite(first_height, "boundary-layer first_height")?;
-        positive_finite(growth, "boundary-layer growth")?;
-        if layers == 0 {
-            return Err("boundary-layer layers must be positive".into());
+        positive_finite(hwall_n, "boundary-layer hwall_n")?;
+        positive_finite(hwall_t, "boundary-layer hwall_t")?;
+        positive_finite(ratio, "boundary-layer ratio")?;
+        positive_finite(thickness, "boundary-layer thickness")?;
+        if ratio < 1.0 {
+            return Err("boundary-layer ratio must be at least 1".into());
+        }
+        if thickness < hwall_n {
+            return Err("boundary-layer thickness must fit at least hwall_n".into());
+        }
+        let mut layers = 0usize;
+        let mut total = 0.0;
+        let mut height = hwall_n;
+        while total + height <= thickness {
+            total += height;
+            layers = layers
+                .checked_add(1)
+                .ok_or_else(|| "boundary-layer layer count overflowed".to_string())?;
+            height *= ratio;
+            if layers == 1_000_000 || !height.is_finite() {
+                break;
+            }
         }
         self.boundary_layers.push(BoundaryLayerControl {
             domain: domain.into(),
             boundary_region: boundary_region.into(),
-            first_height,
+            hwall_n,
+            hwall_t,
+            ratio,
+            thickness,
             layers,
-            growth,
         });
         Ok(())
     }
 
     pub fn validate(&self, domains: &MeshableDomains) -> Result<(), String> {
+        self.require_target_size()?;
         for name in self
             .refinements
             .iter()
@@ -219,10 +261,12 @@ impl ControlSet {
             if self.boundary_layers[..index].iter().any(|other| {
                 other.domain == layer.domain
                     && other.boundary_region == layer.boundary_region
-                    && other != layer
+                    && (other.hwall_n != layer.hwall_n
+                        || other.ratio != layer.ratio
+                        || other.layers != layer.layers)
             }) {
                 return Err(format!(
-                    "domain {:?} boundary region {:?} has incompatible layer controls",
+                    "domain {:?} boundary region {:?} has incompatible normal layer controls",
                     layer.domain, layer.boundary_region
                 ));
             }
@@ -241,6 +285,7 @@ impl ControlSet {
 
     pub fn metadata(&self) -> serde_json::Value {
         serde_json::json!({
+            "target_size": self.target_size,
             "refinement": self.refinements.iter().map(|control| serde_json::json!({
                 "domain": control.domain,
                 "region": region_metadata(&control.region),
@@ -250,9 +295,12 @@ impl ControlSet {
             "boundary_layer": self.boundary_layers.iter().map(|control| serde_json::json!({
                 "domain": control.domain,
                 "boundary_region": control.boundary_region,
-                "first_height": control.first_height,
-                "layers": control.layers,
-                "growth": control.growth,
+                "hwall_n": control.hwall_n,
+                "hwall_t": control.hwall_t,
+                "ratio": control.ratio,
+                "thickness": control.thickness,
+                "derived_layers": control.layers,
+                "actual_thickness": control.total_height(),
             })).collect::<Vec<_>>(),
         })
     }
@@ -319,5 +367,24 @@ mod tests {
             .unwrap();
         assert_eq!(controls.size_at("sea", vec3(0.0, 0.0, 0.0), 1.0), 0.1);
         assert_eq!(controls.size_at("pipe", vec3(0.0, 0.0, 0.0), 1.0), 1.0);
+    }
+
+    #[test]
+    fn boundary_layer_derives_complete_layers_without_exceeding_thickness() {
+        let mut controls = ControlSet::default();
+        controls
+            .boundary_layer("sea", "wall", 0.01, 0.05, 1.2, 0.05)
+            .unwrap();
+        let layer = &controls.boundary_layers[0];
+        assert_eq!(layer.layers, 3);
+        assert!((layer.total_height() - 0.0364).abs() < 1.0e-12);
+        assert!(layer.total_height() + layer.hwall_n * layer.ratio.powi(3) > layer.thickness);
+
+        assert!(controls
+            .boundary_layer("sea", "wall", 0.02, 0.05, 1.2, 0.01)
+            .is_err());
+        assert!(controls
+            .boundary_layer("sea", "wall", 0.01, 0.05, 0.9, 0.05)
+            .is_err());
     }
 }

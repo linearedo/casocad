@@ -33,7 +33,7 @@ for external mesh interoperability.
   contouring, 2D profiles, 1D wires).
 - `render/` — wgpu renderer (WGSL shaders, native + WebGPU/WebGL).
 - `meshing/` — Arrow-native out-of-core mesh storage, queries, quality,
-  camera-driven LOD, Uniform 2D, and Advancing Front 2D/3D.
+  camera-driven LOD, and 2D DistMesh generation with quad boundary layers.
 - `app/` — egui application (viewport, tools, panels); native and wasm entry
   points. `web/` holds the browser shell.
 

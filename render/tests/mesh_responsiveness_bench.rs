@@ -14,13 +14,13 @@ use caso_render::{ViewportRenderer, MESH_TILE_UPLOAD_BUDGET_BYTES};
 
 fn volume_mesh() -> Arc<MeshFile> {
     let document = SceneDocument::default_scene().expect("scene");
+    let mut controls = ControlSet::default();
+    controls.target_size(0.1).expect("target size");
     let output = caso_meshing::run_meshing(
         MeshingRequest {
             domains: meshable_domains_from_document(&document).expect("meshable"),
-            algorithm_id: "advancing_front".into(),
-            element_min_size: 0.025,
-            element_max_size: 0.1,
-            controls: ControlSet::default(),
+            algorithm_id: "distmesh".into(),
+            controls,
             limits: GenerationLimits::default(),
             job_control: JobControl::default(),
         },

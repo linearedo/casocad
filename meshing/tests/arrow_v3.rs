@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arrow_array::{Array, BooleanArray};
 use caso_kernel::meshing::meshable_domains_from_document;
 use caso_kernel::roles::DomainKind;
 use caso_kernel::scene::SceneDocument;
@@ -48,16 +49,41 @@ fn layered_rectangle() -> (caso_kernel::meshing::MeshableDomains, String) {
     (meshable_domains_from_document(&document).unwrap(), region)
 }
 
+fn nested_planar_domains() -> caso_kernel::meshing::MeshableDomains {
+    let mut document = SceneDocument::new();
+    let outer = document
+        .add_primitive_from_drag("rectangle", vec3(-1.5, -1.0, 0.0), vec3(1.5, 1.0, 0.0), 1.0)
+        .unwrap();
+    let inner = document
+        .add_primitive_from_drag(
+            "circle",
+            vec3(-0.45, -0.45, 0.0),
+            vec3(0.45, 0.45, 0.0),
+            1.0,
+        )
+        .unwrap();
+    document.rename(inner, "solid").unwrap();
+    document.set_domain_root(inner, DomainKind::Solid).unwrap();
+    let fluid = document.combine(outer, inner, "difference").unwrap();
+    document.rename(fluid, "fluid").unwrap();
+    document.set_domain_root(fluid, DomainKind::Fluid).unwrap();
+    meshable_domains_from_document(&document).unwrap()
+}
+
 fn request(algorithm: &str) -> MeshingRequest {
     MeshingRequest {
         domains: rectangle(2.0, 1.0),
         algorithm_id: algorithm.into(),
-        element_min_size: 0.1,
-        element_max_size: 0.25,
-        controls: ControlSet::default(),
+        controls: control_set(0.25),
         limits: GenerationLimits::default(),
         job_control: JobControl::default(),
     }
+}
+
+fn control_set(target_size: f64) -> ControlSet {
+    let mut controls = ControlSet::default();
+    controls.target_size(target_size).unwrap();
+    controls
 }
 
 fn memory(output: caso_meshing::MeshingOutput) -> MemoryArtifact {
@@ -69,17 +95,17 @@ fn memory(output: caso_meshing::MeshingOutput) -> MemoryArtifact {
 }
 
 #[test]
-fn advancing_front_v3_is_deterministic_lazy_queryable_and_auditable() {
+fn distmesh_v3_is_deterministic_lazy_queryable_and_auditable() {
     let first = memory(
         caso_meshing::run_meshing(
-            request("advancing_front"),
+            request("distmesh"),
             MemoryStorage::new(64 * 1024 * 1024).unwrap(),
         )
         .unwrap(),
     );
     let second = memory(
         caso_meshing::run_meshing(
-            request("advancing_front"),
+            request("distmesh"),
             MemoryStorage::new(64 * 1024 * 1024).unwrap(),
         )
         .unwrap(),
@@ -112,7 +138,7 @@ fn advancing_front_v3_is_deterministic_lazy_queryable_and_auditable() {
 fn audit_steps_match_the_blocking_report_and_generation_reports_finalization() {
     let phases = Arc::new(Mutex::new(Vec::new()));
     let reported = phases.clone();
-    let mut generation = request("advancing_front");
+    let mut generation = request("distmesh");
     generation.job_control = JobControl::default().with_progress(move |progress| {
         let mut phases = reported.lock().unwrap();
         if phases.last() != Some(&progress.phase) {
@@ -153,7 +179,7 @@ fn audit_steps_match_the_blocking_report_and_generation_reports_finalization() {
 
 #[test]
 fn decoded_chunk_target_is_enforced() {
-    let mut limited = request("advancing_front");
+    let mut limited = request("distmesh");
     limited.limits.target_chunk_bytes = 1;
     assert!(matches!(
         caso_meshing::run_meshing(
@@ -169,7 +195,7 @@ fn planned_cursor_measures_statistics_and_adjacent_tags_share_exact_rows() {
     let file = Arc::new(
         MeshFile::from_memory(memory(
             caso_meshing::run_meshing(
-                request("advancing_front"),
+                request("distmesh"),
                 MemoryStorage::new(64 * 1024 * 1024).unwrap(),
             )
             .unwrap(),
@@ -335,9 +361,9 @@ fn registry_and_capability_errors_use_stable_ids() {
             .iter()
             .map(|descriptor| descriptor.id)
             .collect::<Vec<_>>(),
-        ["advancing_front"]
+        ["distmesh"]
     );
-    assert!(caso_meshing::descriptors()[0].capabilities.refinement);
+    assert!(!caso_meshing::descriptors()[0].capabilities.refinement);
     assert!(caso_meshing::descriptors()[0].capabilities.boundary_layers);
     let missing = request("not_installed");
     assert!(matches!(
@@ -355,17 +381,15 @@ fn cancellation_and_memory_cap_fail_without_artifacts() {
     control.cancel();
     let cancelled = MeshingRequest {
         job_control: control,
-        ..request("advancing_front")
+        ..request("distmesh")
     };
     assert!(matches!(
         caso_meshing::run_meshing(cancelled, MemoryStorage::new(8 * 1024 * 1024).unwrap()),
         Err(MeshError::Cancelled)
     ));
-    assert!(caso_meshing::run_meshing(
-        request("advancing_front"),
-        MemoryStorage::new(128).unwrap()
-    )
-    .is_err());
+    assert!(
+        caso_meshing::run_meshing(request("distmesh"), MemoryStorage::new(128).unwrap()).is_err()
+    );
 }
 
 #[test]
@@ -424,13 +448,8 @@ fn chunk_builder_supports_mixed_v3_families_and_enforces_local_points() {
 }
 
 #[test]
-fn advancing_front_refines_locally_and_generates_2d_boundary_layers() {
-    let coarse = caso_meshing::run_meshing(
-        request("advancing_front"),
-        MemoryStorage::new(64 * 1024 * 1024).unwrap(),
-    )
-    .unwrap();
-    let mut refined = request("advancing_front");
+fn distmesh_rejects_refinement_and_generates_2d_boundary_layers() {
+    let mut refined = request("distmesh");
     refined
         .controls
         .refinement(
@@ -440,16 +459,17 @@ fn advancing_front_refines_locally_and_generates_2d_boundary_layers() {
             0.3,
         )
         .unwrap();
-    let refined =
-        caso_meshing::run_meshing(refined, MemoryStorage::new(64 * 1024 * 1024).unwrap()).unwrap();
-    assert!(refined.statistics.cells > coarse.statistics.cells);
+    assert!(matches!(
+        caso_meshing::run_meshing(refined, MemoryStorage::new(64 * 1024 * 1024).unwrap()),
+        Err(MeshError::Capability(message)) if message.contains("does not support refinement")
+    ));
 
     let (domains, region) = layered_rectangle();
-    let mut layered = request("advancing_front");
+    let mut layered = request("distmesh");
     layered.domains = domains;
     layered
         .controls
-        .boundary_layer("sea", region, 0.04, 2, 1.2)
+        .boundary_layer("sea", region, 0.04, 0.2, 1.2, 0.088)
         .unwrap();
     let layered =
         caso_meshing::run_meshing(layered, MemoryStorage::new(64 * 1024 * 1024).unwrap()).unwrap();
@@ -461,21 +481,20 @@ fn advancing_front_refines_locally_and_generates_2d_boundary_layers() {
 }
 
 #[test]
-fn advancing_front_rejects_3d_boundary_layers_explicitly() {
+fn distmesh_rejects_3d_generation_explicitly() {
     let document = SceneDocument::default_scene().unwrap();
     let domains = meshable_domains_from_document(&document).unwrap();
     let domain = domains.iter().next().unwrap();
     let region = domain.boundary_regions.first().unwrap().name.clone();
     let mut controls = ControlSet::default();
+    controls.target_size(0.1).unwrap();
     controls
-        .boundary_layer(&domain.name, region, 0.01, 2, 1.2)
+        .boundary_layer(&domain.name, region, 0.01, 0.1, 1.2, 0.022)
         .unwrap();
     let result = caso_meshing::run_meshing(
         MeshingRequest {
             domains,
-            algorithm_id: "advancing_front".into(),
-            element_min_size: 0.025,
-            element_max_size: 0.1,
+            algorithm_id: "distmesh".into(),
             controls,
             limits: GenerationLimits::default(),
             job_control: JobControl::default(),
@@ -484,7 +503,7 @@ fn advancing_front_rejects_3d_boundary_layers_explicitly() {
     );
     assert!(matches!(
         result,
-        Err(MeshError::Capability(message)) if message.contains("only for 2D")
+        Err(MeshError::UnsupportedDimension { dimension: 3, .. })
     ));
 }
 
@@ -493,10 +512,8 @@ fn declared_large_rectangle_never_succeeds_with_zero_cells() {
     let output = caso_meshing::run_meshing(
         MeshingRequest {
             domains: rectangle(200.0, 200.0),
-            algorithm_id: "advancing_front".into(),
-            element_min_size: 10.0,
-            element_max_size: 20.0,
-            controls: ControlSet::default(),
+            algorithm_id: "distmesh".into(),
+            controls: control_set(20.0),
             limits: GenerationLimits::default(),
             job_control: JobControl::default(),
         },
@@ -507,55 +524,87 @@ fn declared_large_rectangle_never_succeeds_with_zero_cells() {
 }
 
 #[test]
-fn advancing_front_generates_incremental_mixed_3d_chunks() {
-    let document = SceneDocument::default_scene().unwrap();
+fn uniform_density_increases_as_target_size_decreases() {
+    let mut coarse = request("distmesh");
+    coarse.controls = control_set(0.4);
+    let coarse =
+        caso_meshing::run_meshing(coarse, MemoryStorage::new(64 * 1024 * 1024).unwrap()).unwrap();
+    let mut fine = request("distmesh");
+    fine.controls = control_set(0.2);
+    let fine =
+        caso_meshing::run_meshing(fine, MemoryStorage::new(64 * 1024 * 1024).unwrap()).unwrap();
+    assert!(fine.statistics.cells > coarse.statistics.cells);
+}
+
+#[test]
+fn many_chunks_keep_spade_and_writer_memory_within_the_target() {
+    let mut generation = request("distmesh");
+    generation.controls = control_set(0.08);
+    generation.limits.target_chunk_bytes = 32 * 1024;
+    let output =
+        caso_meshing::run_meshing(generation, MemoryStorage::new(64 * 1024 * 1024).unwrap())
+            .unwrap();
+    assert!(output.statistics.chunks > 1);
+    assert!(output.statistics.peak_active_bytes <= 32 * 1024);
+}
+
+#[test]
+fn directly_nested_planar_domains_generate_auditable_interfaces() {
     let output = caso_meshing::run_meshing(
         MeshingRequest {
+            domains: nested_planar_domains(),
+            algorithm_id: "distmesh".into(),
+            controls: control_set(0.12),
+            limits: GenerationLimits::default(),
+            job_control: JobControl::default(),
+        },
+        MemoryStorage::new(64 * 1024 * 1024).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(output.statistics.domains, 2);
+    let file = MeshFile::from_memory(memory(output)).unwrap();
+    file.full_audit(&JobControl::default()).unwrap();
+    let point_batches = file
+        .entity_batches(RowKind::Point)
+        .map(|entry| entry.batch_index)
+        .collect::<Vec<_>>();
+    let shared_ghosts = point_batches
+        .into_iter()
+        .map(|batch| file.batch_view(batch).unwrap())
+        .map(|view| {
+            let ghosts = view
+                .record_batch()
+                .column_by_name("ghost")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
+            (0..ghosts.len()).filter(|row| ghosts.value(*row)).count()
+        })
+        .sum::<usize>();
+    assert!(
+        shared_ghosts > 0,
+        "the second interface side must reuse owner point IDs"
+    );
+}
+
+#[test]
+fn distmesh_does_not_generate_3d() {
+    let document = SceneDocument::default_scene().unwrap();
+    let result = caso_meshing::run_meshing(
+        MeshingRequest {
             domains: meshable_domains_from_document(&document).unwrap(),
-            algorithm_id: "advancing_front".into(),
-            element_min_size: 0.025,
-            element_max_size: 0.1,
-            controls: ControlSet::default(),
+            algorithm_id: "distmesh".into(),
+            controls: control_set(0.1),
             limits: GenerationLimits::default(),
             job_control: JobControl::default(),
         },
         MemoryStorage::new(256 * 1024 * 1024).unwrap(),
-    )
-    .unwrap();
-    let file = Arc::new(MeshFile::from_memory(memory(output)).unwrap());
-    file.full_audit(&JobControl::default()).unwrap();
-    let types = file
-        .entity_batches(RowKind::Cell)
-        .flat_map(|entry| entry.element_types.iter().map(String::as_str))
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(types.contains("tet4"));
-    assert!(types.contains("pyramid5"));
-    assert!(file.manifest().counts.faces > 0);
-
-    let mut renderer = MeshRendererCache::new(file.clone(), RendererBudgets::default());
-    let target = renderer
-        .update_lod_focus(file.manifest().bounds.min)
-        .expect("focused 3D target");
-    assert!(!target.tiles.is_empty());
-    assert!(target.tiles.len() <= 4);
-    assert!(
-        prepare_all_lines(
-            &mut renderer,
-            &MeshQuery {
-                entity_kind: EntityKind::Cell,
-                ..MeshQuery::default()
-            },
-        ) > 0
     );
-    assert!(
-        prepare_all_lines(
-            &mut renderer,
-            &MeshQuery {
-                entity_kind: EntityKind::Face,
-                ..MeshQuery::default()
-            },
-        ) > 0
-    );
+    assert!(matches!(
+        result,
+        Err(MeshError::UnsupportedDimension { dimension: 3, .. })
+    ));
 }
 
 #[test]
@@ -563,10 +612,8 @@ fn lod_uses_internal_previews_when_zoomed_out_and_exact_leaves_when_close() {
     let output = caso_meshing::run_meshing(
         MeshingRequest {
             domains: rectangle(130.0, 1.0),
-            algorithm_id: "advancing_front".into(),
-            element_min_size: 0.1,
-            element_max_size: 0.1,
-            controls: ControlSet::default(),
+            algorithm_id: "distmesh".into(),
+            controls: control_set(0.1),
             limits: GenerationLimits::default(),
             job_control: JobControl::default(),
         },
@@ -788,27 +835,6 @@ fn prepare_until_progress(
     }
 }
 
-fn prepare_all_lines(renderer: &mut MeshRendererCache, query: &MeshQuery) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut line_count = 0;
-    loop {
-        let update = renderer
-            .prepare_lod_incremental(query.clone(), &BTreeSet::new(), &BTreeSet::new(), 1.0)
-            .unwrap();
-        line_count += update
-            .prepared
-            .iter()
-            .map(|tile| tile.lines.len())
-            .sum::<usize>();
-        if update.stats.pending_tiles == 0 {
-            return line_count;
-        }
-        assert!(Instant::now() < deadline, "mesh preview worker timed out");
-        #[cfg(not(target_arch = "wasm32"))]
-        std::thread::yield_now();
-    }
-}
-
 fn view_for_bounds(bounds: Bounds3, projected_pixels: f64) -> MeshView {
     view_for_bounds_at(
         bounds,
@@ -857,13 +883,13 @@ fn native_and_memory_storage_are_byte_identical_and_replace_atomically() {
     ));
     let memory = memory(
         caso_meshing::run_meshing(
-            request("advancing_front"),
+            request("distmesh"),
             MemoryStorage::new(64 * 1024 * 1024).unwrap(),
         )
         .unwrap(),
     );
     let native = caso_meshing::run_meshing(
-        request("advancing_front"),
+        request("distmesh"),
         caso_meshing::NativeFileStorage::new(&path).unwrap(),
     )
     .unwrap();
@@ -877,7 +903,7 @@ fn native_and_memory_storage_are_byte_identical_and_replace_atomically() {
     assert!(caso_meshing::run_meshing(
         MeshingRequest {
             job_control: control,
-            ..request("advancing_front")
+            ..request("distmesh")
         },
         caso_meshing::NativeFileStorage::new(&path).unwrap(),
     )
@@ -898,10 +924,8 @@ fn native_20_gib_scale_probe() {
     let output = caso_meshing::run_meshing(
         MeshingRequest {
             domains: rectangle(200.0, 200.0),
-            algorithm_id: "advancing_front".into(),
-            element_min_size: size,
-            element_max_size: size,
-            controls: ControlSet::default(),
+            algorithm_id: "distmesh".into(),
+            controls: control_set(size),
             limits: GenerationLimits {
                 max_cells: u64::MAX,
                 max_chunks: u64::MAX,

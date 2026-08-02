@@ -404,8 +404,6 @@ impl WorkerState {
             caso_meshing::MeshingRequest {
                 domains,
                 algorithm_id: document.meshing.algorithm_id.clone(),
-                element_min_size: document.meshing.element_min_size,
-                element_max_size: document.meshing.element_max_size,
                 controls,
                 limits: caso_meshing::GenerationLimits::default(),
                 job_control: control,

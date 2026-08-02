@@ -446,8 +446,10 @@ pub fn run_meshing<S: MeshStorage>(
     let mut writer = MeshArtifactWriter::new(output, dimension, catalog.entries(), request.limits)?;
     let context = MeshingContext {
         domains: &request.domains,
-        element_min_size: request.element_min_size,
-        element_max_size: request.element_max_size,
+        target_size: request
+            .controls
+            .require_target_size()
+            .map_err(MeshError::InvalidInput)?,
         controls: &request.controls,
         job_control: &request.job_control,
         limits: request.limits,
@@ -463,8 +465,7 @@ pub fn run_meshing<S: MeshStorage>(
         }
     }
     let settings = serde_json::json!({
-        "element_min_size": request.element_min_size,
-        "element_max_size": request.element_max_size,
+        "target_size": request.controls.target_size,
         "controls": request.controls.metadata(),
     });
     let (output, mut statistics) = writer.finish(descriptor.id, settings, &request.job_control)?;
@@ -473,6 +474,8 @@ pub fn run_meshing<S: MeshStorage>(
     statistics.peak_active_bytes = statistics
         .peak_active_bytes
         .max(generated.peak_active_bytes);
+    statistics.quality_passes = generated.quality_passes;
+    statistics.quality_termination = generated.quality_termination;
     statistics.elapsed_millis = started.elapsed().as_millis() as u64;
     Ok(MeshingOutput {
         artifact,

@@ -288,8 +288,7 @@ impl JobControl {
 #[derive(Debug)]
 pub struct MeshingContext<'a> {
     pub domains: &'a MeshableDomains,
-    pub element_min_size: f64,
-    pub element_max_size: f64,
+    pub target_size: f64,
     pub controls: &'a ControlSet,
     pub job_control: &'a JobControl,
     pub limits: GenerationLimits,
@@ -316,8 +315,6 @@ impl MeshingContext<'_> {
 pub struct MeshingRequest {
     pub domains: MeshableDomains,
     pub algorithm_id: String,
-    pub element_min_size: f64,
-    pub element_max_size: f64,
     pub controls: ControlSet,
     pub limits: GenerationLimits,
     pub job_control: JobControl,
@@ -328,16 +325,6 @@ impl MeshingRequest {
         if self.domains.is_empty() {
             return Err(MeshError::InvalidInput(
                 "meshing requires at least one declared domain".into(),
-            ));
-        }
-        if !self.element_min_size.is_finite()
-            || !self.element_max_size.is_finite()
-            || self.element_min_size <= 0.0
-            || self.element_max_size <= 0.0
-            || self.element_min_size > self.element_max_size
-        {
-            return Err(MeshError::InvalidInput(
-                "element sizes must be finite, positive, and min <= max".into(),
             ));
         }
         self.controls
@@ -374,4 +361,30 @@ pub struct MeshingStatistics {
     pub committed_batches: u64,
     pub peak_active_bytes: u64,
     pub elapsed_millis: u64,
+    #[serde(default)]
+    pub quality_passes: u64,
+    #[serde(default)]
+    pub quality_termination: QualityTermination,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QualityTermination {
+    #[default]
+    NotRun,
+    Converged,
+    MaxCells,
+    MemoryBudget,
+    IterationLimit,
+}
+
+impl fmt::Display for QualityTermination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotRun => "not run",
+            Self::Converged => "converged",
+            Self::MaxCells => "max cells",
+            Self::MemoryBudget => "memory budget",
+            Self::IterationLimit => "iteration limit",
+        })
+    }
 }

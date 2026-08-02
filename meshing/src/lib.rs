@@ -2,13 +2,9 @@
 
 #![deny(unsafe_code)]
 
-mod advancing_front;
-#[path = "advancing_front_2D.rs"]
-mod advancing_front_2d;
-#[path = "advancing_front_3D.rs"]
-mod advancing_front_3d;
 mod algorithm;
 mod chunk;
+mod distmesh;
 mod error;
 mod file;
 mod query;
@@ -26,7 +22,7 @@ pub mod quality;
 pub use algorithm::{
     CatalogEntry, CatalogKind, DomainCatalogIds, GenerationLimits, JobControl, MeshAlgorithm,
     MeshAlgorithmCapabilities, MeshAlgorithmDescriptor, MeshCatalog, MeshSink, MeshingContext,
-    MeshingPhase, MeshingProgress, MeshingRequest, MeshingStatistics,
+    MeshingPhase, MeshingProgress, MeshingRequest, MeshingStatistics, QualityTermination,
 };
 pub use chunk::{ChunkElement, ChunkPoint, MeshChunk, MeshChunkBuilder, MeshId};
 pub use controls::{BoundaryLayerControl, ControlRegion, ControlSet, RefinementControl};

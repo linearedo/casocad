@@ -101,20 +101,6 @@ fn get_str<'a>(record: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     record.get(key).and_then(Value::as_str)
 }
 
-fn meshing_size(record: &Map<String, Value>, key: &str, default: f64) -> GeometryResult<f64> {
-    match record.get(key) {
-        None => Ok(default),
-        Some(value) => {
-            let value = parse_f64(value)?;
-            if value.is_finite() && value > 0.0 {
-                Ok(value)
-            } else {
-                Err(err(format!("meshing option {key:?} must be positive")))
-            }
-        }
-    }
-}
-
 fn require_f64(record: &Map<String, Value>, key: &str) -> GeometryResult<f64> {
     parse_f64(
         record
@@ -1118,8 +1104,6 @@ pub fn scene_to_value(document: &SceneDocument) -> GeometryResult<Value> {
             "meshing".into(),
             json!({
                 "algorithm_id": document.meshing.algorithm_id,
-                "element_min_size": document.meshing.element_min_size,
-                "element_max_size": document.meshing.element_max_size,
                 "control_script": document.meshing.control_script,
                 "wasm_file_cap_mib": document.meshing.wasm_file_cap_mib,
             }),
@@ -1321,21 +1305,6 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
             Some(Value::String(value)) if !value.trim().is_empty() => value.clone(),
             Some(_) => return Err(err("meshing algorithm_id must be a non-empty string")),
         };
-        let element_max_size = if record.contains_key("element_max_size") {
-            meshing_size(record, "element_max_size", defaults.element_max_size)?
-        } else {
-            meshing_size(record, "cell_size", defaults.element_max_size)?
-        };
-        let default_min = defaults
-            .element_min_size
-            .min(element_max_size)
-            .max(element_max_size * 1.0e-6);
-        let element_min_size = meshing_size(record, "element_min_size", default_min)?;
-        if element_min_size > element_max_size {
-            return Err(err(
-                "meshing element_min_size must not exceed element_max_size",
-            ));
-        }
         let control_script = match record.get("control_script") {
             None => defaults.control_script,
             Some(Value::String(value)) => value.clone(),
@@ -1358,8 +1327,6 @@ pub fn load_scene_from_str(text: &str) -> GeometryResult<SceneDocument> {
         };
         loader.document.meshing = MeshingSettings {
             algorithm_id,
-            element_min_size,
-            element_max_size,
             control_script,
             wasm_file_cap_mib,
         };

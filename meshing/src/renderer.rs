@@ -1504,10 +1504,12 @@ mod tests {
                 let output = crate::run_meshing(
                     MeshingRequest {
                         domains: meshable_domains_from_document(&document).expect("meshable"),
-                        algorithm_id: "advancing_front".into(),
-                        element_min_size: 0.1,
-                        element_max_size: 0.25,
-                        controls: ControlSet::default(),
+                        algorithm_id: "distmesh".into(),
+                        controls: {
+                            let mut controls = ControlSet::default();
+                            controls.target_size(0.25).expect("target size");
+                            controls
+                        },
                         limits: GenerationLimits::default(),
                         job_control: JobControl::default(),
                     },

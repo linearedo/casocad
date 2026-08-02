@@ -176,8 +176,6 @@ pub struct FluidDomainRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeshingSettings {
     pub algorithm_id: String,
-    pub element_min_size: f64,
-    pub element_max_size: f64,
     pub control_script: String,
     pub wasm_file_cap_mib: u16,
 }
@@ -185,10 +183,8 @@ pub struct MeshingSettings {
 impl Default for MeshingSettings {
     fn default() -> Self {
         Self {
-            algorithm_id: "advancing_front".into(),
-            element_min_size: 0.025,
-            element_max_size: 0.1,
-            control_script: String::new(),
+            algorithm_id: "distmesh".into(),
+            control_script: "controls.target_size(0.1);".into(),
             wasm_file_cap_mib: 256,
         }
     }

@@ -1,7 +1,7 @@
-use crate::advancing_front::{ADVANCING_FRONT, ADVANCING_FRONT_DESCRIPTOR};
 use crate::algorithm::{MeshAlgorithm, MeshAlgorithmDescriptor};
+use crate::distmesh::{DISTMESH, DISTMESH_DESCRIPTOR};
 
-static DESCRIPTORS: [MeshAlgorithmDescriptor; 1] = [ADVANCING_FRONT_DESCRIPTOR];
+static DESCRIPTORS: [MeshAlgorithmDescriptor; 1] = [DISTMESH_DESCRIPTOR];
 
 pub fn descriptors() -> &'static [MeshAlgorithmDescriptor] {
     &DESCRIPTORS
@@ -9,7 +9,7 @@ pub fn descriptors() -> &'static [MeshAlgorithmDescriptor] {
 
 pub fn algorithm(id: &str) -> Option<&'static dyn MeshAlgorithm> {
     match id {
-        "advancing_front" => Some(&ADVANCING_FRONT),
+        "distmesh" => Some(&DISTMESH),
         _ => None,
     }
 }
