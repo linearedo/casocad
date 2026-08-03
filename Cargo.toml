@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kernel", "surfaces", "render", "meshing", "app"]
+members = ["kernel", "surfaces", "render", "delaunay", "meshing", "app"]
 
 [workspace.package]
 version = "0.1.0"

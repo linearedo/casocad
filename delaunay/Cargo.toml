@@ -1,0 +1,9 @@
+[package]
+name = "caso-delaunay"
+description = "Dependency-free deterministic 2D and 3D Delaunay primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

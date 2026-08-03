@@ -695,7 +695,7 @@ fn accept_sweep(
     let assessment = assess(domain, space, context, after)?;
     Ok(assessment.refine.is_empty()
         && assessment.score.hard_invalid == 0
-        && constrained_spade_tile(after, &after.cells).is_ok())
+        && validate_planar_tile(after, &after.cells).is_ok())
 }
 
 fn maximum_skewness(candidate: &Candidate) -> f64 {

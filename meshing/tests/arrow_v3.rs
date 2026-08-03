@@ -65,6 +65,27 @@ fn rectangle_with_curved_hole() -> (MeshableDomains, String) {
     (meshable_domains_from_document(&document).unwrap(), region)
 }
 
+fn box_with_surface_region() -> (MeshableDomains, String) {
+    let mut document = SceneDocument::new();
+    let box_id = document
+        .add_primitive_from_drag("box", vec3(-0.75, -0.75, 0.0), vec3(0.75, 0.75, 0.0), 1.5)
+        .unwrap();
+    document.rename(box_id, "air").unwrap();
+    document.set_domain_root(box_id, DomainKind::Fluid).unwrap();
+    let node = document.build_node(box_id).unwrap();
+    let patch = surface_patches_for_root(&node).into_iter().next().unwrap();
+    document
+        .add_boundary_region(
+            patch.owner_object_id,
+            patch.outside_direction,
+            Some(&patch.patch_id),
+            Some(&patch.patch_type),
+        )
+        .unwrap();
+    let region = document.boundary_regions.last().unwrap().name.clone();
+    (meshable_domains_from_document(&document).unwrap(), region)
+}
+
 fn nested_planar_domains() -> MeshableDomains {
     let mut document = SceneDocument::new();
     let outer = document
@@ -77,6 +98,22 @@ fn nested_planar_domains() -> MeshableDomains {
             vec3(0.45, 0.45, 0.0),
             1.0,
         )
+        .unwrap();
+    document.rename(inner, "solid").unwrap();
+    document.set_domain_root(inner, DomainKind::Solid).unwrap();
+    let fluid = document.combine(outer, inner, "difference").unwrap();
+    document.rename(fluid, "fluid").unwrap();
+    document.set_domain_root(fluid, DomainKind::Fluid).unwrap();
+    meshable_domains_from_document(&document).unwrap()
+}
+
+fn nested_volume_domains() -> MeshableDomains {
+    let mut document = SceneDocument::new();
+    let outer = document
+        .add_primitive_from_drag("sphere", vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0), 1.0)
+        .unwrap();
+    let inner = document
+        .add_primitive_from_drag("sphere", vec3(-0.4, -0.4, -0.4), vec3(0.4, 0.4, 0.4), 1.0)
         .unwrap();
     document.rename(inner, "solid").unwrap();
     document.set_domain_root(inner, DomainKind::Solid).unwrap();
@@ -261,7 +298,7 @@ fn cancellation_and_limits_never_publish_artifacts() {
 fn registry_capabilities_and_dimension_neutral_storage_are_explicit() {
     let descriptor = &caso_meshing::descriptors()[0];
     assert_eq!(descriptor.id, "distmesh");
-    assert_eq!(descriptor.dimensions, &[2]);
+    assert_eq!(descriptor.dimensions, &[2, 3]);
     assert!(!descriptor.capabilities.refinement);
     assert!(descriptor.capabilities.boundary_layers);
 
@@ -288,13 +325,12 @@ fn registry_capabilities_and_dimension_neutral_storage_are_explicit() {
     ));
 
     let document = SceneDocument::default_scene().unwrap();
-    assert!(matches!(
-        caso_meshing::run_meshing(
-            request(meshable_domains_from_document(&document).unwrap(), 0.2),
-            MemoryStorage::new(8 * 1024 * 1024).unwrap()
-        ),
-        Err(MeshError::UnsupportedDimension { dimension: 3, .. })
-    ));
+    let volume = caso_meshing::run_meshing(
+        request(meshable_domains_from_document(&document).unwrap(), 0.2),
+        MemoryStorage::new(32 * 1024 * 1024).unwrap(),
+    )
+    .unwrap();
+    assert!(volume.statistics.cells > 0);
 
     let bounds = Bounds3 {
         min: [0.0; 3],
@@ -379,6 +415,35 @@ fn straight_and_curved_boundaries_produce_valid_tagged_quad_layers() {
         .iter()
         .flat_map(|tile| &tile.entities)
         .any(|entity| !entity.tag_ids.is_empty()));
+
+    let (domains, region) = box_with_surface_region();
+    let mut generation = request(domains, 0.3);
+    generation
+        .controls
+        .boundary_layer("air", region, 0.001, 0.2, 1.0, 0.001)
+        .unwrap();
+    let output =
+        caso_meshing::run_meshing(generation, MemoryStorage::new(64 * 1024 * 1024).unwrap())
+            .unwrap();
+    let file = Arc::new(MeshFile::from_memory(memory(output.artifact)).unwrap());
+    file.full_audit(&JobControl::default()).unwrap();
+    let cells = MeshQueryService::new(file)
+        .execute(MeshQuery {
+            entity_kind: EntityKind::Cell,
+            display_limit: usize::MAX,
+            ..MeshQuery::default()
+        })
+        .unwrap();
+    assert!(cells
+        .render_tiles
+        .iter()
+        .flat_map(|tile| &tile.entities)
+        .any(|entity| entity.element_type == "prism6"));
+    assert!(cells
+        .render_tiles
+        .iter()
+        .flat_map(|tile| &tile.entities)
+        .any(|entity| entity.element_type == "pyramid5"));
 }
 
 #[test]
@@ -406,4 +471,13 @@ fn nested_domains_reuse_interface_points_and_pass_the_full_audit() {
         })
         .sum::<usize>();
     assert!(shared_ghosts > 0);
+
+    let output = caso_meshing::run_meshing(
+        request(nested_volume_domains(), 0.35),
+        MemoryStorage::new(64 * 1024 * 1024).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(output.statistics.domains, 2);
+    let file = MeshFile::from_memory(memory(output.artifact)).unwrap();
+    file.full_audit(&JobControl::default()).unwrap();
 }

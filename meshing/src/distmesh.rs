@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use caso_kernel::meshing::{BoundaryBand, MeshableDomain, MeshableDomainSpace, MeshableInterface};
 use caso_kernel::vec3::Vec3;
-use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
 use crate::algorithm::{
     MeshAlgorithm, MeshAlgorithmCapabilities, MeshAlgorithmDescriptor, MeshSink, MeshingContext,
@@ -17,6 +16,8 @@ use crate::schema::Bounds3;
 mod audit;
 mod cdt;
 mod contour;
+mod distmesh_3d;
+mod layers_3d;
 mod optimizer;
 
 const QUALITY_TARGET: f64 = 0.40;
@@ -33,7 +34,7 @@ pub static DISTMESH: DistMesh = DistMesh;
 pub static DISTMESH_DESCRIPTOR: MeshAlgorithmDescriptor = MeshAlgorithmDescriptor {
     id: "distmesh",
     label: "DistMesh (Out-of-Core)",
-    dimensions: &[2],
+    dimensions: &[2, 3],
     capabilities: MeshAlgorithmCapabilities {
         refinement: false,
         boundary_layers: true,
@@ -309,9 +310,6 @@ struct Point {
     protected: bool,
 }
 
-type PointSpade = ConstrainedDelaunayTriangulation<Point2<f64>>;
-type PointSpadeVertices = BTreeMap<PointKey, spade::handles::FixedVertexHandle>;
-
 #[derive(Debug, Clone, Copy)]
 struct SharedBoundaryPoint {
     position: [f64; 3],
@@ -492,6 +490,14 @@ pub(crate) fn generate(
     context: &MeshingContext<'_>,
     sink: &mut dyn MeshSink,
 ) -> MeshResult<MeshingStatistics> {
+    if context
+        .domains
+        .iter()
+        .next()
+        .is_some_and(|domain| domain.dimension == 3)
+    {
+        return distmesh_3d::generate(context, sink);
+    }
     let mut statistics = MeshingStatistics {
         domains: context.domains.len() as u64,
         ..MeshingStatistics::default()
@@ -564,7 +570,7 @@ pub(crate) fn generate(
             &shared_interfaces,
         )?;
         let cdt_result =
-            retriangulate_with_spade(domain, &space, context, &mut candidate, &assessment, true);
+            retriangulate_with_delaunay(domain, &space, context, &mut candidate, &assessment, true);
         let mut cdt_valid = cdt_result.is_ok();
         if let Err(error) = cdt_result {
             if !matches!(error, MeshError::InvalidInput(_)) {
@@ -853,7 +859,7 @@ fn morton2(x: u32, y: u32) -> u64 {
     spread(u64::from(x)) | spread(u64::from(y)) << 1
 }
 
-fn retriangulate_with_spade(
+fn retriangulate_with_delaunay(
     domain: &MeshableDomain,
     space: &MeshableDomainSpace,
     context: &MeshingContext<'_>,
@@ -1899,7 +1905,7 @@ fn rediscretize_layer_boundaries(
     }
     assessment.boundary = constraints;
     assessment.boundary_vertices = retained;
-    retriangulate_with_spade(domain, space, context, candidate, assessment, false)?;
+    retriangulate_with_delaunay(domain, space, context, candidate, assessment, false)?;
     *assessment = assess(domain, space, context, candidate)?;
     if !assessment.refine.is_empty() || assessment.score.hard_invalid != 0 {
         return Err(layer_error(
@@ -4827,7 +4833,6 @@ fn emit(
         context.check()?;
         let start = chunk_index * cells_per_chunk;
         let end = (start + cells_per_chunk).min(candidate.cells.len());
-        let spade_tile = spade_point_tile(candidate, &candidate.cells[start..end])?;
         let used = candidate.cells[start..end]
             .iter()
             .flat_map(|cell| cell.points.iter().copied())
@@ -4887,10 +4892,12 @@ fn emit(
             builder.boundary_edge(edge.points.map(|key| ids[&key]), vec![tag])?;
         }
         let chunk = builder.build(2)?;
-        let active = (chunk.decoded_bytes() + estimated_spade_bytes(&spade_tile)) as u64;
+        let active = (chunk.decoded_bytes()
+            + estimated_planar_bytes(used.len(), &candidate.cells[start..end]))
+            as u64;
         if active > context.limits.target_chunk_bytes as u64 {
             return Err(MeshError::LimitExceeded(format!(
-                "DistMesh chunk {chunk_id} active Spade tile and writer batch require {active} bytes, exceeding the configured {} byte chunk target",
+                "DistMesh chunk {chunk_id} active Delaunay topology and writer batch require {active} bytes, exceeding the configured {} byte chunk target",
                 context.limits.target_chunk_bytes
             )));
         }
@@ -4913,55 +4920,26 @@ fn emit(
     Ok(())
 }
 
-fn constrained_spade_tile(candidate: &Candidate, cells: &[Cell]) -> MeshResult<PointSpade> {
-    let (mut tile, vertices) = spade_tile_vertices(candidate, cells)?;
-    for cell in cells {
-        for edge in 0..cell.points.len() {
-            let a = cell.points[edge];
-            let b = cell.points[(edge + 1) % cell.points.len()];
-            if tile
-                .try_add_constraint(vertices[&a], vertices[&b])
-                .is_empty()
-            {
-                return Err(MeshError::InvalidInput(format!(
-                    "DistMesh cells contain a crossing or overlapping edge {:?} -> {:?}",
-                    candidate.points[&a].world, candidate.points[&b].world,
-                )));
-            }
-        }
+fn validate_planar_tile(candidate: &Candidate, cells: &[Cell]) -> MeshResult<()> {
+    if let Some((first, second)) = crossing_cell_edges(candidate, cells) {
+        return Err(MeshError::InvalidInput(format!(
+            "DistMesh cells contain crossing edges {:?} -> {:?} and {:?} -> {:?}",
+            candidate.points[&first.0].world,
+            candidate.points[&first.1].world,
+            candidate.points[&second.0].world,
+            candidate.points[&second.1].world,
+        )));
     }
-    Ok(tile)
+    Ok(())
 }
 
-fn spade_point_tile(candidate: &Candidate, cells: &[Cell]) -> MeshResult<PointSpade> {
-    spade_tile_vertices(candidate, cells).map(|(tile, _)| tile)
-}
-
-fn spade_tile_vertices(
-    candidate: &Candidate,
-    cells: &[Cell],
-) -> MeshResult<(PointSpade, PointSpadeVertices)> {
-    let used = cells
-        .iter()
-        .flat_map(|cell| cell.points.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let mut tile = ConstrainedDelaunayTriangulation::new();
-    let mut vertices = BTreeMap::new();
-    for key in used {
-        let [a, b] = candidate.points[&key].uv;
-        let vertex = tile.insert(Point2::new(a, b)).map_err(|error| {
-            MeshError::InvalidInput(format!("Spade rejected a DistMesh tile vertex: {error:?}"))
-        })?;
-        vertices.insert(key, vertex);
-    }
-    Ok((tile, vertices))
-}
-
-fn estimated_spade_bytes(tile: &PointSpade) -> usize {
-    std::mem::size_of_val(tile)
-        + tile.num_vertices() * 128
-        + tile.num_undirected_edges() * 96
-        + tile.num_inner_faces() * 64
+fn estimated_planar_bytes(vertices: usize, cells: &[Cell]) -> usize {
+    vertices.saturating_mul(64).saturating_add(
+        cells
+            .iter()
+            .map(|cell| cell.points.len().saturating_mul(24))
+            .sum(),
+    )
 }
 
 fn signed_area(triangle: [PointKey; 3], points: &BTreeMap<PointKey, Point>) -> f64 {

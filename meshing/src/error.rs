@@ -28,7 +28,7 @@ impl fmt::Display for MeshError {
         match self {
             Self::UnsupportedDimension { domain, dimension } => write!(
                 f,
-                "built-in meshing supports only 2D domains; {domain:?} is {dimension}D"
+                "built-in meshing supports only 2D and 3D domains; {domain:?} is {dimension}D"
             ),
             Self::InvalidInput(message)
             | Self::InvalidFile(message)
