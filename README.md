@@ -37,6 +37,11 @@ for external mesh interoperability.
 - `app/` — egui application (viewport, tools, panels); native and wasm entry
   points. `web/` holds the browser shell.
 
+For 2D boundary layers, `hwall_n`, growth, and the derived normal rows are
+hard geometry controls. `hwall_t` is a soft tangential target: the mesher may
+adjust station count and position when that improves strip validity or cell
+quality.
+
 ## Build & test
 
 ```bash

@@ -96,6 +96,8 @@ pub struct BoundaryLayerControl {
     pub domain: String,
     pub boundary_region: String,
     pub hwall_n: f64,
+    /// Soft tangential station-size target. Validity and element quality take
+    /// precedence, so the mesher may locally split, merge, or move stations.
     pub hwall_t: f64,
     pub ratio: f64,
     pub thickness: f64,

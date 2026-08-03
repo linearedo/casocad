@@ -1,0 +1,1507 @@
+{
+  "boundary_regions": {
+    "bezier": {
+      "domain": "sea",
+      "owner": "sea",
+      "patch": "cut_surface.quadratic_bezier_surface_1.outline",
+      "patch_type": "cut_surface"
+    },
+    "ellipse": {
+      "domain": "sea",
+      "owner": "sea",
+      "patch": "cut_surface.ellipse_1.outline",
+      "patch_type": "cut_surface"
+    },
+    "esad": {
+      "domain": "sea",
+      "owner": "sea",
+      "patch": "cut_surface.regular_polygon_1.outline",
+      "patch_type": "cut_surface"
+    },
+    "pipe": {
+      "domain": "sea",
+      "owner": "sea",
+      "patch": "cut_surface.circle_1.outline",
+      "patch_type": "cut_surface"
+    },
+    "roundrect": {
+      "domain": "sea",
+      "owner": "sea",
+      "patch": "cut_surface.rounded_rectangle_1.outline",
+      "patch_type": "cut_surface"
+    }
+  },
+  "domains": {
+    "sea": {
+      "root": "sea",
+      "tags": [
+        "ellipse",
+        "pipe",
+        "roundrect",
+        "bezier",
+        "esad"
+      ],
+      "type": "fluid"
+    }
+  },
+  "format": "casocad",
+  "meshing": {
+    "algorithm_id": "distmesh",
+    "control_script": "controls.target_size(0.2);\ncontrols.boundary_layer(\n\"sea\",\n\"pipe\",\n#{ hwall_n: 0.03, hwall_t: 0.03, ratio: 1.2, thickness: 0.5}\n);\ncontrols.boundary_layer(\n\"sea\",\n\"ellipse\",\n#{ hwall_n: 0.03, hwall_t: 0.03, ratio: 1.2, thickness: 0.5}\n);\ncontrols.boundary_layer(\n\"sea\",\n\"roundrect\",\n#{ hwall_n: 0.03, hwall_t: 0.03, ratio: 1.2, thickness: 0.5}\n);\ncontrols.boundary_layer(\n\"sea\",\n\"bezier\",\n#{ hwall_n: 0.03, hwall_t: 0.03, ratio: 1.2, thickness: 0.5}\n);\ncontrols.boundary_layer(\n\"sea\",\n\"esad\",\n#{ hwall_n: 0.03, hwall_t: 0.03, ratio: 1.2, thickness: 0.5}\n);\n",
+    "wasm_file_cap_mib": 256
+  },
+  "objects": {
+    "circle_1": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "center": [
+          0.0,
+          0.0
+        ],
+        "radius": 0.5,
+        "type": "circle"
+      },
+      "type": "placed_sdf_2d"
+    },
+    "circle_2": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        4.783998564614782,
+        1.2052389048081156,
+        0.0
+      ],
+      "profile": {
+        "center": [
+          0.0,
+          0.0
+        ],
+        "radius": 0.5,
+        "type": "circle"
+      },
+      "type": "placed_sdf_2d"
+    },
+    "difference_1": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "left": {
+          "left": {
+            "center": [
+              0.0,
+              0.0
+            ],
+            "size": [
+              16.0,
+              20.0
+            ],
+            "type": "rectangle"
+          },
+          "operation": "difference",
+          "right": {
+            "child": {
+              "center": [
+                0.0,
+                0.0
+              ],
+              "radius": 0.5,
+              "type": "circle"
+            },
+            "offset": [
+              0.0,
+              0.0
+            ],
+            "type": "offset"
+          },
+          "smoothing": 0.1,
+          "type": "binary"
+        },
+        "operation": "difference",
+        "right": {
+          "child": {
+            "center": [
+              0.0,
+              0.0
+            ],
+            "radius": 0.5,
+            "rotation": 0.0,
+            "side_count": 6,
+            "type": "regular_polygon"
+          },
+          "offset": [
+            0.1929977303843194,
+            -5.494978082573201
+          ],
+          "type": "offset"
+        },
+        "smoothing": 0.1,
+        "type": "binary"
+      },
+      "sources": [
+        "sea_2",
+        "regular_polygon_1"
+      ],
+      "type": "placed_sdf_2d"
+    },
+    "difference_2": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "left": {
+          "left": {
+            "left": {
+              "center": [
+                0.0,
+                0.0
+              ],
+              "size": [
+                16.0,
+                20.0
+              ],
+              "type": "rectangle"
+            },
+            "operation": "difference",
+            "right": {
+              "child": {
+                "center": [
+                  0.0,
+                  0.0
+                ],
+                "radius": 0.5,
+                "type": "circle"
+              },
+              "offset": [
+                0.0,
+                0.0
+              ],
+              "type": "offset"
+            },
+            "smoothing": 0.1,
+            "type": "binary"
+          },
+          "operation": "difference",
+          "right": {
+            "child": {
+              "center": [
+                0.0,
+                0.0
+              ],
+              "radius": 0.5,
+              "rotation": 0.0,
+              "side_count": 6,
+              "type": "regular_polygon"
+            },
+            "offset": [
+              0.1929977303843194,
+              -5.494978082573201
+            ],
+            "type": "offset"
+          },
+          "smoothing": 0.1,
+          "type": "binary"
+        },
+        "operation": "difference",
+        "right": {
+          "child": {
+            "center": [
+              0.0,
+              0.0
+            ],
+            "half_size": 0.5,
+            "type": "square"
+          },
+          "offset": [
+            -3.8397377770321666,
+            -0.08545630743415034
+          ],
+          "type": "offset"
+        },
+        "smoothing": 0.1,
+        "type": "binary"
+      },
+      "sources": [
+        "difference_1",
+        "square_1"
+      ],
+      "type": "placed_sdf_2d"
+    },
+    "difference_3": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "left": {
+          "left": {
+            "left": {
+              "left": {
+                "center": [
+                  0.0,
+                  0.0
+                ],
+                "size": [
+                  16.0,
+                  20.0
+                ],
+                "type": "rectangle"
+              },
+              "operation": "difference",
+              "right": {
+                "child": {
+                  "center": [
+                    0.0,
+                    0.0
+                  ],
+                  "radius": 0.5,
+                  "type": "circle"
+                },
+                "offset": [
+                  0.0,
+                  0.0
+                ],
+                "type": "offset"
+              },
+              "smoothing": 0.1,
+              "type": "binary"
+            },
+            "operation": "difference",
+            "right": {
+              "child": {
+                "center": [
+                  0.0,
+                  0.0
+                ],
+                "radius": 0.5,
+                "rotation": 0.0,
+                "side_count": 6,
+                "type": "regular_polygon"
+              },
+              "offset": [
+                0.1929977303843194,
+                -5.494978082573201
+              ],
+              "type": "offset"
+            },
+            "smoothing": 0.1,
+            "type": "binary"
+          },
+          "operation": "difference",
+          "right": {
+            "child": {
+              "center": [
+                0.0,
+                0.0
+              ],
+              "half_size": 0.5,
+              "type": "square"
+            },
+            "offset": [
+              -3.8397377770321666,
+              -0.08545630743415034
+            ],
+            "type": "offset"
+          },
+          "smoothing": 0.1,
+          "type": "binary"
+        },
+        "operation": "difference",
+        "right": {
+          "child": {
+            "center": [
+              0.0,
+              0.0
+            ],
+            "radius": 0.5,
+            "type": "circle"
+          },
+          "offset": [
+            4.783998564614782,
+            1.2052389048081156
+          ],
+          "type": "offset"
+        },
+        "smoothing": 0.1,
+        "type": "binary"
+      },
+      "sources": [
+        "difference_2",
+        "circle_2"
+      ],
+      "type": "placed_sdf_2d"
+    },
+    "difference_4": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "left": {
+          "left": {
+            "left": {
+              "left": {
+                "left": {
+                  "center": [
+                    0.0,
+                    0.0
+                  ],
+                  "size": [
+                    16.0,
+                    20.0
+                  ],
+                  "type": "rectangle"
+                },
+                "operation": "difference",
+                "right": {
+                  "child": {
+                    "center": [
+                      0.0,
+                      0.0
+                    ],
+                    "radius": 0.5,
+                    "type": "circle"
+                  },
+                  "offset": [
+                    0.0,
+                    0.0
+                  ],
+                  "type": "offset"
+                },
+                "smoothing": 0.1,
+                "type": "binary"
+              },
+              "operation": "difference",
+              "right": {
+                "child": {
+                  "center": [
+                    0.0,
+                    0.0
+                  ],
+                  "radius": 0.5,
+                  "rotation": 0.0,
+                  "side_count": 6,
+                  "type": "regular_polygon"
+                },
+                "offset": [
+                  0.1929977303843194,
+                  -5.494978082573201
+                ],
+                "type": "offset"
+              },
+              "smoothing": 0.1,
+              "type": "binary"
+            },
+            "operation": "difference",
+            "right": {
+              "child": {
+                "center": [
+                  0.0,
+                  0.0
+                ],
+                "half_size": 0.5,
+                "type": "square"
+              },
+              "offset": [
+                -3.8397377770321666,
+                -0.08545630743415034
+              ],
+              "type": "offset"
+            },
+            "smoothing": 0.1,
+            "type": "binary"
+          },
+          "operation": "difference",
+          "right": {
+            "child": {
+              "center": [
+                0.0,
+                0.0
+              ],
+              "radius": 0.5,
+              "type": "circle"
+            },
+            "offset": [
+              4.783998564614782,
+              1.2052389048081156
+            ],
+            "type": "offset"
+          },
+          "smoothing": 0.1,
+          "type": "binary"
+        },
+        "operation": "difference",
+        "right": {
+          "child": {
+            "points": [
+              [
+                3.061616997868383e-17,
+                0.5
+              ],
+              [
+                -0.7794228634059949,
+                0.44999999999999996
+              ],
+              [
+                -0.4330127018922193,
+                -0.25000000000000006
+              ],
+              [
+                -1.6532731788489269e-16,
+                -0.9
+              ],
+              [
+                0.4330127018922192,
+                -0.2500000000000002
+              ],
+              [
+                0.7794228634059949,
+                0.44999999999999996
+              ],
+              [
+                3.061616997868383e-17,
+                0.5
+              ]
+            ],
+            "type": "quadratic_bezier_surface"
+          },
+          "offset": [
+            3.674054301585807,
+            -4.400294481803589
+          ],
+          "type": "offset"
+        },
+        "smoothing": 0.1,
+        "type": "binary"
+      },
+      "sources": [
+        "difference_3",
+        "quadratic_bezier_surface_1"
+      ],
+      "type": "placed_sdf_2d"
+    },
+    "difference_5": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "left": {
+          "left": {
+            "left": {
+              "left": {
+                "left": {
+                  "left": {
+                    "center": [
+                      0.0,
+                      0.0
+                    ],
+                    "size": [
+                      16.0,
+                      20.0
+                    ],
+                    "type": "rectangle"
+                  },
+                  "operation": "difference",
+                  "right": {
+                    "child": {
+                      "center": [
+                        0.0,
+                        0.0
+                      ],
+                      "radius": 0.5,
+                      "type": "circle"
+                    },
+                    "offset": [
+                      0.0,
+                      0.0
+                    ],
+                    "type": "offset"
+                  },
+                  "smoothing": 0.1,
+                  "type": "binary"
+                },
+                "operation": "difference",
+                "right": {
+                  "child": {
+                    "center": [
+                      0.0,
+                      0.0
+                    ],
+                    "radius": 0.5,
+                    "rotation": 0.0,
+                    "side_count": 6,
+                    "type": "regular_polygon"
+                  },
+                  "offset": [
+                    0.1929977303843194,
+                    -5.494978082573201
+                  ],
+                  "type": "offset"
+                },
+                "smoothing": 0.1,
+                "type": "binary"
+              },
+              "operation": "difference",
+              "right": {
+                "child": {
+                  "center": [
+                    0.0,
+                    0.0
+                  ],
+                  "half_size": 0.5,
+                  "type": "square"
+                },
+                "offset": [
+                  -3.8397377770321666,
+                  -0.08545630743415034
+                ],
+                "type": "offset"
+              },
+              "smoothing": 0.1,
+              "type": "binary"
+            },
+            "operation": "difference",
+            "right": {
+              "child": {
+                "center": [
+                  0.0,
+                  0.0
+                ],
+                "radius": 0.5,
+                "type": "circle"
+              },
+              "offset": [
+                4.783998564614782,
+                1.2052389048081156
+              ],
+              "type": "offset"
+            },
+            "smoothing": 0.1,
+            "type": "binary"
+          },
+          "operation": "difference",
+          "right": {
+            "child": {
+              "points": [
+                [
+                  3.061616997868383e-17,
+                  0.5
+                ],
+                [
+                  -0.7794228634059949,
+                  0.44999999999999996
+                ],
+                [
+                  -0.4330127018922193,
+                  -0.25000000000000006
+                ],
+                [
+                  -1.6532731788489269e-16,
+                  -0.9
+                ],
+                [
+                  0.4330127018922192,
+                  -0.2500000000000002
+                ],
+                [
+                  0.7794228634059949,
+                  0.44999999999999996
+                ],
+                [
+                  3.061616997868383e-17,
+                  0.5
+                ]
+              ],
+              "type": "quadratic_bezier_surface"
+            },
+            "offset": [
+              3.674054301585807,
+              -4.400294481803589
+            ],
+            "type": "offset"
+          },
+          "smoothing": 0.1,
+          "type": "binary"
+        },
+        "operation": "difference",
+        "right": {
+          "child": {
+            "points": [
+              [
+                3.061616997868383e-17,
+                0.5
+              ],
+              [
+                -0.47552825814757677,
+                0.15450849718747375
+              ],
+              [
+                -0.2938926261462366,
+                -0.40450849718747367
+              ],
+              [
+                0.29389262614623646,
+                -0.4045084971874738
+              ],
+              [
+                0.4755282581475768,
+                0.1545084971874736
+              ]
+            ],
+            "type": "polygon"
+          },
+          "offset": [
+            -4.238620429193919,
+            -4.054288897060864
+          ],
+          "type": "offset"
+        },
+        "smoothing": 0.1,
+        "type": "binary"
+      },
+      "sources": [
+        "difference_4",
+        "polygon_1"
+      ],
+      "type": "placed_sdf_2d"
+    },
+    "difference_6": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "left": {
+          "left": {
+            "left": {
+              "left": {
+                "left": {
+                  "left": {
+                    "left": {
+                      "center": [
+                        0.0,
+                        0.0
+                      ],
+                      "size": [
+                        16.0,
+                        20.0
+                      ],
+                      "type": "rectangle"
+                    },
+                    "operation": "difference",
+                    "right": {
+                      "child": {
+                        "center": [
+                          0.0,
+                          0.0
+                        ],
+                        "radius": 0.5,
+                        "type": "circle"
+                      },
+                      "offset": [
+                        0.0,
+                        0.0
+                      ],
+                      "type": "offset"
+                    },
+                    "smoothing": 0.1,
+                    "type": "binary"
+                  },
+                  "operation": "difference",
+                  "right": {
+                    "child": {
+                      "center": [
+                        0.0,
+                        0.0
+                      ],
+                      "radius": 0.5,
+                      "rotation": 0.0,
+                      "side_count": 6,
+                      "type": "regular_polygon"
+                    },
+                    "offset": [
+                      0.1929977303843194,
+                      -5.494978082573201
+                    ],
+                    "type": "offset"
+                  },
+                  "smoothing": 0.1,
+                  "type": "binary"
+                },
+                "operation": "difference",
+                "right": {
+                  "child": {
+                    "center": [
+                      0.0,
+                      0.0
+                    ],
+                    "half_size": 0.5,
+                    "type": "square"
+                  },
+                  "offset": [
+                    -3.8397377770321666,
+                    -0.08545630743415034
+                  ],
+                  "type": "offset"
+                },
+                "smoothing": 0.1,
+                "type": "binary"
+              },
+              "operation": "difference",
+              "right": {
+                "child": {
+                  "center": [
+                    0.0,
+                    0.0
+                  ],
+                  "radius": 0.5,
+                  "type": "circle"
+                },
+                "offset": [
+                  4.783998564614782,
+                  1.2052389048081156
+                ],
+                "type": "offset"
+              },
+              "smoothing": 0.1,
+              "type": "binary"
+            },
+            "operation": "difference",
+            "right": {
+              "child": {
+                "points": [
+                  [
+                    3.061616997868383e-17,
+                    0.5
+                  ],
+                  [
+                    -0.7794228634059949,
+                    0.44999999999999996
+                  ],
+                  [
+                    -0.4330127018922193,
+                    -0.25000000000000006
+                  ],
+                  [
+                    -1.6532731788489269e-16,
+                    -0.9
+                  ],
+                  [
+                    0.4330127018922192,
+                    -0.2500000000000002
+                  ],
+                  [
+                    0.7794228634059949,
+                    0.44999999999999996
+                  ],
+                  [
+                    3.061616997868383e-17,
+                    0.5
+                  ]
+                ],
+                "type": "quadratic_bezier_surface"
+              },
+              "offset": [
+                3.674054301585807,
+                -4.400294481803589
+              ],
+              "type": "offset"
+            },
+            "smoothing": 0.1,
+            "type": "binary"
+          },
+          "operation": "difference",
+          "right": {
+            "child": {
+              "points": [
+                [
+                  3.061616997868383e-17,
+                  0.5
+                ],
+                [
+                  -0.47552825814757677,
+                  0.15450849718747375
+                ],
+                [
+                  -0.2938926261462366,
+                  -0.40450849718747367
+                ],
+                [
+                  0.29389262614623646,
+                  -0.4045084971874738
+                ],
+                [
+                  0.4755282581475768,
+                  0.1545084971874736
+                ]
+              ],
+              "type": "polygon"
+            },
+            "offset": [
+              -4.238620429193919,
+              -4.054288897060864
+            ],
+            "type": "offset"
+          },
+          "smoothing": 0.1,
+          "type": "binary"
+        },
+        "operation": "difference",
+        "right": {
+          "child": {
+            "center": [
+              0.0,
+              0.0
+            ],
+            "semi_axes": [
+              0.6,
+              0.35
+            ],
+            "type": "ellipse"
+          },
+          "offset": [
+            -3.5142737565103523,
+            4.336078169942785
+          ],
+          "type": "offset"
+        },
+        "smoothing": 0.1,
+        "type": "binary"
+      },
+      "sources": [
+        "difference_5",
+        "ellipse_1"
+      ],
+      "type": "placed_sdf_2d"
+    },
+    "ellipse_1": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        -3.5142737565103523,
+        4.336078169942785,
+        0.0
+      ],
+      "profile": {
+        "center": [
+          0.0,
+          0.0
+        ],
+        "semi_axes": [
+          0.6,
+          0.35
+        ],
+        "type": "ellipse"
+      },
+      "type": "placed_sdf_2d"
+    },
+    "polygon_1": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        -4.238620429193919,
+        -4.054288897060864,
+        0.0
+      ],
+      "profile": {
+        "points": [
+          [
+            3.061616997868383e-17,
+            0.5
+          ],
+          [
+            -0.47552825814757677,
+            0.15450849718747375
+          ],
+          [
+            -0.2938926261462366,
+            -0.40450849718747367
+          ],
+          [
+            0.29389262614623646,
+            -0.4045084971874738
+          ],
+          [
+            0.4755282581475768,
+            0.1545084971874736
+          ]
+        ],
+        "type": "polygon"
+      },
+      "type": "placed_sdf_2d"
+    },
+    "quadratic_bezier_surface_1": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        3.674054301585807,
+        -4.400294481803589,
+        0.0
+      ],
+      "profile": {
+        "points": [
+          [
+            3.061616997868383e-17,
+            0.5
+          ],
+          [
+            -0.7794228634059949,
+            0.44999999999999996
+          ],
+          [
+            -0.4330127018922193,
+            -0.25000000000000006
+          ],
+          [
+            -1.6532731788489269e-16,
+            -0.9
+          ],
+          [
+            0.4330127018922192,
+            -0.2500000000000002
+          ],
+          [
+            0.7794228634059949,
+            0.44999999999999996
+          ],
+          [
+            3.061616997868383e-17,
+            0.5
+          ]
+        ],
+        "type": "quadratic_bezier_surface"
+      },
+      "type": "placed_sdf_2d"
+    },
+    "rectangle_1": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "center": [
+          0.0,
+          0.0
+        ],
+        "size": [
+          16.0,
+          20.0
+        ],
+        "type": "rectangle"
+      },
+      "type": "placed_sdf_2d"
+    },
+    "regular_polygon_1": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.1929977303843194,
+        -5.494978082573201,
+        0.0
+      ],
+      "profile": {
+        "center": [
+          0.0,
+          0.0
+        ],
+        "radius": 0.5,
+        "rotation": 0.0,
+        "side_count": 6,
+        "type": "regular_polygon"
+      },
+      "type": "placed_sdf_2d"
+    },
+    "rounded_rectangle_1": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        3.0871756201063993,
+        5.047053166480194,
+        0.0
+      ],
+      "profile": {
+        "center": [
+          0.0,
+          0.0
+        ],
+        "corner_radius": 0.1,
+        "size": [
+          1.2,
+          0.8
+        ],
+        "type": "rounded_rectangle"
+      },
+      "type": "placed_sdf_2d"
+    },
+    "sea": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "left": {
+          "left": {
+            "left": {
+              "left": {
+                "left": {
+                  "left": {
+                    "left": {
+                      "left": {
+                        "center": [
+                          0.0,
+                          0.0
+                        ],
+                        "size": [
+                          16.0,
+                          20.0
+                        ],
+                        "type": "rectangle"
+                      },
+                      "operation": "difference",
+                      "right": {
+                        "child": {
+                          "center": [
+                            0.0,
+                            0.0
+                          ],
+                          "radius": 0.5,
+                          "type": "circle"
+                        },
+                        "offset": [
+                          0.0,
+                          0.0
+                        ],
+                        "type": "offset"
+                      },
+                      "smoothing": 0.1,
+                      "type": "binary"
+                    },
+                    "operation": "difference",
+                    "right": {
+                      "child": {
+                        "center": [
+                          0.0,
+                          0.0
+                        ],
+                        "radius": 0.5,
+                        "rotation": 0.0,
+                        "side_count": 6,
+                        "type": "regular_polygon"
+                      },
+                      "offset": [
+                        0.1929977303843194,
+                        -5.494978082573201
+                      ],
+                      "type": "offset"
+                    },
+                    "smoothing": 0.1,
+                    "type": "binary"
+                  },
+                  "operation": "difference",
+                  "right": {
+                    "child": {
+                      "center": [
+                        0.0,
+                        0.0
+                      ],
+                      "half_size": 0.5,
+                      "type": "square"
+                    },
+                    "offset": [
+                      -3.8397377770321666,
+                      -0.08545630743415034
+                    ],
+                    "type": "offset"
+                  },
+                  "smoothing": 0.1,
+                  "type": "binary"
+                },
+                "operation": "difference",
+                "right": {
+                  "child": {
+                    "center": [
+                      0.0,
+                      0.0
+                    ],
+                    "radius": 0.5,
+                    "type": "circle"
+                  },
+                  "offset": [
+                    4.783998564614782,
+                    1.2052389048081156
+                  ],
+                  "type": "offset"
+                },
+                "smoothing": 0.1,
+                "type": "binary"
+              },
+              "operation": "difference",
+              "right": {
+                "child": {
+                  "points": [
+                    [
+                      3.061616997868383e-17,
+                      0.5
+                    ],
+                    [
+                      -0.7794228634059949,
+                      0.44999999999999996
+                    ],
+                    [
+                      -0.4330127018922193,
+                      -0.25000000000000006
+                    ],
+                    [
+                      -1.6532731788489269e-16,
+                      -0.9
+                    ],
+                    [
+                      0.4330127018922192,
+                      -0.2500000000000002
+                    ],
+                    [
+                      0.7794228634059949,
+                      0.44999999999999996
+                    ],
+                    [
+                      3.061616997868383e-17,
+                      0.5
+                    ]
+                  ],
+                  "type": "quadratic_bezier_surface"
+                },
+                "offset": [
+                  3.674054301585807,
+                  -4.400294481803589
+                ],
+                "type": "offset"
+              },
+              "smoothing": 0.1,
+              "type": "binary"
+            },
+            "operation": "difference",
+            "right": {
+              "child": {
+                "points": [
+                  [
+                    3.061616997868383e-17,
+                    0.5
+                  ],
+                  [
+                    -0.47552825814757677,
+                    0.15450849718747375
+                  ],
+                  [
+                    -0.2938926261462366,
+                    -0.40450849718747367
+                  ],
+                  [
+                    0.29389262614623646,
+                    -0.4045084971874738
+                  ],
+                  [
+                    0.4755282581475768,
+                    0.1545084971874736
+                  ]
+                ],
+                "type": "polygon"
+              },
+              "offset": [
+                -4.238620429193919,
+                -4.054288897060864
+              ],
+              "type": "offset"
+            },
+            "smoothing": 0.1,
+            "type": "binary"
+          },
+          "operation": "difference",
+          "right": {
+            "child": {
+              "center": [
+                0.0,
+                0.0
+              ],
+              "semi_axes": [
+                0.6,
+                0.35
+              ],
+              "type": "ellipse"
+            },
+            "offset": [
+              -3.5142737565103523,
+              4.336078169942785
+            ],
+            "type": "offset"
+          },
+          "smoothing": 0.1,
+          "type": "binary"
+        },
+        "operation": "difference",
+        "right": {
+          "child": {
+            "center": [
+              0.0,
+              0.0
+            ],
+            "corner_radius": 0.1,
+            "size": [
+              1.2,
+              0.8
+            ],
+            "type": "rounded_rectangle"
+          },
+          "offset": [
+            3.0871756201063993,
+            5.047053166480194
+          ],
+          "type": "offset"
+        },
+        "smoothing": 0.1,
+        "type": "binary"
+      },
+      "sources": [
+        "difference_6",
+        "rounded_rectangle_1"
+      ],
+      "type": "placed_sdf_2d"
+    },
+    "sea_2": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "profile": {
+        "left": {
+          "center": [
+            0.0,
+            0.0
+          ],
+          "size": [
+            16.0,
+            20.0
+          ],
+          "type": "rectangle"
+        },
+        "operation": "difference",
+        "right": {
+          "child": {
+            "center": [
+              0.0,
+              0.0
+            ],
+            "radius": 0.5,
+            "type": "circle"
+          },
+          "offset": [
+            0.0,
+            0.0
+          ],
+          "type": "offset"
+        },
+        "smoothing": 0.1,
+        "type": "binary"
+      },
+      "sources": [
+        "rectangle_1",
+        "circle_1"
+      ],
+      "type": "placed_sdf_2d"
+    },
+    "square_1": {
+      "axis_u": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "axis_v": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "origin": [
+        -3.8397377770321666,
+        -0.08545630743415034,
+        0.0
+      ],
+      "profile": {
+        "center": [
+          0.0,
+          0.0
+        ],
+        "half_size": 0.5,
+        "type": "square"
+      },
+      "type": "placed_sdf_2d"
+    }
+  },
+  "root_objects": [
+    "sea"
+  ],
+  "unit": "m",
+  "version": 2
+}

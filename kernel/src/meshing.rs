@@ -361,6 +361,36 @@ impl MeshableDomain {
             .collect())
     }
 
+    /// Project onto the exact leaf that owns the local Boolean boundary.
+    /// This is primarily for contour samples that evaluate to exactly zero:
+    /// projecting the combined field would otherwise accept a numerical
+    /// zero plateau without moving to its generating CAD curve.
+    pub fn project_to_boundary_owner(&self, points: &[Vec3]) -> Vec<Projection> {
+        points
+            .iter()
+            .map(|point| {
+                let (_, owner_object_id) = evaluate_with_attribution(&self.region, *point);
+                let attributed =
+                    find_node_by_object_id(&self.region, owner_object_id).unwrap_or(&self.region);
+                let owner = if attributed.children().is_empty() {
+                    attributed
+                } else {
+                    self.region
+                        .leaves()
+                        .into_iter()
+                        .min_by(|a, b| {
+                            a.eval_point(*point)
+                                .abs()
+                                .total_cmp(&b.eval_point(*point).abs())
+                        })
+                        .unwrap_or(attributed)
+                };
+                let (normal_step, _, zero_band) = differential_steps(owner);
+                crate::differential::project_leaf_to_zero_set(owner, *point, normal_step, zero_band)
+            })
+            .collect()
+    }
+
     /// Curvature of the boundary at near-wall points reached from the
     /// interior (project first): mean curvature `H` for 3D domains,
     /// in-plane `kappa` for 2D. At creases the stencil returns O(1/step) —
@@ -792,6 +822,29 @@ fn cut_chain_field(root: &Node, region: &BoundaryRegion) -> GeometryResult<Optio
 /// Boundary entries of one non-fluid marked domain: its regions are
 /// attached by their `domain_root` (the fluid domain keeps its tag-list
 /// path below, which also carries `TagRef::Node` tag objects).
+fn projection_owner<'a>(root: &'a Node, region: &BoundaryRegion, fallback: &'a Node) -> &'a Node {
+    let Some(patch) = region
+        .patch_id
+        .as_deref()
+        .and_then(|patch| patch.strip_prefix("cut_surface."))
+    else {
+        return fallback;
+    };
+    let Some((name, _feature)) = patch.rsplit_once('.') else {
+        return fallback;
+    };
+    find_node_by_name(root, name).unwrap_or(fallback)
+}
+
+fn find_node_by_name<'a>(root: &'a Node, name: &str) -> Option<&'a Node> {
+    if root.name == name {
+        return Some(root);
+    }
+    root.children()
+        .into_iter()
+        .find_map(|child| find_node_by_name(child, name))
+}
+
 fn domain_boundary_entries(
     document: &SceneDocument,
     root: &Node,
@@ -819,7 +872,7 @@ fn domain_boundary_entries(
             owner_object_id: region.owner_object_id,
             root: root.clone(),
             region: region.clone(),
-            owner: owner.clone(),
+            owner: projection_owner(root, region, owner).clone(),
             selector,
         });
     }
@@ -861,7 +914,7 @@ fn fluid_boundary_entries(
                     owner_object_id: region.owner_object_id,
                     root: root.clone(),
                     region: region.clone(),
-                    owner: owner.clone(),
+                    owner: projection_owner(root, region, owner).clone(),
                     selector,
                 });
             }

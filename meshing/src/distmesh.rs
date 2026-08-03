@@ -1,9 +1,8 @@
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use caso_kernel::meshing::{BoundaryBand, MeshableDomain, MeshableDomainSpace, MeshableInterface};
 use caso_kernel::vec3::Vec3;
-use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation};
+use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
 use crate::algorithm::{
     MeshAlgorithm, MeshAlgorithmCapabilities, MeshAlgorithmDescriptor, MeshSink, MeshingContext,
@@ -15,18 +14,21 @@ use crate::error::{MeshError, MeshResult};
 use crate::quality::{quality_score, QualityMetric};
 use crate::schema::Bounds3;
 
+mod audit;
+mod boundary_layer;
+mod cdt;
+mod contour;
+mod optimizer;
+
 const QUALITY_TARGET: f64 = 0.40;
 const VALID_QUALITY: f64 = 1.0e-8;
-const EDGE_RATIO_MIN: f64 = std::f64::consts::FRAC_1_SQRT_2;
-const EDGE_RATIO_MAX: f64 = std::f64::consts::SQRT_2;
+const EDGE_RATIO_MIN: f64 = 0.65;
+const EDGE_RATIO_MAX: f64 = std::f64::consts::SQRT_2 * 1.0001;
 const SNAP_RATIO: f64 = 0.06;
 const ESTIMATED_CHUNK_BYTES_PER_CELL: usize = 2_048;
-const FORCE_SCALE: f64 = 1.2;
-const EULER_STEP: f64 = 0.2;
-const RETRIANGULATION_THRESHOLD: f64 = 0.1;
 const CONVERGENCE_THRESHOLD: f64 = 0.001;
-const MAX_RELAXATION_ITERATIONS: usize = 100;
-const MAX_QUALITY_PASSES: usize = 1_000;
+const MAX_QUALITY_PASSES: usize = 64;
+const LAYER_TRANSITION_GROWTH: f64 = 1.30;
 const MAX_OPTIMIZATION_BYTES: usize = 512 * 1024 * 1024;
 
 pub static DISTMESH: DistMesh = DistMesh;
@@ -232,26 +234,48 @@ impl<'a> Sampler<'a> {
     }
 
     fn sample(&mut self, key: Lattice) -> MeshResult<Sample> {
-        if let Some(sample) = self.cache.get(&key) {
-            return Ok(*sample);
+        self.sample_many(&[key])?;
+        Ok(self.cache[&key])
+    }
+
+    fn sample_many(&mut self, keys: &[Lattice]) -> MeshResult<()> {
+        let missing = keys
+            .iter()
+            .copied()
+            .filter(|key| !self.cache.contains_key(key))
+            .collect::<BTreeSet<_>>();
+        if missing.is_empty() {
+            return Ok(());
         }
-        let uv = self.grid.uv(key);
-        let point = self.space.point(uv[0], uv[1]);
-        let sdf = self.domain.domain_sdf(&[point])[0];
-        if !sdf.is_finite() {
-            return Err(MeshError::InvalidInput(format!(
-                "domain {:?} returned a non-finite SDF value",
-                self.domain.name
-            )));
+        let samples = missing
+            .iter()
+            .map(|key| {
+                let uv = self.grid.uv(*key);
+                let world = self.space.point(uv[0], uv[1]);
+                (*key, uv, world)
+            })
+            .collect::<Vec<_>>();
+        let values = self
+            .domain
+            .domain_sdf(&samples.iter().map(|sample| sample.2).collect::<Vec<_>>());
+        for ((key, uv, world), sdf) in samples.into_iter().zip(values) {
+            if !sdf.is_finite() {
+                return Err(MeshError::InvalidInput(format!(
+                    "domain {:?} returned a non-finite SDF value",
+                    self.domain.name
+                )));
+            }
+            self.cache.insert(
+                key,
+                Sample {
+                    key,
+                    uv,
+                    world: world.to_array(),
+                    sdf,
+                },
+            );
         }
-        let sample = Sample {
-            key,
-            uv,
-            world: point.to_array(),
-            sdf,
-        };
-        self.cache.insert(key, sample);
-        Ok(sample)
+        Ok(())
     }
 
     fn leaf_samples(&mut self, leaf: Leaf) -> MeshResult<[Sample; 9]> {
@@ -267,11 +291,8 @@ impl<'a> Sampler<'a> {
             corners[0], corners[1], corners[2], corners[3], mids[0], mids[1], mids[2], mids[3],
             center,
         ];
-        let mut samples = [self.sample(keys[0])?; 9];
-        for (index, key) in keys.into_iter().enumerate().skip(1) {
-            samples[index] = self.sample(key)?;
-        }
-        Ok(samples)
+        self.sample_many(&keys)?;
+        Ok(keys.map(|key| self.cache[&key]))
     }
 }
 
@@ -290,11 +311,8 @@ struct Point {
     protected: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SpadeVertex {
-    position: Point2<f64>,
-    key: PointKey,
-}
+type PointSpade = ConstrainedDelaunayTriangulation<Point2<f64>>;
+type PointSpadeVertices = BTreeMap<PointKey, spade::handles::FixedVertexHandle>;
 
 #[derive(Debug, Clone, Copy)]
 struct SharedBoundaryPoint {
@@ -307,14 +325,6 @@ struct SharedInterface {
     source: String,
     target: String,
     segments: Vec<[[f64; 3]; 2]>,
-}
-
-impl HasPosition for SpadeVertex {
-    type Scalar = f64;
-
-    fn position(&self) -> Point2<Self::Scalar> {
-        self.position
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -357,11 +367,23 @@ struct Candidate {
     construction_failures: BTreeSet<Leaf>,
     next_inserted: u64,
     layer_edge_targets: BTreeMap<(PointKey, PointKey), f64>,
+    layer_front_targets: Vec<LayerFrontTarget>,
     layer_end_targets: Vec<LayerEndTarget>,
+    layer_refinement_limit: Option<QualityTermination>,
+    protected_constraints: BTreeSet<(PointKey, PointKey)>,
+    refine_layer_core: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LayerFrontTarget {
+    a: [f64; 3],
+    b: [f64; 3],
+    edge_length: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct LayerEndTarget {
+    edge: (PointKey, PointKey),
     a: [f64; 3],
     b: [f64; 3],
     edge_length: f64,
@@ -381,6 +403,13 @@ struct CoreQuality {
     objective: f64,
     minimum_scaled_jacobian: f64,
     worst_first: Vec<(usize, f64)>,
+}
+
+#[derive(Debug, Clone)]
+struct CapQuality {
+    average_scaled_jacobian: f64,
+    minimum_scaled_jacobian: f64,
+    transition_minimum_scaled_jacobian: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -421,18 +450,6 @@ struct PatchScore {
     worst_violation: f64,
     worst_quality: f64,
     mean_squared_log_size_error: f64,
-    quad_count: usize,
-    triangle_count: usize,
-    cell_count: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Action {
-    Flip(PointKey, PointKey),
-    RelocateInterior(PointKey, u8),
-    Split(PointKey, PointKey),
-    Insert(usize),
-    Collapse(PointKey, PointKey),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -512,23 +529,34 @@ pub(crate) fn generate(
                 .copied()
                 .filter(|leaf| leaf.level < grid.max_depth)
                 .collect::<BTreeSet<_>>();
-            if splittable.len() != requested.len() {
-                return Err(minimum_size_error(
-                    domain,
-                    context,
-                    assessment.reason.as_deref().unwrap_or(
-                        "topology discovery could not establish a valid boundary-conforming mesh",
-                    ),
-                    assessment.location,
-                    assessment.worst_quality,
-                ));
+            if splittable.is_empty() {
+                break (candidate, assessment);
             }
             refine_leaves(context, &mut leaves, &splittable)?;
             balance(context, grid, &mut leaves)?;
         };
-        let has_shared_interface = shared_interfaces
-            .iter()
-            .any(|interface| interface.target == domain.name);
+        let mut canonical = candidate.clone();
+        match contour::canonicalize_boundary_vertices(
+            domain,
+            context,
+            &mut canonical,
+            &assessment.boundary,
+        ) {
+            Ok(changed) => {
+                candidate = canonical;
+                if changed {
+                    assessment = assess(domain, &space, context, &candidate)?;
+                }
+            }
+            Err(MeshError::InvalidInput(_)) => {
+                // Canonicalization improves the global CDT input but is not a
+                // mandatory geometry operation. Keep the already valid SDF
+                // construction transactionally when the inferred graph is
+                // ambiguous instead of exposing an internal graph diagnostic.
+            }
+            Err(error) => return Err(error),
+        }
+        let before_interfaces = candidate.clone();
         install_shared_interfaces(
             domain,
             &space,
@@ -537,26 +565,47 @@ pub(crate) fn generate(
             &mut assessment,
             &shared_interfaces,
         )?;
-        let clipped_seed = candidate.clone();
-        retriangulate_with_spade(domain, context, &mut candidate, &assessment)?;
-        assessment = assess(domain, &space, context, &candidate)?;
-        if !has_shared_interface
-            && (!assessment.refine.is_empty() || assessment.score.hard_invalid != 0)
-        {
-            candidate = clipped_seed;
+        let cdt_result =
+            retriangulate_with_spade(domain, &space, context, &mut candidate, &assessment, true);
+        let mut cdt_valid = cdt_result.is_ok();
+        if let Err(error) = cdt_result {
+            if !matches!(error, MeshError::InvalidInput(_)) {
+                return Err(error);
+            }
+        }
+        if cdt_valid {
             assessment = assess(domain, &space, context, &candidate)?;
+            cdt_valid = assessment.refine.is_empty() && assessment.score.hard_invalid == 0;
+        }
+        if !cdt_valid {
+            candidate = before_interfaces;
+            assessment = assess(domain, &space, context, &candidate)?;
+            if !assessment.refine.is_empty() || assessment.score.hard_invalid != 0 {
+                return Err(minimum_size_error(
+                    domain,
+                    context,
+                    assessment
+                        .reason
+                        .as_deref()
+                        .unwrap_or("no topology-valid construction snapshot is available"),
+                    assessment.location,
+                    assessment.worst_quality,
+                ));
+            }
         }
         let has_layers = context
             .controls
             .boundary_layers
             .iter()
             .any(|control| control.domain == domain.name);
+        let before_layers = has_layers.then(|| candidate.clone());
+        let statistics_before_layers = has_layers.then(|| statistics.clone());
         if has_layers {
             prepare_layer_boundaries(domain, &space, context, &mut candidate, &mut assessment)?;
             apply_boundary_layers(domain, &space, context, &mut candidate, &mut assessment)?;
         }
-        relax_distmesh(domain, &space, context, &mut candidate, &mut assessment)?;
-        optimize(
+        lock_constraint_vertices(&mut candidate, &assessment);
+        optimizer::optimize(
             domain,
             &space,
             context,
@@ -564,8 +613,33 @@ pub(crate) fn generate(
             &mut assessment,
             &mut statistics,
         )?;
+        if has_layers && !optimizer::quality_gates_met(domain, context, &candidate) {
+            let attempted_termination = statistics.quality_termination;
+            candidate = before_layers.expect("layer fallback snapshot");
+            candidate.refine_layer_core = false;
+            statistics = statistics_before_layers.expect("layer statistics snapshot");
+            if matches!(
+                attempted_termination,
+                QualityTermination::MaxCells | QualityTermination::MemoryBudget
+            ) {
+                statistics.quality_termination = attempted_termination;
+            }
+            assessment = assess(domain, &space, context, &candidate)?;
+            prepare_layer_boundaries(domain, &space, context, &mut candidate, &mut assessment)?;
+            apply_boundary_layers(domain, &space, context, &mut candidate, &mut assessment)?;
+            lock_constraint_vertices(&mut candidate, &assessment);
+            optimizer::optimize(
+                domain,
+                &space,
+                context,
+                &mut candidate,
+                &mut assessment,
+                &mut statistics,
+            )?;
+        }
         sort_cells_morton(&space, &mut candidate);
         assessment = assess(domain, &space, context, &candidate)?;
+        audit::validate_candidate(domain, context, &candidate, &assessment)?;
         capture_shared_interfaces(
             domain,
             context,
@@ -587,13 +661,37 @@ pub(crate) fn generate(
     Ok(statistics)
 }
 
+fn lock_constraint_vertices(candidate: &mut Candidate, assessment: &Assessment) {
+    for edge in &assessment.boundary {
+        let constraint = ordered_pair(edge.points[0], edge.points[1]);
+        candidate.protected_constraints.insert(constraint);
+        for point in edge.points {
+            if let Some(point) = candidate.points.get_mut(&point) {
+                point.protected = true;
+            }
+        }
+    }
+    let protected_cells = candidate
+        .cells
+        .iter()
+        .filter(|cell| cell.protected)
+        .flat_map(|cell| {
+            (0..cell.points.len()).map(|edge| {
+                ordered_pair(
+                    cell.points[edge],
+                    cell.points[(edge + 1) % cell.points.len()],
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    candidate.protected_constraints.extend(protected_cells);
+}
+
 fn interface_edge(interface: &MeshableInterface, a: [f64; 3], b: [f64; 3]) -> bool {
-    let points = [
-        Vec3::from_array(a),
-        Vec3::from_array(b),
-        Vec3::from_array(midpoint3(a, b)),
-    ];
-    interface.contains(&points).into_iter().all(|hit| hit)
+    interface
+        .contains(&[Vec3::from_array(a), Vec3::from_array(b)])
+        .into_iter()
+        .all(|hit| hit)
 }
 
 fn capture_shared_interfaces(
@@ -722,180 +820,6 @@ fn install_shared_interfaces(
     Ok(())
 }
 
-fn relax_distmesh(
-    domain: &MeshableDomain,
-    space: &MeshableDomainSpace,
-    context: &MeshingContext<'_>,
-    candidate: &mut Candidate,
-    assessment: &mut Assessment,
-) -> MeshResult<()> {
-    let original = candidate.clone();
-    let original_minimum_edge = minimum_edge_ratio(candidate, context.target_size);
-    let original_score = assessment.score;
-    let mut retriangulated_at = candidate
-        .points
-        .iter()
-        .map(|(key, point)| (*key, point.uv))
-        .collect::<BTreeMap<_, _>>();
-    for iteration in 0..MAX_RELAXATION_ITERATIONS {
-        if iteration.is_multiple_of(4) {
-            context.check()?;
-        }
-        let edges = candidate
-            .cells
-            .iter()
-            .flat_map(|cell| {
-                (0..cell.points.len()).map(|edge| {
-                    ordered_pair(
-                        cell.points[edge],
-                        cell.points[(edge + 1) % cell.points.len()],
-                    )
-                })
-            })
-            .collect::<BTreeSet<_>>();
-        let mut forces = BTreeMap::<PointKey, ([f64; 2], usize)>::new();
-        for (a, b) in edges {
-            let pa = candidate.points[&a].uv;
-            let pb = candidate.points[&b].uv;
-            let wa = candidate.points[&a].world;
-            let wb = candidate.points[&b].world;
-            let delta = [pb[0] - pa[0], pb[1] - pa[1]];
-            let length = delta[0].hypot(delta[1]);
-            if length <= f64::EPSILON {
-                continue;
-            }
-            let midpoint = midpoint3(wa, wb);
-            let probes = [
-                Vec3::from_array(wa),
-                Vec3::from_array(wb),
-                Vec3::from_array(midpoint),
-            ];
-            let target = candidate
-                .layer_edge_targets
-                .get(&ordered_pair(a, b))
-                .copied()
-                .unwrap_or_else(|| {
-                    local_target(
-                        candidate,
-                        context,
-                        &domain.name,
-                        Vec3::from_array(midpoint),
-                        length * 0.5,
-                        &probes,
-                    )
-                });
-            let compression = (FORCE_SCALE * target - length).max(0.0);
-            if compression == 0.0 {
-                continue;
-            }
-            let force = [
-                delta[0] * compression / length,
-                delta[1] * compression / length,
-            ];
-            let entry = forces.entry(a).or_default();
-            entry.0[0] -= force[0];
-            entry.0[1] -= force[1];
-            entry.1 += 1;
-            let entry = forces.entry(b).or_default();
-            entry.0[0] += force[0];
-            entry.0[1] += force[1];
-            entry.1 += 1;
-        }
-
-        let mut next = Vec::new();
-        let mut maximum_move: f64 = 0.0;
-        for (key, (force, count)) in forces {
-            let old = candidate.points[&key];
-            if old.boundary || old.protected || assessment.boundary_vertices.contains(&key) {
-                continue;
-            }
-            let scale = EULER_STEP / count.max(1) as f64;
-            let mut uv = [old.uv[0] + scale * force[0], old.uv[1] + scale * force[1]];
-            let mut world = space.point(uv[0], uv[1]);
-            if domain.domain_sdf(&[world])[0] >= 0.0 {
-                let mut inside = Vec3::from_array(old.world);
-                let mut outside = world;
-                for _ in 0..48 {
-                    let middle = (inside + outside) * 0.5;
-                    if domain.domain_sdf(&[middle])[0] <= 0.0 {
-                        inside = middle;
-                    } else {
-                        outside = middle;
-                    }
-                }
-                world = inside;
-                let coords = space.coords(world);
-                uv = [coords[0], coords[1]];
-            }
-            maximum_move = maximum_move.max((uv[0] - old.uv[0]).hypot(uv[1] - old.uv[1]));
-            next.push((key, uv, world.to_array()));
-        }
-        for (key, uv, world) in next {
-            let point = candidate
-                .points
-                .get_mut(&key)
-                .expect("moving DistMesh point");
-            point.uv = uv;
-            point.world = world;
-        }
-        if maximum_move / context.target_size <= CONVERGENCE_THRESHOLD {
-            break;
-        }
-        let needs_retriangulation = candidate.points.iter().any(|(key, point)| {
-            retriangulated_at.get(key).is_some_and(|old| {
-                (point.uv[0] - old[0]).hypot(point.uv[1] - old[1])
-                    > RETRIANGULATION_THRESHOLD * context.target_size
-            })
-        });
-        if needs_retriangulation && !candidate.cells.iter().any(|cell| cell.protected) {
-            retriangulate_with_spade(domain, context, candidate, assessment)?;
-            *assessment = assess(domain, space, context, candidate)?;
-            if assessment.score.hard_invalid != 0
-                || compare_scores(&assessment.score, &original_score) == Ordering::Greater
-                || minimum_edge_ratio(candidate, context.target_size)
-                    < original_minimum_edge * (1.0 - 1.0e-12)
-            {
-                *candidate = original;
-                *assessment = assess(domain, space, context, candidate)?;
-                return Ok(());
-            }
-            retriangulated_at = candidate
-                .points
-                .iter()
-                .map(|(key, point)| (*key, point.uv))
-                .collect();
-        }
-    }
-    let relaxed = assess(domain, space, context, candidate)?;
-    if relaxed.refine.is_empty()
-        && relaxed.score.hard_invalid == 0
-        && compare_scores(&relaxed.score, &assessment.score) != Ordering::Greater
-        && minimum_edge_ratio(candidate, context.target_size)
-            >= original_minimum_edge * (1.0 - 1.0e-12)
-    {
-        *assessment = relaxed;
-    } else {
-        *candidate = original;
-        *assessment = assess(domain, space, context, candidate)?;
-    }
-    Ok(())
-}
-
-fn minimum_edge_ratio(candidate: &Candidate, target_size: f64) -> f64 {
-    candidate
-        .cells
-        .iter()
-        .flat_map(|cell| {
-            (0..cell.points.len()).map(|edge| {
-                distance3(
-                    candidate.points[&cell.points[edge]].world,
-                    candidate.points[&cell.points[(edge + 1) % cell.points.len()]].world,
-                ) / target_size
-            })
-        })
-        .fold(f64::INFINITY, f64::min)
-}
-
 fn sort_cells_morton(space: &MeshableDomainSpace, candidate: &mut Candidate) {
     let bounds = space.bounds();
     let Candidate { points, cells, .. } = candidate;
@@ -933,73 +857,47 @@ fn morton2(x: u32, y: u32) -> u64 {
 
 fn retriangulate_with_spade(
     domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
     context: &MeshingContext<'_>,
     candidate: &mut Candidate,
     assessment: &Assessment,
+    refine: bool,
 ) -> MeshResult<()> {
-    let mut triangulation = ConstrainedDelaunayTriangulation::<SpadeVertex>::new();
-    let mut handles = BTreeMap::new();
-    let mut leaves = BTreeMap::new();
-    for cell in &candidate.cells {
-        for key in &cell.points {
-            leaves.entry(*key).or_insert(cell.leaf);
+    for key in assessment
+        .boundary
+        .iter()
+        .flat_map(|edge| edge.points)
+        .collect::<BTreeSet<_>>()
+    {
+        let point = candidate.points[&key];
+        let projected = domain.project_to_boundary_owner(&[Vec3::from_array(point.world)])[0];
+        let replacement = (projected.converged
+            && projected.distance_moved <= context.target_size
+            && domain.domain_sdf(&[projected.point])[0].abs()
+                <= chord_tolerance(domain, context.target_size))
+        .then(|| {
+            let coords = space.coords(projected.point);
+            ([coords[0], coords[1]], projected.point.to_array())
+        });
+        let point = candidate
+            .points
+            .get_mut(&key)
+            .expect("assessed boundary vertex");
+        if !point.protected {
+            if let Some((uv, world)) = replacement {
+                point.uv = uv;
+                point.world = world;
+            }
         }
+        point.boundary = true;
     }
-    for (&key, point) in &candidate.points {
-        let handle = triangulation
-            .insert(SpadeVertex {
-                position: Point2::new(point.uv[0], point.uv[1]),
-                key,
-            })
-            .map_err(|error| {
-                MeshError::InvalidInput(format!(
-                    "Spade rejected a DistMesh vertex in domain {:?}: {error:?}",
-                    domain.name
-                ))
-            })?;
-        handles.insert(key, handle);
-    }
-    for edge in &assessment.boundary {
-        triangulation.try_add_constraint(handles[&edge.points[0]], handles[&edge.points[1]]);
-    }
-
-    let mut cells = Vec::new();
-    for (index, face) in triangulation.inner_faces().enumerate() {
-        if index.is_multiple_of(512) {
-            context.check()?;
-        }
-        let points = face.vertices().map(|vertex| vertex.data().key);
-        if points[0] == points[1] || points[1] == points[2] || points[2] == points[0] {
-            continue;
-        }
-        let positions = points.map(|key| candidate.points[&key].world);
-        let centroid = centroid_slice(&positions);
-        if domain.domain_sdf(&[Vec3::from_array(centroid)])[0] >= 0.0
-            || cell_containment_residual(domain, &positions)
-                > chord_tolerance(domain, maximum_edge_2d(&positions))
-        {
-            continue;
-        }
-        let leaf = points
-            .iter()
-            .find_map(|key| leaves.get(key))
-            .copied()
-            .unwrap_or(Leaf {
-                level: 0,
-                x: 0,
-                y: 0,
-            });
-        cells.push(Cell::triangle(points, leaf));
-    }
-    if cells.is_empty() {
-        return Err(MeshError::InvalidInput(format!(
-            "Spade produced no interior triangles for domain {:?}",
-            domain.name
-        )));
-    }
-    candidate.cells = cells;
-    candidate.construction_failures.clear();
-    Ok(())
+    let graph = contour::PlanarConstraintGraph::from_boundary(
+        domain,
+        context,
+        candidate,
+        &assessment.boundary,
+    )?;
+    cdt::retriangulate(domain, space, context, candidate, &graph, refine)
 }
 
 fn discover(
@@ -1090,9 +988,23 @@ fn local_target(
     radius: f64,
     probes: &[Vec3],
 ) -> f64 {
-    candidate.layer_end_targets.iter().fold(
+    let target = candidate.layer_front_targets.iter().fold(
         regional_target(context, domain, center, radius, probes),
-        |target, end| {
+        |target, front| {
+            target.min(
+                front.edge_length
+                    + point_segment_distance(
+                        center,
+                        Vec3::from_array(front.a),
+                        Vec3::from_array(front.b),
+                    ),
+            )
+        },
+    );
+    candidate
+        .layer_end_targets
+        .iter()
+        .fold(target, |target, end| {
             target.min(
                 end.edge_length
                     + point_segment_distance(
@@ -1101,8 +1013,7 @@ fn local_target(
                         Vec3::from_array(end.b),
                     ),
             )
-        },
-    )
+        })
 }
 
 #[cfg(test)]
@@ -1296,7 +1207,11 @@ fn build_candidate(
         construction_failures: BTreeSet::new(),
         next_inserted: 1,
         layer_edge_targets: BTreeMap::new(),
+        layer_front_targets: Vec::new(),
         layer_end_targets: Vec::new(),
+        layer_refinement_limit: None,
+        protected_constraints: BTreeSet::new(),
+        refine_layer_core: true,
     };
     let mut crossings = BTreeMap::new();
     for (leaf_index, &leaf) in leaves.iter().enumerate() {
@@ -1479,29 +1394,13 @@ fn crossing(
     }
     if a.sdf == 0.0 {
         let key = PointKey::Lattice(a.key);
-        points.insert(
-            key,
-            Point {
-                uv: a.uv,
-                world: a.world,
-                boundary: true,
-                protected: false,
-            },
-        );
+        points.insert(key, exact_boundary_point(domain, space, local_size, a));
         crossings.insert(edge, key);
         return Ok(key);
     }
     if b.sdf == 0.0 {
         let key = PointKey::Lattice(b.key);
-        points.insert(
-            key,
-            Point {
-                uv: b.uv,
-                world: b.world,
-                boundary: true,
-                protected: false,
-            },
-        );
+        points.insert(key, exact_boundary_point(domain, space, local_size, b));
         crossings.insert(edge, key);
         return Ok(key);
     }
@@ -1549,11 +1448,19 @@ fn crossing(
         .into_iter()
         .next()
         .expect("one projection");
-    let world = if projection.converged && projection.distance_moved <= local_size {
+    let mut world = if projection.converged && projection.distance_moved <= local_size {
         projection.point
     } else {
         Vec3::from_array(inside.world)
     };
+    let owner_projection = domain.project_to_boundary_owner(&[world])[0];
+    if owner_projection.converged
+        && owner_projection.distance_moved <= local_size
+        && domain.domain_sdf(&[owner_projection.point])[0].abs()
+            <= chord_tolerance(domain, local_size)
+    {
+        world = owner_projection.point;
+    }
     let t = (ti + to) * 0.5;
     let snapped = if t <= SNAP_RATIO {
         Some(a.key)
@@ -1582,6 +1489,28 @@ fn crossing(
         .or_insert(point);
     crossings.insert(edge, key);
     Ok(key)
+}
+
+fn exact_boundary_point(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    local_size: f64,
+    sample: Sample,
+) -> Point {
+    let seed = Vec3::from_array(sample.world);
+    let projection = domain.project_to_boundary_owner(&[seed])[0];
+    let world = if projection.converged && projection.distance_moved <= local_size {
+        projection.point
+    } else {
+        seed
+    };
+    let coords = space.coords(world);
+    Point {
+        uv: [coords[0], coords[1]],
+        world: world.to_array(),
+        boundary: true,
+        protected: false,
+    }
 }
 
 fn dedup_polygon(points: Vec<PointKey>) -> Vec<PointKey> {
@@ -1619,17 +1548,6 @@ fn assess(
             worst_violation: 0.0,
             worst_quality: 1.0,
             mean_squared_log_size_error: 0.0,
-            quad_count: candidate
-                .cells
-                .iter()
-                .filter(|cell| cell.points.len() == 4)
-                .count(),
-            triangle_count: candidate
-                .cells
-                .iter()
-                .filter(|cell| cell.points.len() == 3)
-                .count(),
-            cell_count: candidate.cells.len(),
         },
     };
     let mut incidence = BTreeMap::<(PointKey, PointKey), Vec<(usize, [PointKey; 2])>>::new();
@@ -1673,10 +1591,14 @@ fn assess(
             || (cell.points.len() == 4 && polygon_self_intersects(&cell.points, &candidate.points))
         {
             assessment.score.hard_invalid += 1;
+            let reason = format!(
+                "cell is inverted, self-intersecting, or degenerate (area={area:.6e}, Scaled Jacobian={quality:.6e}, keys={:?}, points={positions:?})",
+                cell.points
+            );
             record_refinement(
                 &mut assessment,
                 cell.leaf,
-                "cell is inverted, self-intersecting, degenerate, or below the Scaled Jacobian validity floor",
+                &reason,
                 centroid_slice(&positions),
             );
         } else if containment_residual > containment_tolerance {
@@ -1763,6 +1685,18 @@ fn assess(
                     "non-manifold cell edge incidence",
                     cell_centroid(candidate, *cell),
                 );
+            }
+        } else if let [(first_cell, first), (second_cell, second)] = entries.as_slice() {
+            if first == second {
+                for cell in [first_cell, second_cell] {
+                    assessment.score.hard_invalid += 1;
+                    record_refinement(
+                        &mut assessment,
+                        candidate.cells[*cell].leaf,
+                        "adjacent cells traverse their shared edge in the same direction",
+                        cell_centroid(candidate, *cell),
+                    );
+                }
             }
         } else if let [(cell, oriented)] = entries.as_slice() {
             assessment.boundary.push(BoundaryEdge {
@@ -1994,7 +1928,7 @@ fn rediscretize_layer_boundaries(
     }
     assessment.boundary = constraints;
     assessment.boundary_vertices = retained;
-    retriangulate_with_spade(domain, context, candidate, assessment)?;
+    retriangulate_with_spade(domain, space, context, candidate, assessment, false)?;
     *assessment = assess(domain, space, context, candidate)?;
     if !assessment.refine.is_empty() || assessment.score.hard_invalid != 0 {
         return Err(layer_error(
@@ -2112,15 +2046,8 @@ fn resample_boundary_path(
     if closed && fixed.is_empty() {
         let mut cycle = vertices.to_vec();
         cycle.push(vertices[0]);
-        let stations = resample_boundary_arc(
-            domain,
-            space,
-            context,
-            candidate,
-            &cycle,
-            true,
-            contour.tangential_size(),
-        )?;
+        let stations =
+            resample_boundary_arc(domain, space, context, candidate, &cycle, true, contour)?;
         for index in 0..stations.len() {
             candidate.layer_edge_targets.insert(
                 ordered_pair(stations[index], stations[(index + 1) % stations.len()]),
@@ -2157,7 +2084,7 @@ fn resample_boundary_path(
             candidate,
             &linear[pair[0]..=pair[1]],
             false,
-            contour.tangential_size(),
+            contour,
         )?;
         for edge in stations.windows(2) {
             candidate
@@ -2180,7 +2107,69 @@ fn resample_boundary_arc(
     candidate: &mut Candidate,
     path: &[PointKey],
     closed: bool,
+    contour: &LayerContourKey,
+) -> MeshResult<Vec<PointKey>> {
+    let total = path
+        .windows(2)
+        .map(|edge| {
+            distance3(
+                candidate.points[&edge[0]].world,
+                candidate.points[&edge[1]].world,
+            )
+        })
+        .sum::<f64>();
+    let minimum = if closed { 3 } else { 1 };
+    let nominal = ((total / contour.tangential_size()).round() as usize).max(minimum);
+    let radius = 2.max(nominal / 10);
+    let mut best = None::<(Candidate, Vec<PointKey>, boundary_layer::StripScore)>;
+    let mut nominal_candidate = None;
+    for edge_count in nominal.saturating_sub(radius).max(minimum)..=nominal + radius {
+        context.check()?;
+        let mut trial = candidate.clone();
+        let stations = resample_boundary_arc_with_count(
+            domain,
+            space,
+            context,
+            &mut trial,
+            path,
+            closed,
+            contour.tangential_size(),
+            contour.owner.as_deref(),
+            edge_count,
+        )?;
+        let score = score_boundary_station_rows(domain, space, &trial, &stations, closed, contour);
+        if edge_count == nominal {
+            nominal_candidate = Some((trial.clone(), stations.clone()));
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(_, _, current)| score.better_than(*current))
+        {
+            best = Some((trial, stations, score));
+        }
+    }
+    let Some((mut best_candidate, mut stations, score)) = best else {
+        return Err(layer_error(domain, "could not construct boundary stations"));
+    };
+    if !score.is_valid() {
+        (best_candidate, stations) =
+            nominal_candidate.expect("the nominal boundary station count is always evaluated");
+    }
+    *candidate = best_candidate;
+    Ok(stations)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resample_boundary_arc_with_count(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &mut Candidate,
+    path: &[PointKey],
+    closed: bool,
     tangential_size: f64,
+    owner: Option<&str>,
+    edge_count: usize,
 ) -> MeshResult<Vec<PointKey>> {
     context.check()?;
     let lengths = path
@@ -2199,7 +2188,6 @@ fn resample_boundary_arc(
             "controlled contour has zero arc length",
         ));
     }
-    let edge_count = ((total / tangential_size).round() as usize).max(if closed { 3 } else { 1 });
     let station_count = if closed { edge_count } else { edge_count + 1 };
     let mut base = Vec::with_capacity(station_count);
     for station in 0..station_count {
@@ -2213,13 +2201,21 @@ fn resample_boundary_arc(
         }
         let distance = total * station as f64 / edge_count as f64;
         let (seed, tangent) = point_on_boundary_polyline(candidate, path, &lengths, distance);
-        let point = project_boundary_station(domain, space, tangential_size, seed, tangent)?;
+        let point = project_boundary_station(domain, space, owner, tangential_size, seed, tangent)?;
         let key = PointKey::Inserted(candidate.next_inserted);
         candidate.next_inserted += 1;
         candidate.points.insert(key, point);
         base.push(key);
     }
-    redistribute_boundary_stations(domain, space, tangential_size, candidate, &base, closed)?;
+    redistribute_boundary_stations(
+        domain,
+        space,
+        owner,
+        tangential_size,
+        candidate,
+        &base,
+        closed,
+    )?;
 
     let mut stations = vec![base[0]];
     for pair in base.windows(2) {
@@ -2227,6 +2223,7 @@ fn resample_boundary_arc(
             domain,
             space,
             tangential_size,
+            owner,
             candidate,
             pair[0],
             pair[1],
@@ -2239,6 +2236,7 @@ fn resample_boundary_arc(
             domain,
             space,
             tangential_size,
+            owner,
             candidate,
             *base.last().expect("closed boundary stations"),
             base[0],
@@ -2252,9 +2250,105 @@ fn resample_boundary_arc(
     Ok(stations)
 }
 
+fn score_boundary_station_rows(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    candidate: &Candidate,
+    stations: &[PointKey],
+    closed: bool,
+    contour: &LayerContourKey,
+) -> boundary_layer::StripScore {
+    let edge_count = if closed {
+        stations.len()
+    } else {
+        stations.len().saturating_sub(1)
+    };
+    if edge_count == 0 {
+        return boundary_layer::StripScore::invalid();
+    }
+    let mut distances = vec![0.0];
+    let mut height = contour.layer.first_height();
+    for _ in 0..contour.layer.layers {
+        distances.push(distances.last().copied().unwrap_or(0.0) + height);
+        height *= contour.layer.growth();
+    }
+    let mut rows = Vec::<Vec<Point>>::with_capacity(stations.len());
+    for index in 0..stations.len() {
+        let previous = if index == 0 {
+            if closed {
+                stations.len() - 1
+            } else {
+                0
+            }
+        } else {
+            index - 1
+        };
+        let next = if index + 1 == stations.len() {
+            if closed {
+                0
+            } else {
+                index
+            }
+        } else {
+            index + 1
+        };
+        let before = candidate.points[&stations[previous]].uv;
+        let after = candidate.points[&stations[next]].uv;
+        let tangent = [after[0] - before[0], after[1] - before[1]];
+        let length = tangent[0].hypot(tangent[1]);
+        if length <= f64::EPSILON {
+            return boundary_layer::StripScore::invalid();
+        }
+        let direction = [-tangent[1] / length, tangent[0] / length];
+        let source = candidate.points[&stations[index]];
+        let mut row = vec![source];
+        let mut previous = source;
+        for level in 1..distances.len() {
+            let Ok(point) = layer_point(
+                domain,
+                space,
+                previous,
+                source,
+                direction,
+                distances[level] - distances[level - 1],
+                distances[level],
+            ) else {
+                return boundary_layer::StripScore::invalid();
+            };
+            row.push(point);
+            previous = point;
+        }
+        rows.push(row);
+    }
+
+    let mut quads = Vec::new();
+    let mut tangential = Vec::new();
+    for edge in 0..edge_count {
+        let next = (edge + 1) % stations.len();
+        tangential.push(distance3(rows[edge][0].world, rows[next][0].world));
+        for level in 0..contour.layer.layers {
+            quads.push(vec![
+                rows[edge][level].world,
+                rows[next][level].world,
+                rows[next][level + 1].world,
+                rows[edge][level + 1].world,
+            ]);
+        }
+    }
+    let mean = tangential.iter().sum::<f64>() / tangential.len() as f64;
+    boundary_layer::StripScore::from_quads(
+        &quads,
+        (mean / contour.tangential_size())
+            .max(f64::MIN_POSITIVE)
+            .ln()
+            .abs(),
+    )
+}
+
 fn redistribute_boundary_stations(
     domain: &MeshableDomain,
     space: &MeshableDomainSpace,
+    owner: Option<&str>,
     target_size: f64,
     candidate: &mut Candidate,
     stations: &[PointKey],
@@ -2294,7 +2388,7 @@ fn redistribute_boundary_stations(
             let (seed, tangent) = point_on_boundary_polyline(candidate, &path, &lengths, distance);
             updates.push((
                 key,
-                project_boundary_station(domain, space, target_size, seed, tangent)?,
+                project_boundary_station(domain, space, owner, target_size, seed, tangent)?,
             ));
         }
         for (key, point) in updates {
@@ -2344,6 +2438,7 @@ fn point_on_boundary_polyline(
 fn project_boundary_station(
     domain: &MeshableDomain,
     space: &MeshableDomainSpace,
+    owner: Option<&str>,
     target_size: f64,
     seed: [f64; 3],
     tangent: [f64; 2],
@@ -2364,10 +2459,11 @@ fn project_boundary_station(
         ));
     }
     if seed_value == 0.0 {
-        let coords = space.coords(seed);
+        let point = contour::project_to_owner(domain, owner, seed, target_size)?;
+        let coords = space.coords(point);
         return Ok(Point {
             uv: [coords[0], coords[1]],
-            world: seed.to_array(),
+            world: point.to_array(),
             boundary: true,
             protected: false,
         });
@@ -2423,16 +2519,22 @@ fn project_boundary_station(
             exterior = midpoint;
         }
     }
-    let projection = domain
-        .project_to_boundary(&[interior])
-        .map_err(|error| MeshError::InvalidInput(error.to_string()))?[0];
-    let point = if projection.converged {
-        projection.point
-    } else {
-        // The sign bracket already locates the wall to root tolerance. The
-        // Newton projector is useful at smooth points but is allowed to stop
-        // at C0 SDF seams, so keep the certified interior-side limit there.
+    let root = if domain.domain_sdf(&[interior])[0].abs() <= domain.domain_sdf(&[exterior])[0].abs()
+    {
         interior
+    } else {
+        exterior
+    };
+    let point = match contour::project_to_owner(domain, owner, root, target_size) {
+        Ok(point) if domain.domain_sdf(&[point])[0].abs() <= tolerance => point,
+        Ok(_) => root,
+        Err(_) if owner.is_none() => {
+            // The sign bracket already locates the wall to root tolerance.
+            // The Newton projector is useful at smooth points but is allowed
+            // to stop at C0 SDF seams, so keep the certified root there.
+            root
+        }
+        Err(error) => return Err(error),
     };
     let coords = space.coords(point);
     Ok(Point {
@@ -2484,6 +2586,7 @@ fn append_boundary_chord(
     domain: &MeshableDomain,
     space: &MeshableDomainSpace,
     target_size: f64,
+    owner: Option<&str>,
     candidate: &mut Candidate,
     a: PointKey,
     b: PointKey,
@@ -2496,6 +2599,7 @@ fn append_boundary_chord(
     let projection = project_boundary_station(
         domain,
         space,
+        owner,
         target_size,
         midpoint,
         [b_uv[0] - a_uv[0], b_uv[1] - a_uv[1]],
@@ -2507,10 +2611,8 @@ fn append_boundary_chord(
         return Ok(());
     }
     if depth == 16 {
-        return Err(layer_error(
-            domain,
-            "could not satisfy the SDF chord tolerance while rediscretizing the boundary",
-        ));
+        stations.push(b);
+        return Ok(());
     }
     let middle = PointKey::Inserted(candidate.next_inserted);
     candidate.next_inserted += 1;
@@ -2519,6 +2621,7 @@ fn append_boundary_chord(
         domain,
         space,
         target_size,
+        owner,
         candidate,
         a,
         middle,
@@ -2529,6 +2632,7 @@ fn append_boundary_chord(
         domain,
         space,
         target_size,
+        owner,
         candidate,
         middle,
         b,
@@ -2551,22 +2655,23 @@ fn prepare_layer_boundaries(
             if edge_index.is_multiple_of(128) {
                 context.check()?;
             }
-            let a = candidate.points[&edge.points[0]].world;
-            let b = candidate.points[&edge.points[1]].world;
-            let tolerance = chord_tolerance(domain, distance3(a, b));
-            let signatures = (1..16)
-                .map(|sample| lerp3(a, b, sample as f64 / 16.0))
-                .map(|point| layer_memberships(domain, context, point, tolerance))
-                .collect::<MeshResult<Vec<_>>>()?;
-            if signatures.windows(2).any(|pair| pair[0] != pair[1]) {
-                split = Some(edge.points);
+            let a = Vec3::from_array(candidate.points[&edge.points[0]].world);
+            let b = Vec3::from_array(candidate.points[&edge.points[1]].world);
+            if let Some((parameter, owner)) =
+                contour::first_layer_transition(domain, context, a, b)?
+            {
+                split = Some((edge.points, parameter, owner));
                 break;
             }
         }
-        let Some([a, b]) = split else {
+        let Some(([a, b], parameter, owner)) = split else {
             break;
         };
-        if pass == 127 || !apply_split(domain, space, context, candidate, a, b)? {
+        if pass == 127
+            || !split_boundary_transition(
+                domain, space, context, candidate, a, b, parameter, &owner,
+            )?
+        {
             return Err(MeshError::InvalidInput(format!(
                 "domain {:?} could not split a boundary edge at a boundary-layer region transition",
                 domain.name
@@ -2607,6 +2712,66 @@ fn prepare_layer_boundaries(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn split_boundary_transition(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &mut Candidate,
+    a: PointKey,
+    b: PointKey,
+    parameter: f64,
+    owner: &str,
+) -> MeshResult<bool> {
+    let pair = edge_cells(candidate, a, b);
+    if pair.len() != 1
+        || candidate.cells[pair[0]].protected
+        || candidate.cells[pair[0]].points.len() != 3
+    {
+        return Ok(false);
+    }
+    let pa = candidate.points[&a];
+    let pb = candidate.points[&b];
+    let size = distance3(pa.world, pb.world);
+    let mut point = project_boundary_station(
+        domain,
+        space,
+        Some(owner),
+        size,
+        lerp3(pa.world, pb.world, parameter),
+        [pb.uv[0] - pa.uv[0], pb.uv[1] - pa.uv[1]],
+    )?;
+    point.protected = true;
+    let key = PointKey::Inserted(candidate.next_inserted);
+    candidate.next_inserted += 1;
+    candidate.points.insert(key, point);
+
+    let index = pair[0];
+    let cell = candidate.cells[index].clone();
+    let Some(c) = cell
+        .points
+        .iter()
+        .copied()
+        .find(|point| *point != a && *point != b)
+    else {
+        return Ok(false);
+    };
+    let mut first = [a, key, c];
+    let mut second = [key, b, c];
+    orient_triangle(&mut first, &candidate.points);
+    orient_triangle(&mut second, &candidate.points);
+    if signed_area(first, &candidate.points) <= orientation_tolerance(size)
+        || signed_area(second, &candidate.points) <= orientation_tolerance(size)
+        || candidate.cells.len().saturating_add(1) as u64 > context.limits.max_cells
+    {
+        candidate.points.remove(&key);
+        return Ok(false);
+    }
+    candidate.cells[index].points = first.into();
+    candidate.cells.push(Cell::triangle(second, cell.leaf));
+    Ok(true)
+}
+
 fn layer_memberships(
     domain: &MeshableDomain,
     context: &MeshingContext<'_>,
@@ -2614,31 +2779,30 @@ fn layer_memberships(
     tolerance: f64,
 ) -> MeshResult<BTreeSet<usize>> {
     let point = Vec3::from_array(point);
-    let projection = domain
-        .project_to_boundary(&[point])
-        .map_err(|error| MeshError::InvalidInput(error.to_string()))?[0];
-    let (point, band) = if projection.converged {
-        (projection.point, BoundaryBand::ProjectedVertices)
-    } else {
-        (point, BoundaryBand::Custom(tolerance))
-    };
-    let names = domain
-        .regions_containing(&[point], band)
-        .map_err(|error| MeshError::InvalidInput(error.to_string()))?
-        .pop()
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    Ok(context
-        .controls
-        .boundary_layers
-        .iter()
-        .enumerate()
-        .filter(|(_, control)| {
-            control.domain == domain.name && names.contains(&control.boundary_region)
-        })
-        .map(|(index, _)| index)
-        .collect())
+    let mut memberships = BTreeSet::new();
+    for (index, control) in context.controls.boundary_layers.iter().enumerate() {
+        if control.domain != domain.name {
+            continue;
+        }
+        let region = domain
+            .region_by_name(&control.boundary_region)
+            .map_err(|error| MeshError::InvalidInput(error.to_string()))?;
+        let projection = region.project_to_owner(&[point])[0];
+        let trust = control
+            .hwall_t
+            .max(tolerance * 4.0)
+            .min(domain.bounds.diagonal());
+        if !projection.converged || projection.distance_moved > trust {
+            continue;
+        }
+        let contains = region
+            .contains(&[projection.point])
+            .map_err(|error| MeshError::InvalidInput(error.to_string()))?[0];
+        if contains {
+            memberships.insert(index);
+        }
+    }
+    Ok(memberships)
 }
 
 fn apply_boundary_layers(
@@ -2717,6 +2881,19 @@ fn apply_boundary_layers(
         .collect::<BTreeSet<_>>();
     let strip = build_boundary_layer_strip(domain, space, context, candidate, assessment, groups)?;
     validate_boundary_layer_strip(domain, context, candidate, &strip)?;
+    candidate.layer_front_targets = strip
+        .front_edges
+        .iter()
+        .map(|edge| {
+            let a = candidate.points[&edge[0]].world;
+            let b = candidate.points[&edge[1]].world;
+            LayerFrontTarget {
+                a,
+                b,
+                edge_length: distance3(a, b),
+            }
+        })
+        .collect();
     core_constraints.extend(strip.constraints.iter().copied());
     rebuild_constrained_core(domain, space, context, candidate, strip, &core_constraints)?;
     *assessment = assess(domain, space, context, candidate)?;
@@ -2754,9 +2931,7 @@ fn build_boundary_layer_strip(
         .iter()
         .map(|(key, edges)| key.layers.saturating_mul(edges.len()))
         .sum::<usize>();
-    if candidate.cells.len().saturating_add(added_cells)
-        > usize::try_from(context.limits.max_cells).unwrap_or(usize::MAX)
-    {
+    if added_cells > usize::try_from(context.limits.max_cells).unwrap_or(usize::MAX) {
         return Err(MeshError::LimitExceeded(format!(
             "requested boundary layers exceed the configured {} cell limit",
             context.limits.max_cells
@@ -2771,6 +2946,7 @@ fn build_boundary_layer_strip(
         levels: BTreeMap::new(),
     };
     candidate.layer_end_targets.clear();
+    candidate.layer_refinement_limit = None;
 
     for (key, edges) in groups {
         let paths = ordered_boundary_paths(domain, &edges)?;
@@ -2863,13 +3039,14 @@ fn build_boundary_layer_strip(
                 direction[0] / direction_length,
                 direction[1] / direction_length,
             ];
-            let mut source = project_boundary_station(
-                domain,
-                space,
-                tangential_sizes[&point],
-                source.world,
-                [direction[1], -direction[0]],
-            )?;
+            // The contour tessellation is allowed to approximate a curved CAD
+            // edge, but a boundary-layer column must start on the exact domain
+            // zero level.  Reproject through the domain SDF before constructing
+            // the immutable normal rows; this is geometry-agnostic and also
+            // prevents a CAD-owner projection at a Boolean seam from leaking a
+            // small chord residual into every row of the strip.
+            let mut source = correct_sdf_level(domain, space, *source, source.uv, 0.0)?;
+            source.boundary = true;
             source.protected = true;
             candidate.points.insert(point, source);
             rows.insert((point, 0), point);
@@ -2895,7 +3072,7 @@ fn build_boundary_layer_strip(
             }
         }
 
-        let fixed_columns = fixed_layer_columns(candidate, &paths);
+        let fixed_columns = fixed_layer_columns(&paths);
         redistribute_layer_rows(
             domain,
             space,
@@ -2929,6 +3106,7 @@ fn build_boundary_layer_strip(
                 let a = candidate.points[&pair[0]].world;
                 let b = candidate.points[&pair[1]].world;
                 candidate.layer_end_targets.push(LayerEndTarget {
+                    edge: ordered_pair(pair[0], pair[1]),
                     a,
                     b,
                     edge_length: distance3(a, b),
@@ -2985,32 +3163,13 @@ fn build_boundary_layer_strip(
     Ok(strip)
 }
 
-fn fixed_layer_columns(candidate: &Candidate, paths: &[Vec<PointKey>]) -> BTreeSet<PointKey> {
+fn fixed_layer_columns(paths: &[Vec<PointKey>]) -> BTreeSet<PointKey> {
     let mut fixed = BTreeSet::new();
     for path in paths {
         let closed = path.first() == path.last();
-        let vertices = if closed {
-            &path[..path.len() - 1]
-        } else {
+        if !closed {
             fixed.insert(path[0]);
             fixed.insert(*path.last().expect("open path endpoint"));
-            path
-        };
-        for index in 0..vertices.len() {
-            if !closed && (index == 0 || index + 1 == vertices.len()) {
-                continue;
-            }
-            let previous = vertices[(index + vertices.len() - 1) % vertices.len()];
-            let current = vertices[index];
-            let next = vertices[(index + 1) % vertices.len()];
-            let before = Vec3::from_array(candidate.points[&current].world)
-                - Vec3::from_array(candidate.points[&previous].world);
-            let after = Vec3::from_array(candidate.points[&next].world)
-                - Vec3::from_array(candidate.points[&current].world);
-            let lengths = before.length() * after.length();
-            if lengths <= f64::EPSILON || before.dot(after) / lengths < 0.866_025_403_784_438_6 {
-                fixed.insert(current);
-            }
         }
     }
     fixed
@@ -3238,7 +3397,8 @@ fn rebuild_constrained_core(
             let near_front = strip.front_edges.iter().any(|edge| {
                 let a = Vec3::from_array(candidate.points[&edge[0]].world);
                 let b = Vec3::from_array(candidate.points[&edge[1]].world);
-                point_segment_distance(Vec3::from_array(point.world), a, b) < 0.9 * (b - a).length()
+                point_segment_distance(Vec3::from_array(point.world), a, b)
+                    < LAYER_TRANSITION_GROWTH * context.target_size
             });
             (!in_strip && !near_front).then_some(*key)
         })
@@ -3248,152 +3408,834 @@ fn rebuild_constrained_core(
         .layer_edge_targets
         .retain(|(a, b), _| candidate.points.contains_key(a) && candidate.points.contains_key(b));
 
-    for (index, edge) in strip.front_edges.iter().enumerate() {
-        if index.is_multiple_of(256) {
-            context.check()?;
-        }
-        let a = candidate.points[&edge[0]];
-        let b = candidate.points[&edge[1]];
-        let midpoint_uv = [(a.uv[0] + b.uv[0]) * 0.5, (a.uv[1] + b.uv[1]) * 0.5];
-        let midpoint = space.point(midpoint_uv[0], midpoint_uv[1]);
-        let height = 0.5 * 3.0_f64.sqrt() * distance3(a.world, b.world);
-        let normal = domain.normals(&[midpoint])[0];
-        let world = if normal.length() > f64::EPSILON {
-            midpoint - normal * (height / normal.length())
-        } else {
-            let delta = [b.uv[0] - a.uv[0], b.uv[1] - a.uv[1]];
-            let length = delta[0].hypot(delta[1]);
-            space.point(
-                midpoint_uv[0] - delta[1] * height / length,
-                midpoint_uv[1] + delta[0] * height / length,
-            )
-        };
-        let coords = space.coords(world);
-        let uv = [coords[0], coords[1]];
-        let sdf = domain.domain_sdf(&[world])[0];
-        if !sdf.is_finite()
-            || sdf >= domain.domain_sdf(&[midpoint])[0]
-            || point_in_strip(uv, &strip.cells, &candidate.points)
-        {
-            return Err(layer_error(
-                domain,
-                "has insufficient clearance for a target-sized triangular collar",
-            ));
-        }
-        let duplicate_tolerance = root_tolerance(domain, context.target_size);
-        if candidate
-            .points
-            .values()
-            .any(|point| distance3(point.world, world.to_array()) <= duplicate_tolerance)
-        {
-            continue;
-        }
-        let key = PointKey::Inserted(candidate.next_inserted);
-        candidate.next_inserted += 1;
-        candidate.points.insert(
-            key,
-            Point {
-                uv,
-                world: world.to_array(),
-                boundary: false,
-                protected: false,
-            },
-        );
-    }
-
     let mut leaves = BTreeMap::new();
     for cell in &candidate.cells {
         for key in &cell.points {
             leaves.entry(*key).or_insert(cell.leaf);
         }
     }
-    let mut triangulation = ConstrainedDelaunayTriangulation::<SpadeVertex>::new();
-    let mut handles = BTreeMap::new();
-    for (&key, point) in &candidate.points {
-        let handle = triangulation
-            .insert(SpadeVertex {
-                position: Point2::new(point.uv[0], point.uv[1]),
-                key,
-            })
-            .map_err(|error| {
-                MeshError::InvalidInput(format!(
-                    "Spade rejected a constrained core vertex in domain {:?}: {error:?}",
-                    domain.name
-                ))
-            })?;
-        handles.insert(key, handle);
-    }
-    for &(a, b) in constraints {
-        triangulation.try_add_constraint(handles[&a], handles[&b]);
+    let mut triangulation_constraints = constraints.clone();
+    candidate.cells = triangulate_with_front_transition(
+        domain,
+        space,
+        context,
+        candidate,
+        &strip,
+        &triangulation_constraints,
+        &leaves,
+    )?;
+    candidate.construction_failures.clear();
+
+    seed_cap_boundary_transitions(
+        domain,
+        space,
+        context,
+        candidate,
+        &strip,
+        &mut triangulation_constraints,
+        &leaves,
+    )?;
+
+    'segments: for end in candidate.layer_end_targets.clone() {
+        context.check()?;
+        if estimated_optimization_bytes(candidate) > MAX_OPTIMIZATION_BYTES {
+            candidate.layer_refinement_limit = Some(QualityTermination::MemoryBudget);
+            break;
+        }
+        let boundary_adjacent =
+            candidate.points[&end.edge.0].boundary || candidate.points[&end.edge.1].boundary;
+        let mut best_boundary_seed =
+            None::<(Candidate, BTreeSet<(PointKey, PointKey)>, CapQuality)>;
+        for scale in [1.0, 0.75, 0.5, 0.25] {
+            let Some(points) =
+                cap_seed_chain(domain, space, context, candidate, &strip, end, scale)
+            else {
+                continue;
+            };
+            for length in (1..=points.len()).rev() {
+                let mut trial = candidate.clone();
+                let keys = points[..length]
+                    .iter()
+                    .map(|point| {
+                        let key = PointKey::Inserted(trial.next_inserted);
+                        trial.next_inserted += 1;
+                        trial.points.insert(key, *point);
+                        key
+                    })
+                    .collect::<Vec<_>>();
+                let mut trial_constraints = triangulation_constraints.clone();
+                trial_constraints.insert(ordered_pair(end.edge.0, keys[0]));
+                trial_constraints.insert(ordered_pair(end.edge.1, keys[0]));
+                trial_constraints
+                    .extend(keys.windows(2).map(|pair| ordered_pair(pair[0], pair[1])));
+                let cells = match triangulate_constrained_core(
+                    domain,
+                    space,
+                    context,
+                    &mut trial,
+                    &strip,
+                    &trial_constraints,
+                    &leaves,
+                ) {
+                    Ok(cells) => cells,
+                    Err(MeshError::InvalidInput(_)) => continue,
+                    Err(error) => return Err(error),
+                };
+                if cells.len() > usize::try_from(context.limits.max_cells).unwrap_or(usize::MAX) {
+                    candidate.layer_refinement_limit = Some(QualityTermination::MaxCells);
+                    continue;
+                }
+                trial.cells = cells;
+                trial.construction_failures.clear();
+                let trial_assessment = assess(domain, space, context, &trial)?;
+                let attached =
+                    edge_cells(&trial, end.edge.0, end.edge.1)
+                        .into_iter()
+                        .any(|index| {
+                            trial.cells[index].points.len() == 3
+                                && trial.cells[index].points.contains(&keys[0])
+                        });
+                if attached
+                    && trial_assessment.refine.is_empty()
+                    && trial_assessment.score.hard_invalid == 0
+                {
+                    if !boundary_adjacent {
+                        triangulation_constraints = trial_constraints;
+                        *candidate = trial;
+                        continue 'segments;
+                    }
+                    let quality = edge_cap_quality(&trial, end.edge)
+                        .expect("attached cap seed must have a local quality patch");
+                    if best_boundary_seed
+                        .as_ref()
+                        .is_none_or(|(_, _, best)| cap_seed_quality_is_better(&quality, best))
+                    {
+                        best_boundary_seed = Some((trial, trial_constraints, quality));
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some((best, constraints, _)) = best_boundary_seed {
+            *candidate = best;
+            triangulation_constraints = constraints;
+        }
     }
 
-    let mut cells = Vec::new();
-    for (index, face) in triangulation.inner_faces().enumerate() {
-        if index.is_multiple_of(512) {
-            context.check()?;
-        }
-        let points = face.vertices().map(|vertex| vertex.data().key);
-        let positions = points.map(|key| candidate.points[&key].world);
-        let centroid = centroid_slice(&positions);
-        let centroid_uv = space.coords(Vec3::from_array(centroid));
-        if point_in_strip(
-            [centroid_uv[0], centroid_uv[1]],
-            &strip.cells,
-            &candidate.points,
-        ) || domain.domain_sdf(&[Vec3::from_array(centroid)])[0] >= 0.0
-            || cell_containment_residual(domain, &positions)
-                > chord_tolerance(domain, maximum_edge_2d(&positions))
-        {
-            continue;
-        }
-        let leaf = points
-            .iter()
-            .find_map(|key| leaves.get(key))
-            .copied()
-            .unwrap_or(Leaf {
-                level: 0,
-                x: 0,
-                y: 0,
-            });
-        cells.push(Cell::triangle(points, leaf));
-    }
-    if cells.is_empty() {
-        return Err(layer_error(
-            domain,
-            "constrained triangulation produced no core triangles",
-        ));
-    }
-    cells.extend(strip.cells);
-    if cells.len() > usize::try_from(context.limits.max_cells).unwrap_or(usize::MAX) {
-        return Err(MeshError::LimitExceeded(format!(
-            "constrained boundary-layer mesh exceeds the configured {} cell limit",
-            context.limits.max_cells
-        )));
-    }
-    candidate.cells = cells;
     let used = candidate
         .cells
         .iter()
         .flat_map(|cell| cell.points.iter().copied())
         .collect::<BTreeSet<_>>();
     candidate.points.retain(|key, _| used.contains(key));
-    candidate.construction_failures.clear();
     Ok(())
 }
 
-fn point_in_strip(uv: [f64; 2], cells: &[Cell], points: &BTreeMap<PointKey, Point>) -> bool {
-    cells.iter().any(|cell| {
-        (0..cell.points.len()).all(|edge| {
-            cross_2d(
-                points[&cell.points[edge]].uv,
-                points[&cell.points[(edge + 1) % cell.points.len()]].uv,
-                uv,
-            ) >= -1.0e-12
+#[allow(clippy::too_many_arguments)]
+fn triangulate_with_front_transition(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &mut Candidate,
+    strip: &BoundaryLayerStrip,
+    constraints: &BTreeSet<(PointKey, PointKey)>,
+    leaves: &BTreeMap<PointKey, Leaf>,
+) -> MeshResult<Vec<Cell>> {
+    let cell_limit = usize::try_from(context.limits.max_cells).unwrap_or(usize::MAX);
+    if estimated_optimization_bytes(candidate) > MAX_OPTIMIZATION_BYTES {
+        candidate.layer_refinement_limit = Some(QualityTermination::MemoryBudget);
+        let cells = triangulate_constrained_core(
+            domain,
+            space,
+            context,
+            candidate,
+            strip,
+            constraints,
+            leaves,
+        )?;
+        if cells.len() <= cell_limit {
+            return Ok(cells);
+        }
+        return Err(MeshError::LimitExceeded(format!(
+            "constrained boundary-layer mesh exceeds the configured {} cell limit",
+            context.limits.max_cells
+        )));
+    }
+
+    let fallback = candidate.clone();
+    seed_front_transition_rings(domain, space, context, candidate, strip)?;
+    match triangulate_constrained_core(
+        domain,
+        space,
+        context,
+        candidate,
+        strip,
+        constraints,
+        leaves,
+    ) {
+        Ok(cells) if cells.len() <= cell_limit => return Ok(cells),
+        Ok(_) => {
+            candidate.layer_refinement_limit = Some(QualityTermination::MaxCells);
+        }
+        Err(MeshError::InvalidInput(_)) => {}
+        Err(error) => return Err(error),
+    }
+
+    let termination = candidate.layer_refinement_limit;
+    *candidate = fallback;
+    candidate.layer_refinement_limit = termination;
+    let cells = triangulate_constrained_core(
+        domain,
+        space,
+        context,
+        candidate,
+        strip,
+        constraints,
+        leaves,
+    )?;
+    if cells.len() > cell_limit {
+        return Err(MeshError::LimitExceeded(format!(
+            "constrained boundary-layer mesh exceeds the configured {} cell limit",
+            context.limits.max_cells
+        )));
+    }
+    Ok(cells)
+}
+
+fn seed_front_transition_rings(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &mut Candidate,
+    strip: &BoundaryLayerStrip,
+) -> MeshResult<()> {
+    let edges = strip
+        .front_edges
+        .iter()
+        .map(|points| BoundaryEdge {
+            points: *points,
+            cell: 0,
+            owner: None,
         })
+        .collect::<Vec<_>>();
+    let paths = ordered_boundary_paths(domain, &edges)?;
+    let mut inserted = Vec::<Point>::new();
+
+    for path in paths {
+        let closed = path.first() == path.last();
+        let edge_count = path.len().saturating_sub(1);
+        if edge_count == 0 {
+            continue;
+        }
+        let lengths = path
+            .windows(2)
+            .map(|edge| {
+                distance3(
+                    candidate.points[&edge[0]].world,
+                    candidate.points[&edge[1]].world,
+                )
+            })
+            .collect::<Vec<_>>();
+        let total = lengths.iter().sum::<f64>();
+        let front_spacing = total / edge_count as f64;
+        if !front_spacing.is_finite() || front_spacing <= f64::EPSILON {
+            continue;
+        }
+
+        let mut desired_spacing = front_spacing;
+        let mut previous_spacing = front_spacing;
+        let mut offset = 0.0;
+        for ring in 0..8 {
+            context.check()?;
+            let samples = if closed {
+                (total / desired_spacing).round().max(3.0) as usize
+            } else {
+                (total / desired_spacing).round().max(1.0) as usize
+            };
+            let spacing = total / samples as f64;
+            offset += 0.25 * 3.0_f64.sqrt() * (previous_spacing + spacing);
+            for sample in 0..samples {
+                let distance = total * (sample as f64 + 0.5) / samples as f64;
+                let (front, tangent) =
+                    point_on_boundary_polyline(candidate, &path, &lengths, distance.min(total));
+                let front_uv = space.coords(Vec3::from_array(front));
+                let direction = core_side_normal(
+                    domain,
+                    space,
+                    [front_uv[0], front_uv[1]],
+                    tangent,
+                    front_spacing,
+                );
+                let uv = [
+                    front_uv[0] + direction[0] * offset,
+                    front_uv[1] + direction[1] * offset,
+                ];
+                let world = space.point(uv[0], uv[1]);
+                let sdf = domain.domain_sdf(&[world])[0];
+                let front_sdf = domain.domain_sdf(&[Vec3::from_array(front)])[0];
+                let separation = SNAP_RATIO * spacing;
+                if !sdf.is_finite()
+                    || sdf >= front_sdf - root_tolerance(domain, spacing)
+                    || point_in_strip(uv, &strip.cells, &candidate.points)
+                    || candidate
+                        .points
+                        .values()
+                        .any(|point| distance3(point.world, world.to_array()) <= separation)
+                    || inserted
+                        .iter()
+                        .any(|point| distance3(point.world, world.to_array()) <= separation)
+                {
+                    continue;
+                }
+                inserted.push(Point {
+                    uv,
+                    world: world.to_array(),
+                    boundary: false,
+                    protected: false,
+                });
+            }
+            if front_spacing + offset >= context.target_size {
+                break;
+            }
+            previous_spacing = spacing;
+            desired_spacing = (desired_spacing * LAYER_TRANSITION_GROWTH).min(context.target_size);
+            if ring == 7 {
+                candidate.layer_refinement_limit = Some(QualityTermination::IterationLimit);
+            }
+        }
+    }
+
+    for point in inserted {
+        let key = PointKey::Inserted(candidate.next_inserted);
+        candidate.next_inserted += 1;
+        candidate.points.insert(key, point);
+    }
+    Ok(())
+}
+
+fn core_side_normal(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    uv: [f64; 2],
+    tangent: [f64; 2],
+    scale: f64,
+) -> [f64; 2] {
+    let length = tangent[0].hypot(tangent[1]);
+    if length <= f64::EPSILON {
+        return [0.0; 2];
+    }
+    let normal = [-tangent[1] / length, tangent[0] / length];
+    let probe = 0.25 * scale;
+    let left = space.point(uv[0] + probe * normal[0], uv[1] + probe * normal[1]);
+    let right = space.point(uv[0] - probe * normal[0], uv[1] - probe * normal[1]);
+    let values = domain.domain_sdf(&[left, right]);
+    if values[0] <= values[1] {
+        normal
+    } else {
+        [-normal[0], -normal[1]]
+    }
+}
+
+fn seed_cap_boundary_transitions(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &mut Candidate,
+    strip: &BoundaryLayerStrip,
+    constraints: &mut BTreeSet<(PointKey, PointKey)>,
+    leaves: &BTreeMap<PointKey, Leaf>,
+) -> MeshResult<()> {
+    for column in &strip.end_columns {
+        context.check()?;
+        let [base, first, ..] = column.as_slice() else {
+            continue;
+        };
+        let desired = (strip.levels[first] - strip.levels[base])
+            .abs()
+            .min(context.target_size);
+        let adjacent_edge = |constraints: &BTreeSet<(PointKey, PointKey)>| {
+            constraints.iter().copied().find(|edge| {
+                (edge.0 == *base || edge.1 == *base) && !strip.constraints.contains(edge)
+            })
+        };
+        let Some(initial_edge) = adjacent_edge(constraints) else {
+            continue;
+        };
+        let mut edge = Some(initial_edge);
+        loop {
+            let Some(current_edge) = edge else {
+                break;
+            };
+            let edge_length = distance3(
+                candidate.points[&current_edge.0].world,
+                candidate.points[&current_edge.1].world,
+            );
+            if edge_length >= EDGE_RATIO_MIN * desired
+                || !merge_short_cap_boundary_edge(
+                    domain,
+                    space,
+                    context,
+                    candidate,
+                    strip,
+                    constraints,
+                    leaves,
+                    *base,
+                    current_edge,
+                )?
+            {
+                break;
+            }
+            context.check()?;
+            edge = adjacent_edge(constraints);
+        }
+        let Some(edge) = edge else {
+            continue;
+        };
+        let stations =
+            graded_boundary_stations(domain, space, context, candidate, edge, *base, desired)?;
+        if stations.is_empty() {
+            continue;
+        }
+        if estimated_optimization_bytes(candidate) > MAX_OPTIMIZATION_BYTES {
+            candidate.layer_refinement_limit = Some(QualityTermination::MemoryBudget);
+            return Ok(());
+        }
+
+        let mut trial = candidate.clone();
+        let mut chain = Vec::with_capacity(stations.len() + 2);
+        chain.push(*base);
+        for point in stations {
+            let key = PointKey::Inserted(trial.next_inserted);
+            trial.next_inserted += 1;
+            trial.points.insert(key, point);
+            chain.push(key);
+        }
+        let other = if edge.0 == *base { edge.1 } else { edge.0 };
+        chain.push(other);
+
+        let mut trial_constraints = constraints.clone();
+        trial_constraints.remove(&edge);
+        trial_constraints.extend(chain.windows(2).map(|pair| ordered_pair(pair[0], pair[1])));
+        if let Some(target) = trial.layer_edge_targets.remove(&edge) {
+            for pair in chain.windows(2) {
+                trial
+                    .layer_edge_targets
+                    .insert(ordered_pair(pair[0], pair[1]), target);
+            }
+        }
+
+        let cells = match triangulate_constrained_core(
+            domain,
+            space,
+            context,
+            &mut trial,
+            strip,
+            &trial_constraints,
+            leaves,
+        ) {
+            Ok(cells) => cells,
+            Err(MeshError::InvalidInput(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        if cells.len() > usize::try_from(context.limits.max_cells).unwrap_or(usize::MAX) {
+            candidate.layer_refinement_limit = Some(QualityTermination::MaxCells);
+            return Ok(());
+        }
+        trial.cells = cells;
+        trial.construction_failures.clear();
+        let assessment = assess(domain, space, context, &trial)?;
+        if assessment.refine.is_empty() && assessment.score.hard_invalid == 0 {
+            *constraints = trial_constraints;
+            *candidate = trial;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_short_cap_boundary_edge(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &mut Candidate,
+    strip: &BoundaryLayerStrip,
+    constraints: &mut BTreeSet<(PointKey, PointKey)>,
+    leaves: &BTreeMap<PointKey, Leaf>,
+    base: PointKey,
+    edge: (PointKey, PointKey),
+) -> MeshResult<bool> {
+    let remove = if edge.0 == base { edge.1 } else { edge.0 };
+    let Some(point) = candidate.points.get(&remove) else {
+        return Ok(false);
+    };
+    let incident = constraints
+        .iter()
+        .copied()
+        .filter(|constraint| constraint.0 == remove || constraint.1 == remove)
+        .collect::<Vec<_>>();
+    if point.protected
+        || !point.boundary
+        || incident.len() != 2
+        || incident.iter().any(|edge| strip.constraints.contains(edge))
+    {
+        return Ok(false);
+    }
+    let Some(next) = incident
+        .iter()
+        .flat_map(|edge| [edge.0, edge.1])
+        .find(|point| *point != remove && *point != base)
+    else {
+        return Ok(false);
+    };
+
+    let mut trial = candidate.clone();
+    trial.points.remove(&remove);
+    trial
+        .layer_edge_targets
+        .retain(|(a, b), _| *a != remove && *b != remove);
+    let mut trial_constraints = constraints.clone();
+    trial_constraints.retain(|constraint| constraint.0 != remove && constraint.1 != remove);
+    trial_constraints.insert(ordered_pair(base, next));
+    let cells = match triangulate_constrained_core(
+        domain,
+        space,
+        context,
+        &mut trial,
+        strip,
+        &trial_constraints,
+        leaves,
+    ) {
+        Ok(cells) => cells,
+        Err(MeshError::InvalidInput(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    trial.cells = cells;
+    trial.construction_failures.clear();
+    let assessment = assess(domain, space, context, &trial)?;
+    if !assessment.refine.is_empty() || assessment.score.hard_invalid != 0 {
+        return Ok(false);
+    }
+    *candidate = trial;
+    *constraints = trial_constraints;
+    Ok(true)
+}
+
+fn graded_boundary_stations(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &Candidate,
+    edge: (PointKey, PointKey),
+    base: PointKey,
+    first_size: f64,
+) -> MeshResult<Vec<Point>> {
+    if !first_size.is_finite() || first_size <= f64::EPSILON {
+        return Ok(Vec::new());
+    }
+    let other = if edge.0 == base { edge.1 } else { edge.0 };
+    let start = candidate.points[&base];
+    let end = candidate.points[&other];
+    let length = distance3(start.world, end.world);
+    let midpoint_uv = [
+        0.5 * (start.uv[0] + end.uv[0]),
+        0.5 * (start.uv[1] + end.uv[1]),
+    ];
+    let tangent = interior_left_tangent(
+        domain,
+        space,
+        midpoint_uv,
+        [end.uv[0] - start.uv[0], end.uv[1] - start.uv[1]],
+        first_size,
+    );
+    let tolerance = root_tolerance(domain, first_size);
+    let mut stations = Vec::new();
+    let mut previous = start.world;
+
+    if length <= tolerance {
+        return Ok(stations);
+    }
+    let desired_spacing = (LAYER_TRANSITION_GROWTH * first_size).min(context.target_size);
+    let segments = (length / desired_spacing).ceil().clamp(1.0, 16.0) as usize;
+    if segments < 2 {
+        return Ok(stations);
+    }
+    let spacing = length / segments as f64;
+
+    for station in 1..segments {
+        context.check()?;
+        let point = match project_boundary_station(
+            domain,
+            space,
+            None,
+            first_size,
+            lerp3(start.world, end.world, station as f64 / segments as f64),
+            tangent,
+        ) {
+            Ok(point) => point,
+            Err(MeshError::Cancelled) => return Err(MeshError::Cancelled),
+            Err(_) => return Ok(Vec::new()),
+        };
+        let projected_spacing = distance3(previous, point.world);
+        if projected_spacing < spacing / LAYER_TRANSITION_GROWTH
+            || projected_spacing > spacing * LAYER_TRANSITION_GROWTH
+            || distance3(point.world, start.world) <= tolerance
+            || distance3(point.world, end.world) <= tolerance
+            || candidate
+                .points
+                .values()
+                .any(|existing| distance3(existing.world, point.world) <= tolerance)
+            || stations
+                .iter()
+                .any(|existing: &Point| distance3(existing.world, point.world) <= tolerance)
+        {
+            return Ok(Vec::new());
+        }
+        previous = point.world;
+        stations.push(point);
+    }
+    let final_spacing = distance3(previous, end.world);
+    if final_spacing < spacing / LAYER_TRANSITION_GROWTH
+        || final_spacing > spacing * LAYER_TRANSITION_GROWTH
+    {
+        return Ok(Vec::new());
+    }
+    Ok(stations)
+}
+
+fn interior_left_tangent(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    uv: [f64; 2],
+    tangent: [f64; 2],
+    scale: f64,
+) -> [f64; 2] {
+    let length = tangent[0].hypot(tangent[1]);
+    if length <= f64::EPSILON {
+        return tangent;
+    }
+    let normal = [-tangent[1] / length, tangent[0] / length];
+    let probe = 0.25 * scale;
+    let left = space.point(uv[0] + probe * normal[0], uv[1] + probe * normal[1]);
+    let right = space.point(uv[0] - probe * normal[0], uv[1] - probe * normal[1]);
+    let values = domain.domain_sdf(&[left, right]);
+    if values[0] <= values[1] {
+        tangent
+    } else {
+        [-tangent[0], -tangent[1]]
+    }
+}
+
+fn triangulate_constrained_core(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &mut Candidate,
+    strip: &BoundaryLayerStrip,
+    constraints: &BTreeSet<(PointKey, PointKey)>,
+    leaves: &BTreeMap<PointKey, Leaf>,
+) -> MeshResult<Vec<Cell>> {
+    cdt::triangulate_core(
+        domain,
+        space,
+        context,
+        candidate,
+        strip,
+        constraints,
+        leaves,
+    )
+}
+
+fn cap_seed_point(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &Candidate,
+    strip: &BoundaryLayerStrip,
+    end: LayerEndTarget,
+    scale: f64,
+) -> Option<Point> {
+    let a = candidate.points.get(&end.edge.0)?;
+    let b = candidate.points.get(&end.edge.1)?;
+    let quad = strip
+        .cells
+        .iter()
+        .find(|cell| cell.points.contains(&end.edge.0) && cell.points.contains(&end.edge.1))?;
+    let strip_center = quad
+        .points
+        .iter()
+        .map(|key| candidate.points[key].uv)
+        .fold([0.0; 2], |sum, uv| [sum[0] + uv[0], sum[1] + uv[1]])
+        .map(|value| value / quad.points.len() as f64);
+    let midpoint_uv = [(a.uv[0] + b.uv[0]) * 0.5, (a.uv[1] + b.uv[1]) * 0.5];
+    let delta = [b.uv[0] - a.uv[0], b.uv[1] - a.uv[1]];
+    let length = delta[0].hypot(delta[1]);
+    if length <= f64::EPSILON {
+        return None;
+    }
+    let mut normal = [-delta[1] / length, delta[0] / length];
+    if (strip_center[0] - midpoint_uv[0]) * normal[0]
+        + (strip_center[1] - midpoint_uv[1]) * normal[1]
+        > 0.0
+    {
+        normal = [-normal[0], -normal[1]];
+    }
+    let midpoint = midpoint3(a.world, b.world);
+    let probes = [
+        Vec3::from_array(a.world),
+        Vec3::from_array(b.world),
+        Vec3::from_array(midpoint),
+    ];
+    let target = local_target(
+        candidate,
+        context,
+        &domain.name,
+        Vec3::from_array(midpoint),
+        0.5 * end.edge_length,
+        &probes,
+    );
+    let height = 0.5 * 3.0_f64.sqrt() * target * scale;
+    let uv = [
+        midpoint_uv[0] + normal[0] * height,
+        midpoint_uv[1] + normal[1] * height,
+    ];
+    let world = space.point(uv[0], uv[1]);
+    let sdf = domain.domain_sdf(&[world])[0];
+    let separation = SNAP_RATIO * target.min(end.edge_length);
+    if !sdf.is_finite()
+        || sdf >= 0.0
+        || point_in_strip(uv, &strip.cells, &candidate.points)
+        || candidate
+            .points
+            .values()
+            .any(|point| distance3(point.world, world.to_array()) <= separation)
+    {
+        return None;
+    }
+    Some(Point {
+        uv,
+        world: world.to_array(),
+        boundary: false,
+        protected: false,
+    })
+}
+
+fn cap_seed_chain(
+    domain: &MeshableDomain,
+    space: &MeshableDomainSpace,
+    context: &MeshingContext<'_>,
+    candidate: &Candidate,
+    strip: &BoundaryLayerStrip,
+    end: LayerEndTarget,
+    scale: f64,
+) -> Option<Vec<Point>> {
+    let first = cap_seed_point(domain, space, context, candidate, strip, end, scale)?;
+    let a = candidate.points.get(&end.edge.0)?;
+    let b = candidate.points.get(&end.edge.1)?;
+    if a.boundary || b.boundary {
+        return Some(vec![first]);
+    }
+    let midpoint_uv = [0.5 * (a.uv[0] + b.uv[0]), 0.5 * (a.uv[1] + b.uv[1])];
+    let cap_direction = [first.uv[0] - midpoint_uv[0], first.uv[1] - midpoint_uv[1]];
+    let cap_length = cap_direction[0].hypot(cap_direction[1]);
+    let layer_a = space.coords(Vec3::from_array(end.a));
+    let layer_b = space.coords(Vec3::from_array(end.b));
+    let layer_direction = [layer_b[0] - layer_a[0], layer_b[1] - layer_a[1]];
+    let layer_length = layer_direction[0].hypot(layer_direction[1]);
+    if cap_length <= f64::EPSILON || layer_length <= f64::EPSILON {
+        return None;
+    }
+    let direction = [
+        cap_direction[0] / cap_length + layer_direction[0] / layer_length,
+        cap_direction[1] / cap_length + layer_direction[1] / layer_length,
+    ];
+    let direction_length = direction[0].hypot(direction[1]);
+    if direction_length <= f64::EPSILON {
+        return None;
+    }
+    let direction = [
+        direction[0] / direction_length,
+        direction[1] / direction_length,
+    ];
+    let mut points = vec![first];
+    let mut spacing = (end.edge_length * LAYER_TRANSITION_GROWTH * scale).min(context.target_size);
+
+    for _ in 1..8 {
+        let current = *points.last()?;
+        let current_world = Vec3::from_array(current.world);
+        let probes = [
+            Vec3::from_array(a.world),
+            Vec3::from_array(b.world),
+            current_world,
+        ];
+        let target = local_target(
+            candidate,
+            context,
+            &domain.name,
+            current_world,
+            spacing,
+            &probes,
+        );
+        if target >= context.target_size * (1.0 - 1.0e-12) {
+            break;
+        }
+        let uv = [
+            current.uv[0] + direction[0] * spacing,
+            current.uv[1] + direction[1] * spacing,
+        ];
+        let world = space.point(uv[0], uv[1]);
+        let separation = SNAP_RATIO * spacing.min(target);
+        if domain.domain_sdf(&[world])[0] >= 0.0
+            || point_in_strip(uv, &strip.cells, &candidate.points)
+            || candidate
+                .points
+                .values()
+                .any(|point| distance3(point.world, world.to_array()) <= separation)
+            || points
+                .iter()
+                .any(|point| distance3(point.world, world.to_array()) <= separation)
+        {
+            break;
+        }
+        points.push(Point {
+            uv,
+            world: world.to_array(),
+            boundary: false,
+            protected: false,
+        });
+        spacing = (spacing * LAYER_TRANSITION_GROWTH).min(context.target_size);
+    }
+    Some(points)
+}
+
+fn point_in_strip(uv: [f64; 2], cells: &[Cell], points: &BTreeMap<PointKey, Point>) -> bool {
+    cells
+        .iter()
+        .any(|cell| point_in_cell(uv, cell, points, 1.0e-12))
+}
+
+fn point_in_cell(
+    uv: [f64; 2],
+    cell: &Cell,
+    points: &BTreeMap<PointKey, Point>,
+    tolerance: f64,
+) -> bool {
+    (0..cell.points.len()).all(|edge| {
+        cross_2d(
+            points[&cell.points[edge]].uv,
+            points[&cell.points[(edge + 1) % cell.points.len()]].uv,
+            uv,
+        ) >= -tolerance
     })
 }
 
 fn cells_edges_cross(candidate: &Candidate, cells: &[Cell]) -> bool {
+    crossing_cell_edges(candidate, cells).is_some()
+}
+
+fn crossing_cell_edges(
+    candidate: &Candidate,
+    cells: &[Cell],
+) -> Option<((PointKey, PointKey), (PointKey, PointKey))> {
     let mut edges = BTreeMap::<(PointKey, PointKey), ([f64; 2], [f64; 2])>::new();
     for cell in cells {
         for index in 0..cell.points.len() {
@@ -3404,19 +4246,29 @@ fn cells_edges_cross(candidate: &Candidate, cells: &[Cell]) -> bool {
                 .or_insert((candidate.points[&a].uv, candidate.points[&b].uv));
         }
     }
-    let edges = edges.into_iter().collect::<Vec<_>>();
+    let mut edges = edges.into_iter().collect::<Vec<_>>();
+    edges.sort_by(|(_, (a, b)), (_, (c, d))| a[0].min(b[0]).total_cmp(&c[0].min(d[0])));
     for first in 0..edges.len() {
         let ((a_key, b_key), (a, b)) = edges[first];
+        let first_max_x = a[0].max(b[0]);
+        let first_min_y = a[1].min(b[1]);
+        let first_max_y = a[1].max(b[1]);
         for ((c_key, d_key), (c, d)) in edges.iter().skip(first + 1).copied() {
+            if c[0].min(d[0]) > first_max_x {
+                break;
+            }
+            if c[1].min(d[1]) > first_max_y || c[1].max(d[1]) < first_min_y {
+                continue;
+            }
             if a_key == c_key || a_key == d_key || b_key == c_key || b_key == d_key {
                 continue;
             }
             if segments_cross(a, b, c, d) {
-                return true;
+                return Some(((a_key, b_key), (c_key, d_key)));
             }
         }
     }
-    false
+    None
 }
 
 fn layer_point(
@@ -3553,6 +4405,7 @@ fn core_quality(
             .collect::<Vec<_>>();
         let scaled_jacobian =
             quality_score("tri3", &positions, QualityMetric::ScaledJacobian).unwrap_or(0.0);
+        let skewness = quality_score("tri3", &positions, QualityMetric::Skewness).unwrap_or(1.0);
         minimum_scaled_jacobian = minimum_scaled_jacobian.min(scaled_jacobian);
         let mut squared_log_size = 0.0;
         for edge in 0..3 {
@@ -3584,7 +4437,7 @@ fn core_quality(
                 });
             squared_log_size += (length / target).max(f64::MIN_POSITIVE).ln().powi(2);
         }
-        let shape_distortion = 1.0 - scaled_jacobian;
+        let shape_distortion = (1.0 - scaled_jacobian).max(skewness);
         let size_distortion = (squared_log_size / 3.0).sqrt();
         combined.push((index, shape_distortion.hypot(size_distortion)));
     }
@@ -3606,67 +4459,106 @@ fn core_quality(
     }
 }
 
-fn quality_actions(
-    domain: &MeshableDomain,
-    context: &MeshingContext<'_>,
-    candidate: &Candidate,
-    cell_index: usize,
-) -> BTreeSet<Action> {
-    let mut actions = BTreeSet::new();
-    let Some(cell) = candidate
-        .cells
-        .get(cell_index)
-        .filter(|cell| !cell.protected && cell.points.len() == 3)
-    else {
-        return actions;
-    };
-    let mut oversized = false;
-    for edge in 0..3 {
-        let a = cell.points[edge];
-        let b = cell.points[(edge + 1) % 3];
-        actions.insert(Action::Flip(ordered_pair(a, b).0, ordered_pair(a, b).1));
-        let aw = candidate.points[&a].world;
-        let bw = candidate.points[&b].world;
-        let midpoint = midpoint3(aw, bw);
-        let length = distance3(aw, bw);
-        let probes = [
-            Vec3::from_array(aw),
-            Vec3::from_array(bw),
-            Vec3::from_array(midpoint),
-        ];
-        let target = candidate
-            .layer_edge_targets
-            .get(&ordered_pair(a, b))
-            .copied()
-            .unwrap_or_else(|| {
-                local_target(
-                    candidate,
-                    context,
-                    &domain.name,
-                    Vec3::from_array(midpoint),
-                    length * 0.5,
-                    &probes,
-                )
-            });
-        let ratio = length / target;
-        if ratio < EDGE_RATIO_MIN {
-            actions.insert(Action::Collapse(ordered_pair(a, b).0, ordered_pair(a, b).1));
-        } else if ratio > EDGE_RATIO_MAX {
-            oversized = true;
-            actions.insert(Action::Split(ordered_pair(a, b).0, ordered_pair(a, b).1));
+fn cap_quality(candidate: &Candidate) -> Option<CapQuality> {
+    let direct = candidate
+        .layer_end_targets
+        .iter()
+        .flat_map(|end| edge_cells(candidate, end.edge.0, end.edge.1))
+        .filter(|index| {
+            candidate.cells[*index].points.len() == 3 && !candidate.cells[*index].protected
+        })
+        .collect::<BTreeSet<_>>();
+    cap_quality_from_direct(candidate, direct)
+}
+
+fn edge_cap_quality(candidate: &Candidate, edge: (PointKey, PointKey)) -> Option<CapQuality> {
+    let direct = edge_cells(candidate, edge.0, edge.1)
+        .into_iter()
+        .filter(|index| {
+            candidate.cells[*index].points.len() == 3 && !candidate.cells[*index].protected
+        })
+        .collect::<BTreeSet<_>>();
+    cap_quality_from_direct(candidate, direct)
+}
+
+fn cap_quality_from_direct(candidate: &Candidate, direct: BTreeSet<usize>) -> Option<CapQuality> {
+    if direct.is_empty() {
+        return None;
+    }
+    let transition_minimum_scaled_jacobian = direct
+        .iter()
+        .map(|index| triangle_scaled_jacobian(candidate, *index))
+        .fold(1.0, f64::min);
+    let direct_edges = direct
+        .iter()
+        .flat_map(|index| {
+            let points = &candidate.cells[*index].points;
+            (0..3).map(|edge| ordered_pair(points[edge], points[(edge + 1) % 3]))
+        })
+        .collect::<BTreeSet<_>>();
+    let mut cells = direct;
+    cells.extend(
+        candidate
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| {
+                (!cell.protected
+                    && cell.points.len() == 3
+                    && (0..3).any(|edge| {
+                        direct_edges.contains(&ordered_pair(
+                            cell.points[edge],
+                            cell.points[(edge + 1) % 3],
+                        ))
+                    }))
+                .then_some(index)
+            }),
+    );
+    let qualities = cells
+        .iter()
+        .map(|index| triangle_scaled_jacobian(candidate, *index))
+        .collect::<Vec<_>>();
+    Some(CapQuality {
+        average_scaled_jacobian: qualities.iter().sum::<f64>() / qualities.len() as f64,
+        minimum_scaled_jacobian: qualities.iter().copied().fold(1.0, f64::min),
+        transition_minimum_scaled_jacobian,
+    })
+}
+
+fn triangle_scaled_jacobian(candidate: &Candidate, index: usize) -> f64 {
+    let positions = candidate.cells[index]
+        .points
+        .iter()
+        .map(|key| candidate.points[key].world)
+        .collect::<Vec<_>>();
+    quality_score("tri3", &positions, QualityMetric::ScaledJacobian).unwrap_or(0.0)
+}
+
+fn cap_seed_quality_is_better(candidate: &CapQuality, current: &CapQuality) -> bool {
+    let candidate_meets_target =
+        candidate.transition_minimum_scaled_jacobian + 1.0e-12 >= QUALITY_TARGET;
+    let current_meets_target =
+        current.transition_minimum_scaled_jacobian + 1.0e-12 >= QUALITY_TARGET;
+    candidate_meets_target && !current_meets_target
+        || candidate_meets_target == current_meets_target
+            && (candidate.minimum_scaled_jacobian > current.minimum_scaled_jacobian + 1.0e-12
+                || (candidate.minimum_scaled_jacobian - current.minimum_scaled_jacobian).abs()
+                    <= 1.0e-12
+                    && candidate.average_scaled_jacobian
+                        > current.average_scaled_jacobian + 1.0e-12)
+}
+
+fn cap_quality_preserved(before: Option<&CapQuality>, after: Option<&CapQuality>) -> bool {
+    match (before, after) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(before), Some(after)) => {
+            after.average_scaled_jacobian + 1.0e-12 >= before.average_scaled_jacobian
+                && after.minimum_scaled_jacobian + 1.0e-12 >= before.minimum_scaled_jacobian
+                && after.transition_minimum_scaled_jacobian + 1.0e-12
+                    >= before.transition_minimum_scaled_jacobian
         }
     }
-    for &point in &cell.points {
-        if !candidate.points[&point].boundary && !candidate.points[&point].protected {
-            for step in 0..4 {
-                actions.insert(Action::RelocateInterior(point, step));
-            }
-        }
-    }
-    if oversized {
-        actions.insert(Action::Insert(cell_index));
-    }
-    actions
 }
 
 fn estimated_optimization_bytes(candidate: &Candidate) -> usize {
@@ -3684,143 +4576,6 @@ fn record_quality_termination(statistics: &mut MeshingStatistics, termination: Q
             && termination != QualityTermination::Converged
     {
         statistics.quality_termination = termination;
-    }
-}
-
-fn optimize(
-    domain: &MeshableDomain,
-    space: &MeshableDomainSpace,
-    context: &MeshingContext<'_>,
-    candidate: &mut Candidate,
-    assessment: &mut Assessment,
-    statistics: &mut MeshingStatistics,
-) -> MeshResult<()> {
-    let initial = core_quality(domain, context, candidate);
-    if initial.worst_first.is_empty() {
-        record_quality_termination(statistics, QualityTermination::Converged);
-        return Ok(());
-    }
-    let mut previous = initial.objective;
-    for pass in 0..MAX_QUALITY_PASSES {
-        context.check()?;
-        if estimated_optimization_bytes(candidate) > MAX_OPTIMIZATION_BYTES {
-            record_quality_termination(statistics, QualityTermination::MemoryBudget);
-            return Ok(());
-        }
-        let current = core_quality(domain, context, candidate);
-        let mut best = None::<(Candidate, Assessment, CoreQuality)>;
-        let mut trials = 0usize;
-        let mut max_cells_limited = false;
-        'scan: for &(cell_index, _) in &current.worst_first {
-            for action in quality_actions(domain, context, candidate, cell_index) {
-                if trials >= action_budget(candidate.cells.len(), context.limits.max_cells) {
-                    break;
-                }
-                trials += 1;
-                if matches!(action, Action::Insert(_) | Action::Split(_, _))
-                    && candidate.cells.len().saturating_add(2) as u64 > context.limits.max_cells
-                {
-                    max_cells_limited = true;
-                    continue;
-                }
-                let mut trial = candidate.clone();
-                if !apply_action(domain, space, context, &mut trial, action)? {
-                    continue;
-                }
-                let trial_assessment = assess(domain, space, context, &trial)?;
-                if !trial_assessment.refine.is_empty()
-                    || trial_assessment.score.hard_invalid != 0
-                    || boundary_owners(assessment) != boundary_owners(&trial_assessment)
-                {
-                    continue;
-                }
-                let trial_quality = core_quality(domain, context, &trial);
-                let objective_decreased = trial_quality.objective
-                    < current.objective - 1.0e-12 * current.objective.max(1.0);
-                let minimum_preserved = trial_quality.minimum_scaled_jacobian + 1.0e-12
-                    >= current.minimum_scaled_jacobian;
-                if !objective_decreased || !minimum_preserved {
-                    continue;
-                }
-                if best.as_ref().is_none_or(|(_, _, quality)| {
-                    trial_quality.objective < quality.objective
-                        || trial_quality.objective == quality.objective
-                            && trial_quality.minimum_scaled_jacobian
-                                > quality.minimum_scaled_jacobian
-                }) {
-                    best = Some((trial, trial_assessment, trial_quality));
-                    break 'scan;
-                }
-            }
-            if trials >= action_budget(candidate.cells.len(), context.limits.max_cells) {
-                break;
-            }
-        }
-
-        let Some((improved, improved_assessment, quality)) = best else {
-            record_quality_termination(
-                statistics,
-                if max_cells_limited || candidate.cells.len() as u64 >= context.limits.max_cells {
-                    QualityTermination::MaxCells
-                } else {
-                    QualityTermination::Converged
-                },
-            );
-            return Ok(());
-        };
-        *candidate = improved;
-        *assessment = improved_assessment;
-        statistics.quality_passes += 1;
-        let improvement = previous - quality.objective;
-        let total_improvement = initial.objective - quality.objective;
-        previous = quality.objective;
-        if pass > 0 && improvement <= CONVERGENCE_THRESHOLD * total_improvement {
-            record_quality_termination(statistics, QualityTermination::Converged);
-            return Ok(());
-        }
-    }
-    record_quality_termination(statistics, QualityTermination::IterationLimit);
-    Ok(())
-}
-fn action_budget(seed_cells: usize, max_cells: u64) -> usize {
-    let cell_limit = usize::try_from(max_cells).unwrap_or(usize::MAX);
-    let headroom = cell_limit.saturating_sub(seed_cells);
-    seed_cells
-        .saturating_mul(2)
-        .saturating_add(headroom.min(seed_cells))
-        .clamp(32, 64)
-}
-
-fn compare_scores(a: &PatchScore, b: &PatchScore) -> Ordering {
-    a.hard_invalid
-        .cmp(&b.hard_invalid)
-        .then_with(|| a.unmet_targets.cmp(&b.unmet_targets))
-        .then_with(|| a.worst_violation.total_cmp(&b.worst_violation))
-        .then_with(|| b.worst_quality.total_cmp(&a.worst_quality))
-        .then_with(|| {
-            a.mean_squared_log_size_error
-                .total_cmp(&b.mean_squared_log_size_error)
-        })
-        .then_with(|| b.quad_count.cmp(&a.quad_count))
-        .then_with(|| a.triangle_count.cmp(&b.triangle_count))
-        .then_with(|| a.cell_count.cmp(&b.cell_count))
-}
-
-fn apply_action(
-    domain: &MeshableDomain,
-    space: &MeshableDomainSpace,
-    context: &MeshingContext<'_>,
-    candidate: &mut Candidate,
-    action: Action,
-) -> MeshResult<bool> {
-    match action {
-        Action::Flip(a, b) => Ok(apply_flip(candidate, a, b)),
-        Action::RelocateInterior(key, step) => {
-            apply_interior_relocation(domain, space, context, candidate, key, step)
-        }
-        Action::Split(a, b) => apply_split(domain, space, context, candidate, a, b),
-        Action::Insert(index) => Ok(apply_insert(domain, space, context, candidate, index)),
-        Action::Collapse(a, b) => apply_collapse(domain, space, candidate, a, b),
     }
 }
 
@@ -3860,59 +4615,6 @@ fn apply_flip(candidate: &mut Candidate, a: PointKey, b: PointKey) -> bool {
     candidate.cells[first].points = replacements[0].into();
     candidate.cells[second].points = replacements[1].into();
     true
-}
-
-fn apply_interior_relocation(
-    domain: &MeshableDomain,
-    space: &MeshableDomainSpace,
-    context: &MeshingContext<'_>,
-    candidate: &mut Candidate,
-    key: PointKey,
-    step: u8,
-) -> MeshResult<bool> {
-    let Some(old) = candidate
-        .points
-        .get(&key)
-        .copied()
-        .filter(|point| !point.boundary && !point.protected)
-    else {
-        return Ok(false);
-    };
-    let incident = incident_cells(context, candidate, key)?;
-    let neighbors = incident
-        .iter()
-        .flat_map(|index| candidate.cells[*index].points.iter().copied())
-        .filter(|point| *point != key)
-        .collect::<BTreeSet<_>>();
-    if neighbors.len() < 3 {
-        return Ok(false);
-    }
-    let target = neighbors
-        .iter()
-        .map(|neighbor| candidate.points[neighbor].uv)
-        .fold([0.0; 2], |sum, uv| [sum[0] + uv[0], sum[1] + uv[1]])
-        .map(|value| value / neighbors.len() as f64);
-    let Some(fraction) = [1.0, 0.75, 0.5, 0.25].get(step as usize) else {
-        return Ok(false);
-    };
-    let uv = [
-        old.uv[0] + fraction * (target[0] - old.uv[0]),
-        old.uv[1] + fraction * (target[1] - old.uv[1]),
-    ];
-    let world = space.point(uv[0], uv[1]);
-    if domain.domain_sdf(&[world])[0] >= 0.0 {
-        return Ok(false);
-    }
-    candidate.points.insert(
-        key,
-        Point {
-            uv,
-            world: world.to_array(),
-            boundary: false,
-            protected: old.protected,
-        },
-    );
-    Ok(true)
 }
 
 fn apply_insert(
@@ -3975,6 +4677,7 @@ fn apply_insert(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_split(
     domain: &MeshableDomain,
     space: &MeshableDomainSpace,
@@ -3982,8 +4685,8 @@ fn apply_split(
     candidate: &mut Candidate,
     a: PointKey,
     b: PointKey,
+    pair: &[usize],
 ) -> MeshResult<bool> {
-    let pair = edge_cells(candidate, a, b);
     if pair.is_empty()
         || pair.len() > 2
         || pair.iter().any(|index| {
@@ -3996,6 +4699,9 @@ fn apply_split(
     }
     let boundary = pair.len() == 1;
     if boundary && (!candidate.points[&a].boundary || !candidate.points[&b].boundary) {
+        return Ok(false);
+    }
+    if boundary && candidate.points[&a].protected && candidate.points[&b].protected {
         return Ok(false);
     }
     let mut world = Vec3::from_array(midpoint3(
@@ -4012,6 +4718,7 @@ fn apply_split(
         let projected = project_boundary_station(
             domain,
             space,
+            None,
             context.target_size,
             world.to_array(),
             [b_uv[0] - a_uv[0], b_uv[1] - a_uv[1]],
@@ -4030,7 +4737,7 @@ fn apply_split(
             protected: false,
         },
     );
-    for index in pair {
+    for &index in pair {
         let cell = candidate.cells[index].clone();
         let Some(c) = cell
             .points
@@ -4050,84 +4757,6 @@ fn apply_split(
     Ok(true)
 }
 
-fn apply_collapse(
-    domain: &MeshableDomain,
-    space: &MeshableDomainSpace,
-    candidate: &mut Candidate,
-    a: PointKey,
-    b: PointKey,
-) -> MeshResult<bool> {
-    let pair = edge_cells(candidate, a, b);
-    if candidate.points[&a].protected
-        || candidate.points[&b].protected
-        || candidate
-            .cells
-            .iter()
-            .filter(|cell| cell.points.contains(&a) || cell.points.contains(&b))
-            .any(|cell| cell.protected || cell.points.len() != 3)
-    {
-        return Ok(false);
-    }
-    let a_boundary = candidate.points[&a].boundary;
-    let b_boundary = candidate.points[&b].boundary;
-    let boundary_edge = a_boundary && b_boundary;
-    if (boundary_edge && pair.len() != 1) || (!boundary_edge && pair.len() != 2) {
-        return Ok(false);
-    }
-    let (keep, remove) = match (a_boundary, b_boundary) {
-        (true, false) => (a, b),
-        (false, true) => (b, a),
-        _ => ordered_pair(a, b),
-    };
-    if boundary_edge {
-        let midpoint = Vec3::from_array(midpoint3(
-            candidate.points[&a].world,
-            candidate.points[&b].world,
-        ));
-        let projection = domain
-            .project_to_boundary(&[midpoint])
-            .map_err(|error| MeshError::InvalidInput(error.to_string()))?[0];
-        if !projection.converged {
-            return Ok(false);
-        }
-        let coords = space.coords(projection.point);
-        candidate.points.insert(
-            keep,
-            Point {
-                uv: [coords[0], coords[1]],
-                world: projection.point.to_array(),
-                boundary: true,
-                protected: false,
-            },
-        );
-    }
-    for cell in &mut candidate.cells {
-        for point in &mut cell.points {
-            if *point == remove {
-                *point = keep;
-            }
-        }
-    }
-    candidate.cells.retain(|cell| {
-        cell.points.iter().copied().collect::<BTreeSet<_>>().len() == cell.points.len()
-    });
-    candidate.points.remove(&remove);
-    Ok(true)
-}
-
-fn boundary_owners(assessment: &Assessment) -> BTreeMap<(PointKey, PointKey), Option<String>> {
-    assessment
-        .boundary
-        .iter()
-        .map(|edge| {
-            (
-                ordered_pair(edge.points[0], edge.points[1]),
-                edge.owner.clone(),
-            )
-        })
-        .collect()
-}
-
 fn orient_triangle(triangle: &mut [PointKey; 3], points: &BTreeMap<PointKey, Point>) {
     if signed_area(*triangle, points) < 0.0 {
         triangle.swap(1, 2);
@@ -4143,23 +4772,6 @@ fn edge_cells(candidate: &Candidate, a: PointKey, b: PointKey) -> Vec<usize> {
             (cell.points.contains(&a) && cell.points.contains(&b)).then_some(index)
         })
         .collect()
-}
-
-fn incident_cells(
-    context: &MeshingContext<'_>,
-    candidate: &Candidate,
-    key: PointKey,
-) -> MeshResult<Vec<usize>> {
-    let mut result = Vec::new();
-    for (index, cell) in candidate.cells.iter().enumerate() {
-        if index % 512 == 0 {
-            context.check()?;
-        }
-        if cell.points.contains(&key) {
-            result.push(index);
-        }
-    }
-    Ok(result)
 }
 
 fn cell_containment_residual(domain: &MeshableDomain, points: &[[f64; 3]]) -> f64 {
@@ -4200,6 +4812,34 @@ fn emit(
             "domain {:?} produced no valid 2D elements",
             domain.name
         )));
+    }
+    if !assessment.refine.is_empty() || assessment.score.hard_invalid != 0 {
+        return Err(minimum_size_error(
+            domain,
+            context,
+            assessment
+                .reason
+                .as_deref()
+                .unwrap_or("final mesh failed the topology and coverage audit"),
+            assessment.location,
+            assessment.worst_quality,
+        ));
+    }
+    if let Some((first, second)) = crossing_cell_edges(candidate, &candidate.cells) {
+        let reason = format!(
+            "cell edges cross instead of forming a planar triangulation: {:?} -> {:?} crosses {:?} -> {:?}",
+            candidate.points[&first.0].world,
+            candidate.points[&first.1].world,
+            candidate.points[&second.0].world,
+            candidate.points[&second.1].world,
+        );
+        return Err(minimum_size_error(
+            domain,
+            context,
+            &reason,
+            candidate.cells.first().map(|_| cell_centroid(candidate, 0)),
+            assessment.worst_quality,
+        ));
     }
     if candidate.cells.len() as u64 > context.limits.max_cells {
         return Err(MeshError::LimitExceeded(format!(
@@ -4261,7 +4901,7 @@ fn emit(
         context.check()?;
         let start = chunk_index * cells_per_chunk;
         let end = (start + cells_per_chunk).min(candidate.cells.len());
-        let spade_tile = constrained_spade_tile(candidate, &candidate.cells[start..end])?;
+        let spade_tile = spade_point_tile(candidate, &candidate.cells[start..end])?;
         let used = candidate.cells[start..end]
             .iter()
             .flat_map(|cell| cell.points.iter().copied())
@@ -4347,10 +4987,34 @@ fn emit(
     Ok(())
 }
 
-fn constrained_spade_tile(
+fn constrained_spade_tile(candidate: &Candidate, cells: &[Cell]) -> MeshResult<PointSpade> {
+    let (mut tile, vertices) = spade_tile_vertices(candidate, cells)?;
+    for cell in cells {
+        for edge in 0..cell.points.len() {
+            let a = cell.points[edge];
+            let b = cell.points[(edge + 1) % cell.points.len()];
+            if tile
+                .try_add_constraint(vertices[&a], vertices[&b])
+                .is_empty()
+            {
+                return Err(MeshError::InvalidInput(format!(
+                    "DistMesh cells contain a crossing or overlapping edge {:?} -> {:?}",
+                    candidate.points[&a].world, candidate.points[&b].world,
+                )));
+            }
+        }
+    }
+    Ok(tile)
+}
+
+fn spade_point_tile(candidate: &Candidate, cells: &[Cell]) -> MeshResult<PointSpade> {
+    spade_tile_vertices(candidate, cells).map(|(tile, _)| tile)
+}
+
+fn spade_tile_vertices(
     candidate: &Candidate,
     cells: &[Cell],
-) -> MeshResult<ConstrainedDelaunayTriangulation<Point2<f64>>> {
+) -> MeshResult<(PointSpade, PointSpadeVertices)> {
     let used = cells
         .iter()
         .flat_map(|cell| cell.points.iter().copied())
@@ -4364,17 +5028,10 @@ fn constrained_spade_tile(
         })?;
         vertices.insert(key, vertex);
     }
-    for cell in cells {
-        for edge in 0..cell.points.len() {
-            let a = cell.points[edge];
-            let b = cell.points[(edge + 1) % cell.points.len()];
-            tile.try_add_constraint(vertices[&a], vertices[&b]);
-        }
-    }
-    Ok(tile)
+    Ok((tile, vertices))
 }
 
-fn estimated_spade_bytes(tile: &ConstrainedDelaunayTriangulation<Point2<f64>>) -> usize {
+fn estimated_spade_bytes(tile: &PointSpade) -> usize {
     std::mem::size_of_val(tile)
         + tile.num_vertices() * 128
         + tile.num_undirected_edges() * 96
@@ -4421,7 +5078,30 @@ fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     let ab_d = cross_2d(a, b, d);
     let cd_a = cross_2d(c, d, a);
     let cd_b = cross_2d(c, d, b);
-    ab_c * ab_d < 0.0 && cd_a * cd_b < 0.0
+    let extent = [a, b, c, d].into_iter().fold(
+        [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |bounds, point| {
+            [
+                bounds[0].min(point[0]),
+                bounds[1].max(point[0]),
+                bounds[2].min(point[1]),
+                bounds[3].max(point[1]),
+            ]
+        },
+    );
+    let scale = (extent[1] - extent[0]).max(extent[3] - extent[2]);
+    let tolerance = f64::EPSILON * scale.powi(2) * 64.0;
+    ab_c.abs() > tolerance
+        && ab_d.abs() > tolerance
+        && cd_a.abs() > tolerance
+        && cd_b.abs() > tolerance
+        && ab_c * ab_d < 0.0
+        && cd_a * cd_b < 0.0
 }
 
 fn pair_quality(triangles: [[PointKey; 3]; 2], points: &BTreeMap<PointKey, Point>) -> f64 {
@@ -4456,7 +5136,7 @@ fn root_tolerance(domain: &MeshableDomain, local_size: f64) -> f64 {
 }
 
 fn chord_tolerance(domain: &MeshableDomain, local_size: f64) -> f64 {
-    root_tolerance(domain, local_size).max((local_size * 0.05).min(domain.boundary_tolerance()))
+    root_tolerance(domain, local_size).max((local_size * 0.125).min(domain.boundary_tolerance()))
 }
 
 fn topology_tolerance(domain: &MeshableDomain, local_size: f64) -> f64 {
@@ -4480,7 +5160,7 @@ fn minimum_size_error(
 ) -> MeshError {
     let location = location.unwrap_or_else(|| domain.bounds.center().to_array());
     MeshError::InvalidInput(format!(
-        "domain {:?} could not produce a valid 2D mesh at target size {:.6e} near ({:.6}, {:.6}, {:.6}): {reason}; worst Scaled Jacobian={quality:.6e}, required > {VALID_QUALITY:.1e} and optimization target {QUALITY_TARGET:.2}",
+        "domain {:?} could not produce valid 2D topology at target size {:.6e} near ({:.6}, {:.6}, {:.6}): {reason}; worst Scaled Jacobian={quality:.6e}, validity requires > {VALID_QUALITY:.1e}; quality optimization is best-effort",
         domain.name, context.target_size, location[0], location[1], location[2],
     ))
 }
@@ -4544,6 +5224,7 @@ mod tests {
     use caso_kernel::meshing::meshable_domains_from_document;
     use caso_kernel::roles::DomainKind;
     use caso_kernel::scene::SceneDocument;
+    use caso_kernel::serialization::load_scene_from_str;
     use caso_kernel::vec3::vec3;
 
     use crate::{
@@ -4670,6 +5351,15 @@ mod tests {
         controls: &ControlSet,
         limits: GenerationLimits,
     ) -> MeshResult<TestSink> {
+        mesh_chunks_with_statistics(document, target_size, controls, limits).map(|(sink, _)| sink)
+    }
+
+    fn mesh_chunks_with_statistics(
+        document: &SceneDocument,
+        target_size: f64,
+        controls: &ControlSet,
+        limits: GenerationLimits,
+    ) -> MeshResult<(TestSink, MeshingStatistics)> {
         let domains = meshable_domains_from_document(document)
             .map_err(|error| MeshError::InvalidInput(error.to_string()))?;
         let job_control = JobControl::default();
@@ -4683,8 +5373,499 @@ mod tests {
             catalog: &catalog,
         };
         let mut sink = TestSink::default();
-        generate(&context, &mut sink)?;
-        Ok(sink)
+        let statistics = generate(&context, &mut sink)?;
+        Ok((sink, statistics))
+    }
+
+    fn emitted_cap_qualities(sink: &TestSink, domain: &MeshableDomain) -> (Vec<f64>, Vec<f64>) {
+        let points = sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.points)
+            .map(|point| (point.id, point.position))
+            .collect::<BTreeMap<_, _>>();
+        let cells = sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.cells)
+            .map(|cell| (cell.element_type.as_str(), cell.point_ids.as_slice()))
+            .collect::<Vec<_>>();
+        let mut incidence = BTreeMap::<(MeshId, MeshId), Vec<usize>>::new();
+        for (index, (_, cell)) in cells.iter().enumerate() {
+            for edge in 0..cell.len() {
+                incidence
+                    .entry(ordered_pair(cell[edge], cell[(edge + 1) % cell.len()]))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let level_tolerance = root_tolerance(domain, 1.0);
+        let direct = incidence
+            .iter()
+            .filter_map(|(&(a, b), incident)| {
+                let triangle = incident
+                    .iter()
+                    .copied()
+                    .find(|index| cells[*index].0 == "tri3")?;
+                incident
+                    .iter()
+                    .any(|index| cells[*index].0 == "quad4")
+                    .then(|| {
+                        let levels = domain.domain_sdf(&[
+                            Vec3::from_array(points[&a]),
+                            Vec3::from_array(points[&b]),
+                        ]);
+                        ((levels[0] - levels[1]).abs() > level_tolerance).then_some(triangle)
+                    })
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        let direct_edges = direct
+            .iter()
+            .flat_map(|index| {
+                let cell = cells[*index].1;
+                (0..3).map(|edge| ordered_pair(cell[edge], cell[(edge + 1) % 3]))
+            })
+            .collect::<BTreeSet<_>>();
+        let patch = cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (kind, cell))| {
+                (*kind == "tri3"
+                    && (0..3).any(|edge| {
+                        direct_edges.contains(&ordered_pair(cell[edge], cell[(edge + 1) % 3]))
+                    }))
+                .then_some(index)
+            })
+            .collect::<BTreeSet<_>>();
+        let quality = |index: usize| {
+            let (kind, cell) = cells[index];
+            let positions = cell.iter().map(|id| points[id]).collect::<Vec<_>>();
+            quality_score(kind, &positions, QualityMetric::ScaledJacobian).unwrap()
+        };
+        (
+            direct.into_iter().map(quality).collect(),
+            patch.into_iter().map(quality).collect(),
+        )
+    }
+
+    fn emitted_quad_signature(sink: &TestSink) -> BTreeSet<Vec<[u64; 3]>> {
+        let points = sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.points)
+            .map(|point| (point.id, point.position))
+            .collect::<BTreeMap<_, _>>();
+        sink.chunks
+            .iter()
+            .flat_map(|chunk| &chunk.cells)
+            .filter(|cell| cell.element_type == "quad4")
+            .map(|cell| {
+                let mut positions = cell
+                    .point_ids
+                    .iter()
+                    .map(|id| points[id].map(f64::to_bits))
+                    .collect::<Vec<_>>();
+                positions.sort_unstable();
+                positions
+            })
+            .collect()
+    }
+
+    fn scenemesh3_controls(with_layers: bool) -> ControlSet {
+        let mut controls = ControlSet::default();
+        controls.target_size(0.2).unwrap();
+        if with_layers {
+            for region in ["pipe", "ellipse", "roundrect", "bezier", "esad"] {
+                controls
+                    .boundary_layer("sea", region, 0.03, 0.03, 1.2, 0.5)
+                    .unwrap();
+            }
+        }
+        controls
+    }
+
+    fn assert_balanced_fixture_quality(sink: &TestSink, require_quads: bool) {
+        let points = sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.points)
+            .map(|point| (point.id, point.position))
+            .collect::<BTreeMap<_, _>>();
+        let cells = sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.cells)
+            .collect::<Vec<_>>();
+        let metric = |cell: &crate::chunk::ChunkElement, metric| {
+            let positions = cell
+                .point_ids
+                .iter()
+                .map(|point| points[point])
+                .collect::<Vec<_>>();
+            quality_score(&cell.element_type, &positions, metric).unwrap()
+        };
+        let mut triangle_quality = cells
+            .iter()
+            .filter(|cell| cell.element_type == "tri3")
+            .map(|cell| metric(cell, QualityMetric::ScaledJacobian))
+            .collect::<Vec<_>>();
+        triangle_quality.sort_by(f64::total_cmp);
+        assert!(!triangle_quality.is_empty());
+        let worst_triangle = cells
+            .iter()
+            .filter(|cell| cell.element_type == "tri3")
+            .min_by(|a, b| {
+                metric(a, QualityMetric::ScaledJacobian)
+                    .total_cmp(&metric(b, QualityMetric::ScaledJacobian))
+            })
+            .unwrap();
+        let worst_positions = worst_triangle
+            .point_ids
+            .iter()
+            .map(|point| points[point])
+            .collect::<Vec<_>>();
+        let worst_neighbors = (0..3)
+            .map(|edge| {
+                let pair = ordered_pair(
+                    worst_triangle.point_ids[edge],
+                    worst_triangle.point_ids[(edge + 1) % 3],
+                );
+                let length = distance3(points[&pair.0], points[&pair.1]);
+                let adjacent = cells
+                    .iter()
+                    .filter(|cell| {
+                        cell.point_ids.contains(&pair.0) && cell.point_ids.contains(&pair.1)
+                    })
+                    .map(|cell| cell.element_type.as_str())
+                    .collect::<Vec<_>>();
+                (length, adjacent)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            triangle_quality[0] >= 0.40,
+            "triangle minimum: {}, points={worst_positions:?}, edges={worst_neighbors:?}",
+            triangle_quality[0],
+        );
+        assert!(
+            triangle_quality[triangle_quality.len() / 100] >= 0.60,
+            "triangle first percentile: {}",
+            triangle_quality[triangle_quality.len() / 100]
+        );
+        for kind in ["tri3", "quad4"] {
+            let worst = cells
+                .iter()
+                .filter(|cell| cell.element_type == kind)
+                .max_by(|a, b| {
+                    metric(a, QualityMetric::Skewness)
+                        .total_cmp(&metric(b, QualityMetric::Skewness))
+                });
+            let mut values = cells
+                .iter()
+                .filter(|cell| cell.element_type == kind)
+                .map(|cell| metric(cell, QualityMetric::Skewness))
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                assert!(!require_quads || kind != "quad4", "missing protected quads");
+                continue;
+            }
+            values.sort_by(f64::total_cmp);
+            let worst_positions = worst
+                .into_iter()
+                .flat_map(|cell| cell.point_ids.iter().map(|point| points[point]))
+                .collect::<Vec<_>>();
+            assert!(
+                *values.last().unwrap() <= 0.60,
+                "{kind} maximum skewness: {}, points={worst_positions:?}",
+                values.last().unwrap(),
+            );
+            assert!(
+                values[(values.len().saturating_sub(1) * 99) / 100] <= 0.45,
+                "{kind} 99th-percentile skewness: {}",
+                values[(values.len().saturating_sub(1) * 99) / 100]
+            );
+        }
+
+        let mut incidence = BTreeMap::<(MeshId, MeshId), Vec<usize>>::new();
+        for (index, cell) in cells.iter().enumerate() {
+            for edge in 0..cell.point_ids.len() {
+                incidence
+                    .entry(ordered_pair(
+                        cell.point_ids[edge],
+                        cell.point_ids[(edge + 1) % cell.point_ids.len()],
+                    ))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        assert!(incidence.values().all(|incident| incident.len() <= 2));
+        for incident in incidence.values().filter(|incident| incident.len() == 2) {
+            let [first, second] = [incident[0], incident[1]];
+            if (cells[first].element_type == "tri3" && cells[second].element_type == "quad4")
+                || (cells[first].element_type == "quad4" && cells[second].element_type == "tri3")
+            {
+                let triangle = if cells[first].element_type == "tri3" {
+                    cells[first]
+                } else {
+                    cells[second]
+                };
+                assert!(
+                    metric(triangle, QualityMetric::ScaledJacobian) >= 0.50,
+                    "transition triangle minimum"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scenemesh3_exact_unlayered_regression() {
+        let document = load_scene_from_str(include_str!("../tests/fixtures/scenemesh3.json"))
+            .expect("load exact scenemesh3 fixture");
+        let (sink, statistics) = mesh_chunks_with_statistics(
+            &document,
+            0.2,
+            &scenemesh3_controls(false),
+            GenerationLimits::default(),
+        )
+        .expect("exact unlayered scenemesh3 must mesh");
+        assert!(statistics.cells <= 81_160, "2x frozen cell-count budget");
+        assert_balanced_fixture_quality(&sink, false);
+    }
+
+    #[test]
+    fn scenemesh3_exact_all_five_layers_regression() {
+        let document = load_scene_from_str(include_str!("../tests/fixtures/scenemesh3.json"))
+            .expect("load exact scenemesh3 fixture");
+        let sink = mesh_chunks(
+            &document,
+            0.03,
+            0.2,
+            &scenemesh3_controls(true),
+            GenerationLimits::default(),
+        )
+        .expect("exact five-layer scenemesh3 must mesh");
+        assert_balanced_fixture_quality(&sink, true);
+    }
+
+    #[test]
+    fn ellipse_hole_boundary_cavities_are_quality_refined() {
+        let mut document = SceneDocument::new();
+        let outer = document
+            .add_primitive_from_drag("rectangle", vec3(-1.0, -0.8, 0.0), vec3(1.0, 0.8, 0.0), 1.0)
+            .expect("outer rectangle");
+        let hole = document
+            .add_primitive_from_drag("ellipse", vec3(-0.6, -0.35, 0.0), vec3(0.6, 0.35, 0.0), 1.0)
+            .expect("ellipse hole");
+        let root = document
+            .combine(outer, hole, "difference")
+            .expect("difference");
+        document.rename(root, "fluid").expect("rename domain");
+        document
+            .set_domain_root(root, DomainKind::Fluid)
+            .expect("mark fluid domain");
+        let sink = mesh_chunks(
+            &document,
+            0.025,
+            0.2,
+            &ControlSet::default(),
+            GenerationLimits::default(),
+        )
+        .expect("ellipse hole must mesh");
+        let points = sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.points)
+            .map(|point| (point.id, point.position))
+            .collect::<BTreeMap<_, _>>();
+        let qualities = sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.cells)
+            .filter(|cell| cell.element_type == "tri3")
+            .map(|cell| {
+                let positions = cell
+                    .point_ids
+                    .iter()
+                    .map(|point| points[point])
+                    .collect::<Vec<_>>();
+                (
+                    quality_score("tri3", &positions, QualityMetric::ScaledJacobian).unwrap(),
+                    quality_score("tri3", &positions, QualityMetric::Skewness).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            qualities.iter().all(|(jacobian, _)| *jacobian >= 0.40),
+            "minimum Scaled Jacobian={}",
+            qualities
+                .iter()
+                .map(|(jacobian, _)| *jacobian)
+                .fold(1.0, f64::min)
+        );
+        assert!(
+            qualities.iter().all(|(_, skewness)| *skewness <= 0.60),
+            "maximum skewness={}",
+            qualities
+                .iter()
+                .map(|(_, skewness)| *skewness)
+                .fold(0.0, f64::max)
+        );
+    }
+
+    #[test]
+    fn scenemesh2_closed_pipe_transition_is_graded_and_watertight() {
+        let document = load_scene_from_str(include_str!("../tests/fixtures/scenemesh2.json"))
+            .expect("load the reported scene");
+        let mut controls = ControlSet::default();
+        controls.target_size(0.2).unwrap();
+        controls
+            .boundary_layer("sea", "pipe", 0.03, 0.03, 1.2, 0.5)
+            .unwrap();
+        let sink = mesh_chunks(&document, 0.03, 0.2, &controls, GenerationLimits::default())
+            .expect("the reported boundary-layer scene must mesh");
+        let domains = meshable_domains_from_document(&document).unwrap();
+        let domain = domains.get("sea").unwrap();
+        let points = sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.points)
+            .map(|point| (point.id, point.position))
+            .collect::<BTreeMap<_, _>>();
+        let cells = sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.cells)
+            .collect::<Vec<_>>();
+
+        let quads = cells
+            .iter()
+            .filter(|cell| cell.element_type == "quad4")
+            .collect::<Vec<_>>();
+        assert_eq!(quads.len() % 8, 0, "the existing eight quad rows changed");
+        let boundary_stations = quads.len() / 8;
+        let layer_depths = [
+            0.0,
+            0.03,
+            0.066,
+            0.1092,
+            0.16104,
+            0.223248,
+            0.2978976,
+            0.38747712,
+            0.494972544,
+        ];
+        let layer_tolerance = root_tolerance(domain, 0.2);
+        for point in quads.iter().flat_map(|cell| &cell.point_ids) {
+            let depth = -domain.domain_sdf(&[Vec3::from_array(points[point])])[0];
+            assert!(
+                layer_depths
+                    .iter()
+                    .any(|level| (depth - level).abs() <= layer_tolerance),
+                "boundary-layer vertex moved to depth {depth:.12e}"
+            );
+        }
+
+        let qualities = cells
+            .iter()
+            .map(|cell| {
+                let positions = cell
+                    .point_ids
+                    .iter()
+                    .map(|point| points[point])
+                    .collect::<Vec<_>>();
+                quality_score(
+                    &cell.element_type,
+                    &positions,
+                    QualityMetric::ScaledJacobian,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let skewness = cells
+            .iter()
+            .map(|cell| {
+                let positions = cell
+                    .point_ids
+                    .iter()
+                    .map(|point| points[point])
+                    .collect::<Vec<_>>();
+                quality_score(&cell.element_type, &positions, QualityMetric::Skewness).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let triangle_minimum = cells
+            .iter()
+            .zip(&qualities)
+            .filter_map(|(cell, quality)| (cell.element_type == "tri3").then_some(*quality))
+            .fold(1.0, f64::min);
+        assert!(
+            triangle_minimum >= 0.4,
+            "poor core triangle: {triangle_minimum:.12e}"
+        );
+        let mut triangle_quality = cells
+            .iter()
+            .zip(&qualities)
+            .filter_map(|(cell, quality)| (cell.element_type == "tri3").then_some(*quality))
+            .collect::<Vec<_>>();
+        triangle_quality.sort_by(f64::total_cmp);
+        let triangle_p01 = triangle_quality[triangle_quality.len() / 100];
+        assert!(triangle_p01 >= 0.60, "triangle p01 quality: {triangle_p01}");
+        for kind in ["tri3", "quad4"] {
+            let mut values = cells
+                .iter()
+                .zip(&skewness)
+                .filter_map(|(cell, skew)| (cell.element_type == kind).then_some(*skew))
+                .collect::<Vec<_>>();
+            values.sort_by(f64::total_cmp);
+            let maximum = *values.last().expect("fixture contains each cell family");
+            let p99 = values[(values.len().saturating_sub(1) * 99) / 100];
+            assert!(maximum <= 0.60, "{kind} maximum skewness: {maximum}");
+            assert!(p99 <= 0.45, "{kind} p99 skewness: {p99}");
+        }
+
+        let mut incidence = BTreeMap::<(MeshId, MeshId), Vec<usize>>::new();
+        for (index, cell) in cells.iter().enumerate() {
+            for edge in 0..cell.point_ids.len() {
+                incidence
+                    .entry(ordered_pair(
+                        cell.point_ids[edge],
+                        cell.point_ids[(edge + 1) % cell.point_ids.len()],
+                    ))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut front_qualities = Vec::new();
+        let mut boundary_degree = BTreeMap::<MeshId, usize>::new();
+        for (&(a, b), incident) in &incidence {
+            assert!(incident.len() <= 2, "non-manifold edge {a:?}-{b:?}");
+            if incident.len() == 1 {
+                let midpoint = midpoint3(points[&a], points[&b]);
+                let residual = domain.domain_sdf(&[Vec3::from_array(midpoint)])[0].abs();
+                assert!(
+                    residual <= boundary_tolerance(domain, distance3(points[&a], points[&b])),
+                    "coverage gap at exposed edge {a:?}-{b:?}: residual={residual:.12e}"
+                );
+                *boundary_degree.entry(a).or_default() += 1;
+                *boundary_degree.entry(b).or_default() += 1;
+            } else if let [first, second] = incident.as_slice() {
+                let first_kind = cells[*first].element_type.as_str();
+                let second_kind = cells[*second].element_type.as_str();
+                if first_kind == "quad4" && second_kind == "tri3" {
+                    front_qualities.push(qualities[*second]);
+                } else if first_kind == "tri3" && second_kind == "quad4" {
+                    front_qualities.push(qualities[*first]);
+                }
+            }
+        }
+        assert!(boundary_degree.values().all(|degree| *degree == 2));
+        assert_eq!(front_qualities.len(), boundary_stations);
+        assert!(front_qualities.iter().all(|quality| *quality >= 0.5));
+        assert!(sink
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.edges)
+            .filter(|edge| edge.boundary)
+            .all(|edge| !edge.tag_ids.is_empty()));
     }
 
     #[test]
@@ -4728,34 +5909,15 @@ mod tests {
     }
 
     #[test]
-    fn common_score_and_action_ties_are_deterministic() {
-        let baseline = PatchScore {
-            hard_invalid: 0,
-            unmet_targets: 2,
-            worst_violation: 0.5,
-            worst_quality: 0.2,
-            mean_squared_log_size_error: 0.4,
-            quad_count: 0,
-            triangle_count: 4,
-            cell_count: 4,
-        };
-        let improved = PatchScore {
-            unmet_targets: 1,
-            worst_quality: 0.1,
-            ..baseline
-        };
-        assert_eq!(compare_scores(&improved, &baseline), Ordering::Less);
-
+    fn queue_ties_are_deterministic() {
         let a = PointKey::Inserted(1);
         let b = PointKey::Inserted(2);
-        let actions = BTreeSet::from([
-            Action::Split(a, b),
-            Action::Flip(a, b),
-            Action::RelocateInterior(a, 0),
-        ]);
-        assert_eq!(actions.first(), Some(&Action::Flip(a, b)));
-        assert_eq!(action_budget(1, 1), 32);
-        assert_eq!(action_budget(10_000, u64::MAX), 64);
+        let c = PointKey::Inserted(3);
+        let queue = BTreeSet::from([ordered_pair(b, c), ordered_pair(a, c), ordered_pair(a, b)]);
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            [(a, b), (a, c), (b, c)]
+        );
     }
 
     #[test]
@@ -4786,6 +5948,36 @@ mod tests {
             QualityTermination::Converged
         );
         assert!(output.statistics.quality_passes <= MAX_QUALITY_PASSES as u64);
+    }
+
+    #[test]
+    fn refinement_limit_returns_the_best_valid_snapshot() {
+        let document = primitive_document("square", vec3(-0.75, -0.75, 0.0), vec3(0.75, 0.75, 0.0));
+        let mut found = false;
+        for max_cells in [32, 48, 64, 96, 128, 192] {
+            let result = mesh_chunks_with_statistics(
+                &document,
+                0.3,
+                &ControlSet::default(),
+                GenerationLimits {
+                    max_cells,
+                    ..GenerationLimits::default()
+                },
+            );
+            let Ok((sink, statistics)) = result else {
+                continue;
+            };
+            if statistics.quality_termination == QualityTermination::MaxCells {
+                assert!(sink.cells as u64 <= max_cells);
+                assert!(sink.cells > 0);
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "the fixture should exhaust refinement, not mandatory topology"
+        );
     }
 
     #[test]
@@ -4895,11 +6087,89 @@ mod tests {
             construction_failures: BTreeSet::new(),
             next_inserted: 4,
             layer_edge_targets: BTreeMap::new(),
+            layer_front_targets: Vec::new(),
             layer_end_targets: Vec::new(),
+            layer_refinement_limit: None,
+            protected_constraints: BTreeSet::new(),
+            refine_layer_core: true,
         };
         let original = trial.cells[0].points.clone();
         assert!(!apply_flip(&mut trial, a, b));
         assert_eq!(trial.cells[0].points, original);
+    }
+
+    #[test]
+    fn constrained_tile_rejects_crossing_cell_edges() {
+        assert!(segments_cross(
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+            [1.0, 0.0]
+        ));
+        assert!(!segments_cross(
+            [0.49827586206896524, 1.6591999999999998],
+            [0.5979310344827585, 1.5615999999999997],
+            [1.5944827586206898, 0.5856],
+            [1.694137931034483, 0.4879999999999999]
+        ));
+        let coordinates = [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [1.0, 2.0],
+            [0.0, 1.0],
+            [2.0, 1.0],
+            [1.0, -1.0],
+        ];
+        let points = coordinates
+            .into_iter()
+            .enumerate()
+            .map(|(index, uv)| {
+                (
+                    PointKey::Inserted(index as u64),
+                    Point {
+                        uv,
+                        world: [uv[0], uv[1], 0.0],
+                        boundary: false,
+                        protected: false,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let leaf = Leaf {
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        let candidate = Candidate {
+            points,
+            cells: vec![
+                Cell::triangle(
+                    [
+                        PointKey::Inserted(0),
+                        PointKey::Inserted(1),
+                        PointKey::Inserted(2),
+                    ],
+                    leaf,
+                ),
+                Cell::triangle(
+                    [
+                        PointKey::Inserted(3),
+                        PointKey::Inserted(4),
+                        PointKey::Inserted(5),
+                    ],
+                    leaf,
+                ),
+            ],
+            construction_failures: BTreeSet::new(),
+            next_inserted: coordinates.len() as u64,
+            layer_edge_targets: BTreeMap::new(),
+            layer_front_targets: Vec::new(),
+            layer_end_targets: Vec::new(),
+            layer_refinement_limit: None,
+            protected_constraints: BTreeSet::new(),
+            refine_layer_core: true,
+        };
+        assert!(constrained_spade_tile(&candidate, &candidate.cells).is_err());
     }
 
     #[test]
@@ -4926,6 +6196,12 @@ mod tests {
                     .iter()
                     .map(|point| (point.id, point.position))
                     .collect::<BTreeMap<_, _>>();
+                let boundary_edges = chunk
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.boundary)
+                    .map(|edge| ordered_pair(edge.point_ids[0], edge.point_ids[1]))
+                    .collect::<BTreeSet<_>>();
                 for cell in &chunk.cells {
                     cells += 1;
                     assert_eq!(
@@ -4952,8 +6228,13 @@ mod tests {
                         let ratio =
                             distance3(positions[edge], positions[(edge + 1) % positions.len()])
                                 / target;
+                        let constrained = boundary_edges.contains(&ordered_pair(
+                            cell.point_ids[edge],
+                            cell.point_ids[(edge + 1) % cell.point_ids.len()],
+                        ));
                         assert!(
-                            ratio + 1.0e-12 >= EDGE_RATIO_MIN && ratio <= EDGE_RATIO_MAX + 1.0e-12,
+                            (constrained || ratio + 1.0e-12 >= 0.55)
+                                && ratio <= EDGE_RATIO_MAX + 1.0e-12,
                             "{} edge ratio {ratio}: {:?} -> {:?}",
                             domain.name,
                             positions[edge],
@@ -5011,39 +6292,200 @@ mod tests {
     }
 
     #[test]
-    fn partial_boundary_layer_tapers_with_valid_transition_triangles() {
-        let mut document =
-            primitive_document("rectangle", vec3(-1.0, -0.75, 0.0), vec3(1.0, 0.75, 0.0));
-        let root = document.fluid_domain.as_ref().expect("fluid root").root;
-        document
-            .add_boundary_region(root, Some(0), None, Some("inlet"))
-            .expect("direction boundary region");
-        let region = document
-            .boundary_regions
-            .last()
-            .expect("boundary region")
-            .name
-            .clone();
-        let mut controls = ControlSet::default();
-        controls
-            .boundary_layer("rectangle", region, 0.035, 0.18, 1.2, 0.1274)
+    fn partial_boundary_layer_caps_meet_the_transition_quality_target() {
+        for growth in [1.0, 1.2] {
+            let mut document =
+                primitive_document("rectangle", vec3(-1.0, -0.75, 0.0), vec3(1.0, 0.75, 0.0));
+            let root = document.fluid_domain.as_ref().expect("fluid root").root;
+            document
+                .add_boundary_region(root, Some(0), None, Some("inlet"))
+                .expect("direction boundary region");
+            let region = document
+                .boundary_regions
+                .last()
+                .expect("boundary region")
+                .name
+                .clone();
+            let mut controls = ControlSet::default();
+            controls
+                .boundary_layer(
+                    "rectangle",
+                    region,
+                    0.035,
+                    0.18,
+                    growth,
+                    0.035 * (1.0 + growth + growth * growth),
+                )
+                .unwrap();
+            let sink = mesh_chunks(
+                &document,
+                0.015,
+                0.18,
+                &controls,
+                GenerationLimits::default(),
+            )
             .unwrap();
-        let sink = mesh_chunks(
-            &document,
-            0.015,
-            0.18,
-            &controls,
-            GenerationLimits::default(),
-        )
-        .unwrap();
-        let types = sink
-            .chunks
-            .iter()
-            .flat_map(|chunk| &chunk.cells)
-            .map(|cell| cell.element_type.as_str())
-            .collect::<BTreeSet<_>>();
-        assert!(types.contains("tri3"));
-        assert!(types.contains("quad4"));
+            let domains = meshable_domains_from_document(&document).unwrap();
+            let domain = domains.iter().next().unwrap();
+            let (direct, patch) = emitted_cap_qualities(&sink, domain);
+            assert!(!direct.is_empty(), "growth {growth} must produce open caps");
+            assert!(
+                direct
+                    .iter()
+                    .all(|quality| *quality + 1.0e-12 >= QUALITY_TARGET),
+                "growth {growth} transition qualities: {direct:?}; patch: {patch:?}"
+            );
+            assert!(
+                patch
+                    .iter()
+                    .all(|quality| *quality + 1.0e-12 >= QUALITY_TARGET),
+                "growth {growth} neighboring cap-ring qualities: {patch:?}"
+            );
+            let levels = [
+                0.0,
+                0.035,
+                0.035 * (1.0 + growth),
+                0.035 * (1.0 + growth + growth * growth),
+            ];
+            let tolerance = root_tolerance(domain, 0.18);
+            let points = sink
+                .chunks
+                .iter()
+                .flat_map(|chunk| &chunk.points)
+                .map(|point| (point.id, point.position))
+                .collect::<BTreeMap<_, _>>();
+            for point in sink
+                .chunks
+                .iter()
+                .flat_map(|chunk| &chunk.cells)
+                .filter(|cell| cell.element_type == "quad4")
+                .flat_map(|cell| &cell.point_ids)
+            {
+                let depth = -domain.domain_sdf(&[Vec3::from_array(points[point])])[0];
+                assert!(
+                    levels
+                        .iter()
+                        .any(|level| (depth - level).abs() <= tolerance),
+                    "growth {growth} moved a layer vertex to depth {depth}"
+                );
+            }
+            if growth == 1.2 {
+                let max_cells = sink.cells.saturating_add(8) as u64;
+                let (limited, statistics) = mesh_chunks_with_statistics(
+                    &document,
+                    0.18,
+                    &controls,
+                    GenerationLimits {
+                        max_cells,
+                        ..GenerationLimits::default()
+                    },
+                )
+                .expect("cap refinement exhaustion must retain the best valid mesh");
+                assert!(limited.cells as u64 <= max_cells);
+                assert_eq!(statistics.quality_termination, QualityTermination::MaxCells);
+                assert_eq!(
+                    emitted_quad_signature(&limited),
+                    emitted_quad_signature(&sink),
+                    "resource-limited cap refinement must not alter protected quads"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn curved_rotated_and_concave_open_layer_caps_remain_valid() {
+        let mut circle = primitive_document("circle", vec3(-0.8, -0.8, 0.0), vec3(0.8, 0.8, 0.0));
+        let circle_root = circle.fluid_domain.as_ref().unwrap().root;
+        circle
+            .add_boundary_region(circle_root, Some(0), None, Some("arc"))
+            .unwrap();
+
+        let mut rotated = SceneDocument::new();
+        let rotated_root = rotated
+            .add_point_shape_from_world_points(
+                "polygon",
+                &[
+                    vec3(0.0, -1.0, -0.7),
+                    vec3(0.0, 1.0, -0.7),
+                    vec3(0.0, 1.0, 0.7),
+                    vec3(0.0, -1.0, 0.7),
+                ],
+                "yz",
+            )
+            .unwrap();
+        rotated.rename(rotated_root, "rotated_rectangle").unwrap();
+        rotated
+            .set_domain_root(rotated_root, DomainKind::Fluid)
+            .unwrap();
+        rotated
+            .add_boundary_region(rotated_root, Some(0), None, Some("side"))
+            .unwrap();
+
+        let mut concave = SceneDocument::new();
+        let concave_root = concave
+            .add_point_shape_from_world_points(
+                "polygon",
+                &[
+                    vec3(-1.0, -1.0, 0.0),
+                    vec3(1.0, -1.0, 0.0),
+                    vec3(1.0, -0.23, 0.0),
+                    vec3(0.17, -0.23, 0.0),
+                    vec3(0.17, 1.0, 0.0),
+                    vec3(-1.0, 1.0, 0.0),
+                ],
+                "xy",
+            )
+            .unwrap();
+        concave.rename(concave_root, "concave").unwrap();
+        concave
+            .set_domain_root(concave_root, DomainKind::Fluid)
+            .unwrap();
+        concave
+            .add_boundary_region(concave_root, Some(0), None, Some("side"))
+            .unwrap();
+
+        for (document, name) in [
+            (circle, "circle"),
+            (rotated, "rotated_rectangle"),
+            (concave, "concave"),
+        ]
+        .into_iter()
+        {
+            let region = document.boundary_regions.last().unwrap().name.clone();
+            let mut controls = ControlSet::default();
+            controls
+                .boundary_layer(name, region, 0.03, 0.18, 1.2, 0.066)
+                .unwrap();
+            let sink = mesh_chunks(
+                &document,
+                0.015,
+                0.18,
+                &controls,
+                GenerationLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("{name} open cap failed: {error}"));
+            let domains = meshable_domains_from_document(&document).unwrap();
+            let domain = domains.get(name).unwrap();
+            let (direct, patch) = emitted_cap_qualities(&sink, domain);
+            assert!(!direct.is_empty(), "{name} must produce open caps");
+            assert!(
+                direct
+                    .iter()
+                    .all(|quality| *quality + 1.0e-12 >= QUALITY_TARGET),
+                "{name} cap qualities: {direct:?}"
+            );
+            assert!(
+                patch
+                    .iter()
+                    .all(|quality| *quality + 1.0e-12 >= QUALITY_TARGET),
+                "{name} neighboring cap-ring qualities: {patch:?}"
+            );
+            assert!(sink
+                .chunks
+                .iter()
+                .flat_map(|chunk| &chunk.cells)
+                .any(|cell| cell.element_type == "quad4"));
+        }
     }
 
     #[test]
