@@ -131,6 +131,16 @@ fn simplify_contour(
             let previous = vertices[(index + vertices.len() - 1) % vertices.len()];
             let current = vertices[index];
             let next = vertices[(index + 1) % vertices.len()];
+            // Core contour cleanup must not undo boundary-layer rediscretization.
+            if candidate
+                .layer_edge_targets
+                .contains_key(&ordered_pair(previous, current))
+                || candidate
+                    .layer_edge_targets
+                    .contains_key(&ordered_pair(current, next))
+            {
+                continue;
+            }
             let a = Vec3::from_array(candidate.points[&previous].world);
             let point = Vec3::from_array(candidate.points[&current].world);
             let b = Vec3::from_array(candidate.points[&next].world);

@@ -51,6 +51,11 @@ fn retriangulate_once(
         .iter()
         .flat_map(|&(a, b)| [a, b])
         .collect::<BTreeSet<_>>();
+    let layer_constraint_points = graph_constraints
+        .iter()
+        .filter(|edge| candidate.layer_edge_targets.contains_key(edge))
+        .flat_map(|&(a, b)| [a, b])
+        .collect::<BTreeSet<_>>();
     let canonical_tolerance =
         root_tolerance(domain, context.target_size).max(context.target_size * 0.025);
     let mut representative_buckets = BTreeMap::<(i64, i64, i64), Vec<PointKey>>::new();
@@ -62,6 +67,12 @@ fn retriangulate_once(
             (point[1] / canonical_tolerance).floor() as i64,
             (point[2] / canonical_tolerance).floor() as i64,
         );
+        // Boundary-layer stations are authored constraints, even when their
+        // spacing is much smaller than the core target size.
+        if layer_constraint_points.contains(&key) {
+            representative_buckets.entry(bucket).or_default().push(key);
+            continue;
+        }
         let mut representative = None;
         'nearby_representative: for dx in -1..=1 {
             for dy in -1..=1 {
@@ -91,6 +102,13 @@ fn retriangulate_once(
     let chord_limit = chord_tolerance(domain, context.target_size);
     for edge in &graph.edges {
         let [a, b] = edge.points;
+        // The core may coalesce short CAD chords, but never hwall_t edges.
+        if candidate
+            .layer_edge_targets
+            .contains_key(&ordered_pair(a, b))
+        {
+            continue;
+        }
         let a_root = resolved_alias(&graph_aliases, a);
         let b_root = resolved_alias(&graph_aliases, b);
         if a_root == b_root {

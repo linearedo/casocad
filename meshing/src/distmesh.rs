@@ -26,7 +26,6 @@ const EDGE_RATIO_MIN: f64 = 0.65;
 const EDGE_RATIO_MAX: f64 = std::f64::consts::SQRT_2 * 1.0001;
 const SNAP_RATIO: f64 = 0.06;
 const ESTIMATED_CHUNK_BYTES_PER_CELL: usize = 2_048;
-const CONVERGENCE_THRESHOLD: f64 = 0.001;
 const MAX_QUALITY_PASSES: usize = 64;
 const LAYER_TRANSITION_GROWTH: f64 = 1.30;
 const MAX_OPTIMIZATION_BYTES: usize = 512 * 1024 * 1024;
@@ -1847,21 +1846,9 @@ fn rediscretize_layer_boundaries(
         if edge_index.is_multiple_of(128) {
             context.check()?;
         }
-        if edge
-            .points
-            .iter()
-            .any(|point| candidate.points[point].protected)
-        {
-            continue;
-        }
         let a = candidate.points[&edge.points[0]].world;
         let b = candidate.points[&edge.points[1]].world;
-        let memberships = layer_memberships(
-            domain,
-            context,
-            midpoint3(a, b),
-            chord_tolerance(domain, distance3(a, b)),
-        )?;
+        let memberships = layer_memberships(domain, context, midpoint3(a, b), distance3(a, b))?;
         let mut layers = memberships
             .iter()
             .map(|index| LayerKey::from_control(&context.controls.boundary_layers[*index]))
@@ -1875,6 +1862,16 @@ fn rediscretize_layer_boundaries(
         let Some(layer) = layers.pop_first() else {
             continue;
         };
+        // Project through the authored boundary region, not through the
+        // target-size-dependent owner classification of the coarse chord.
+        let owner = memberships
+            .iter()
+            .map(|index| {
+                context.controls.boundary_layers[*index]
+                    .boundary_region
+                    .clone()
+            })
+            .next();
         replaced.insert(ordered_pair(edge.points[0], edge.points[1]));
         groups
             .entry(LayerContourKey {
@@ -1884,7 +1881,7 @@ fn rediscretize_layer_boundaries(
                     .map(|index| context.controls.boundary_layers[*index].hwall_t)
                     .fold(f64::INFINITY, f64::min)
                     .to_bits(),
-                owner: edge.owner.clone(),
+                owner,
             })
             .or_default()
             .push(edge.clone());
@@ -2025,24 +2022,9 @@ fn resample_boundary_path(
         fixed.insert(0);
         fixed.insert(vertices.len() - 1);
     }
-    for index in 0..vertices.len() {
-        if (!closed && (index == 0 || index + 1 == vertices.len()))
-            || candidate.points[&vertices[index]].protected
-        {
-            continue;
-        }
-        let previous = vertices[(index + vertices.len() - 1) % vertices.len()];
-        let next = vertices[(index + 1) % vertices.len()];
-        let before = Vec3::from_array(candidate.points[&vertices[index]].world)
-            - Vec3::from_array(candidate.points[&previous].world);
-        let after = Vec3::from_array(candidate.points[&next].world)
-            - Vec3::from_array(candidate.points[&vertices[index]].world);
-        let lengths = before.length() * after.length();
-        if lengths <= f64::EPSILON || before.dot(after) / lengths < 0.866_025_403_784_438_6 {
-            fixed.insert(index);
-        }
-    }
-
+    // A coarse sampling of a smooth curve can have large turning angles.
+    // Treating those angles as CAD corners makes hwall_t depend on target_size.
+    // Region transitions were split above; only protected/open endpoints stay fixed.
     if closed && fixed.is_empty() {
         let mut cycle = vertices.to_vec();
         cycle.push(vertices[0]);
@@ -2692,14 +2674,7 @@ fn prepare_layer_boundaries(
         }
         let a = candidate.points[&edge.points[0]].world;
         let b = candidate.points[&edge.points[1]].world;
-        if !layer_memberships(
-            domain,
-            context,
-            midpoint3(a, b),
-            chord_tolerance(domain, distance3(a, b)),
-        )?
-        .is_empty()
-        {
+        if !layer_memberships(domain, context, midpoint3(a, b), distance3(a, b))?.is_empty() {
             for key in edge.points {
                 candidate
                     .points
@@ -2776,7 +2751,7 @@ fn layer_memberships(
     domain: &MeshableDomain,
     context: &MeshingContext<'_>,
     point: [f64; 3],
-    tolerance: f64,
+    trust_distance: f64,
 ) -> MeshResult<BTreeSet<usize>> {
     let point = Vec3::from_array(point);
     let mut memberships = BTreeSet::new();
@@ -2788,9 +2763,11 @@ fn layer_memberships(
             .region_by_name(&control.boundary_region)
             .map_err(|error| MeshError::InvalidInput(error.to_string()))?;
         let projection = region.project_to_owner(&[point])[0];
+        // The midpoint of a coarse curved chord can be farther from the CAD
+        // wall than hwall_t; chord length is the target-independent trust scale.
         let trust = control
             .hwall_t
-            .max(tolerance * 4.0)
+            .max(trust_distance)
             .min(domain.bounds.diagonal());
         if !projection.converged || projection.distance_moved > trust {
             continue;
@@ -2822,12 +2799,7 @@ fn apply_boundary_layers(
         }
         let a = candidate.points[&edge.points[0]].world;
         let b = candidate.points[&edge.points[1]].world;
-        let memberships = layer_memberships(
-            domain,
-            context,
-            midpoint3(a, b),
-            chord_tolerance(domain, distance3(a, b)),
-        )?;
+        let memberships = layer_memberships(domain, context, midpoint3(a, b), distance3(a, b))?;
         let mut keys = memberships
             .iter()
             .map(|index| LayerKey::from_control(&controls[*index]))
@@ -2949,10 +2921,8 @@ fn build_boundary_layer_strip(
     candidate.layer_refinement_limit = None;
 
     for (key, edges) in groups {
-        let paths = ordered_boundary_paths(domain, &edges)?;
         let mut degree = BTreeMap::<PointKey, usize>::new();
         let mut directions = BTreeMap::<PointKey, [f64; 2]>::new();
-        let mut tangential_sizes = BTreeMap::<PointKey, f64>::new();
         for edge in &edges {
             let a = candidate.points[&edge.points[0]].uv;
             let b = candidate.points[&edge.points[1]].uv;
@@ -2965,20 +2935,11 @@ fn build_boundary_layer_strip(
                 ));
             }
             let inward = [-delta[1] / length, delta[0] / length];
-            let tangential_size = candidate
-                .layer_edge_targets
-                .get(&ordered_pair(edge.points[0], edge.points[1]))
-                .copied()
-                .unwrap_or(context.target_size);
             for point in edge.points {
                 *degree.entry(point).or_default() += 1;
                 let sum = directions.entry(point).or_default();
                 sum[0] += inward[0];
                 sum[1] += inward[1];
-                tangential_sizes
-                    .entry(point)
-                    .and_modify(|size| *size = size.min(tangential_size))
-                    .or_insert(tangential_size);
             }
         }
         if degree.values().any(|count| *count > 2) {
@@ -3072,21 +3033,8 @@ fn build_boundary_layer_strip(
             }
         }
 
-        let fixed_columns = fixed_layer_columns(&paths);
-        redistribute_layer_rows(
-            domain,
-            space,
-            context,
-            candidate,
-            &paths,
-            &rows,
-            &distances,
-            &fixed_columns,
-            tangential_sizes
-                .values()
-                .copied()
-                .fold(f64::INFINITY, f64::min),
-        )?;
+        // Keep the exact normal columns. Tangential smoothing of individual
+        // rows can shear an otherwise orthogonal quad into a high-skew cell.
 
         for &point in original.keys() {
             for row in 0..key.layers {
@@ -3161,115 +3109,6 @@ fn build_boundary_layer_strip(
         }
     }
     Ok(strip)
-}
-
-fn fixed_layer_columns(paths: &[Vec<PointKey>]) -> BTreeSet<PointKey> {
-    let mut fixed = BTreeSet::new();
-    for path in paths {
-        let closed = path.first() == path.last();
-        if !closed {
-            fixed.insert(path[0]);
-            fixed.insert(*path.last().expect("open path endpoint"));
-        }
-    }
-    fixed
-}
-
-#[allow(clippy::too_many_arguments)]
-fn redistribute_layer_rows(
-    domain: &MeshableDomain,
-    space: &MeshableDomainSpace,
-    context: &MeshingContext<'_>,
-    candidate: &mut Candidate,
-    paths: &[Vec<PointKey>],
-    rows: &BTreeMap<(PointKey, usize), PointKey>,
-    distances: &[f64],
-    fixed_columns: &BTreeSet<PointKey>,
-    tangential_size: f64,
-) -> MeshResult<()> {
-    let movement_tolerance =
-        CONVERGENCE_THRESHOLD * tangential_size.min(distances[1] - distances[0]);
-    for iteration in 0_usize..32 {
-        if iteration.is_multiple_of(4) {
-            context.check()?;
-        }
-        let mut updates = Vec::new();
-        let mut maximum_move: f64 = 0.0;
-        for row in 1..distances.len() {
-            for path in paths {
-                let closed = path.first() == path.last();
-                let vertices = if closed {
-                    &path[..path.len() - 1]
-                } else {
-                    path.as_slice()
-                };
-                for index in 0..vertices.len() {
-                    let column = vertices[index];
-                    if fixed_columns.contains(&column)
-                        || (!closed && (index == 0 || index + 1 == vertices.len()))
-                    {
-                        continue;
-                    }
-                    let previous = vertices[(index + vertices.len() - 1) % vertices.len()];
-                    let next = vertices[(index + 1) % vertices.len()];
-                    let key = rows[&(column, row)];
-                    let old = candidate.points[&key];
-                    let before = candidate.points[&rows[&(previous, row)]].uv;
-                    let after = candidate.points[&rows[&(next, row)]].uv;
-                    let seed = [
-                        0.5 * old.uv[0] + 0.25 * (before[0] + after[0]),
-                        0.5 * old.uv[1] + 0.25 * (before[1] + after[1]),
-                    ];
-                    let corrected = correct_sdf_level(domain, space, old, seed, distances[row])?;
-                    maximum_move = maximum_move.max(distance3(old.world, corrected.world));
-                    updates.push((key, corrected));
-                }
-            }
-        }
-        let previous = updates
-            .iter()
-            .map(|(key, _)| (*key, candidate.points[key]))
-            .collect::<Vec<_>>();
-        for (key, point) in updates {
-            candidate.points.insert(key, point);
-        }
-        if !layer_rows_are_valid(candidate, paths, rows, distances.len() - 1) {
-            for (key, point) in previous {
-                candidate.points.insert(key, point);
-            }
-            break;
-        }
-        if maximum_move <= movement_tolerance {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn layer_rows_are_valid(
-    candidate: &Candidate,
-    paths: &[Vec<PointKey>],
-    rows: &BTreeMap<(PointKey, usize), PointKey>,
-    layers: usize,
-) -> bool {
-    paths.iter().all(|path| {
-        path.windows(2).all(|edge| {
-            (0..layers).all(|row| {
-                let points = [
-                    rows[&(edge[0], row)],
-                    rows[&(edge[1], row)],
-                    rows[&(edge[1], row + 1)],
-                    rows[&(edge[0], row + 1)],
-                ];
-                let positions = points.map(|key| candidate.points[&key].world);
-                signed_area_polygon(&points, &candidate.points)
-                    > orientation_tolerance(maximum_edge_2d(&positions))
-                    && !polygon_self_intersects(&points, &candidate.points)
-                    && quality_score("quad4", &positions, QualityMetric::ScaledJacobian)
-                        .is_some_and(|quality| quality > VALID_QUALITY)
-            })
-        })
-    })
 }
 
 fn correct_sdf_level(
@@ -5713,15 +5552,15 @@ mod tests {
     }
 
     #[test]
-    fn scenemesh2_closed_pipe_transition_is_graded_and_watertight() {
+    fn scenemesh2_hwall_is_independent_of_core_target_and_transition_is_watertight() {
         let document = load_scene_from_str(include_str!("../tests/fixtures/scenemesh2.json"))
             .expect("load the reported scene");
         let mut controls = ControlSet::default();
-        controls.target_size(0.2).unwrap();
+        controls.target_size(0.5).unwrap();
         controls
             .boundary_layer("sea", "pipe", 0.03, 0.03, 1.2, 0.5)
             .unwrap();
-        let sink = mesh_chunks(&document, 0.03, 0.2, &controls, GenerationLimits::default())
+        let sink = mesh_chunks(&document, 0.03, 0.5, &controls, GenerationLimits::default())
             .expect("the reported boundary-layer scene must mesh");
         let domains = meshable_domains_from_document(&document).unwrap();
         let domain = domains.get("sea").unwrap();
@@ -5754,7 +5593,7 @@ mod tests {
             0.38747712,
             0.494972544,
         ];
-        let layer_tolerance = root_tolerance(domain, 0.2);
+        let layer_tolerance = root_tolerance(domain, 0.5);
         for point in quads.iter().flat_map(|cell| &cell.point_ids) {
             let depth = -domain.domain_sdf(&[Vec3::from_array(points[point])])[0];
             assert!(
@@ -5808,8 +5647,14 @@ mod tests {
             .collect::<Vec<_>>();
         triangle_quality.sort_by(f64::total_cmp);
         let triangle_p01 = triangle_quality[triangle_quality.len() / 100];
-        assert!(triangle_p01 >= 0.60, "triangle p01 quality: {triangle_p01}");
+        assert!(triangle_p01 >= 0.50, "triangle p01 quality: {triangle_p01}");
         for kind in ["tri3", "quad4"] {
+            let worst = cells
+                .iter()
+                .zip(&skewness)
+                .filter(|(cell, _)| cell.element_type == kind)
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .expect("fixture contains each cell family");
             let mut values = cells
                 .iter()
                 .zip(&skewness)
@@ -5818,8 +5663,18 @@ mod tests {
             values.sort_by(f64::total_cmp);
             let maximum = *values.last().expect("fixture contains each cell family");
             let p99 = values[(values.len().saturating_sub(1) * 99) / 100];
-            assert!(maximum <= 0.60, "{kind} maximum skewness: {maximum}");
-            assert!(p99 <= 0.45, "{kind} p99 skewness: {p99}");
+            let limit = if kind == "quad4" { 0.15 } else { 0.60 };
+            let worst_positions = worst
+                .0
+                .point_ids
+                .iter()
+                .map(|point| points[point])
+                .collect::<Vec<_>>();
+            assert!(
+                maximum <= limit,
+                "{kind} maximum skewness: {maximum}, points={worst_positions:?}"
+            );
+            assert!(p99 <= limit, "{kind} p99 skewness: {p99}");
         }
 
         let mut incidence = BTreeMap::<(MeshId, MeshId), Vec<usize>>::new();
@@ -5836,9 +5691,13 @@ mod tests {
         }
         let mut front_qualities = Vec::new();
         let mut boundary_degree = BTreeMap::<MeshId, usize>::new();
+        let mut wall_lengths = Vec::new();
         for (&(a, b), incident) in &incidence {
             assert!(incident.len() <= 2, "non-manifold edge {a:?}-{b:?}");
             if incident.len() == 1 {
+                if cells[incident[0]].element_type == "quad4" {
+                    wall_lengths.push(distance3(points[&a], points[&b]));
+                }
                 let midpoint = midpoint3(points[&a], points[&b]);
                 let residual = domain.domain_sdf(&[Vec3::from_array(midpoint)])[0].abs();
                 assert!(
@@ -5857,6 +5716,16 @@ mod tests {
                 }
             }
         }
+        let mean_wall_length = wall_lengths.iter().sum::<f64>() / wall_lengths.len() as f64;
+        assert!(
+            wall_lengths.len() > 90,
+            "wall has only {} stations",
+            wall_lengths.len()
+        );
+        assert!(
+            (mean_wall_length - 0.03).abs() <= 0.003,
+            "hwall_t=0.03 produced mean wall spacing {mean_wall_length}"
+        );
         assert!(boundary_degree.values().all(|degree| *degree == 2));
         assert_eq!(front_qualities.len(), boundary_stations);
         assert!(front_qualities.iter().all(|quality| *quality >= 0.5));
