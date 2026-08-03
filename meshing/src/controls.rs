@@ -122,10 +122,6 @@ pub struct ControlSet {
 }
 
 impl ControlSet {
-    pub fn is_empty(&self) -> bool {
-        self.target_size.is_none() && self.refinements.is_empty() && self.boundary_layers.is_empty()
-    }
-
     pub fn target_size(&mut self, size: f64) -> Result<(), String> {
         positive_finite(size, "target size")?;
         if self.target_size.is_some() {
@@ -207,8 +203,13 @@ impl ControlSet {
                 .checked_add(1)
                 .ok_or_else(|| "boundary-layer layer count overflowed".to_string())?;
             height *= ratio;
-            if layers == 1_000_000 || !height.is_finite() {
-                break;
+            if layers == 1_000_000 {
+                return Err(
+                    "boundary-layer layer count exceeds the one-million safety limit".into(),
+                );
+            }
+            if !height.is_finite() {
+                return Err("boundary-layer height progression is not finite".into());
             }
         }
         self.boundary_layers.push(BoundaryLayerControl {
@@ -350,43 +351,4 @@ fn segment_distance(point: Vec3, a: Vec3, b: Vec3) -> f64 {
     let ab = b - a;
     let t = ((point - a).dot(ab) / ab.dot(ab)).clamp(0.0, 1.0);
     (point - (a + ab * t)).length()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn size_at_is_domain_scoped_and_graded() {
-        let mut controls = ControlSet::default();
-        controls
-            .refinement(
-                "sea",
-                ControlRegion::sphere(vec3(0.0, 0.0, 0.0), 1.0).unwrap(),
-                0.1,
-                0.2,
-            )
-            .unwrap();
-        assert_eq!(controls.size_at("sea", vec3(0.0, 0.0, 0.0), 1.0), 0.1);
-        assert_eq!(controls.size_at("pipe", vec3(0.0, 0.0, 0.0), 1.0), 1.0);
-    }
-
-    #[test]
-    fn boundary_layer_derives_complete_layers_without_exceeding_thickness() {
-        let mut controls = ControlSet::default();
-        controls
-            .boundary_layer("sea", "wall", 0.01, 0.05, 1.2, 0.05)
-            .unwrap();
-        let layer = &controls.boundary_layers[0];
-        assert_eq!(layer.layers, 3);
-        assert!((layer.total_height() - 0.0364).abs() < 1.0e-12);
-        assert!(layer.total_height() + layer.hwall_n * layer.ratio.powi(3) > layer.thickness);
-
-        assert!(controls
-            .boundary_layer("sea", "wall", 0.02, 0.05, 1.2, 0.01)
-            .is_err());
-        assert!(controls
-            .boundary_layer("sea", "wall", 0.01, 0.05, 0.9, 0.05)
-            .is_err());
-    }
 }

@@ -27,6 +27,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Test meshing contracts
+        run: cargo test -p caso-meshing --test arrow_v3
+
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 

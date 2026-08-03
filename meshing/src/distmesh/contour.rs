@@ -348,7 +348,7 @@ pub(super) fn first_layer_transition(
     Ok(best)
 }
 
-fn reject_crossings(
+pub(super) fn reject_crossings(
     domain: &MeshableDomain,
     context: &MeshingContext<'_>,
     candidate: &Candidate,

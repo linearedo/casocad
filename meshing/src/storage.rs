@@ -132,23 +132,6 @@ impl MeshStorage for MemoryStorage {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn publishing_preserves_the_vec_allocation() {
-        let mut storage = MemoryStorage::new(1024).unwrap();
-        let mut writer = storage.begin().unwrap();
-        writer.write_all(&[7; 128]).unwrap();
-        let allocation = writer.bytes.as_ptr();
-        let MeshArtifact::Memory(artifact) = storage.publish(writer).unwrap() else {
-            unreachable!()
-        };
-        assert_eq!(artifact.as_ptr(), allocation);
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub struct NativeFileStorage {

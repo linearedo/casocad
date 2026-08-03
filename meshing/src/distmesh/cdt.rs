@@ -46,21 +46,26 @@ fn retriangulate_once(
     // carrying an interior sign.  Keeping it beside the immutable contour
     // creates an unrefinable sliver, so canonicalize such seeds into the
     // boundary by omitting them from the global point load.
-    let graph_constraints = graph.constraints();
-    let graph_points = graph_constraints
+    let original_graph_constraints = graph.constraints();
+    let original_graph_points = original_graph_constraints
         .iter()
         .flat_map(|&(a, b)| [a, b])
         .collect::<BTreeSet<_>>();
-    let layer_constraint_points = graph_constraints
+    let layer_constraint_points = original_graph_constraints
         .iter()
         .filter(|edge| candidate.layer_edge_targets.contains_key(edge))
         .flat_map(|&(a, b)| [a, b])
+        .collect::<BTreeSet<_>>();
+    let immutable_points = original_graph_points
+        .iter()
+        .copied()
+        .filter(|key| candidate.points[key].protected || layer_constraint_points.contains(key))
         .collect::<BTreeSet<_>>();
     let canonical_tolerance =
         root_tolerance(domain, context.target_size).max(context.target_size * 0.025);
     let mut representative_buckets = BTreeMap::<(i64, i64, i64), Vec<PointKey>>::new();
     let mut graph_aliases = BTreeMap::<PointKey, PointKey>::new();
-    for &key in &graph_points {
+    for &key in &original_graph_points {
         let point = candidate.points[&key].world;
         let bucket = (
             (point[0] / canonical_tolerance).floor() as i64,
@@ -69,8 +74,7 @@ fn retriangulate_once(
         );
         // Boundary-layer stations are authored constraints, even when their
         // spacing is much smaller than the core target size.
-        if layer_constraint_points.contains(&key) {
-            representative_buckets.entry(bucket).or_default().push(key);
+        if immutable_points.contains(&key) {
             continue;
         }
         let mut representative = None;
@@ -102,16 +106,16 @@ fn retriangulate_once(
     let chord_limit = chord_tolerance(domain, context.target_size);
     for edge in &graph.edges {
         let [a, b] = edge.points;
-        // The core may coalesce short CAD chords, but never hwall_t edges.
-        if candidate
-            .layer_edge_targets
-            .contains_key(&ordered_pair(a, b))
-        {
+        // Authored and protected constraints are immutable.
+        if immutable_points.contains(&a) || immutable_points.contains(&b) {
             continue;
         }
         let a_root = resolved_alias(&graph_aliases, a);
         let b_root = resolved_alias(&graph_aliases, b);
-        if a_root == b_root {
+        if a_root == b_root
+            || immutable_points.contains(&a_root)
+            || immutable_points.contains(&b_root)
+        {
             continue;
         }
         let aw = candidate.points[&a_root].world;
@@ -149,6 +153,28 @@ fn retriangulate_once(
             }
         }
     }
+    let graph_constraints = original_graph_constraints
+        .iter()
+        .filter_map(|&(a, b)| {
+            let edge = ordered_pair(
+                resolved_alias(&graph_aliases, a),
+                resolved_alias(&graph_aliases, b),
+            );
+            (edge.0 != edge.1).then_some(edge)
+        })
+        .collect::<BTreeSet<_>>();
+    let graph_points = graph_constraints
+        .iter()
+        .flat_map(|&(a, b)| [a, b])
+        .collect::<BTreeSet<_>>();
+    let aliased_edges = graph_constraints
+        .iter()
+        .map(|&(a, b)| contour::GraphEdge {
+            points: [a, b],
+            owner: None,
+        })
+        .collect::<Vec<_>>();
+    contour::reject_crossings(domain, context, candidate, &aliased_edges)?;
     let seed_tolerance =
         (root_tolerance(domain, context.target_size) * 4.0).max(context.target_size * 0.20);
     let seed_keys = candidate
@@ -284,7 +310,8 @@ fn retriangulate_once(
         .enumerate()
         .map(|(index, key)| (*key, index))
         .collect::<BTreeMap<_, _>>();
-    for (&alias, &representative) in &graph_aliases {
+    for &alias in graph_aliases.keys() {
+        let representative = resolved_alias(&graph_aliases, alias);
         indices.insert(alias, indices[&representative]);
     }
     let vertices = keys
@@ -321,7 +348,8 @@ fn retriangulate_once(
         return Err(invalid_cdt(domain, "contains intersecting constraints"));
     }
     let (_, mut key_handles) = reordered_input_keys(domain, &triangulation, candidate, &keys)?;
-    for (&alias, &representative) in &graph_aliases {
+    for &alias in graph_aliases.keys() {
+        let representative = resolved_alias(&graph_aliases, alias);
         key_handles.insert(alias, key_handles[&representative]);
     }
     verify_constraints(domain, &triangulation, &graph_constraints, &key_handles)?;
@@ -404,7 +432,7 @@ fn retriangulate_once(
             .flat_map(|cell| cell.points.iter().copied())
             .filter(|key| !removable.contains(key))
             .collect::<BTreeSet<_>>();
-        retained.extend(graph_points);
+        retained.extend(&original_graph_points);
         retained.extend(
             candidate
                 .points
@@ -433,7 +461,7 @@ fn retriangulate_once(
             .iter()
             .flat_map(|cell| cell.points.iter().copied())
             .collect::<BTreeSet<_>>();
-        retained.extend(graph_points);
+        retained.extend(&original_graph_points);
         retained.extend(
             candidate
                 .points
@@ -463,7 +491,7 @@ fn retriangulate_once(
         .iter()
         .flat_map(|cell| cell.points.iter().copied())
         .collect::<BTreeSet<_>>();
-    used.extend(graph_points);
+    used.extend(&original_graph_points);
     candidate.points.retain(|key, _| used.contains(key));
     Ok(())
 }

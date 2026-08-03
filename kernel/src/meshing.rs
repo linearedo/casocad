@@ -9,7 +9,7 @@
 use crate::boundary::{BoundaryRegion, CutSide};
 use crate::boundary_ops::{
     boundary_region_mask, cut_volume, evaluate_with_attribution, find_node_by_object_id,
-    RELATIVE_SURFACE_TOLERANCE,
+    surface_patches_for_root, CurvePatchKind, RELATIVE_SURFACE_TOLERANCE,
 };
 use crate::differential::{
     batch_normals, curvature_2d, differential_steps, mean_curvature, project_to_zero_set,
@@ -166,6 +166,92 @@ pub struct MeshableBoundaryRegion {
 }
 
 impl MeshableBoundaryRegion {
+    /// Exposed CAD vertices belonging to exact straight curve patches.
+    /// Smooth outlines intentionally return no feature points so meshers may
+    /// redistribute their stations freely.
+    pub fn curve_feature_points(&self) -> GeometryResult<Vec<Vec3>> {
+        let mut points = Vec::new();
+        for patch in surface_patches_for_root(&self.root) {
+            if patch.owner_object_id != self.owner_object_id
+                || self
+                    .region
+                    .patch_id
+                    .as_ref()
+                    .is_some_and(|id| id != &patch.patch_id)
+            {
+                continue;
+            }
+            let feature_points = match &patch.curve {
+                Some(CurvePatchKind::Edge { start, end, .. }) => vec![*start, *end],
+                Some(CurvePatchKind::Outline) => {
+                    let Shape::PlacedSdf2D(placed) = &patch.owner.shape else {
+                        continue;
+                    };
+                    let local = match &placed.profile {
+                        Profile2D::RegularPolygon {
+                            center,
+                            radius,
+                            side_count,
+                            rotation,
+                        } => (0..*side_count)
+                            .map(|index| {
+                                let angle = rotation
+                                    + f64::from(index) * 2.0 * std::f64::consts::PI
+                                        / f64::from(*side_count);
+                                [
+                                    center[0] + radius * angle.cos(),
+                                    center[1] + radius * angle.sin(),
+                                ]
+                            })
+                            .collect::<Vec<_>>(),
+                        Profile2D::RoundedRectangle {
+                            center,
+                            half_size,
+                            corner_radius,
+                        } => {
+                            let [cx, cy] = *center;
+                            let [hx, hy] = *half_size;
+                            let r = *corner_radius;
+                            vec![
+                                [cx - hx + r, cy - hy],
+                                [cx + hx - r, cy - hy],
+                                [cx + hx, cy - hy + r],
+                                [cx + hx, cy + hy - r],
+                                [cx + hx - r, cy + hy],
+                                [cx - hx + r, cy + hy],
+                                [cx - hx, cy + hy - r],
+                                [cx - hx, cy - hy + r],
+                            ]
+                        }
+                        Profile2D::QuadraticBezierSurface { points }
+                            if points.first() != points.last() =>
+                        {
+                            vec![points[0], points[points.len() - 1]]
+                        }
+                        _ => continue,
+                    };
+                    local
+                        .into_iter()
+                        .map(|point| {
+                            placed.origin + placed.axis_u * point[0] + placed.axis_v * point[1]
+                        })
+                        .collect()
+                }
+                None => continue,
+            };
+            for point in feature_points {
+                if self.contains(&[point])?[0]
+                    && !points
+                        .iter()
+                        .any(|existing: &Vec3| (*existing - point).length() <= 1.0e-12)
+                {
+                    points.push(point);
+                }
+            }
+        }
+        Ok(points)
+    }
+
     /// Exact membership of world points — what is highlighted is what you get.
     pub fn contains(&self, points: &[Vec3]) -> GeometryResult<Vec<bool>> {
         boundary_region_mask(&self.root, &self.region, points, None)

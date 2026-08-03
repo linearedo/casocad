@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use caso_kernel::meshing::{MeshableDomain, MeshableDomainSpace, MeshableDomains};
+use caso_kernel::meshing::MeshableDomains;
 use serde::{Deserialize, Serialize};
 
 use crate::chunk::{MeshChunk, MeshChunkBuilder};
@@ -296,16 +296,6 @@ pub struct MeshingContext<'a> {
 }
 
 impl MeshingContext<'_> {
-    pub fn mesh_space(&self, domain: &MeshableDomain) -> MeshResult<Option<MeshableDomainSpace>> {
-        if domain.dimension != 2 {
-            return Ok(None);
-        }
-        domain
-            .mesh_space()
-            .map(Some)
-            .map_err(|error| MeshError::InvalidInput(error.to_string()))
-    }
-
     pub fn check(&self) -> MeshResult<()> {
         self.job_control.check()
     }
