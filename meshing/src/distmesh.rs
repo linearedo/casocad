@@ -7,11 +7,11 @@ use crate::algorithm::{
     MeshAlgorithm, MeshAlgorithmCapabilities, MeshAlgorithmDescriptor, MeshSink, MeshingContext,
     MeshingPhase, MeshingProgress, MeshingStatistics, QualityTermination,
 };
-use crate::chunk::{MeshChunkBuilder, MeshId};
+use crate::chunk::{ChunkElement, ChunkPoint, MeshChunkBuilder, MeshId};
 use crate::controls::BoundaryLayerControl;
 use crate::error::{MeshError, MeshResult};
 use crate::quality::{quality_score, QualityMetric};
-use crate::schema::Bounds3;
+use crate::schema::{Bounds3, MAX_BATCH_BYTES, MAX_BATCH_ROWS};
 
 mod audit;
 mod cdt;
@@ -19,13 +19,14 @@ mod contour;
 mod distmesh_3d;
 mod layers_3d;
 mod optimizer;
+mod optimizer_3d;
+mod partition;
 
 const QUALITY_TARGET: f64 = 0.40;
 const VALID_QUALITY: f64 = 1.0e-8;
 const EDGE_RATIO_MIN: f64 = 0.65;
 const EDGE_RATIO_MAX: f64 = std::f64::consts::SQRT_2 * 1.0001;
 const SNAP_RATIO: f64 = 0.06;
-const ESTIMATED_CHUNK_BYTES_PER_CELL: usize = 2_048;
 const MAX_QUALITY_PASSES: usize = 64;
 const LAYER_TRANSITION_GROWTH: f64 = 1.30;
 const MAX_OPTIMIZATION_BYTES: usize = 512 * 1024 * 1024;
@@ -133,8 +134,9 @@ impl Grid {
             ));
         }
         // The core remains uniform. Extra dyadic levels are available only
-        // to resolve SDF topology and boundary curvature.
-        let max_depth = 8;
+        // to resolve SDF topology and boundary curvature. Stop at the exact
+        // integer-coordinate capacity instead of an unrelated fixed depth.
+        let max_depth = (u32::MAX / base[0].max(base[1])).ilog2() as u8;
         Ok(Self {
             bounds,
             base,
@@ -4779,15 +4781,32 @@ fn emit(
             context.limits.max_cells
         )));
     }
-    let cells_per_chunk =
-        (context.limits.target_chunk_bytes / ESTIMATED_CHUNK_BYTES_PER_CELL).max(1);
-    let chunk_count = candidate.cells.len().div_ceil(cells_per_chunk);
+    let remaining_chunks = context
+        .limits
+        .max_chunks
+        .saturating_sub(statistics.chunks)
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let tiles = partition::by_budget(
+        candidate.cells.len(),
+        context.limits.target_chunk_bytes.min(MAX_BATCH_BYTES),
+        MAX_BATCH_ROWS,
+        remaining_chunks,
+        |tile| {
+            Ok((
+                planar_tile_bytes(candidate, assessment, tile.clone()),
+                tile.len(),
+            ))
+        },
+    )?;
+    let chunk_count = tiles.len();
     let chunk_ids = (0..chunk_count)
         .map(|_| sink.allocate_chunk_id())
         .collect::<MeshResult<Vec<_>>>()?;
-    let cell_chunk = (0..candidate.cells.len())
-        .map(|index| index / cells_per_chunk)
-        .collect::<Vec<_>>();
+    let mut cell_chunk = vec![0usize; candidate.cells.len()];
+    for (chunk, tile) in tiles.iter().enumerate() {
+        cell_chunk[tile.clone()].fill(chunk);
+    }
     let mut uses = BTreeMap::<PointKey, BTreeSet<usize>>::new();
     for (cell_index, cell) in candidate.cells.iter().enumerate() {
         for &point in &cell.points {
@@ -4831,9 +4850,8 @@ fn emit(
     let catalog = context.catalog.domain(&domain.name)?;
     for (chunk_index, &chunk_id) in chunk_ids.iter().enumerate() {
         context.check()?;
-        let start = chunk_index * cells_per_chunk;
-        let end = (start + cells_per_chunk).min(candidate.cells.len());
-        let used = candidate.cells[start..end]
+        let tile = tiles[chunk_index].clone();
+        let used = candidate.cells[tile.clone()]
             .iter()
             .flat_map(|cell| cell.points.iter().copied())
             .collect::<BTreeSet<_>>();
@@ -4852,7 +4870,7 @@ fn emit(
                 Vec::new(),
             )?;
         }
-        for cell in &candidate.cells[start..end] {
+        for cell in &candidate.cells[tile.clone()] {
             match cell.points.as_slice() {
                 [a, b, c] => {
                     builder.tri3([ids[a], ids[b], ids[c]], catalog.zone, catalog.source)?;
@@ -4870,7 +4888,7 @@ fn emit(
         for edge in assessment
             .boundary
             .iter()
-            .filter(|edge| (start..end).contains(&edge.cell))
+            .filter(|edge| tile.contains(&edge.cell))
         {
             let a = candidate.points[&edge.points[0]].world;
             let b = candidate.points[&edge.points[1]].world;
@@ -4893,7 +4911,7 @@ fn emit(
         }
         let chunk = builder.build(2)?;
         let active = (chunk.decoded_bytes()
-            + estimated_planar_bytes(used.len(), &candidate.cells[start..end]))
+            + estimated_planar_bytes(used.len(), &candidate.cells[tile.clone()]))
             as u64;
         if active > context.limits.target_chunk_bytes as u64 {
             return Err(MeshError::LimitExceeded(format!(
@@ -4940,6 +4958,49 @@ fn estimated_planar_bytes(vertices: usize, cells: &[Cell]) -> usize {
             .map(|cell| cell.points.len().saturating_mul(24))
             .sum(),
     )
+}
+
+fn planar_tile_bytes(
+    candidate: &Candidate,
+    assessment: &Assessment,
+    tile: std::ops::Range<usize>,
+) -> usize {
+    let used = candidate.cells[tile.clone()]
+        .iter()
+        .flat_map(|cell| cell.points.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let point_bytes = used
+        .iter()
+        .map(|point| {
+            std::mem::size_of::<ChunkPoint>()
+                + if assessment.boundary_vertices.contains(point) {
+                    "boundary".len()
+                } else {
+                    "interior".len()
+                }
+        })
+        .sum::<usize>();
+    let cell_bytes = candidate.cells[tile.clone()]
+        .iter()
+        .map(|cell| {
+            std::mem::size_of::<ChunkElement>()
+                + cell.element_type().len()
+                + cell.points.len() * std::mem::size_of::<MeshId>()
+        })
+        .sum::<usize>();
+    let boundary_bytes = assessment
+        .boundary
+        .iter()
+        .filter(|edge| tile.contains(&edge.cell))
+        .count()
+        * (std::mem::size_of::<ChunkElement>()
+            + "line2".len()
+            + 2 * std::mem::size_of::<MeshId>()
+            + std::mem::size_of::<u64>());
+    point_bytes
+        .saturating_add(cell_bytes)
+        .saturating_add(boundary_bytes)
+        .saturating_add(estimated_planar_bytes(used.len(), &candidate.cells[tile]))
 }
 
 fn signed_area(triangle: [PointKey; 3], points: &BTreeMap<PointKey, Point>) -> f64 {

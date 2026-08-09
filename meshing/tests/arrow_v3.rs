@@ -378,6 +378,36 @@ fn smaller_target_size_produces_a_denser_mesh() {
 }
 
 #[test]
+fn byte_budget_partitions_planar_and_layered_volume_meshes() {
+    let mut planar = request(rectangle(2.0, 1.0), 0.2);
+    planar.limits.target_chunk_bytes = 4 * 1024;
+    let output =
+        caso_meshing::run_meshing(planar, MemoryStorage::new(64 * 1024 * 1024).unwrap()).unwrap();
+    assert!(output.statistics.chunks > 1);
+    assert!(output.statistics.peak_active_bytes <= 4 * 1024);
+    MeshFile::from_memory(memory(output.artifact))
+        .unwrap()
+        .full_audit(&JobControl::default())
+        .unwrap();
+
+    let (domains, region) = box_with_surface_region();
+    let mut layered = request(domains, 0.5);
+    layered.limits.target_chunk_bytes = 8 * 1024;
+    layered
+        .controls
+        .boundary_layer("air", region, 0.002, 0.5, 1.0, 0.004)
+        .unwrap();
+    let output =
+        caso_meshing::run_meshing(layered, MemoryStorage::new(64 * 1024 * 1024).unwrap()).unwrap();
+    assert!(output.statistics.chunks > 1);
+    assert!(output.statistics.peak_active_bytes <= 8 * 1024);
+    MeshFile::from_memory(memory(output.artifact))
+        .unwrap()
+        .full_audit(&JobControl::default())
+        .unwrap();
+}
+
+#[test]
 fn straight_and_curved_boundaries_produce_valid_tagged_quad_layers() {
     let (domains, region) = rectangle_with_curved_hole();
     let mut generation = request(domains, 0.25);

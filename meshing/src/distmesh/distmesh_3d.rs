@@ -8,12 +8,12 @@ use caso_kernel::vec3::Vec3;
 use crate::algorithm::{
     MeshSink, MeshingContext, MeshingPhase, MeshingProgress, MeshingStatistics,
 };
-use crate::chunk::{MeshChunkBuilder, MeshId};
+use crate::chunk::{ChunkElement, ChunkPoint, MeshChunkBuilder, MeshId};
 use crate::error::{MeshError, MeshResult};
-use crate::schema::Bounds3;
+use crate::schema::{Bounds3, MAX_BATCH_BYTES, MAX_BATCH_ROWS};
 
-const ESTIMATED_BYTES_PER_TET: usize = 256;
 const ROOT_STEPS: usize = 64;
+const MAX_BACKGROUND_RETRIES: usize = 4;
 
 #[derive(Clone, Copy)]
 struct Sample {
@@ -60,7 +60,8 @@ pub(super) fn generate(
     let mut shared_boundary_points = Vec::<([f64; 3], MeshId)>::new();
     for domain in context.domains.iter() {
         context.check()?;
-        let mesh = build_domain(domain, sampling_bounds, context)?;
+        let mut mesh = build_domain(domain, sampling_bounds, context)?;
+        super::optimizer_3d::optimize(domain, context, &mut mesh, &mut statistics)?;
         emit_domain(
             domain,
             context,
@@ -92,10 +93,52 @@ fn build_domain(
             domain.name
         )));
     }
-    let counts =
+    let base_counts =
         lengths.map(|length| ((length / context.target_size).ceil() as usize).clamp(1, 1_024));
+    let mut refinement = 1usize;
+    let mut previous = None;
+    let mut last_error = None;
+    for attempt in 0..MAX_BACKGROUND_RETRIES {
+        let counts = base_counts.map(|count| count.saturating_mul(refinement).min(1_024));
+        if previous == Some(counts) {
+            return Err(last_error.unwrap_or_else(|| {
+                MeshError::InvalidInput(format!(
+                    "domain {:?} exhausted the adaptive 3D coordinate grid",
+                    domain.name
+                ))
+            }));
+        }
+        previous = Some(counts);
+        match build_domain_grid(domain, bounds, lengths, counts, context) {
+            Ok(mesh) => return Ok(mesh),
+            Err(error @ (MeshError::Cancelled | MeshError::LimitExceeded(_))) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 == MAX_BACKGROUND_RETRIES {
+            break;
+        }
+        refinement = refinement.checked_mul(2).ok_or_else(|| {
+            MeshError::LimitExceeded("adaptive 3D refinement depth overflowed".into())
+        })?;
+    }
+    Err(last_error.unwrap_or_else(|| {
+        MeshError::LimitExceeded(format!(
+            "domain {:?} exhausted the adaptive 3D refinement iteration budget",
+            domain.name
+        ))
+    }))
+}
+
+fn build_domain_grid(
+    domain: &MeshableDomain,
+    bounds: BoundingBox3D,
+    lengths: [f64; 3],
+    counts: [usize; 3],
+    context: &MeshingContext<'_>,
+) -> MeshResult<VolumeMesh> {
     let background_tets = counts
-        .into_iter()
+        .iter()
+        .copied()
         .try_fold(6usize, usize::checked_mul)
         .ok_or_else(|| MeshError::LimitExceeded("3D background grid size overflowed".into()))?;
     if background_tets > usize::try_from(context.limits.max_cells).unwrap_or(usize::MAX) * 4 {
@@ -383,6 +426,11 @@ fn audit_mesh(domain: &MeshableDomain, mesh: &mut VolumeMesh) -> MeshResult<()> 
             face
         })
         .collect::<BTreeSet<_>>();
+    boundary.extend(
+        faces
+            .iter()
+            .filter_map(|(face, incidence)| (*incidence == 1).then_some(*face)),
+    );
     boundary.retain(|face| faces.get(face) == Some(&1));
     mesh.boundary_faces = boundary.into_iter().collect();
     mesh.boundary_points = mesh.boundary_faces.iter().flatten().copied().collect();
@@ -403,107 +451,290 @@ fn emit_domain(
     statistics: &mut MeshingStatistics,
     shared_boundary_points: &mut Vec<([f64; 3], MeshId)>,
 ) -> MeshResult<()> {
-    let estimated = (mesh.cells.len() + mesh.prisms.len() + mesh.pyramids.len())
-        .saturating_mul(ESTIMATED_BYTES_PER_TET);
-    if estimated > context.limits.target_chunk_bytes {
-        return Err(MeshError::LimitExceeded(format!(
-            "3D Delaunay topology and writer batch require about {estimated} bytes, exceeding the configured {} byte chunk target",
-            context.limits.target_chunk_bytes
-        )));
+    let mut elements = (0..mesh.cells.len())
+        .map(VolumeElement::Tet)
+        .chain((0..mesh.prisms.len()).map(VolumeElement::Prism))
+        .chain((0..mesh.pyramids.len()).map(VolumeElement::Pyramid))
+        .collect::<Vec<_>>();
+    elements.sort_by_key(|element| (morton_centroid(mesh, *element, domain.bounds), *element));
+    let boundary_owners = boundary_owners(mesh, &elements)?;
+    let remaining_chunks = context
+        .limits
+        .max_chunks
+        .saturating_sub(statistics.chunks)
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let tiles = super::partition::by_budget(
+        elements.len(),
+        context.limits.target_chunk_bytes.min(MAX_BATCH_BYTES),
+        MAX_BATCH_ROWS,
+        remaining_chunks,
+        |tile| {
+            Ok((
+                volume_tile_bytes(mesh, &elements, &boundary_owners, tile.clone()),
+                tile.len(),
+            ))
+        },
+    )?;
+    let chunk_ids = (0..tiles.len())
+        .map(|_| sink.allocate_chunk_id())
+        .collect::<MeshResult<Vec<_>>>()?;
+    let mut point_uses = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for (tile_index, tile) in tiles.iter().enumerate() {
+        for element in &elements[tile.clone()] {
+            for &point in element.vertices(mesh) {
+                point_uses.entry(point).or_default().insert(tile_index);
+            }
+        }
     }
-    let chunk_id = sink.allocate_chunk_id()?;
-    let bounds = Bounds3::from_points(mesh.points.iter().copied())
-        .expanded(domain.bounds.diagonal() * 1.0e-12 + f64::EPSILON);
-    let mut builder = MeshChunkBuilder::new(chunk_id, bounds)?;
     let shared_tolerance = domain.bounds.diagonal() * 1.0e-10 + f64::EPSILON;
     let previous_shared = shared_boundary_points.len();
-    let mut ids = BTreeMap::new();
-    for (index, point) in mesh.points.iter().enumerate() {
+    let mut ordinals = vec![1u32; tiles.len()];
+    let mut ids = BTreeMap::<usize, MeshId>::new();
+    let mut positions = BTreeMap::<usize, [f64; 3]>::new();
+    for (&index, uses) in &point_uses {
+        let point = mesh.points[index];
         let boundary = mesh.boundary_points.contains(&index);
         if boundary {
             if let Some((position, id)) = shared_boundary_points[..previous_shared]
                 .iter()
-                .find(|(position, _)| distance(*position, *point) <= shared_tolerance)
+                .find(|(position, _)| distance(*position, point) <= shared_tolerance)
             {
-                builder.point_copy(*id, *position, "boundary", Vec::new())?;
                 ids.insert(index, *id);
+                positions.insert(index, *position);
                 continue;
             }
         }
-        let id = builder.classified_point(
-            *point,
-            if boundary { "boundary" } else { "interior" },
-            Vec::new(),
-        )?;
+        let owner = *uses.first().expect("used volume point has a tile");
+        let ordinal = ordinals[owner];
+        ordinals[owner] = ordinal
+            .checked_add(1)
+            .ok_or_else(|| MeshError::LimitExceeded("3D point ID space exhausted".into()))?;
+        let id = MeshId::from_raw((u64::from(chunk_ids[owner]) << 32) | u64::from(ordinal));
         if boundary {
-            shared_boundary_points.push((*point, id));
+            shared_boundary_points.push((point, id));
         }
         ids.insert(index, id);
+        positions.insert(index, point);
     }
     let catalog = context.catalog.domain(&domain.name)?;
-    for cell in &mesh.cells {
-        builder.tet4(
-            cell.map(|vertex| ids[&vertex]),
-            catalog.zone,
-            catalog.source,
-        )?;
+    for (tile_index, &chunk_id) in chunk_ids.iter().enumerate() {
+        context.check()?;
+        let tile = tiles[tile_index].clone();
+        let used = elements[tile.clone()]
+            .iter()
+            .flat_map(|element| element.vertices(mesh).iter().copied())
+            .collect::<BTreeSet<_>>();
+        let bounds = Bounds3::from_points(used.iter().map(|point| positions[point]))
+            .expanded(domain.bounds.diagonal() * 1.0e-12 + f64::EPSILON);
+        let mut builder = MeshChunkBuilder::new(chunk_id, bounds)?;
+        for &point in &used {
+            builder.point_copy(
+                ids[&point],
+                positions[&point],
+                if mesh.boundary_points.contains(&point) {
+                    "boundary"
+                } else {
+                    "interior"
+                },
+                Vec::new(),
+            )?;
+        }
+        for element in &elements[tile.clone()] {
+            match *element {
+                VolumeElement::Tet(index) => builder.tet4(
+                    mesh.cells[index].map(|vertex| ids[&vertex]),
+                    catalog.zone,
+                    catalog.source,
+                )?,
+                VolumeElement::Prism(index) => builder.prism6(
+                    mesh.prisms[index].map(|vertex| ids[&vertex]),
+                    catalog.zone,
+                    catalog.source,
+                )?,
+                VolumeElement::Pyramid(index) => builder.pyramid5(
+                    mesh.pyramids[index].map(|vertex| ids[&vertex]),
+                    catalog.zone,
+                    catalog.source,
+                )?,
+            };
+        }
+        for (face_index, face) in mesh.boundary_faces.iter().enumerate() {
+            if !tile.contains(&boundary_owners[face_index]) {
+                continue;
+            }
+            let center = centroid(face.iter().map(|vertex| positions[vertex]));
+            let class = domain
+                .classify_boundary(
+                    &[Vec3::from_array(center)],
+                    BoundaryBand::UnprojectedSamples,
+                )
+                .map_err(|error| MeshError::InvalidInput(error.to_string()))?
+                .into_iter()
+                .next()
+                .expect("one boundary classification");
+            let tag = class
+                .region_name
+                .as_deref()
+                .and_then(|region| context.catalog.boundary_tag(&domain.name, region))
+                .unwrap_or(catalog.wall_tag);
+            builder.boundary_face("tri3", &face.map(|vertex| ids[&vertex]), vec![tag])?;
+        }
+        let chunk = builder.build(3)?;
+        let active = (chunk.decoded_bytes()
+            + estimated_volume_bytes(used.len(), &elements[tile.clone()], mesh))
+            as u64;
+        if active > context.limits.target_chunk_bytes as u64 {
+            return Err(MeshError::LimitExceeded(format!(
+                "3D DistMesh chunk {chunk_id} requires {active} bytes, exceeding the configured {} byte chunk target",
+                context.limits.target_chunk_bytes
+            )));
+        }
+        let points = chunk.points.len() as u64;
+        let cells = chunk.cells.len() as u64;
+        sink.emit(chunk)?;
+        statistics.chunks += 1;
+        statistics.points += points;
+        statistics.cells += cells;
+        statistics.peak_active_bytes = statistics.peak_active_bytes.max(active);
+        context.job_control.report(MeshingProgress {
+            phase: MeshingPhase::Generating,
+            phase_completed: statistics.chunks,
+            phase_total: tiles.len() as u64,
+            completed_chunks: statistics.chunks,
+            cells_committed: statistics.cells,
+            active_bytes: active,
+        });
     }
-    for cell in &mesh.prisms {
-        builder.prism6(
-            cell.map(|vertex| ids[&vertex]),
-            catalog.zone,
-            catalog.source,
-        )?;
-    }
-    for cell in &mesh.pyramids {
-        builder.pyramid5(
-            cell.map(|vertex| ids[&vertex]),
-            catalog.zone,
-            catalog.source,
-        )?;
-    }
-    for face in &mesh.boundary_faces {
-        let center = centroid(face.iter().map(|vertex| mesh.points[*vertex]));
-        let class = domain
-            .classify_boundary(
-                &[Vec3::from_array(center)],
-                BoundaryBand::UnprojectedSamples,
-            )
-            .map_err(|error| MeshError::InvalidInput(error.to_string()))?
-            .into_iter()
-            .next()
-            .expect("one boundary classification");
-        let tag = class
-            .region_name
-            .as_deref()
-            .and_then(|region| context.catalog.boundary_tag(&domain.name, region))
-            .unwrap_or(catalog.wall_tag);
-        builder.boundary_face("tri3", &face.map(|vertex| ids[&vertex]), vec![tag])?;
-    }
-    let chunk = builder.build(3)?;
-    let active = chunk.decoded_bytes() as u64;
-    if active > context.limits.target_chunk_bytes as u64 {
-        return Err(MeshError::LimitExceeded(format!(
-            "3D chunk {chunk_id} requires {active} bytes, exceeding the configured {} byte chunk target",
-            context.limits.target_chunk_bytes
-        )));
-    }
-    let points = chunk.points.len() as u64;
-    let cells = chunk.cells.len() as u64;
-    sink.emit(chunk)?;
-    statistics.chunks += 1;
-    statistics.points += points;
-    statistics.cells += cells;
-    statistics.peak_active_bytes = statistics.peak_active_bytes.max(active);
-    context.job_control.report(MeshingProgress {
-        phase: MeshingPhase::Generating,
-        phase_completed: statistics.chunks,
-        phase_total: context.domains.len() as u64,
-        completed_chunks: statistics.chunks,
-        cells_committed: statistics.cells,
-        active_bytes: active,
-    });
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum VolumeElement {
+    Tet(usize),
+    Prism(usize),
+    Pyramid(usize),
+}
+
+impl VolumeElement {
+    fn vertices(self, mesh: &VolumeMesh) -> &[usize] {
+        match self {
+            Self::Tet(index) => &mesh.cells[index],
+            Self::Prism(index) => &mesh.prisms[index],
+            Self::Pyramid(index) => &mesh.pyramids[index],
+        }
+    }
+
+    fn element_type(self) -> &'static str {
+        match self {
+            Self::Tet(_) => "tet4",
+            Self::Prism(_) => "prism6",
+            Self::Pyramid(_) => "pyramid5",
+        }
+    }
+}
+
+fn boundary_owners(mesh: &VolumeMesh, elements: &[VolumeElement]) -> MeshResult<Vec<usize>> {
+    let mut uses = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for (index, element) in elements.iter().enumerate() {
+        for &vertex in element.vertices(mesh) {
+            uses.entry(vertex).or_default().insert(index);
+        }
+    }
+    mesh.boundary_faces
+        .iter()
+        .map(|face| {
+            uses.get(&face[0])
+                .into_iter()
+                .flatten()
+                .copied()
+                .find(|element| {
+                    face.iter()
+                        .all(|vertex| elements[*element].vertices(mesh).contains(vertex))
+                })
+                .ok_or_else(|| {
+                    MeshError::InvalidInput(format!(
+                        "3D boundary facet {face:?} has no owning volume element"
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn volume_tile_bytes(
+    mesh: &VolumeMesh,
+    elements: &[VolumeElement],
+    boundary_owners: &[usize],
+    tile: std::ops::Range<usize>,
+) -> usize {
+    let used = elements[tile.clone()]
+        .iter()
+        .flat_map(|element| element.vertices(mesh).iter().copied())
+        .collect::<BTreeSet<_>>();
+    let points = used
+        .iter()
+        .map(|point| {
+            std::mem::size_of::<ChunkPoint>()
+                + if mesh.boundary_points.contains(point) {
+                    "boundary".len()
+                } else {
+                    "interior".len()
+                }
+        })
+        .sum::<usize>();
+    let cells = elements[tile.clone()]
+        .iter()
+        .map(|element| {
+            std::mem::size_of::<ChunkElement>()
+                + element.element_type().len()
+                + element.vertices(mesh).len() * std::mem::size_of::<MeshId>()
+        })
+        .sum::<usize>();
+    let faces = boundary_owners
+        .iter()
+        .filter(|owner| tile.contains(owner))
+        .count()
+        * (std::mem::size_of::<ChunkElement>()
+            + "tri3".len()
+            + 3 * std::mem::size_of::<MeshId>()
+            + std::mem::size_of::<u64>());
+    points
+        .saturating_add(cells)
+        .saturating_add(faces)
+        .saturating_add(estimated_volume_bytes(used.len(), &elements[tile], mesh))
+}
+
+fn estimated_volume_bytes(vertices: usize, elements: &[VolumeElement], mesh: &VolumeMesh) -> usize {
+    vertices.saturating_mul(64).saturating_add(
+        elements
+            .iter()
+            .map(|element| element.vertices(mesh).len().saturating_mul(24))
+            .sum(),
+    )
+}
+
+fn morton_centroid(mesh: &VolumeMesh, element: VolumeElement, bounds: BoundingBox3D) -> u64 {
+    let center = centroid(
+        element
+            .vertices(mesh)
+            .iter()
+            .map(|vertex| mesh.points[*vertex]),
+    );
+    let min = [bounds.x_min, bounds.y_min, bounds.z_min];
+    let max = [bounds.x_max, bounds.y_max, bounds.z_max];
+    let coordinate = |axis: usize| {
+        (((center[axis] - min[axis]) / (max[axis] - min[axis])).clamp(0.0, 1.0)
+            * ((1u32 << 21) - 1) as f64) as u32
+    };
+    morton3(coordinate(0), coordinate(1), coordinate(2))
+}
+
+fn morton3(x: u32, y: u32, z: u32) -> u64 {
+    (0..21).fold(0, |code, bit| {
+        code | (u64::from((x >> bit) & 1) << (3 * bit))
+            | (u64::from((y >> bit) & 1) << (3 * bit + 1))
+            | (u64::from((z >> bit) & 1) << (3 * bit + 2))
+    })
 }
 
 fn tetrahedron_edges(tetrahedron: [usize; 4]) -> [[usize; 2]; 6] {
