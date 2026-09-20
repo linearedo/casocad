@@ -4,18 +4,11 @@ SDF-based CAD for solver-ready analysis cases (CFD first), written in Rust and
 targeting **native desktop and the web browser** from a single codebase
 (egui + wgpu).
 
-This Rust workspace is the full port of the original Python casoCAD, now the
-sole codebase. The final Python snapshot is archived at the `python-final` tag
-(branch `final-python`, commit `6185ec6`).
-
 Principles:
 
 - Unsafe code is denied workspace-wide.
-- Minimal dependencies: the kernel has **zero**; later crates add only what is
-  irreplaceable (`wgpu`, `egui`).
+- Minimal dependencies
 - f64 for all kernel/analysis math; f32 only at GPU upload boundaries.
-- SDF terminology: boolean operations are *SDF operators* (never "CSG");
-  "meshing" is reserved for FEA/CFD — the viewport makes *surfaces*.
 
 See [DESIGN.md](DESIGN.md) for the architecture and product scope,
 [Console Draw scripting](docs/console_draw_api.md) for transactional CAD
